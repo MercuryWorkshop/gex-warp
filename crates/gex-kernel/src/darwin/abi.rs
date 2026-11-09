@@ -248,6 +248,8 @@ pub mod map {
     pub const NORESERVE: u64 = 0x40;
     pub const JIT: u64 = 0x800;
     pub const ANON: u64 = 0x1000;
+    /// The caller wants POSIX's argument checks.
+    pub const UNIX03: u64 = 0x4_0000;
 }
 
 /// Darwin `mmap` flags as the kernel's.

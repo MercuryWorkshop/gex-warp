@@ -32,6 +32,35 @@ __asm__(
     "  syscall\n  ret\n");
 #endif
 
+// The trampoline: (handler, style, signal, siginfo, context, token). The
+// handler is called as handler(signal, siginfo, context), then
+// sigreturn(context, UC_FLAVOR, token) puts the interrupted thread back.
+#if defined(__arm64__)
+__asm__(
+    ".text\n.p2align 2\n_t_sigtramp:\n"
+    "  mov x19, x4\n  mov x20, x5\n  mov x8, x0\n"
+    "  mov x0, x2\n  mov x1, x3\n  mov x2, x4\n  blr x8\n"
+    "  mov x0, x19\n  mov x1, #30\n  mov x2, x20\n  mov x16, #184\n  svc #0x80\n  brk #1\n");
+#elif defined(__x86_64__)
+__asm__(
+    ".text\n_t_sigtramp:\n"
+    "  movq %r8, %r12\n  movq %r9, %r13\n  movq %rdi, %rax\n"
+    "  movq %rdx, %rdi\n  movq %rcx, %rsi\n  movq %r8, %rdx\n  callq *%rax\n"
+    "  movq %r12, %rdi\n  movl $30, %esi\n  movq %r13, %rdx\n  movl $0x20000b8, %eax\n  syscall\n  ud2\n");
+#endif
+extern void t_sigtramp(void) __asm__("_t_sigtramp");
+
+long t_sigaction(int sig, void *handler, int flags, u32 mask, struct t_sigaction *old) {
+    // struct __sigaction: the handler, the trampoline, the mask, the flags.
+    struct {
+        void *handler;
+        void (*tramp)(void);
+        u32 mask;
+        int flags;
+    } act = {handler, t_sigtramp, mask, flags};
+    return SYS(SYS_sigaction, sig, &act, old);
+}
+
 size_t t_strlen(const char *s) {
     size_t n = 0;
     while (s[n]) n++;

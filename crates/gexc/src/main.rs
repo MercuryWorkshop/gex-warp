@@ -830,6 +830,18 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     choose_mem(&mut ra, &bytes, wide)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
+    // A Darwin program that a signal ended: by Darwin's number for it, as
+    // its own shell would report it (the kernel's are Linux's).
+    let exit = match exit {
+        Exit::Signal { signal, pc, detail, internal } if program.is_darwin() => {
+            let signal = match gex_kernel::darwin::abi::sig_to_darwin(signal as u32) {
+                0 => signal,
+                d => d as i32,
+            };
+            Exit::Signal { signal, pc, detail, internal }
+        }
+        e => e,
+    };
     learn_mem(&ra, &bytes, wide);
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {

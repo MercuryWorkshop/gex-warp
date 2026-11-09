@@ -5166,6 +5166,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if deliver_guest_fault(&mut caller, fault_code::BREAKPOINT, pc as u64 + 1, pc as u64)? {
                 return Err(StopExecution.into());
             }
+            // An A64 `brk` in a program with a SIGTRAP handler: the handler
+            // runs, from a frame whose pc is the instruction's (a host call
+            // has the thread's registers in its context, so the frame is
+            // exact). With none it ends the process, below.
+            if !gex_abi::X86 && fault_hook_of(caller.data()).is_none() {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let mut gm = GuestMem::new(memory.bytes());
+                    let d = caller.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signal::SIGTRAP as u32, pc as u64, pc as u64));
+                    if let gex_kernel::signal::Delivery::Resume(target) = d {
+                        caller.data_mut().resume_cause = Some("brk".into());
+                        caller.data_mut().resume_at = Some(target);
+                        return Err(StopExecution.into());
+                    }
+                }
+            }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,
                 pc: pc as u64,

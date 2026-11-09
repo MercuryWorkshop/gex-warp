@@ -180,7 +180,22 @@ impl Kernel {
                     l => set(nr::KILL, &[x[0] as i32 as i64 as u64, l as u64]),
                 },
             },
+            // `sigsuspend`'s mask is an argument, not a pointer: the
+            // kernel's 64-bit one goes in the scratch.
+            d::SIGSUSPEND | d::SIGSUSPEND_NOCANCEL => {
+                let at = self.ctx_addr + SCRATCH_SLOT as u64;
+                let _ = m.write_u64(at, abi::sigset_to_linux(x[0] as u32));
+                set(nr::RT_SIGSUSPEND, &[at, 8])
+            }
             d::EXECVE => set(nr::EXECVE, &x[..3]),
+            // A handler's return, which restores a whole context; or, by its
+            // second argument, a note that the thread is on or off its
+            // alternate stack, which is worked out from its stack pointer
+            // here and needs no note.
+            d::SIGRETURN => match x[1] as u32 {
+                signal::dframe::UC_SET_ALT_STACK | signal::dframe::UC_RESET_ALT_STACK => set(nr::NOOP_OK, &[]),
+                _ => set(nr::RT_SIGRETURN, &x[..3]),
+            },
             d::MUNMAP => set(nr::MUNMAP, &x[..2]),
             d::MPROTECT => set(nr::MPROTECT, &x[..3]),
             d::MSYNC => set(nr::MSYNC, &x[..3]),
@@ -259,7 +274,8 @@ impl Kernel {
                 }
                 set(nr::PPOLL, &[x[0], x[1], ts, 0, 0])
             }
-            d::GETENTROPY => {
+            // At most 256 bytes a call.
+            d::GETENTROPY if x[1] <= 256 => {
                 self.darwin_post = Post::Zero;
                 set(nr::GETRANDOM, &[x[0], x[1], 0])
             }
@@ -272,7 +288,10 @@ impl Kernel {
         match code {
             // A signal number Darwin does not have.
             d::KILL => Err(Errno::EINVAL),
-            d::GETRLIMIT | d::SETRLIMIT => Err(Errno::EINVAL),
+            d::GETRLIMIT | d::SETRLIMIT | d::GETENTROPY => Err(Errno::EINVAL),
+            // A wait on a Mach semaphore, which is how the libc sleeps: the
+            // semaphore must be one.
+            d::SEMWAIT_SIGNAL | d::SEMWAIT_SIGNAL_NOCANCEL => Err(Errno::EINVAL),
             d::GETDTABLESIZE => Ok(self.rlimits.get()[RLIMIT_NOFILE][0].min(i32::MAX as u64)),
             d::DUP2 => {
                 if x[0] != x[1] {
@@ -327,15 +346,25 @@ impl Kernel {
     /// first Darwin page in it.
     fn darwin_mmap(&mut self, m: &mut GuestMem<'_>, x: [u64; 8]) -> SysResult {
         let (addr, len, prot_bits, flags, off) = (x[0], x[1], x[2] & 7, x[3], x[5]);
-        if len == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let kflags = abi::mmap_flags(flags);
+        let mut kflags = abi::mmap_flags(flags);
         // An anonymous mapping's descriptor carries Mach VM flags (a tag
         // for `vmmap`), not a file.
         let fd = if flags & abi::map::ANON != 0 { u64::MAX } else { x[4] as i32 as i64 as u64 };
+        // POSIX's rules are for a caller that asks for them (the libc's
+        // `mmap` does, with `MAP_UNIX03`): without, a mapping neither shared
+        // nor private is private, and one of no length is no mapping.
+        let unix03 = flags & abi::map::UNIX03 != 0;
         if kflags & (mflags::SHARED | mflags::PRIVATE) == 0 {
-            return Err(Errno::EINVAL);
+            if unix03 {
+                return Err(Errno::EINVAL);
+            }
+            kflags |= mflags::PRIVATE;
+        }
+        if fd != u64::MAX {
+            self.fds.get(fd as i32)?;
+        }
+        if len == 0 {
+            return if unix03 { Err(Errno::EINVAL) } else { Ok(0) };
         }
         let page = abi::PAGE_SIZE;
         if flags & abi::map::FIXED != 0 {
@@ -479,7 +508,8 @@ impl Kernel {
             let a = self.signals.alt_stack();
             m.write_u64(old, a.sp)?;
             m.write_u64(old + 8, a.size)?;
-            m.write_u32(old + 16, flags_out(a.flags))?;
+            // A thread that has set none has a disabled one.
+            m.write_u32(old + 16, if a.size == 0 { 4 } else { flags_out(a.flags) })?;
         }
         if let Some(a) = want {
             self.signals.set_alt_stack(a);

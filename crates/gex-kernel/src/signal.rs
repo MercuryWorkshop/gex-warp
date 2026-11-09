@@ -1036,6 +1036,60 @@ pub mod xframe {
     pub const GPR_ORDER: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
 }
 
+/// Byte offsets inside the frame XNU's `sendsig` builds for an arm64 thread
+/// (`struct user_sigframe64`, bsd/dev/arm/unix_signal.c): a `siginfo`, a
+/// `ucontext` and the machine context it points at, which is the thread's
+/// exception, general and NEON state. A Darwin handler is not entered
+/// directly: the thread goes to the trampoline its libc registered with the
+/// action (`_sigtramp`), which calls the handler and then `sigreturn`.
+pub mod dframe {
+    /// `user64_siginfo_t`: si_signo, si_errno, si_code, si_pid, si_uid,
+    /// si_status (4 bytes each), si_addr at 24, si_value, si_band, and seven
+    /// words of padding whose first is the interrupted stack pointer.
+    pub const SIGINFO: usize = 0;
+    pub const SI_ADDR: usize = 24;
+    pub const SI_PAD: usize = 48;
+    pub const SIGINFO_SIZE: usize = 104;
+    /// `struct user_ucontext64`.
+    pub const UCONTEXT: usize = SIGINFO_SIZE;
+    pub const UC_ONSTACK: usize = 0;
+    pub const UC_SIGMASK: usize = 4;
+    pub const UC_STACK_SP: usize = 8;
+    pub const UC_STACK_SIZE: usize = 16;
+    pub const UC_STACK_FLAGS: usize = 24;
+    pub const UC_MCSIZE: usize = 40;
+    pub const UC_MCONTEXT: usize = 48;
+    pub const UCONTEXT_SIZE: usize = 56;
+    /// `mcontext64_t`: `arm_exception_state64` (far, esr, exception), then
+    /// `arm_thread_state64` (x0-x28, fp, lr, sp, pc, cpsr, flags), then
+    /// `arm_neon_state64` (v0-v31, fpsr, fpcr).
+    pub const MCONTEXT: usize = UCONTEXT + UCONTEXT_SIZE;
+    pub const MC_FAR: usize = 0;
+    pub const MC_REGS: usize = 16;
+    pub const MC_SP: usize = MC_REGS + 31 * 8;
+    pub const MC_PC: usize = MC_SP + 8;
+    pub const MC_CPSR: usize = MC_PC + 8;
+    pub const MC_V: usize = 288;
+    pub const MC_FPSR: usize = MC_V + 32 * 16;
+    pub const MC_FPCR: usize = MC_FPSR + 4;
+    /// `UC_FLAVOR_SIZE64`, which `sigreturn` checks `uc_mcsize` against.
+    pub const MCONTEXT_SIZE: usize = 816;
+    pub const FRAME_SIZE: usize = MCONTEXT + MCONTEXT_SIZE;
+    /// The red zone below the stack pointer a frame must not touch.
+    pub const RED_ZONE: u64 = 128;
+    /// How the handler wants to be called (the trampoline's second
+    /// argument): with a siginfo and context (`SA_SIGINFO`), or without.
+    pub const UC_FLAVOR: u64 = 30;
+    pub const UC_TRAD: u64 = 1;
+    /// `sigreturn`'s other use: mark the thread on or off its alternate
+    /// stack (a `longjmp` out of a handler), with no context to restore.
+    pub const UC_SET_ALT_STACK: u32 = 0x4000_0000;
+    pub const UC_RESET_ALT_STACK: u32 = 0x8000_0000;
+    /// What the token a frame carries is the context's address mixed with:
+    /// `sigreturn` refuses a context the kernel did not make.
+    pub const TOKEN: u64 = 0x6765_785f_7369_6721;
+}
+
 /// A fault signal's name, for a line that says one was taken.
 pub fn fault_name(signo: u32) -> &'static str {
     match signo {
@@ -1085,6 +1139,9 @@ fn build_frame(
 ) -> Result<u64, Errno> {
     if compat {
         return setup_frame_i386(signals, m, ctx_addr, signal, fault_address, taken);
+    }
+    if crate::darwin::on() && !gex_abi::X86 {
+        return setup_frame_darwin(signals, m, ctx_addr, signal, fault_address, taken);
     }
     if gex_abi::X86 {
         return setup_frame_x86(signals, m, ctx_addr, signal, fault_address, taken);
@@ -1170,6 +1227,149 @@ fn build_frame(
     m.write_u64(ctx_addr + ctx::x(30) as u64, ret)?;
     m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
     Ok(action.handler)
+}
+
+/// The Darwin arm64 frame builder. See [`dframe`] for the layout.
+fn setup_frame_darwin(
+    signals: &Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault_address: u64,
+    taken: Taken,
+) -> Result<u64, Errno> {
+    use crate::darwin::abi;
+    let action = signals.action(signal);
+    let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
+    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    let mut own = signals.own();
+    // On the alternate stack when the action asks, one is installed and the
+    // thread is not on it already.
+    let alt = own.alt_stack;
+    let on_alt = alt.size > 0 && sp > alt.sp && sp <= alt.sp + alt.size;
+    let (base, stack_size) = if action.flags & sa::ONSTACK != 0 && alt.size > 0 && alt.flags & 2 == 0 && !on_alt {
+        (alt.sp + alt.size, alt.size)
+    } else {
+        (sp, 0)
+    };
+    let frame = (base - dframe::FRAME_SIZE as u64 - dframe::RED_ZONE) & !0xf;
+    m.zero(frame, dframe::FRAME_SIZE)?;
+
+    // The siginfo: the signal by Darwin's number, the interrupted pc and sp,
+    // and for a fault where it was. A signal a process sent says nothing of
+    // its sender, but for a child's end.
+    let source = match taken {
+        Taken::Fault => signals.take_source(signal),
+        Taken::Claimed(source) => source,
+    };
+    let info = frame + dframe::SIGINFO as u64;
+    let number = abi::sig_to_darwin(signal);
+    m.write_u32(info, number)?;
+    m.write_u64(info + dframe::SI_ADDR as u64, pc)?;
+    m.write_u64(info + dframe::SI_PAD as u64, sp)?;
+    match signal {
+        // ILL_ILLTRP
+        sig::SIGILL => m.write_u32(info + 8, 2)?,
+        // BUS_ADRALN, and SEGV_ACCERR: what XNU says of every one on arm64.
+        sig::SIGBUS | sig::SIGSEGV => {
+            m.write_u32(info + 8, if signal == sig::SIGBUS { 1 } else { 2 })?;
+            m.write_u64(info + dframe::SI_ADDR as u64, fault_address)?;
+        }
+        sig::SIGCHLD => {
+            if let Some(src) = source {
+                m.write_u32(info + 8, src.code as u32)?;
+                m.write_u32(info + 12, src.pid as u32)?;
+                m.write_u32(info + 16, src.uid)?;
+            }
+        }
+        _ => {}
+    }
+
+    let uc = frame + dframe::UCONTEXT as u64;
+    let mc = frame + dframe::MCONTEXT as u64;
+    m.write_u32(uc + dframe::UC_ONSTACK as u64, on_alt as u32)?;
+    // The mask to restore on return is the one in force right now.
+    let mask = own.suspend_restore.take().unwrap_or(own.blocked);
+    m.write_u32(uc + dframe::UC_SIGMASK as u64, abi::sigset_to_darwin(mask))?;
+    m.write_u64(uc + dframe::UC_STACK_SP as u64, frame)?;
+    m.write_u64(uc + dframe::UC_STACK_SIZE as u64, stack_size)?;
+    m.write_u32(uc + dframe::UC_STACK_FLAGS as u64, on_alt as u32)?;
+    m.write_u64(uc + dframe::UC_MCSIZE as u64, dframe::MCONTEXT_SIZE as u64)?;
+    m.write_u64(uc + dframe::UC_MCONTEXT as u64, mc)?;
+
+    // The machine context: the thread's whole state, the vector registers
+    // included, which a host call has already made complete in its context.
+    m.write_u64(mc + dframe::MC_FAR as u64, fault_address)?;
+    for i in 0..31u8 {
+        let v = m.read_u64(ctx_addr + ctx::x(i) as u64)?;
+        m.write_u64(mc + dframe::MC_REGS as u64 + i as u64 * 8, v)?;
+    }
+    m.write_u64(mc + dframe::MC_SP as u64, sp)?;
+    m.write_u64(mc + dframe::MC_PC as u64, pc)?;
+    m.write_u32(mc + dframe::MC_CPSR as u64, read_pstate(m, ctx_addr)? as u32)?;
+    m.copy_within(ctx_addr + ctx::V as u64, mc + dframe::MC_V as u64, 32 * 16)?;
+    let fpsr = m.read_u32(ctx_addr + ctx::FPSR as u64)?;
+    let fpcr = m.read_u32(ctx_addr + ctx::FPCR as u64)?;
+    m.write_u32(mc + dframe::MC_FPSR as u64, fpsr)?;
+    m.write_u32(mc + dframe::MC_FPCR as u64, fpcr)?;
+
+    own.blocked |= action.mask;
+    if action.flags & sa::NODEFER == 0 {
+        own.blocked |= bit(signal);
+    }
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
+    if action.flags & sa::RESETHAND != 0 {
+        let _ = signals.set_action(signal, SigAction::default());
+    }
+
+    // The trampoline's arguments: the handler, how to call it, the signal,
+    // the siginfo, the context, and the token `sigreturn` wants back.
+    let style = if action.flags & sa::SIGINFO != 0 { dframe::UC_FLAVOR } else { dframe::UC_TRAD };
+    for (reg, v) in [action.handler, style, number as u64, info, uc, uc ^ dframe::TOKEN].into_iter().enumerate() {
+        m.write_u64(ctx_addr + ctx::x(reg as u8) as u64, v)?;
+    }
+    m.write_u64(ctx_addr + ctx::SP as u64, frame)?;
+    // The trampoline is the action's (`sa_tramp`, kept as its restorer).
+    m.write_u64(ctx_addr + ctx::PC as u64, action.restorer)?;
+    Ok(action.restorer)
+}
+
+/// Darwin's `sigreturn(uctx, infostyle, token)` for an arm64 thread: the
+/// context at `uctx` is the thread's again, and the mask it carries.
+fn sigreturn_darwin(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+    use crate::darwin::abi;
+    let uc = m.read_u64(ctx_addr + ctx::x(0) as u64)?;
+    let token = m.read_u64(ctx_addr + ctx::x(2) as u64)?;
+    if m.read_u64(uc + dframe::UC_MCSIZE as u64)? != dframe::MCONTEXT_SIZE as u64 || token != uc ^ dframe::TOKEN {
+        return Err(Errno::EINVAL);
+    }
+    let mc = m.read_u64(uc + dframe::UC_MCONTEXT as u64)?;
+    // All of it is read before any of it is written: the context is the
+    // thread's own, and what is being replaced is what names it.
+    let mut regs = [0u64; 33];
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = m.read_u64(mc + dframe::MC_REGS as u64 + i as u64 * 8)?;
+    }
+    let cpsr = m.read_u32(mc + dframe::MC_CPSR as u64)?;
+    let fpsr = m.read_u32(mc + dframe::MC_FPSR as u64)?;
+    let fpcr = m.read_u32(mc + dframe::MC_FPCR as u64)?;
+    let mask = m.read_u32(uc + dframe::UC_SIGMASK as u64)?;
+    m.copy_within(mc + dframe::MC_V as u64, ctx_addr + ctx::V as u64, 32 * 16)?;
+    for (i, r) in regs[..31].iter().enumerate() {
+        m.write_u64(ctx_addr + ctx::x(i as u8) as u64, *r)?;
+    }
+    m.write_u64(ctx_addr + ctx::SP as u64, regs[31])?;
+    m.write_u64(ctx_addr + ctx::PC as u64, regs[32])?;
+    write_pstate(m, ctx_addr, cpsr as u64)?;
+    m.write_u32(ctx_addr + ctx::FPSR as u64, fpsr)?;
+    m.write_u32(ctx_addr + ctx::FPCR as u64, fpcr)?;
+    let mut own = signals.own();
+    own.blocked = abi::sigset_to_linux(mask) & !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
+    own.in_handler = false;
+    Ok(regs[32])
 }
 
 /// The x86-64 frame builder. See [`xframe`] for the layout.
@@ -1639,6 +1839,9 @@ pub fn sigreturn(
         let _ = legacy;
         let kind = signals.own().legacy_frame;
         return sigreturn_i386(signals, m, ctx_addr, kind);
+    }
+    if crate::darwin::on() && !gex_abi::X86 {
+        return sigreturn_darwin(signals, m, ctx_addr);
     }
     if gex_abi::X86 {
         return sigreturn_x86(signals, m, ctx_addr);

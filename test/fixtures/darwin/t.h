@@ -47,6 +47,49 @@ void t_show(const char *name, long r);
 void t_check(const char *name, int cond);
 void t_exit(int code) __attribute__((noreturn));
 
+// sigaction as the libc makes the call: with a trampoline the kernel enters
+// instead of the handler, which calls it and then sigreturn. `handler` is
+// 0 (SIG_DFL), 1 (SIG_IGN) or a function; `mask` and the answer's are
+// Darwin's 32-bit sets. The old action's handler and flags go to `old`.
+struct t_sigaction {
+    void *handler;
+    u32 mask;
+    int flags;
+};
+long t_sigaction(int sig, void *handler, int flags, u32 mask, struct t_sigaction *old);
+// What a handler installed with SA_SIGINFO is called with.
+struct t_siginfo {
+    int si_signo, si_errno, si_code, si_pid;
+    u32 si_uid;
+    int si_status;
+    void *si_addr;
+    long si_value, si_band;
+    u64 pad[7];
+};
+struct t_ucontext {
+    int uc_onstack;
+    u32 uc_sigmask;
+    void *ss_sp;
+    u64 ss_size;
+    int ss_flags;
+    void *uc_link;
+    u64 uc_mcsize;
+    struct t_mcontext *uc_mcontext;
+};
+#if defined(__arm64__)
+struct t_mcontext {
+    u64 far;
+    u32 esr, exception;
+    u64 x[29], fp, lr, sp, pc;
+    u32 cpsr, flags;
+    __uint128_t v[32];
+    u32 fpsr, fpcr;
+};
+#endif
+enum { SA_ONSTACK = 1, SA_RESTART = 2, SA_RESETHAND = 4, SA_NODEFER = 0x10, SA_SIGINFO = 0x40 };
+enum { SIG_BLOCK = 1, SIG_UNBLOCK = 2, SIG_SETMASK = 3 };
+#define T_SIGBIT(sig) (1u << ((sig) - 1))
+
 size_t t_strlen(const char *s);
 int t_strcmp(const char *a, const char *b);
 int t_strncmp(const char *a, const char *b, size_t n);
@@ -68,7 +111,7 @@ enum {
     SYS_dup2 = 90, SYS_fcntl = 92, SYS_select = 93, SYS_fsync = 95, SYS_gettimeofday = 116,
     SYS_getrusage = 117, SYS_readv = 120, SYS_writev = 121, SYS_fchmod = 124, SYS_rename = 128,
     SYS_flock = 131, SYS_mkdir = 136, SYS_rmdir = 137, SYS_utimes = 138, SYS_setsid = 147,
-    SYS_getpgid = 151, SYS_pread = 153, SYS_pwrite = 154, SYS_sigreturn = 184, SYS_getrlimit = 194,
+    SYS_sigsuspend = 111, SYS_getpgid = 151, SYS_pread = 153, SYS_pwrite = 154, SYS_sigreturn = 184, SYS_getrlimit = 194,
     SYS_setrlimit = 195, SYS_mmap = 197, SYS_lseek = 199, SYS_truncate = 200, SYS_ftruncate = 201,
     SYS_sysctl = 202, SYS_poll = 230, SYS_sysctlbyname = 274, SYS_issetugid = 327, SYS___pthread_kill = 328,
     SYS___semwait_signal = 334, SYS_stat64 = 338, SYS_fstat64 = 339, SYS_lstat64 = 340,

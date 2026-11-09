@@ -5844,7 +5844,7 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
             | nr::MUNLOCKALL
             | nr::MLOCK2
     ) || (n == nr::ARCH_PRCTL && gex_abi::X86)
-        || (n == nr::NOOP_OK && (gex_abi::X86 || compat))
+        || (n == nr::NOOP_OK && (gex_abi::X86 || compat || darwin::on()))
 }
 
 /// The calls that make a descriptor's object or work one, needing the
@@ -9880,7 +9880,8 @@ impl Kernel {
         // point of no return (apt's methods are one 14 MB program, read
         // three times over per exec while every check read all of it).
         let image = self.read_head(&path, 64).ok_or(Errno::ENOENT)?;
-        if image.len() < 64 || &image[..4] != b"\x7fELF" {
+        // An ELF image, or a Mach-O one (thin or universal).
+        if image.len() < 64 || (&image[..4] != b"\x7fELF" && !gex_ld::macho::is_macho(&image)) {
             return Err(Errno::ENOEXEC);
         }
         Ok((path, argv, envp))
@@ -10330,6 +10331,12 @@ impl Kernel {
                         return SyscallOutcome::Continue;
                     }
                     SyscallOutcome::Resume(pc)
+                }
+                // XNU refuses a context it did not make with an error, and
+                // the thread goes on from the call.
+                Err(e) if self.darwin => {
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
+                    SyscallOutcome::Continue
                 }
                 Err(_) => SyscallOutcome::Killed {
                     signal: signal::sig::SIGSEGV,

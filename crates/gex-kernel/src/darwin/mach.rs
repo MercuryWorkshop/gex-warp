@@ -56,6 +56,8 @@ fn kern(r: Result<u64, Errno>) -> u64 {
         Err(Errno::EINVAL) => KERN_INVALID_ARGUMENT,
         Err(Errno::EFAULT) => KERN_INVALID_ADDRESS,
         Err(Errno::EACCES) => KERN_PROTECTION_FAILURE,
+        // Not this task's port: what the trap says of a port it cannot use.
+        Err(Errno::ESRCH) => MACH_SEND_INVALID_DEST,
         Err(_) => KERN_FAILURE,
     }
 }
@@ -94,7 +96,7 @@ impl Kernel {
             t::MACH_VM_MAP => kern(self.darwin_vm_allocate(m, x[0], x[1], x[2], x[3], x[4], x[5] as u32 & 7)),
             t::MACH_VM_DEALLOCATE => {
                 if x[0] as u32 != port::TASK {
-                    KERN_INVALID_ARGUMENT
+                    MACH_SEND_INVALID_DEST
                 } else if x[2] == 0 {
                     KERN_SUCCESS
                 } else {
@@ -106,7 +108,7 @@ impl Kernel {
             // maximum is not kept, so setting one changes nothing.
             t::MACH_VM_PROTECT => {
                 if x[0] as u32 != port::TASK {
-                    KERN_INVALID_ARGUMENT
+                    MACH_SEND_INVALID_DEST
                 } else if x[3] != 0 {
                     KERN_SUCCESS
                 } else {
@@ -142,7 +144,7 @@ impl Kernel {
     #[allow(clippy::too_many_arguments)]
     fn darwin_vm_allocate(&mut self, m: &mut GuestMem<'_>, target: u64, addr_ptr: u64, size: u64, mask: u64, flags: u64, prot_bits: u32) -> Result<u64, Errno> {
         if target as u32 != port::TASK {
-            return Err(Errno::EINVAL);
+            return Err(Errno::ESRCH);
         }
         let page = abi::PAGE_SIZE;
         let want = m.read_u64(addr_ptr)?;
