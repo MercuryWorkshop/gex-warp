@@ -714,6 +714,8 @@ pub struct Kernel {
     pub darwin_x: [u64; 8],
     /// The next Mach port name this task allocates.
     pub darwin_port_names: Arc<std::sync::atomic::AtomicU32>,
+    /// What the process registered of its threads ([`darwin::thread`]).
+    pub darwin_threads: Arc<std::sync::Mutex<darwin::thread::Registration>>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -9711,6 +9713,7 @@ impl Kernel {
             darwin_post: darwin::Post::None,
             darwin_x: [0; 8],
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
+            darwin_threads: Default::default(),
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -10140,6 +10143,8 @@ impl Kernel {
             darwin_post: darwin::Post::None,
             darwin_x: [0; 8],
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
+            // The child's libpthread is the parent's, registered already.
+            darwin_threads: Arc::new(std::sync::Mutex::new(*self.darwin_threads.lock().unwrap_or_else(|e| e.into_inner()))),
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -10375,6 +10380,12 @@ impl Kernel {
             }
             self.procs.request_halt(0);
             return SyscallOutcome::Exit(0);
+        }
+        // A Darwin thread made or ended.
+        if self.darwin {
+            if let Some(out) = self.darwin_outcome(m, n) {
+                return out;
+            }
         }
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {

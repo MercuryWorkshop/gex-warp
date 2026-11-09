@@ -22,6 +22,7 @@ pub mod abi;
 mod bsd;
 mod mach;
 pub mod nr;
+pub mod thread;
 
 use super::*;
 
@@ -104,6 +105,11 @@ pub enum Post {
     Restore { at: u64, was: [u64; 4], words: u8 },
     /// `getrlimit`: the two limits at `at`, Linux's infinity as Darwin's.
     Rlimit { at: u64 },
+    /// `ulock_wait`: a word that had already changed is no error, and a
+    /// wake answers zero.
+    UlockWait,
+    /// `ulock_wake`: waking nobody is `ENOENT`.
+    UlockWake,
     /// A Mach trap that waited: its answer as a `kern_return_t`.
     Kern { timed_out: u32 },
 }
@@ -258,6 +264,15 @@ impl Kernel {
                 }
                 r
             }
+            Post::UlockWait => match r {
+                Ok(_) | Err(Errno::EAGAIN) => Ok(0),
+                e => e,
+            },
+            Post::UlockWake => match r {
+                Ok(0) => Err(Errno::ENOENT),
+                Ok(_) => Ok(0),
+                e => e,
+            },
             Post::Kern { timed_out } => Ok(match r {
                 Ok(_) => mach::KERN_SUCCESS,
                 Err(Errno::ETIMEDOUT) => timed_out as u64,
@@ -268,17 +283,47 @@ impl Kernel {
     }
 }
 
-/// Hand a system call's answer back to a Darwin thread: the value with the
-/// carry flag clear, or a positive Darwin error number with it set, as
-/// XNU's `arm_prepare_syscall_return` leaves them. `ret` is the kernel's
-/// own convention (`-errno`).
+/// Hand a system call's answer back to a Darwin thread. A BSD call's is
+/// the value with the carry flag clear, or a positive Darwin error number
+/// with it set, as XNU's `arm_prepare_syscall_return` leaves them. A Mach
+/// trap's or a machine-dependent call's is the value alone: no errors, and
+/// the flags are not touched. `ret` is the kernel's own convention
+/// (`-errno`). The call is the one the context's number register still
+/// names.
 pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
+    let raw = m.read_u64(ctx_addr + ctx::LAST_SYSCALL as u64)?;
+    let unix = if gex_abi::X86 { (raw >> 24) & 0xff == 2 } else { (raw as u32 as i32) >= 0 };
+    if !unix {
+        return m.write_u64(ctx_addr + ctx::x(0) as u64, ret);
+    }
     let (value, carry) = match ret as i64 {
-        e @ -4095..=-1 => (abi::errno_to_darwin(Errno(-e as i32)) as u64, 1u8),
+        e @ -4095..=-1 => {
+            let number = abi::errno_to_darwin(Errno(-e as i32)) as u64;
+            // `ULF_NO_ERRNO`: a `ulock` call that wants its error as a
+            // negative answer, not through the carry flag and `errno`.
+            if ulock_no_errno(m, ctx_addr, raw) {
+                (number.wrapping_neg(), 0u8)
+            } else {
+                (number, 1u8)
+            }
+        }
         _ => (ret, 0),
     };
     m.write_u64(ctx_addr + ctx::x(0) as u64, value)?;
     m.write(ctx_addr + ctx::CF as u64, &[carry])
+}
+
+/// Whether the BSD call `raw` names, its arguments still in the context, is
+/// a `ulock` call made with `ULF_NO_ERRNO`.
+fn ulock_no_errno(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> bool {
+    let args = ctx::SYSCALL_ARGS;
+    let arg = |i: usize| m.read_u64(ctx_addr + args[i] as u64).unwrap_or(0);
+    // `syscall(number, ...)`: the call and its arguments are one along.
+    let (code, op) = match raw & if gex_abi::X86 { 0xff_ffff } else { 0xffff } {
+        0 => (arg(0) & 0xffff, arg(1)),
+        c => (c, arg(0)),
+    };
+    matches!(code, nr::ULOCK_WAIT | nr::ULOCK_WAKE | nr::ULOCK_WAIT2) && op as u32 & thread::ULF_NO_ERRNO != 0
 }
 
 /// A forked child's second result: one (its parent's is zero), which is

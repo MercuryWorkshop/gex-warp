@@ -61,6 +61,124 @@ long t_sigaction(int sig, void *handler, int flags, u32 mask, struct t_sigaction
     return SYS(SYS_sigaction, sig, &act, old);
 }
 
+void t_lock(u32 *word) {
+    // 0 free, 1 held, 2 held and waited for.
+    u32 c = 0;
+    if (__atomic_compare_exchange_n(word, &c, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    if (c != 2) c = __atomic_exchange_n(word, 2, __ATOMIC_ACQUIRE);
+    while (c != 0) {
+        SYS(SYS_ulock_wait, UL_COMPARE_AND_WAIT, word, 2, 0);
+        c = __atomic_exchange_n(word, 2, __ATOMIC_ACQUIRE);
+    }
+}
+
+void t_unlock(u32 *word) {
+    if (__atomic_exchange_n(word, 0, __ATOMIC_RELEASE) == 2) SYS(SYS_ulock_wake, UL_COMPARE_AND_WAIT, word, 0);
+}
+
+#define T_THREADS 16
+#ifdef T_STATIC
+// What stands for a pthread_t: the kernel is told where in it the thread's
+// own data is (`tsd`), and points the thread pointer there.
+struct t_pthread {
+    void *(*fn)(void *);
+    void *arg;
+    u32 done, port;
+    u64 pad;
+    u64 tsd[8];
+};
+static struct t_pthread *threads[T_THREADS];
+static int nthreads;
+
+void t_thread_main(struct t_pthread *self, u32 port) {
+    u64 tp = 0;
+#if defined(__arm64__)
+    __asm__("mrs %0, tpidrro_el0" : "=r"(tp));
+#else
+    __asm__("movq %%gs:0, %0" : "=r"(tp));
+    self->tsd[0] = (u64)self->tsd;
+#endif
+    if (tp != (u64)self->tsd) t_printf("FAIL the new thread's thread pointer\n");
+    if (port != (u32)TRAP(TRAP_thread_self)) t_printf("FAIL the new thread's port\n");
+    self->port = port;
+    self->fn(self->arg);
+    __atomic_store_n(&self->done, 1, __ATOMIC_RELEASE);
+    SYS(SYS_ulock_wake, UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, &self->done, 0);
+    // (no stack to free: the joiner still reads this thread's record)
+    for (;;) SYS(SYS_bsdthread_terminate, 0, 0, 0, 0);
+}
+
+#if defined(__arm64__)
+// (pthread, port, fn, arg, stack, flags), on the new stack.
+__asm__(".text\n.p2align 2\n_t_thread_entry:\n  bl _t_thread_main\n  brk #1\n");
+#elif defined(__x86_64__)
+__asm__(".text\n_t_thread_entry:\n  andq $-16, %rsp\n  callq _t_thread_main\n  ud2\n");
+#endif
+extern void t_thread_entry(void) __asm__("_t_thread_entry");
+
+int t_thread_start(void *(*fn)(void *), void *arg) {
+    static int registered;
+    if (!registered) {
+        // struct _pthread_registration_data, packed.
+        struct __attribute__((packed)) {
+            u64 version, dispatch_queue_offset, main_qos;
+            u32 tsd_offset, return_to_kernel_offset, mach_thread_self_offset;
+            u64 stack_addr_hint;
+            u32 mutex_default_policy, joinable_offset_bits, wq_quantum_expiry_offset;
+        } data;
+        t_memset(&data, 0, sizeof data);
+        data.version = sizeof data;
+        data.tsd_offset = __builtin_offsetof(struct t_pthread, tsd);
+        long r = SYS(SYS_bsdthread_register, t_thread_entry, 0, sizeof(struct t_pthread), &data, sizeof data, 0);
+        if (r < 0) return (int)r;
+        registered = 1;
+    }
+    if (nthreads == T_THREADS) return -1;
+    // The stack, with the thread's record at its top.
+    long size = 256 * 1024;
+    long base = SYS(SYS_mmap, 0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base < 0) return (int)base;
+    struct t_pthread *t = (struct t_pthread *)(base + size - 4096);
+    t->fn = fn, t->arg = arg;
+    threads[nthreads] = t;
+    // PTHREAD_START_CUSTOM: the stack and the record are the caller's.
+    long r = SYS(SYS_bsdthread_create, fn, arg, t, t, 0x01000000);
+    if (r < 0) return (int)r;
+    return nthreads++;
+}
+
+void t_thread_join(int handle) {
+    struct t_pthread *t = threads[handle];
+    while (!__atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) SYS(SYS_ulock_wait, UL_COMPARE_AND_WAIT, &t->done, 0, 0);
+}
+
+u32 t_thread_port(int handle) {
+    // Set by the thread itself as it starts.
+    while (!__atomic_load_n(&threads[handle]->port, __ATOMIC_ACQUIRE)) TRAP(TRAP_swtch_pri, 0);
+    return threads[handle]->port;
+}
+#else
+int pthread_create(void **thread, const void *attr, void *(*fn)(void *), void *arg);
+int pthread_join(void *thread, void **value);
+u32 pthread_mach_thread_np(void *thread);
+static void *threads[T_THREADS];
+static int nthreads;
+
+int t_thread_start(void *(*fn)(void *), void *arg) {
+    if (nthreads == T_THREADS) return -1;
+    int r = pthread_create(&threads[nthreads], 0, fn, arg);
+    return r ? -r : nthreads++;
+}
+
+void t_thread_join(int handle) {
+    pthread_join(threads[handle], 0);
+}
+
+u32 t_thread_port(int handle) {
+    return pthread_mach_thread_np(threads[handle]);
+}
+#endif
+
 size_t t_strlen(const char *s) {
     size_t n = 0;
     while (s[n]) n++;

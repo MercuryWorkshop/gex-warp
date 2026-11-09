@@ -279,6 +279,15 @@ impl Kernel {
                 self.darwin_post = Post::Zero;
                 set(nr::GETRANDOM, &[x[0], x[1], 0])
             }
+            d::ULOCK_WAIT => return self.darwin_ulock_wait(m, x, false, a),
+            d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
+            d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
+            // (thread port, signal): a signal for one thread of this process.
+            d::PTHREAD_KILL => match (super::mach::port_thread(self.pid, x[0] as u32), abi::sig_to_linux(x[1] as u32)) {
+                (Some(tid), l) if l != 0 || x[1] == 0 => set(nr::TGKILL, &[self.pid as u64, tid as u64, l as u64]),
+                (None, _) => NATIVE + d::PTHREAD_KILL,
+                _ => NATIVE + d::KILL,
+            },
             _ => NATIVE + code,
         }
     }
@@ -288,6 +297,17 @@ impl Kernel {
         match code {
             // A signal number Darwin does not have.
             d::KILL => Err(Errno::EINVAL),
+            // A port that is no thread's.
+            d::PTHREAD_KILL => Err(Errno::ESRCH),
+            d::BSDTHREAD_REGISTER => self.darwin_bsdthread_register(m, x),
+            // An operation `ulock` does not have.
+            d::ULOCK_WAIT => Err(Errno::EINVAL),
+            // Quality-of-service requests: there is one class of thread.
+            d::BSDTHREAD_CTL => Ok(0),
+            // Signals are delivered to whichever thread does not block
+            // them; a thread that wants none says so at its end, when there
+            // is nothing left to deliver to.
+            d::DISABLE_THREADSIGNAL => Ok(0),
             d::GETRLIMIT | d::SETRLIMIT | d::GETENTROPY => Err(Errno::EINVAL),
             // A wait on a Mach semaphore, which is how the libc sleeps: the
             // semaphore must be one.

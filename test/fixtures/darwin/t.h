@@ -90,6 +90,20 @@ enum { SA_ONSTACK = 1, SA_RESTART = 2, SA_RESETHAND = 4, SA_NODEFER = 0x10, SA_S
 enum { SIG_BLOCK = 1, SIG_UNBLOCK = 2, SIG_SETMASK = 3 };
 #define T_SIGBIT(sig) (1u << ((sig) - 1))
 
+// A thread running fn(arg) on a stack of its own: its handle, or a negative
+// error. The static build asks the kernel directly (bsdthread_register once,
+// then bsdthread_create, as libpthread does); the Mac's build goes through
+// the libpthread that is already registered there. t_thread_join waits for
+// its end, t_thread_port is its Mach port's name (for __pthread_kill).
+int t_thread_start(void *(*fn)(void *), void *arg);
+void t_thread_join(int handle);
+u32 t_thread_port(int handle);
+// A lock on a word of memory, waited for with ulock_wait: what
+// os_unfair_lock is, less the owner's name.
+void t_lock(u32 *word);
+void t_unlock(u32 *word);
+enum { UL_COMPARE_AND_WAIT = 1, UL_UNFAIR_LOCK = 2, ULF_WAKE_ALL = 0x100, ULF_NO_ERRNO = 0x1000000 };
+
 size_t t_strlen(const char *s);
 int t_strcmp(const char *a, const char *b);
 int t_strncmp(const char *a, const char *b, size_t n);

@@ -48,6 +48,18 @@ pub mod port {
     pub const FIRST_ALLOCATED: u32 = 0x1003;
 }
 
+/// The name of thread `tid`'s port in process `pid`: the first thread's is
+/// [`port::THREAD`], and each later one's a step further.
+pub fn thread_port(pid: i32, tid: i32) -> u32 {
+    port::THREAD.wrapping_add((tid - pid).unsigned_abs().wrapping_mul(0x100))
+}
+
+/// The thread of process `pid` a port name is for, if it is a thread's.
+pub fn port_thread(pid: i32, name: u32) -> Option<i32> {
+    let step = name.checked_sub(port::THREAD)?;
+    (step % 0x100 == 0 && step / 0x100 < 1 << 20).then(|| pid + (step / 0x100) as i32)
+}
+
 fn kern(r: Result<u64, Errno>) -> u64 {
     match r {
         Ok(_) => KERN_SUCCESS,
@@ -71,7 +83,7 @@ impl Kernel {
 
     /// The name of the calling thread's own port.
     pub(super) fn darwin_thread_port(&self) -> u32 {
-        port::THREAD + (self.tid - self.pid).unsigned_abs() * 0x100
+        thread_port(self.pid, self.tid)
     }
 
     /// The name of the port of a process's first thread, which XNU tells a

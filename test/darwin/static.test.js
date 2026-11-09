@@ -4,8 +4,9 @@
 // (lib/darwin.mjs). What a new process is handed on its stack; files and
 // directories in Darwin's layouts and error numbers; fork, wait4, kill and
 // execve; mmap on Darwin's page and Mach's virtual memory traps; the clocks
-// and the calls that wait; and signals, delivered through XNU's frame to a
-// handler behind its trampoline.
+// and the calls that wait; signals, delivered through XNU's frame to a
+// handler behind its trampoline; and threads, made as libpthread asks for
+// them (on the Mac, by its libpthread), waiting on ulock.
 import { darwin } from '../lib/darwin.mjs';
 
 export const meta = { hosts: ['node'], arches: ['a64'], timeout: 600 };
@@ -13,6 +14,6 @@ export const meta = { hosts: ['node'], arches: ['a64'], timeout: 600 };
 export default async function (t) {
   const d = darwin(t);
   await d.compare('hello', await d.build('hello'), ['one', 'two words']);
-  for (const name of ['files', 'proc', 'mem', 'time', 'sig']) await d.compare(name, await d.build(name));
+  for (const name of ['files', 'proc', 'mem', 'time', 'sig', 'thr']) await d.compare(name, await d.build(name));
   d.n.clean();
 }
