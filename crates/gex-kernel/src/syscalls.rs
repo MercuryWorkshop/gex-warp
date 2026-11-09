@@ -25,6 +25,11 @@ use crate::GuestMem;
 use gex_abi::{ctx, ctx_addr};
 use std::sync::{Arc, Mutex};
 
+/// The Darwin personality: a child of this module, as it calls the same
+/// private halves of the kernel the Linux calls do.
+#[path = "darwin/mod.rs"]
+pub mod darwin;
+
 /// aarch64 syscall numbers (the asm-generic ABI).
 pub mod nr {
     pub const GETCWD: u64 = 17;
@@ -234,7 +239,22 @@ pub mod nr {
 /// `x(0)`). `ret` is the kernel's own convention, `-errno` for a failure.
 /// Every place a result is written goes through here.
 pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
+    // A Darwin thread's is a value or a positive error and the carry flag.
+    if darwin::on() {
+        return darwin::set_result(m, ctx_addr, ret);
+    }
     m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(ret))
+}
+
+/// What `fork` answers in the new process, written by the host into the
+/// child's copy of the calling thread: zero, and for a Darwin process the
+/// second result its `fork` stub tells the child by.
+pub fn set_fork_child_result(m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<(), Errno> {
+    set_result(m, ctx_addr, 0)?;
+    if darwin::on() {
+        darwin::set_fork_child(m, ctx_addr)?;
+    }
+    Ok(())
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -684,6 +704,16 @@ pub struct Kernel {
     /// ones (see `crate::i386`). Set at exec from the image's class,
     /// inherited across fork.
     pub compat: bool,
+    /// A Darwin process: it enters as XNU is entered, and its numbering,
+    /// structures and error numbers are Darwin's (see [`darwin`]). Set at
+    /// exec for a Mach-O image, inherited across fork.
+    pub darwin: bool,
+    /// What the Darwin call in hand has left to do when it has its answer.
+    pub darwin_post: darwin::Post,
+    /// The arguments of the Darwin call in hand, as its thread passed them.
+    pub darwin_x: [u64; 8],
+    /// The next Mach port name this task allocates.
+    pub darwin_port_names: Arc<std::sync::atomic::AtomicU32>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -9457,6 +9487,8 @@ pub struct PendingCall {
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
     pub block_pc: u64,
+    /// What a Darwin call that waits has left to do ([`darwin::Post`]).
+    pub darwin_post: darwin::Post,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -9517,6 +9549,7 @@ impl Kernel {
             retry_lock: self.retry_lock.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
+            darwin_post: std::mem::take(&mut self.darwin_post),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -9531,6 +9564,7 @@ impl Kernel {
         self.retry_lock = call.retry_lock;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
+        self.darwin_post = call.darwin_post;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -9668,6 +9702,10 @@ impl Kernel {
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: false,
+            darwin: false,
+            darwin_post: darwin::Post::None,
+            darwin_x: [0; 8],
+            darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -10092,6 +10130,10 @@ impl Kernel {
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: self.compat,
+            darwin: self.darwin,
+            darwin_post: darwin::Post::None,
+            darwin_x: [0; 8],
+            darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -10200,7 +10242,13 @@ impl Kernel {
         self.syscall_pc = pc;
         // An i386-ABI process has its number in eax (`x(0)`) in every build:
         // on an AArch64 build that is a native wasm32 program.
-        let nr_slot = if self.compat { ctx::x(0) } else { ctx::SYSCALL_NR };
+        let nr_slot = if self.compat {
+            ctx::x(0)
+        } else if self.darwin {
+            darwin::NR_SLOT
+        } else {
+            ctx::SYSCALL_NR
+        };
         let raw = m
             .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
@@ -10222,7 +10270,7 @@ impl Kernel {
         };
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
-        if gex_abi::X86 {
+        if gex_abi::X86 || self.darwin {
             let _ = m.write_u64(self.ctx_addr + ctx::LAST_SYSCALL as u64, raw);
         }
         // An x86-64 guest's numbering is translated to the canonical one, and
@@ -10240,6 +10288,10 @@ impl Kernel {
             post = p;
             self.sigreturn_legacy = (raw & 0xffff_ffff) == crate::i386::raw::SIGRETURN;
             n
+        } else if self.darwin {
+            // A Darwin thread's call, as the canonical call that does its
+            // work (or one of `darwin`'s own).
+            self.darwin_translate(m, raw, &mut a)
         } else if gex_abi::X86 {
             crate::x86::translate(
                 raw,
@@ -10547,6 +10599,7 @@ impl Kernel {
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
+                _ if self.darwin => encode(self.darwin_finish(m, *r)),
                 _ => encode(*r),
             },
             Err(exit) => {
@@ -10864,6 +10917,7 @@ impl Kernel {
                 crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
             );
         }
+        let r = if self.darwin { self.darwin_finish(m, r) } else { r };
         let ret = encode(r);
         let _ = set_result(m, self.ctx_addr, ret);
         if let Some(mask) = suspended {
@@ -11052,6 +11106,9 @@ impl Kernel {
             }
 
             nr::FUTEX => self.sys_futex(m, a),
+
+            // What only Darwin has.
+            n if self.darwin && darwin::is_own(n) => self.darwin_call(m, n),
 
             _ => {
                 if !self.unimplemented.contains(&n) {
@@ -12833,6 +12890,9 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
 
 /// Name a syscall for trace output.
 pub fn syscall_name(n: u64) -> &'static str {
+    if let Some(name) = darwin::name(n) {
+        return name;
+    }
     match n {
         nr::DUP2 => "dup2",
         nr::TIME => "time",

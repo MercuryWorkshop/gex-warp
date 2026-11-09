@@ -1,4 +1,5 @@
-//! `gex-kernel` — the Linux personality.
+//! `gex-kernel` — the Linux personality, and the Darwin one over it
+//! ([`darwin`]).
 //!
 //! A syscall implementation, not a machine emulator. The kernel is
 //! a plain Rust library that operates on the guest's linear memory as a byte
@@ -74,6 +75,7 @@ pub use syscalls::{
     SyscallOutcome, ThreadState,
 };
 pub use proclive::{KernelProcSource, ProcCell};
+pub use syscalls::darwin;
 
 /// Guest linear memory, addressed exactly as the guest addresses it.
 ///

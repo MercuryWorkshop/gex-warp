@@ -74,6 +74,12 @@ impl Errno {
 
     /// Map a host I/O error onto the closest guest errno.
     pub fn from_io(e: &std::io::Error) -> Errno {
+        // A macOS host's error numbers are Darwin's, which number most
+        // things past 34 differently: by its own number, respelled.
+        #[cfg(target_os = "macos")]
+        if let Some(code) = e.raw_os_error().filter(|c| *c > 0) {
+            return crate::darwin::abi::errno_from_darwin(code);
+        }
         use std::io::ErrorKind::*;
         match e.kind() {
             NotFound => Errno::ENOENT,
@@ -84,8 +90,8 @@ impl Errno {
             WouldBlock => Errno::EAGAIN,
             Interrupted => Errno::EINTR,
             _ => match e.raw_os_error() {
-                // The host is Linux in every supported native configuration,
-                // so a raw errno passes straight through.
+                // A Linux host's raw errno passes straight through (a macOS
+                // host's was respelled above).
                 Some(code) if code > 0 => Errno(code),
                 _ => Errno::EIO,
             },

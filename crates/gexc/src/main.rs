@@ -34,6 +34,20 @@ fn main() -> ExitCode {
     if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
         unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
     }
+    // The host's own ids, where gex-kernel has no /proc to read them from
+    // (it forbids `unsafe`, so it takes them from here).
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: the calls only return numbers; `getgroups` fills at most
+        // the count it is given.
+        let (uid, gid, groups) = unsafe {
+            let mut g = vec![0 as libc::gid_t; 64];
+            let n = libc::getgroups(g.len() as i32, g.as_mut_ptr());
+            g.truncate(n.max(0) as usize);
+            (libc::geteuid(), libc::getegid(), g)
+        };
+        gex_kernel::vfs::hostfs::set_host_ids(uid, gid, groups);
+    }
     match real_main() {
         Ok(code) => code,
         Err(e) => {
@@ -717,6 +731,14 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             ra.path = bb.to_string_lossy().into_owned();
             ra.opts.exe = Some(ra.path.clone());
         }
+    }
+    // The guest is the user running gexc unless told otherwise. Where there
+    // is no /proc to read that from (the native host reads
+    // /proc/self/status), the host is asked here.
+    #[cfg(not(target_os = "linux"))]
+    if ra.opts.identity.is_none() {
+        // SAFETY: both calls only return a number.
+        ra.opts.identity = Some(unsafe { (libc::getuid(), libc::getgid()) });
     }
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     // Resolved through the guest's namespace (the sysroot when given), so a

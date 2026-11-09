@@ -127,8 +127,8 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         }
     };
     if r < 0 {
-        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-        return Err(Errno(e as _));
+        // (a macOS host's number is respelled: its ENOATTR is not Linux's)
+        return Err(Errno::from_io(&std::io::Error::last_os_error()));
     }
     Ok(r as usize)
 }

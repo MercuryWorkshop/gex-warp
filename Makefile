@@ -56,7 +56,7 @@ GEXCC_PREFIX ?= $(OUT)/gexcc
 
 .PHONY: help help-all help-tools gexc page page-sp assets mesa xwayland serve runtime \
         sysroot sysroot64 busybox gexcc gexcc-win wine wine-x64 native-libs steam-api \
-        eject-page eject-site test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
+        eject-page eject-site test check check-gl regen-gl regen-mesa-hot regen-darwin lint wine32 toolchains \
         musl-src musl64-src llvm-src wine64-src
 
 help:
@@ -89,6 +89,7 @@ help-all: help
 	@echo 'make check-gl      the GL tables match their generators'
 	@echo 'make regen-gl      rewrite the GL tables from the Khronos registry'
 	@echo 'make regen-mesa-hot  rewrite ports/mesa/hot.txt (PLAIN=, LOGS=)'
+	@echo 'make regen-darwin  rewrite the Darwin system call and Mach trap numbers from an XNU checkout (XNU_SRC=)'
 	@echo 'make lint          every script is a target, called by one, or a public tool'
 	@echo 'make help-tools    the tools other repos and users call by path'
 	@echo 'make wine32        LEGACY: old 32-bit Wine (wine Makefile), until it is removed'
@@ -269,6 +270,10 @@ regen-gl:
 regen-mesa-hot:
 	@[ -n "$(PLAIN)" ] && [ -n "$(LOGS)" ] || { echo "make regen-mesa-hot: set PLAIN (gex-wgpu-replay.wasm.orig) and LOGS (profile logs)"; exit 1; }
 	python3 $(ROOT)/ports/mesa/mesa-hot.py $(PLAIN) $(LOGS) -o $(ROOT)/ports/mesa/hot.txt
+# XNU_SRC: a checkout of https://github.com/apple-oss-distributions/xnu
+regen-darwin:
+	@[ -n "$(XNU_SRC)" ] || { echo "make regen-darwin: set XNU_SRC (an apple-oss-distributions/xnu checkout)"; exit 1; }
+	cd $(ROOT) && python3 scripts/gen-darwin-syscalls.py $(XNU_SRC)
 lint:
 	$(ROOT)/scripts/lint-scripts.py
 

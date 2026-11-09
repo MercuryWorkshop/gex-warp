@@ -977,8 +977,19 @@ struct HostIds {
 }
 
 #[cfg(unix)]
+static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
+
+/// Say whose permissions [`host_access`] checks against: the host
+/// process's effective ids and groups, from a host with no
+/// `/proc/self/status` to read them from (macOS). Before any guest runs;
+/// the first answer stands.
+#[cfg(unix)]
+pub fn set_host_ids(uid: u32, gid: u32, groups: Vec<u32>) {
+    let _ = IDS.set(HostIds { uid, gid, groups });
+}
+
+#[cfg(unix)]
 fn host_ids() -> &'static HostIds {
-    static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
     IDS.get_or_init(|| {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         // "Uid:\treal\teffective\tsaved\tfs"; the effective one decides.

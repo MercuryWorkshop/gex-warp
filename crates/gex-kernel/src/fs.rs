@@ -74,11 +74,17 @@ pub mod oflags {
 
     /// Flags as this process passed them, in the kernel's spelling.
     pub fn from_guest(f: u64, compat: bool) -> u64 {
+        if crate::darwin::on() {
+            return crate::darwin::abi::oflags_to_kernel(f);
+        }
         if generic_guest(compat) { from_generic(f) } else { f }
     }
 
     /// Flags in the kernel's spelling, as this process reads them.
     pub fn to_guest(f: u64, compat: bool) -> u64 {
+        if crate::darwin::on() {
+            return crate::darwin::abi::oflags_to_darwin(f);
+        }
         if generic_guest(compat) { to_generic(f) } else { f }
     }
 }
@@ -122,7 +128,7 @@ pub struct StatBytes {
 }
 
 impl StatBytes {
-    fn zeroed(n: usize) -> StatBytes {
+    pub(crate) fn zeroed(n: usize) -> StatBytes {
         StatBytes { b: [0; 144], n }
     }
 }
@@ -157,6 +163,10 @@ impl Stat {
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
     pub fn encode_for(&self, compat: bool) -> StatBytes {
+        // A Darwin process's `struct stat` is its own.
+        if crate::darwin::on() {
+            return crate::darwin::abi::stat(self);
+        }
         if compat {
             let mut b = StatBytes::zeroed(96);
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());

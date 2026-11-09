@@ -785,6 +785,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             exe: image.clone(),
             interp: None,
             direct: None,
+            darwin: None,
         },
         opts,
         xlate,
@@ -914,6 +915,8 @@ fn run_program_with(
         gex_xlate::set_compat(program.compat());
         lockstep::set_compat(program.compat());
         gex_kernel::set_compat32(program.compat() && gex_abi::X86);
+        // And a Mach-O program's is Darwin's.
+        gex_kernel::darwin::set(program.is_darwin());
     }
     ftab::selftest_init();
 
@@ -1176,6 +1179,7 @@ fn run_program_with(
     // translator for every guest process, so a mixed tree is not supported
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
+    kernel.darwin = program.is_darwin();
     // Set again by `wasmprog` if this program is native wasm32.
     kernel.wasm32 = false;
     // An ejected project's replacement code has its own region. Recorded for
@@ -2782,7 +2786,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it.
         let mut gm = GuestMem::new(dst);
-        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
+        let _ = gex_kernel::syscalls::set_fork_child_result(&mut gm, ctx_addr);
         if req.child_stack != 0 {
             let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
@@ -4298,14 +4302,21 @@ fn place_image(
 
     // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
-    let layout = build_initial_stack(
-        image,
-        gex_abi::STACK_TOP,
-        &opts.args,
-        &opts.env,
-        *b"gexdeterministic",
-        id,
-    );
+    let layout = match &program.darwin {
+        // A Darwin process's is XNU's: no auxiliary vector, the `apple`
+        // strings instead.
+        Some(darwin) => {
+            let (exe_path, thread_port) = store.data_mut().with_kernel(|k| (k.exe_path.clone(), k.darwin_main_thread_port()));
+            let apple = gex_ld::macho::AppleStrings {
+                exe_path,
+                stack: (gex_abi::STACK_TOP, gex_abi::STACK_SIZE),
+                thread_port: Some(thread_port),
+                random: *b"gexdeterministic",
+            };
+            gex_ld::macho::build_stack(darwin, gex_abi::STACK_TOP, &opts.args, &opts.env, &apple.strings(darwin))
+        }
+        None => build_initial_stack(image, gex_abi::STACK_TOP, &opts.args, &opts.env, *b"gexdeterministic", id),
+    };
     let data = memory.bytes();
     let start = layout.low as usize;
     let end = start + layout.bytes.len();

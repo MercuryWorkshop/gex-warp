@@ -25,6 +25,9 @@ pub struct Program {
     /// `ld.so PROGRAM` does. This is the interpreter's path; [`Self::argv`]
     /// gives it the program to run.
     pub direct: Option<String>,
+    /// A Mach-O program: what its Darwin process is started with
+    /// ([`crate::macho`]). `interp` is then its dynamic linker, dyld.
+    pub darwin: Option<crate::macho::Darwin>,
 }
 
 impl Program {
@@ -40,6 +43,11 @@ impl Program {
     /// compatibility mode and it speaks the i386 system-call ABI.
     pub fn compat(&self) -> bool {
         self.exe.class32
+    }
+
+    /// Whether this is a Darwin program: it speaks XNU's system-call ABI.
+    pub fn is_darwin(&self) -> bool {
+        self.darwin.is_some()
     }
 
     /// The arguments the process starts with: `argv` as asked, or for a
@@ -99,9 +107,12 @@ pub fn load_program(
     interp_base: u64,
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<Program, LoadError> {
+    if crate::macho::is_macho(bytes) {
+        return crate::macho::load_program(bytes, pie_base, interp_base, read);
+    }
     let exe = load(bytes, pie_base)?;
     let Some(path) = exe.interp.clone() else {
-        return Ok(Program { exe, interp: None, direct: None });
+        return Ok(Program { exe, interp: None, direct: None, darwin: None });
     };
     let Some(interp_bytes) = read(&path) else {
         return Err(LoadError::NeedsInterpreter(path));
@@ -110,13 +121,14 @@ pub fn load_program(
     // clear of the executable so neither can overlap the other's mappings.
     let interp = load(&interp_bytes, interp_base)?;
     if too_big(&exe, interp_base) {
-        return Ok(Program { exe: interp, interp: None, direct: Some(path) });
+        return Ok(Program { exe: interp, interp: None, direct: Some(path), darwin: None });
     }
     check_overlap(&exe, &interp)?;
     Ok(Program {
         exe,
         interp: Some(interp),
         direct: None,
+        darwin: None,
     })
 }
 
@@ -132,7 +144,7 @@ pub fn plan_program(
 ) -> Result<(Program, crate::elf::FileRanges), LoadError> {
     let (exe_image, mut ranges) = crate::elf::plan(&|o, b| read_at(exe, o, b), pie_base)?;
     let Some(path) = exe_image.interp.clone() else {
-        return Ok((Program { exe: exe_image, interp: None, direct: None }, ranges));
+        return Ok((Program { exe: exe_image, interp: None, direct: None, darwin: None }, ranges));
     };
     let (interp, interp_ranges) = match crate::elf::plan(&|o, b| read_at(&path, o, b), interp_base) {
         Ok(p) => p,
@@ -143,11 +155,11 @@ pub fn plan_program(
         Err(e) => return Err(e),
     };
     if too_big(&exe_image, interp_base) {
-        return Ok((Program { exe: interp, interp: None, direct: Some(path) }, interp_ranges));
+        return Ok((Program { exe: interp, interp: None, direct: Some(path), darwin: None }, interp_ranges));
     }
     check_overlap(&exe_image, &interp)?;
     ranges.extend(interp_ranges);
-    Ok((Program { exe: exe_image, interp: Some(interp), direct: None }, ranges))
+    Ok((Program { exe: exe_image, interp: Some(interp), direct: None, darwin: None }, ranges))
 }
 
 /// A position-independent executable that reaches the interpreter's
