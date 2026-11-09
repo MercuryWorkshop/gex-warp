@@ -103,8 +103,14 @@ impl Kernel {
             }
             d::LINK => set(nr::LINKAT, &[CWD, x[0], CWD, x[1], 0]),
             d::LINKAT => set(nr::LINKAT, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3], at_flags(x[4])]),
-            d::UNLINK => set(nr::UNLINKAT, &[CWD, x[0], 0]),
-            d::UNLINKAT => set(nr::UNLINKAT, &[dirfd(x[0]), x[1], at_flags(x[2])]),
+            d::UNLINK => {
+                self.darwin_post = Post::Unlink;
+                set(nr::UNLINKAT, &[CWD, x[0], 0])
+            }
+            d::UNLINKAT => {
+                self.darwin_post = Post::Unlink;
+                set(nr::UNLINKAT, &[dirfd(x[0]), x[1], at_flags(x[2])])
+            }
             d::RMDIR => set(nr::UNLINKAT, &[CWD, x[0], K_REMOVEDIR]),
             d::MKDIR => set(nr::MKDIRAT, &[CWD, x[0], x[1]]),
             d::MKDIRAT => set(nr::MKDIRAT, &[dirfd(x[0]), x[1], x[2]]),

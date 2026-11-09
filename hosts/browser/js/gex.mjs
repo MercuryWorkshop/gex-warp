@@ -4071,7 +4071,8 @@ export class Gex {
       child.tls,
       child.brk ?? 0n,
     );
-    if (child.compat) e.gex_set_compat?.(1);
+    // (its ABI as `gex_compat` gave it: i386's bit, Darwin's bit)
+    if (child.compat) e.gex_set_compat?.(child.compat);
     // Its program is its parent's, served again here: no spare for that one.
     this.#spareGen = e.gex_exec_gen?.() ?? 0;
     if (child.wasm32) {

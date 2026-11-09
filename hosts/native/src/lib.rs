@@ -10,7 +10,7 @@ use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
 use gex_kernel::vfs::ProcSource as _;
 use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcCell, SyscallOutcome, ThreadState};
-use gex_ld::{build_initial_stack, Identity, Image, Program};
+use gex_ld::{Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
@@ -4312,21 +4312,18 @@ fn place_image(
 
     // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
-    let layout = match &program.darwin {
-        // A Darwin process's is XNU's: no auxiliary vector, the `apple`
-        // strings instead.
-        Some(darwin) => {
-            let (exe_path, thread_port) = store.data_mut().with_kernel(|k| (k.exe_path.clone(), k.darwin_main_thread_port()));
-            let apple = gex_ld::macho::AppleStrings {
-                exe_path,
-                stack: (gex_abi::STACK_TOP, gex_abi::STACK_SIZE),
-                thread_port: Some(thread_port),
-                random: *b"gexdeterministic",
-            };
-            gex_ld::macho::build_stack(darwin, gex_abi::STACK_TOP, &opts.args, &opts.env, &apple.strings(darwin))
-        }
-        None => build_initial_stack(image, gex_abi::STACK_TOP, &opts.args, &opts.env, *b"gexdeterministic", id),
-    };
+    let (exe_path, thread_port) = store.data_mut().with_kernel(|k| (k.exe_path.clone(), k.darwin_main_thread_port()));
+    let layout = gex_ld::build_program_stack(
+        program,
+        gex_abi::STACK_TOP,
+        gex_abi::STACK_SIZE,
+        &opts.args,
+        &opts.env,
+        *b"gexdeterministic",
+        id,
+        &exe_path,
+        Some(thread_port),
+    );
     let data = memory.bytes();
     let start = layout.low as usize;
     let end = start + layout.bytes.len();

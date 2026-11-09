@@ -243,6 +243,32 @@ pub fn build_initial_stack(
     StackLayout { sp, low, bytes }
 }
 
+/// The initial stack of `program`'s process: XNU's for a Mach-O program
+/// ([`crate::macho::build_stack`], with the `apple` strings in place of an
+/// auxiliary vector), Linux's otherwise. `exe_path` is the path the program
+/// was started by and `thread_port` the name of its first thread's Mach
+/// port, which only a Darwin process is told.
+#[allow(clippy::too_many_arguments)]
+pub fn build_program_stack(
+    program: &crate::Program,
+    stack_top: u64,
+    stack_size: u64,
+    args: &[String],
+    env: &[String],
+    random: [u8; 16],
+    id: Identity,
+    exe_path: &str,
+    thread_port: Option<u32>,
+) -> StackLayout {
+    match &program.darwin {
+        Some(darwin) => {
+            let apple = crate::macho::AppleStrings { exe_path: exe_path.to_string(), stack: (stack_top, stack_size), thread_port, random };
+            crate::macho::build_stack(darwin, stack_top, args, env, &apple.strings(darwin))
+        }
+        None => build_initial_stack(&program.exe, stack_top, args, env, random, id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -126,9 +126,15 @@ impl<'a> Rd<'a> {
 /// something gex only ignores. (XNU prefers arm64e where the binary may use
 /// it, which is Apple's own.)
 pub fn guest_slice(bytes: &[u8]) -> Result<(usize, usize), LoadError> {
+    guest_slice_in(bytes, bytes.len() as u64)
+}
+
+/// [`guest_slice`] of a file `file_len` bytes long whose first bytes are
+/// `bytes` (all of it, or enough to hold a universal file's table).
+fn guest_slice_in(bytes: &[u8], file_len: u64) -> Result<(usize, usize), LoadError> {
     let head = bytes.get(..8).ok_or(LoadError::TooShort)?;
     if u32::from_le_bytes(head[..4].try_into().unwrap()) == MH_MAGIC_64 {
-        return Ok((0, bytes.len()));
+        return Ok((0, file_len as usize));
     }
     let magic = u32::from_be_bytes(head[..4].try_into().unwrap());
     if magic != FAT_MAGIC && magic != FAT_MAGIC_64 {
@@ -153,7 +159,7 @@ pub fn guest_slice(bytes: &[u8]) -> Result<(usize, usize), LoadError> {
         if cputype != CPU_TYPE_GUEST {
             continue;
         }
-        if off.checked_add(len).is_none_or(|e| e > bytes.len() as u64) {
+        if off.checked_add(len).is_none_or(|e| e > file_len) {
             return Err(bad("a universal file's slice lies outside the file"));
         }
         // Lower is better: the plain subtype, then arm64e, then its variants.
@@ -262,6 +268,12 @@ impl MachO {
 
 /// Parse one thin image (a [`guest_slice`]).
 pub fn parse(data: &[u8]) -> Result<MachO, LoadError> {
+    parse_head(data, data.len() as u64)
+}
+
+/// [`parse`] from the image's header and load commands alone (`data`), the
+/// image itself `len` bytes long.
+fn parse_head(data: &[u8], len: u64) -> Result<MachO, LoadError> {
     let r = Rd(data);
     if data.len() < 32 {
         return Err(LoadError::TooShort);
@@ -337,7 +349,7 @@ pub fn parse(data: &[u8]) -> Result<MachO, LoadError> {
                 if seg.filesize > seg.vmsize && seg.vmsize != 0 {
                     return Err(bad("a segment with more file than memory"));
                 }
-                if seg.fileoff.checked_add(seg.filesize).is_none_or(|e| e > data.len() as u64) {
+                if seg.fileoff.checked_add(seg.filesize).is_none_or(|e| e > len) {
                     return Err(bad("a segment's contents lie outside the file"));
                 }
                 if seg.vmaddr.checked_add(seg.vmsize).is_none() {
@@ -461,8 +473,10 @@ fn functions(m: &MachO, data: &[u8]) -> Vec<Symbol> {
         .collect()
 }
 
-/// Place a parsed image: its mapped segments at `vmaddr + slide`.
-fn place(m: &MachO, data: &[u8], slide: u64) -> Result<Image, LoadError> {
+/// Place a parsed image: its mapped segments at `vmaddr + slide`, with
+/// their bytes from `data` (the whole image), or left in the file (`None`:
+/// a plan, whose segments are empty and whose symbols are not read).
+fn place(m: &MachO, data: Option<&[u8]>, slide: u64) -> Result<Image, LoadError> {
     let mut segments = Vec::new();
     let mut code = Vec::new();
     let (mut text_lo, mut text_hi, mut top) = (u64::MAX, 0u64, 0u64);
@@ -492,7 +506,7 @@ fn place(m: &MachO, data: &[u8], slide: u64) -> Result<Image, LoadError> {
         top = top.max(end);
         segments.push(Segment {
             vaddr,
-            bytes: data[s.fileoff as usize..(s.fileoff + s.filesize) as usize].to_vec(),
+            bytes: data.map_or_else(Vec::new, |d| d[s.fileoff as usize..(s.fileoff + s.filesize) as usize].to_vec()),
             mem_size,
             readable: s.initprot & VM_PROT_READ != 0,
             writable: s.initprot & VM_PROT_WRITE != 0,
@@ -515,7 +529,8 @@ fn place(m: &MachO, data: &[u8], slide: u64) -> Result<Image, LoadError> {
         Some(Entry::Main { entryoff, .. }) => header.ok_or(bad("an entry point with no header to count from"))?.wrapping_add(entryoff),
         None => 0,
     };
-    let symbols = functions(m, data)
+    let symbols = data
+        .map_or_else(Vec::new, |d| functions(m, d))
         .into_iter()
         .map(|mut s| {
             s.value = s.value.wrapping_add(slide);
@@ -587,17 +602,8 @@ pub fn load_program(
     if m.filetype != MH_EXECUTE {
         return Err(LoadError::UnsupportedType(m.filetype as u16));
     }
-    let exe = place(&m, data, slide_for(&m, pie_base)?)?;
-    let mut darwin = Darwin {
-        mach_header: m.header_vmaddr().map_or(0, |a| a.wrapping_add(exe.bias)),
-        dynamic: false,
-        stack_size: match m.entry {
-            Some(Entry::Main { stacksize, .. }) => stacksize,
-            _ => 0,
-        },
-        arm64e: m.arm64e(),
-        uuid: m.uuid,
-    };
+    let exe = place(&m, Some(data), slide_for(&m, pie_base)?)?;
+    let mut darwin = darwin_of(&m, &exe);
     let Some(path) = m.dylinker.clone() else {
         if !matches!(m.entry, Some(Entry::Thread { .. })) {
             return Err(bad("an executable with neither a dynamic linker nor a thread state to start from"));
@@ -613,7 +619,14 @@ pub fn load_program(
     if lm.filetype != MH_DYLINKER || !matches!(lm.entry, Some(Entry::Thread { .. })) {
         return Err(bad("the dynamic linker is not one"));
     }
-    let interp = place(&lm, ldata, slide_for(&lm, interp_base)?)?;
+    let interp = place(&lm, Some(ldata), slide_for(&lm, interp_base)?)?;
+    check_apart(&exe, &interp)?;
+    darwin.dynamic = true;
+    Ok(Program { exe, interp: Some(interp), direct: None, darwin: Some(darwin) })
+}
+
+/// Two independently placed images must not claim the same addresses.
+fn check_apart(exe: &Image, interp: &Image) -> Result<(), LoadError> {
     for a in &exe.segments {
         for b in &interp.segments {
             let (a_end, b_end) = (a.vaddr + a.mem_size, b.vaddr + b.mem_size);
@@ -627,8 +640,116 @@ pub fn load_program(
             }
         }
     }
+    Ok(())
+}
+
+/// What [`Darwin`] says of executable `m`, placed as `exe`.
+fn darwin_of(m: &MachO, exe: &Image) -> Darwin {
+    Darwin {
+        mach_header: m.header_vmaddr().map_or(0, |a| a.wrapping_add(exe.bias)),
+        dynamic: false,
+        stack_size: match m.entry {
+            Some(Entry::Main { stacksize, .. }) => stacksize,
+            _ => 0,
+        },
+        arm64e: m.arm64e(),
+        uuid: m.uuid,
+    }
+}
+
+/// One image of a plan: the guest's slice of the file `read_at` reads,
+/// parsed from its header and load commands alone, and where the slice
+/// starts in the file.
+fn plan_image(read_at: &dyn Fn(u64, &mut [u8]) -> Option<usize>) -> Result<(MachO, u64), LoadError> {
+    let read = |off: u64, len: usize| -> Result<Vec<u8>, LoadError> {
+        let mut v = vec![0u8; len];
+        let n = read_at(off, &mut v).ok_or(LoadError::TooShort)?;
+        v.truncate(n);
+        Ok(v)
+    };
+    // A universal file's table of slices is in its first page; a slice's
+    // header and load commands are its first `32 + sizeofcmds` bytes.
+    let head = read(0, 4096)?;
+    if !is_macho(&head) {
+        return Err(bad("not a Mach-O file"));
+    }
+    let thin = head.len() >= 4 && u32::from_le_bytes(head[..4].try_into().unwrap()) == MH_MAGIC_64;
+    let (off, len) = if thin {
+        (0, u64::MAX)
+    } else {
+        // (`guest_slice` checks each slice against the file's length, which
+        // a plan does not know: it is taken as the table's largest claim.)
+        let (o, l) = guest_slice_of(&head)?;
+        (o as u64, l as u64)
+    };
+    let mut cmds = read(off, 4096)?;
+    if cmds.len() < 32 {
+        return Err(LoadError::TooShort);
+    }
+    let need = 32 + u32::from_le_bytes(cmds[20..24].try_into().unwrap()) as usize;
+    if need > cmds.len() && need <= 1 << 22 {
+        cmds = read(off, need)?;
+    }
+    Ok((parse_head(&cmds, len)?, off))
+}
+
+/// [`guest_slice`] of a universal file's first bytes alone: the slices it
+/// names lie past them.
+fn guest_slice_of(table: &[u8]) -> Result<(usize, usize), LoadError> {
+    let n = u32::from_be_bytes(table.get(4..8).ok_or(LoadError::TooShort)?.try_into().unwrap()) as usize;
+    let wide = u32::from_be_bytes(table[..4].try_into().unwrap()) == FAT_MAGIC_64;
+    let entry = if wide { 32 } else { 20 };
+    let mut end = table.len() as u64;
+    for i in 0..n.min(32) {
+        let at = 8 + i * entry;
+        let Some(e) = table.get(at..at + entry) else { return Err(LoadError::TooShort) };
+        let (off, len) = if wide {
+            (u64::from_be_bytes(e[8..16].try_into().unwrap()), u64::from_be_bytes(e[16..24].try_into().unwrap()))
+        } else {
+            (u32::from_be_bytes(e[8..12].try_into().unwrap()) as u64, u32::from_be_bytes(e[12..16].try_into().unwrap()) as u64)
+        };
+        end = end.max(off.saturating_add(len));
+    }
+    guest_slice_in(table, end)
+}
+
+/// [`load_program`] for `execve`, from headers alone, as
+/// [`crate::plan_program`] plans an ELF program: the program with its
+/// segments' bytes left in the files, and where in each file they are --
+/// the executable's ranges, then the dynamic linker's, in
+/// [`Program::placements`] order. `read_at` reads a range of a guest path.
+pub fn plan_program(
+    exe: &str,
+    pie_base: u64,
+    interp_base: u64,
+    read_at: &dyn Fn(&str, u64, &mut [u8]) -> Option<usize>,
+) -> Result<(Program, crate::elf::FileRanges), LoadError> {
+    let (m, off) = plan_image(&|o, b| read_at(exe, o, b))?;
+    if m.filetype != MH_EXECUTE {
+        return Err(LoadError::UnsupportedType(m.filetype as u16));
+    }
+    let image = place(&m, None, slide_for(&m, pie_base)?)?;
+    let mut ranges: crate::elf::FileRanges = m.mapped().map(|s| (off + s.fileoff, s.filesize)).collect();
+    let mut darwin = darwin_of(&m, &image);
+    let Some(path) = m.dylinker.clone() else {
+        if !matches!(m.entry, Some(Entry::Thread { .. })) {
+            return Err(bad("an executable with neither a dynamic linker nor a thread state to start from"));
+        }
+        return Ok((Program { exe: image, interp: None, direct: None, darwin: Some(darwin) }, ranges));
+    };
+    let (lm, loff) = match plan_image(&|o, b| read_at(&path, o, b)) {
+        Ok(p) => p,
+        Err(_) if read_at(&path, 0, &mut [0u8; 1]).is_none() => return Err(LoadError::NeedsInterpreter(path)),
+        Err(e) => return Err(e),
+    };
+    if lm.filetype != MH_DYLINKER || !matches!(lm.entry, Some(Entry::Thread { .. })) {
+        return Err(bad("the dynamic linker is not one"));
+    }
+    let interp = place(&lm, None, slide_for(&lm, interp_base)?)?;
+    check_apart(&image, &interp)?;
+    ranges.extend(lm.mapped().map(|s| (loff + s.fileoff, s.filesize)));
     darwin.dynamic = true;
-    Ok(Program { exe, interp: Some(interp), direct: None, darwin: Some(darwin) })
+    Ok((Program { exe: image, interp: Some(interp), direct: None, darwin: Some(darwin) }, ranges))
 }
 
 /// What the `apple` vector says of a new process, beyond its path.
@@ -850,6 +971,41 @@ mod tests {
         assert_eq!(p.exe.interp.as_deref(), Some("/usr/lib/dyld"));
         let missing = load_program(&exe, 0x2000_0000, 0x3000_0000, &|_| None).unwrap_err();
         assert_eq!(missing, LoadError::NeedsInterpreter("/usr/lib/dyld".into()));
+    }
+
+    /// `execve`'s plan places what `load_program` places, from the files.
+    #[test]
+    fn a_plan_is_the_program_without_its_bytes() {
+        let exe = image(MH_EXECUTE, MH_PIE, BASE, &[main_cmd(0x123), string_cmd(LC_LOAD_DYLINKER, "/usr/lib/dyld")]);
+        let dyld = image(MH_DYLINKER, 0, 0, &[thread(0x40)]);
+        let file = |path: &str| match path {
+            "/exe" => Some(exe.clone()),
+            "/usr/lib/dyld" => Some(dyld.clone()),
+            _ => None,
+        };
+        let read_at = |path: &str, off: u64, out: &mut [u8]| {
+            let f = file(path)?;
+            let from = (off as usize).min(f.len());
+            let n = out.len().min(f.len() - from);
+            out[..n].copy_from_slice(&f[from..from + n]);
+            Some(n)
+        };
+        let loaded = load_program(&exe, 0x2000_0000, 0x3000_0000, &|p| file(p)).unwrap();
+        let (planned, ranges) = plan_program("/exe", 0x2000_0000, 0x3000_0000, &read_at).unwrap();
+        assert_eq!(planned.entry(), loaded.entry());
+        assert_eq!(planned.darwin, loaded.darwin);
+        let segs: Vec<_> = loaded.placements().collect();
+        let plan: Vec<_> = planned.placements().collect();
+        assert_eq!((segs.len(), ranges.len()), (plan.len(), plan.len()));
+        let files = [&exe, &dyld];
+        for (i, ((l, lf), (p, pf))) in segs.iter().zip(&plan).enumerate() {
+            assert_eq!((l.vaddr, l.mem_size, lf), (p.vaddr, p.mem_size, pf));
+            assert!(p.bytes.is_empty());
+            let f = files[usize::from(pf.is_some())];
+            let (o, n) = ranges[i];
+            assert_eq!(&f[o as usize..(o + n) as usize], &l.bytes[..]);
+        }
+        assert!(plan_program("/nope", 0x2000_0000, 0x3000_0000, &read_at).is_err());
     }
 
     #[test]

@@ -7387,6 +7387,11 @@ pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
 /// [`free_class`] of a call already read ([`call_regs`] of the same
 /// context and ABI).
 pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<FreeCall> {
+    // A Darwin process's calls are numbered and argued its own way, and
+    // every one takes the full path, which rewrites them ([`darwin`]).
+    if darwin::on() {
+        return None;
+    }
     let CallRegs { raw, mut a } = regs;
     // i386's `socketcall` is classed as the call it makes, with that call's
     // arguments; `raw` stays the number the guest used, which a restart

@@ -16,10 +16,15 @@
 // ordinary dynamic one for the Mac, which will not run a static program.
 // Neither asks anything of libSystem, so what they print is the kernel's
 // answers alone.
+//
+// `compare` runs the static program twice: under gexc, and (`page: true`,
+// when the page's shim is built) on the page's runtime under Node
+// (hosts/browser/js/run-node.mjs: the kernel in wasm, a Worker for each
+// process and thread, an in-memory filesystem).
 
-import { mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { exec, native } from './native.mjs';
+import { exec, native, ROOT } from './native.mjs';
 
 export const PROGRAMS = join(import.meta.dirname, '..', 'fixtures', 'darwin');
 
@@ -74,15 +79,40 @@ export function darwin(t) {
     mac(prog, args = [], { env = {}, timeout = 120000 } = {}) {
       return exec([prog.mac, ...args], { cwd: cwd(prog.name), env: { T_VAR: 'yes', ...env }, timeout });
     },
-    /** Both, one check: the same stdout and the same exit status. */
-    async compare(label, prog, args = [], opts = {}) {
+    /**
+     * `prog` on the page's runtime under Node, in the guest's /tmp: `{ code,
+     * stdout, stderr }`, stdout the guest's own lines (the runtime narrates
+     * on it too). `null` when the page's shim is not built.
+     */
+    async page(prog, args = [], { env = {}, timeout = 120000 } = {}) {
+      const seed = join(ROOT, 'page/public/gex/seed.shared.wasm');
+      if (!existsSync(seed) || !existsSync(join(ROOT, 'page/public/gex/gex_browser.shared.wasm'))) return null;
+      const envs = Object.entries({ T_VAR: 'yes', ...env }).flatMap(([k, v]) => ['--env', `${k}=${v}`]);
+      const r = await n.g.run(seed, prog.gex, args, { files: { [prog.gex]: prog.gex }, env: { GEX_SHARED: '1' }, flags: [...envs, '--cwd', '/tmp'], timeout });
+      return { ...r, stdout: r.stdout.split('\n').filter((l) => !l.startsWith('[')).join('\n') };
+    },
+    /**
+     * The Mac's run against gexc's, one check: the same stdout and the same
+     * exit status. With `page: true`, the page runtime's too, where its
+     * shim is built (a line says when it is not).
+     */
+    async compare(label, prog, args = [], { page = false, ...opts } = {}) {
       const want = await this.mac(prog, args, opts);
+      const lines = `${want.stdout.split('\n').length - 1} lines, exit ${want.code}`;
+      const leg = (name, got) => {
+        const same = want.stdout === got.stdout && want.code === got.code;
+        const why = want.code !== got.code ? `exit status: mac ${want.code}, gex ${got.code}` : differ(want.stdout, got.stdout);
+        t.check(`${label}: ${name}as on the Mac (${lines})`, same,
+          same ? '' : `${why}${got.stderr.trim() ? ` / gex said: ${got.stderr.trim().split('\n').slice(-4).join(' / ')}` : ''}`);
+      };
       const got = await this.gex(prog, args, opts);
-      const same = want.stdout === got.stdout && want.code === got.code;
-      const why = want.code !== got.code ? `exit status: mac ${want.code}, gex ${got.code}` : differ(want.stdout, got.stdout);
-      t.check(`${label}: as on the Mac (${want.stdout.split('\n').length - 1} lines, exit ${want.code})`, same,
-        same ? '' : `${why}${got.stderr.trim() ? ` / gex said: ${got.stderr.trim().split('\n').slice(-4).join(' / ')}` : ''}`);
+      leg('', got);
       t.check(`${label}: nothing failed on the Mac`, !/^FAIL /m.test(want.stdout), want.stdout.split('\n').filter((l) => l.startsWith('FAIL ')).join(' / '));
+      if (page) {
+        const on = await this.page(prog, args, opts);
+        if (on) leg('on the page runtime, ', on);
+        else t.say(`${label}: no page leg (page/public/gex has no shared shim: hosts/browser/build.sh)`);
+      }
       return { want, got };
     },
   };

@@ -259,6 +259,7 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     child.kernel.mem = mem;
     child.kernel.wasm32 = wasm32;
     child.kernel.compat = compat;
+    child.kernel.darwin = gex_kernel::darwin::on();
     child.kernel.started = started;
     CHILD.with(|c| c.set(&mut *child));
     std::mem::forget(child);

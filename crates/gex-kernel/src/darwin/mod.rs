@@ -110,6 +110,8 @@ pub enum Post {
     UlockWait,
     /// `ulock_wake`: waking nobody is `ENOENT`.
     UlockWake,
+    /// `unlink`: a directory is refused as Darwin refuses one.
+    Unlink,
     /// A Mach trap that waited: its answer as a `kern_return_t`.
     Kern { timed_out: u32 },
 }
@@ -224,62 +226,75 @@ impl Kernel {
     /// Apply what a rewritten call left to do ([`Post`]) to its answer.
     pub(super) fn darwin_finish(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SysResult {
         let post = std::mem::take(&mut self.darwin_post);
-        // The exclusive monitor does not survive a system call, and its
-        // slots may have been this call's scratch.
-        if !gex_abi::X86 {
-            let _ = m.write_u64(self.ctx_addr + ctx::MON_SIZE as u64, 0);
+        finish(m, self.ctx_addr, post, r)
+    }
+}
+
+/// Apply what a rewritten call left to do (`post`) to its answer `r`, for
+/// the thread whose context is at `ctx_addr`: [`Kernel::finish_blocking`]'s
+/// part, for a host that finishes its waits without the kernel (the page
+/// takes `Kernel::darwin_post` with the rest of what a parked call owes).
+pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> SysResult {
+    // The exclusive monitor does not survive a system call, and its slots
+    // may have been this call's scratch.
+    if !gex_abi::X86 {
+        let _ = m.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+    }
+    match post {
+        Post::None => r,
+        Post::Zero => r.map(|_| 0),
+        Post::WaitStatus { status } => {
+            if r.is_ok() && status != 0 {
+                if let Ok(w) = m.read_u32(status) {
+                    let _ = m.write_u32(status, abi::wait_status_to_darwin(w));
+                }
+            }
+            r
         }
-        match post {
-            Post::None => r,
-            Post::Zero => r.map(|_| 0),
-            Post::WaitStatus { status } => {
-                if r.is_ok() && status != 0 {
-                    if let Ok(w) = m.read_u32(status) {
-                        let _ = m.write_u32(status, abi::wait_status_to_darwin(w));
+        Post::Pipe => {
+            let at = ctx_addr + SCRATCH_SLOT as u64;
+            r.and_then(|_| {
+                let (rd, wr) = (m.read_u32(at)?, m.read_u32(at + 4)?);
+                m.write_u64(ctx_addr + RET2_SLOT as u64, wr as u64)?;
+                Ok(rd as u64)
+            })
+        }
+        Post::Restore { at, was, words } => {
+            for (i, w) in was.iter().take(words as usize).enumerate() {
+                let _ = m.write_u64(at + 8 * i as u64, *w);
+            }
+            r
+        }
+        Post::Rlimit { at } => {
+            if r.is_ok() {
+                for o in [0, 8] {
+                    if m.read_u64(at + o) == Ok(RLIM_INFINITY) {
+                        let _ = m.write_u64(at + o, abi::RLIM_INFINITY);
                     }
                 }
-                r
             }
-            Post::Pipe => {
-                let at = self.ctx_addr + SCRATCH_SLOT as u64;
-                r.and_then(|_| {
-                    let (rd, wr) = (m.read_u32(at)?, m.read_u32(at + 4)?);
-                    m.write_u64(self.ctx_addr + RET2_SLOT as u64, wr as u64)?;
-                    Ok(rd as u64)
-                })
-            }
-            Post::Restore { at, was, words } => {
-                for (i, w) in was.iter().take(words as usize).enumerate() {
-                    let _ = m.write_u64(at + 8 * i as u64, *w);
-                }
-                r
-            }
-            Post::Rlimit { at } => {
-                if r.is_ok() {
-                    for o in [0, 8] {
-                        if m.read_u64(at + o) == Ok(RLIM_INFINITY) {
-                            let _ = m.write_u64(at + o, abi::RLIM_INFINITY);
-                        }
-                    }
-                }
-                r
-            }
-            Post::UlockWait => match r {
-                Ok(_) | Err(Errno::EAGAIN) => Ok(0),
-                e => e,
-            },
-            Post::UlockWake => match r {
-                Ok(0) => Err(Errno::ENOENT),
-                Ok(_) => Ok(0),
-                e => e,
-            },
-            Post::Kern { timed_out } => Ok(match r {
-                Ok(_) => mach::KERN_SUCCESS,
-                Err(Errno::ETIMEDOUT) => timed_out as u64,
-                Err(Errno::EINTR) => mach::KERN_ABORTED,
-                Err(_) => mach::KERN_FAILURE,
-            }),
+            r
         }
+        Post::UlockWait => match r {
+            Ok(_) | Err(Errno::EAGAIN) => Ok(0),
+            e => e,
+        },
+        Post::UlockWake => match r {
+            Ok(0) => Err(Errno::ENOENT),
+            Ok(_) => Ok(0),
+            e => e,
+        },
+        // `unlink` of a directory is EPERM on Darwin (Linux says EISDIR).
+        Post::Unlink => match r {
+            Err(Errno::EISDIR) => Err(Errno::EPERM),
+            r => r,
+        },
+        Post::Kern { timed_out } => Ok(match r {
+            Ok(_) => mach::KERN_SUCCESS,
+            Err(Errno::ETIMEDOUT) => timed_out as u64,
+            Err(Errno::EINTR) => mach::KERN_ABORTED,
+            Err(_) => mach::KERN_FAILURE,
+        }),
     }
 }
 

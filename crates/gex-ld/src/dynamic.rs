@@ -142,6 +142,10 @@ pub fn plan_program(
     interp_base: u64,
     read_at: &dyn Fn(&str, u64, &mut [u8]) -> Option<usize>,
 ) -> Result<(Program, crate::elf::FileRanges), LoadError> {
+    let mut magic = [0u8; 8];
+    if read_at(exe, 0, &mut magic) == Some(8) && crate::macho::is_macho(&magic) {
+        return crate::macho::plan_program(exe, pie_base, interp_base, read_at);
+    }
     let (exe_image, mut ranges) = crate::elf::plan(&|o, b| read_at(exe, o, b), pie_base)?;
     let Some(path) = exe_image.interp.clone() else {
         return Ok((Program { exe: exe_image, interp: None, direct: None, darwin: None }, ranges));

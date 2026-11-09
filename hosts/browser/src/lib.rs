@@ -3940,6 +3940,9 @@ struct Owed {
     /// The call is made again once its wait is over (an `accept`, a
     /// `recvmsg`, a transfer), from its instruction, rather than finished.
     reissue: bool,
+    /// What a Darwin call has left to do with its answer
+    /// (`gex_kernel::darwin::finish`).
+    darwin_post: gex_kernel::darwin::Post,
 }
 
 impl Run {
@@ -6259,6 +6262,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // decoding in the translator.
     kernel.compat = program.compat();
     gex_xlate::set_compat(program.compat());
+    // A Mach-O program: XNU's system-call ABI in the kernel.
+    kernel.darwin = program.is_darwin();
+    gex_kernel::darwin::set(program.is_darwin());
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // The clock calls' process constants (`clock_syscall`), before the
     // process's first syscall.
@@ -6429,18 +6435,21 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.envp = env.to_vec();
     // Process one links for itself and leaves the answer for whoever runs the
     // same program next. There is nothing to restore from: it is the first.
-    let hook = if snapshots_on() && program.interp.is_some() {
+    // (a snapshot is taken where an ELF interpreter hands over, through
+    // the auxiliary vector's entry: a Mach-O program has neither)
+    let hook = if snapshots_on() && program.interp.is_some() && !program.is_darwin() {
         SNAP_STUB
     } else {
         0
     };
     let snap_key_1 = snap_key(&kernel.exe_path, &kernel.envp);
     let stack_args = program.argv(args.clone(), &kernel.exe_path);
-    let layout = gex_ld::build_initial_stack(
-        &program.exe,
+    let layout = gex_ld::build_program_stack(
+        &program,
         // `STACK_TOP`, not the top of the addressable range: a stack at the
         // top makes the memory allocate up to it, four gigabytes per process.
         gex_abi::STACK_TOP,
+        gex_abi::STACK_SIZE,
         &stack_args,
         &env,
         *b"gexdeterministic",
@@ -6451,6 +6460,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             interp_base: program.interp_base(),
             entry_hook: hook,
         },
+        &kernel.exe_path,
+        Some(kernel.darwin_main_thread_port()),
     );
     data.write(layout.low, &layout.bytes).expect("the new stack outside memory");
     kernel.mem.lock().insert(
@@ -9256,6 +9267,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     reissue: k.retry_accept.take().is_some()
                         | k.retry_recvmsg.take().is_some()
                         | k.retry_transfer.take().is_some(),
+                    darwin_post: std::mem::take(&mut k.darwin_post),
                 };
                 {
                     let mut r = h.threads[cur()].run();
@@ -11730,7 +11742,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     {
         let mut gm = guest();
         // What `fork` returns in the child.
-        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
+        let _ = gex_kernel::syscalls::set_fork_child_result(&mut gm, ctx_addr);
         if sp != 0 {
             // `posix_spawn` clones onto a stack it allocated; a plain `fork`
             // passes zero and keeps the parent's.
@@ -12090,7 +12102,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     note_exec(path, argv);
     // Record, when this is the first process to run the program and there is
     // a linker to catch.
-    let hook = if program.as_ref().and_then(|p| p.interp.as_ref()).is_some() && snapshots_on() {
+    let hook = if program.as_ref().is_some_and(|p| p.interp.is_some() && !p.is_darwin()) && snapshots_on() {
         SNAP_STUB
     } else {
         0
@@ -12210,6 +12222,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if let Some(p) = program.as_ref() {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());
+        h.kernel.darwin = p.is_darwin();
+        gex_kernel::darwin::set(p.is_darwin());
     }
     // An exec keeps the process's start (its processor time goes on).
     if h.kernel.started == 0 {
@@ -12315,22 +12329,32 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // (a program its interpreter maps starts as the interpreter's command
     // line for it: gex_ld::Program::direct)
     let direct_argv = program.as_ref().filter(|p| p.direct.is_some()).map(|p| p.argv(argv.to_vec(), &h.kernel.exe_path));
-    let layout = gex_ld::build_initial_stack(
-        &facts,
-        // `STACK_TOP`, not the top of the addressable range: a stack at the
-        // top makes the memory allocate up to it, four gigabytes per process.
-        gex_abi::STACK_TOP,
-        direct_argv.as_deref().unwrap_or(argv),
-        envp,
-        *b"gexdeterministic",
-        // The process's, which a `setuid` before the exec changed.
-        gex_ld::Identity {
-            uid: h.kernel.creds.uid(),
-            gid: h.kernel.creds.gid(),
-            interp_base,
-            entry_hook: hook,
-        },
-    );
+    // The process's ids, which a `setuid` before the exec changed.
+    let id = gex_ld::Identity { uid: h.kernel.creds.uid(), gid: h.kernel.creds.gid(), interp_base, entry_hook: hook };
+    let layout = match program.as_ref().filter(|p| p.is_darwin()) {
+        // A Mach-O program's stack is XNU's.
+        Some(p) => gex_ld::build_program_stack(
+            p,
+            gex_abi::STACK_TOP,
+            gex_abi::STACK_SIZE,
+            argv,
+            envp,
+            *b"gexdeterministic",
+            id,
+            &h.kernel.exe_path,
+            Some(h.kernel.darwin_main_thread_port()),
+        ),
+        None => gex_ld::build_initial_stack(
+            &facts,
+            // `STACK_TOP`, not the top of the addressable range: a stack at the
+            // top makes the memory allocate up to it, four gigabytes per process.
+            gex_abi::STACK_TOP,
+            direct_argv.as_deref().unwrap_or(argv),
+            envp,
+            *b"gexdeterministic",
+            id,
+        ),
+    };
     // Zero first, then lay the new stack on top: `execve` gives a fresh stack,
     // which on Linux reads as zero. Writing only the layout left everything
     // below it as the previous image had, so a program reading an uninitialised
@@ -14716,7 +14740,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = r.park_as(waiting);
         r.blocked_on = Some(op);
-        r.owed = Owed { restore_sigmask, write_blocked, reissue };
+        r.owed = Owed { restore_sigmask, write_blocked, reissue, ..Owed::default() };
     }
     waitq::begin_turn();
     // The compositor first, as the locked turn pumps it (`schedule`): this is
@@ -15112,6 +15136,9 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
         );
     }
     let sigpipe = owed.write_blocked && res == Err(Errno::EPIPE);
+    // A Darwin call's answer in Darwin's form (a wait status by its signal
+    // numbers, a Mach wait as a kern_return_t).
+    let res = if gex_kernel::darwin::on() { gex_kernel::darwin::finish(&mut gm, ctx_addr, owed.darwin_post, res) } else { res };
     let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, gex_kernel::errno::encode(res));
     match sigs::finish(&mut gm, ctx_addr, owed.restore_sigmask, sigpipe) {
         gex_kernel::signal::Delivery::None => Done::At(ctx_addr, pc),
@@ -15817,12 +15844,13 @@ pub extern "C" fn gex_inst_align_shift() -> i32 {
 /// translated after this call starts by reporting its pc and registers to the
 /// debug console. Enormous; pipe it to `tail`. The one tool that shows what ran
 /// between two syscalls when the guest lands somewhere wild.
-/// Whether this process is a 32-bit (i386) one, for the JS side to carry to
-/// the Worker a fork child or a new thread runs in: each Worker has its own
-/// shim instance, whose decoder mode starts out 64-bit.
+/// Which ABI this process speaks, for the JS side to carry to the Worker a
+/// fork child or a new thread runs in: each Worker has its own shim
+/// instance, whose decoder mode starts out 64-bit and whose kernel Linux's.
+/// Bit 0: a 32-bit (i386) process. Bit 1: a Darwin one.
 #[no_mangle]
 pub extern "C" fn gex_compat() -> i32 {
-    compat_abi() as i32
+    compat_abi() as i32 | (gex_kernel::darwin::on() as i32) << 1
 }
 
 /// The other half: said in the child's or thread's Worker once its kernel
@@ -15833,8 +15861,10 @@ pub extern "C" fn gex_set_compat(on: i32) {
     // of its threads run: the process is this Worker's alone, and its
     // fields are written directly. A thread's Worker never calls it
     // (what it sets is shared).
+    let (compat, darwin) = (on & 1 != 0, on & 2 != 0);
     with_own_host(|h| {
-        h.kernel.compat = on != 0;
+        h.kernel.compat = compat;
+        h.kernel.darwin = darwin;
         // A child's process starts now.
         if h.kernel.started == 0 {
             h.kernel.started = now_ns() as u128;
@@ -15845,10 +15875,11 @@ pub extern "C" fn gex_set_compat(on: i32) {
     // `ctx::SP`; an i386-ABI process's is `esp` (`ctx::sp_slot`), which on
     // an AArch64 build is another slot (its i386-ABI processes are wasm32
     // programs: posix_spawn's child starts on that stack).
-    if on != 0 && !gex_abi::X86 {
+    if compat && !gex_abi::X86 {
         compat_stack(my_ctx());
     }
-    gex_xlate::set_compat(on != 0);
+    gex_xlate::set_compat(compat);
+    gex_kernel::darwin::set(darwin);
 }
 
 /// An adopted i386-ABI child's stack, from `ctx::SP` (where its adoption
@@ -16034,6 +16065,20 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         trace_line(&line);
         set_exit(128 + 11);
         trap();
+    }
+    // An A64 `brk` in a program with a SIGTRAP handler: the handler runs,
+    // from a frame whose pc is the instruction's, as natively.
+    if !gex_abi::X86 {
+        let c = my_ctx();
+        let mut gm = guest();
+        if let gex_kernel::signal::Delivery::Resume(target) = sigs::fault(&mut gm, c, 5, pc as u64, pc as u64) {
+            if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+            }
+            set_resume(target);
+            set_resume_ctx(c);
+            trap();
+        }
     }
     // A bare `brk` is almost always glibc's `abort()` (the trap it ends on when
     // `raise(SIGABRT)` returns) or a compiler `__builtin_trap`. Name where it
