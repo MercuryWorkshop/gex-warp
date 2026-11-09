@@ -11,6 +11,7 @@ pub fn install() {
 }
 
 /// `struct open_how` (linux/openat2.h).
+#[cfg(not(target_os = "macos"))]
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -18,8 +19,10 @@ struct OpenHow {
     resolve: u64,
 }
 
+#[cfg(not(target_os = "macos"))]
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
+#[cfg(not(target_os = "macos"))]
 fn no_links(root: i32, rel: &str) -> bool {
     if rel.is_empty() {
         return true;
@@ -39,4 +42,45 @@ fn no_links(root: i32, rel: &str) -> bool {
     // before any link: there is none to follow up to there (ELOOP for a
     // link; ENOSYS and the rest cannot say).
     matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+}
+
+/// macOS has no `openat2(RESOLVE_NO_SYMLINKS)`; the same answer comes from
+/// opening each component with `O_NOFOLLOW` (`O_EVTONLY`, so no read or write
+/// permission is asked for, as `O_PATH` does not). A component that is a
+/// link fails with ELOOP, which is the answer "there is a link".
+#[cfg(target_os = "macos")]
+fn no_links(root: i32, rel: &str) -> bool {
+    if rel.is_empty() {
+        return true;
+    }
+    // SAFETY: the descriptor the caller owns, duplicated so this walk's own
+    // is closed once and the caller's stays.
+    let mut dir = unsafe { libc::dup(root) };
+    if dir < 0 {
+        return false;
+    }
+    let mut answer = true;
+    for comp in rel.split('/').filter(|c| !c.is_empty()) {
+        let Ok(c) = CString::new(comp) else {
+            answer = false;
+            break;
+        };
+        // SAFETY: a live CString for the call's length.
+        let fd = unsafe {
+            libc::openat(dir, c.as_ptr(), libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        };
+        // SAFETY: this walk's own descriptor, closed once.
+        unsafe { libc::close(dir) };
+        if fd < 0 {
+            answer = matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::ENOTDIR)
+            );
+            return answer;
+        }
+        dir = fd;
+    }
+    // SAFETY: the descriptor this walk opened, closed once.
+    unsafe { libc::close(dir) };
+    answer
 }

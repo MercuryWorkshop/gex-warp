@@ -872,10 +872,23 @@ mod tests {
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
     }
 
+    /// The directory the emulated call starts from, where there is no
+    /// `/proc/self/fd` to name the descriptor by (macOS). The hook is handed
+    /// only the descriptor, and the test opens exactly one directory, so its
+    /// path is the same thing.
+    #[cfg(not(target_os = "linux"))]
+    static EMULATED_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
     /// The host's call as the native shim makes it, in safe code: a
     /// component at a time (what `openat2(RESOLVE_NO_SYMLINKS)` answers).
     fn emulated_no_links(root: i32, rel: &str) -> bool {
+        #[cfg(target_os = "linux")]
         let mut at = PathBuf::from(format!("/proc/self/fd/{root}"));
+        #[cfg(not(target_os = "linux"))]
+        let mut at = {
+            let _ = root;
+            EMULATED_ROOT.get().expect("set before the hook is installed").clone()
+        };
         for c in rel.split('/').filter(|c| !c.is_empty()) {
             at.push(c);
             match std::fs::symlink_metadata(&at) {
@@ -903,6 +916,8 @@ mod tests {
         link("loop2", "loop1");
         link("loop1", "loop2");
         let fs = HostFs::new(&dir);
+        #[cfg(not(target_os = "linux"))]
+        let _ = EMULATED_ROOT.set(dir.clone());
         host_walk::set_host_no_links(emulated_no_links);
         let paths = [
             "/a/b/c/f", "/l/c/f", "/l2/c/f", "/abs/b/c", "/a/b/up/l/c", "/a/b/up/a/b/up/abs/b", "/dangle",
