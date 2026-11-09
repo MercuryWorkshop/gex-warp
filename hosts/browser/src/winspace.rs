@@ -17,7 +17,8 @@ mod stub {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// As the shared build's: `MMAP_TOP`, or all of the memory for a
-    /// process that translates nothing ([`raise_native_ceiling`]).
+    /// process that translates nothing ([`raise_native_ceiling`]), or what a
+    /// guest that owns the memory itself leaves free ([`set_arena_ceiling`]).
     static ARENA_CEILING: AtomicU64 = AtomicU64::new(gex_abi::MMAP_TOP);
 
     pub(crate) fn arena_ceiling() -> u64 {
@@ -26,6 +27,15 @@ mod stub {
 
     pub(crate) fn raise_native_ceiling() {
         ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
+    }
+
+    /// Where the arena stops, set once before anything is taken from it: a
+    /// guest that lays out its own address space (a Switch game, whose world
+    /// is its own from `DM_CODE_BASE` up) names the band this module's heap
+    /// and Worker stacks may use. On the web the guest's world *is* the
+    /// memory, so an arena climbing through it is a heap over the game's code.
+    pub(crate) fn set_arena_ceiling(at: u64) {
+        ARENA_CEILING.store(at, Ordering::Relaxed);
     }
 
     pub(crate) fn windows_space() -> u64 {
@@ -91,6 +101,15 @@ mod imp {
 
     pub(crate) fn arena_ceiling() -> u64 {
         ARENA_CEILING.load(Ordering::Relaxed)
+    }
+
+    /// Where the arena stops, set once before anything is taken from it: a
+    /// guest that lays out its own address space (a Switch game, whose world
+    /// is its own from `DM_CODE_BASE` up) names the band this module's heap
+    /// and Worker stacks may use. On the web the guest's world *is* the
+    /// memory, so an arena climbing through it is a heap over the game's code.
+    pub(crate) fn set_arena_ceiling(at: u64) {
+        ARENA_CEILING.store(at, Ordering::Relaxed);
     }
 
     /// A process that translates nothing (no placement window) names no

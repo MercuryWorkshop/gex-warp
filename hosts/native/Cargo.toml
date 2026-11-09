@@ -23,6 +23,7 @@ gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-cgen.workspace = true
 gex-dylink.workspace = true
 gex-ir.workspace = true
+gex-isa.workspace = true
 
 anyhow = "1"
 # `parallel-compilation` is not a default here because `default-features` is

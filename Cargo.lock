@@ -561,6 +561,9 @@ version = "0.0.1"
 [[package]]
 name = "gex-atomic"
 version = "0.0.1"
+dependencies = [
+ "gex-abi",
+]
 
 [[package]]
 name = "gex-browser"
@@ -572,6 +575,7 @@ dependencies = [
  "gex-dylink",
  "gex-emit",
  "gex-ir",
+ "gex-isa",
  "gex-kernel",
  "gex-key",
  "gex-ld",
@@ -733,6 +737,9 @@ dependencies = [
 [[package]]
 name = "gex-kmem"
 version = "0.0.1"
+dependencies = [
+ "gex-abi",
+]
 
 [[package]]
 name = "gex-ld"
@@ -781,6 +788,7 @@ dependencies = [
  "gex-gl",
  "gex-gpu",
  "gex-ir",
+ "gex-isa",
  "gex-kernel",
  "gex-key",
  "gex-ld",

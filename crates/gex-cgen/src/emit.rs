@@ -885,7 +885,16 @@ impl<'a> Emitter<'a> {
 
     fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
         match s {
-            Stmt::Def { dst, expr } => self.def(*dst, expr)?,
+            Stmt::Def { dst, expr } => {
+                self.def(*dst, expr)?;
+                // An atomic's page, after it (page write tracking).
+                if gex_abi::write_map().is_some() {
+                    if let Expr::Rmw { addr, sz, .. } | Expr::CmpXchg { addr, sz, .. } = expr {
+                        let p = self.address(*addr, 0);
+                        self.line(format!("gex_wmark({p}, {}u);", sz.bytes()));
+                    }
+                }
+            }
             Stmt::WriteReg { reg, val } => {
                 let v = self.v(*val);
                 self.write_reg(*reg, &v);
@@ -917,6 +926,9 @@ impl<'a> Emitter<'a> {
                     ));
                 } else {
                     self.line(format!("*(volatile {ut} *)({p}) = ({nt}){v};"));
+                }
+                if gex_abi::write_map().is_some() {
+                    self.line(format!("gex_wmark({p}, {}u);", sz.bytes()));
                 }
             }
             Stmt::Trap { cond, pc, code } => {
@@ -990,6 +1002,9 @@ impl<'a> Emitter<'a> {
                     8 => self.line(format!("wasm_v128_store64_lane({p}, {v}, 0);")),
                     b => bail!("vector store of {b} bytes"),
                 }
+                if gex_abi::write_map().is_some() {
+                    self.line(format!("gex_wmark({p}, {bytes}u);"));
+                }
                 self.line("GEX_ORDER();");
             }
             Stmt::MemCopy { dst, src, len } => {
@@ -1002,6 +1017,9 @@ impl<'a> Emitter<'a> {
                 self.clamp("d");
                 self.clamp("s");
                 self.line(format!("  __builtin_memmove(GEX_P(d), GEX_P(s), ({nc})n);"));
+                if gex_abi::write_map().is_some() {
+                    self.line("  gex_wmark_range((uint64_t)d, n);");
+                }
                 self.line("}");
             }
             Stmt::MemFill { dst, val, len } => {
@@ -1013,6 +1031,9 @@ impl<'a> Emitter<'a> {
                 self.line(format!("  {at} d = {d}; uint64_t n = {n}, room;"));
                 self.clamp("d");
                 self.line(format!("  __builtin_memset(GEX_P(d), (int)(uint32_t){v}, ({nc})n);"));
+                if gex_abi::write_map().is_some() {
+                    self.line("  gex_wmark_range((uint64_t)d, n);");
+                }
                 self.line("}");
             }
             Stmt::MemCmp { dst, a, b, len } => {
@@ -1214,6 +1235,13 @@ impl<'a> Emitter<'a> {
         self.line("  }");
         self.line(format!("  {id}:;"));
         self.line(format!("  {oc} = lc; {od} = ld; {os} = ls; {oa} = la; {ob} = lb;"));
+        // Page write tracking: a storing one's span, between its first and
+        // final destination and an element past the higher.
+        if gex_abi::write_map().is_some() && matches!(kind, gex_ir::StrKind::Movs | gex_ir::StrKind::Stos) {
+            self.line(format!(
+                "  {{ uint64_t lo = {dst} < ld ? {dst} : ld, hi = {dst} < ld ? ld : {dst}; gex_wmark_range(lo, hi - lo + {bytes}u); }}"
+            ));
+        }
         self.line("}");
         Ok(())
     }
@@ -1988,9 +2016,12 @@ impl<'a> Emitter<'a> {
                 }
                 self.dispatch("tgt");
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, imm } => {
                 self.flush();
                 self.store_pc(&format!("0x{next:x}ull"));
+                if imm != 0 {
+                    self.line(format!("GEX_C64(GEX_CTX_SYSCALL_IMM) = {imm}ull;"));
+                }
                 let at = block.end - gex_abi::SYSCALL_INST_BYTES;
                 self.line(format!("gex_syscall(ctx, 0x{at:x}ll);"));
                 self.invalidate();
@@ -2038,6 +2069,16 @@ pub(crate) fn lane_bin(op: VLaneBinOp, lane: VLane) -> Result<String> {
     if op.wasm_opcode(lane).is_none() {
         bail!("no wasm SIMD instruction for {op:?} on {lane:?}");
     }
+    // The widening multiplies are named for their result and their source.
+    if let ExtMulLowS | ExtMulHighS = op {
+        let (to, from) = match lane {
+            VLane::I8 => ("i16x8", "i8x16"),
+            VLane::I16 => ("i32x4", "i16x8"),
+            _ => ("i64x2", "i32x4"),
+        };
+        let half = if op == ExtMulLowS { "low" } else { "high" };
+        return Ok(format!("wasm_{to}_extmul_{half}_{from}"));
+    }
     let unsigned = matches!(
         op,
         MinU | MaxU | AddSatU | SubSatU | AvgrU | LtU | GtU | LeU | GeU
@@ -2052,6 +2093,8 @@ pub(crate) fn lane_bin(op: VLaneBinOp, lane: VLane) -> Result<String> {
         AddSatS | AddSatU => "add_sat",
         SubSatS | SubSatU => "sub_sat",
         AvgrU => "avgr",
+        Q15MulrSatS => "q15mulr_sat",
+        ExtMulLowS | ExtMulHighS => unreachable!("named above"),
         Eq => "eq",
         Ne => "ne",
         LtS | LtU => "lt",

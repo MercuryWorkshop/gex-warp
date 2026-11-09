@@ -628,6 +628,16 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         // Emitter switches read from the environment.
         vec![gex_emit::tier1::knobs()],
     ];
+    // Page write tracking's map, whose address the marks carry: named only
+    // when on, so every other key stays as it was.
+    if let Some(map) = gex_abi::write_map() {
+        fields.push(map.to_le_bytes().into());
+    }
+    // The M64 tables' place, whose address every dispatch carries: named
+    // only when it is not the default, so every other key stays as it was.
+    if gex_abi::mem64() && gex_abi::m64_tables() != gex_abi::M64Tables::Middle {
+        fields.push(gex_abi::dispatch_dir64().to_le_bytes().into());
+    }
     for seg in &image.segments {
         fields.push(seg.vaddr.to_le_bytes().into());
         fields.push(vec![seg.executable as u8]);
@@ -2773,7 +2783,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // An M64 memory's directory and patched bits are its dense tables
         // above 4 GiB instead.
         if gex_abi::mem64() {
-            let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::HIGH_TABLES_END as usize);
+            let (a, b) = (gex_abi::dispatch_dir64() as usize, gex_abi::high_tables_end() as usize);
             dst[a..b].copy_from_slice(&src[a..b]);
         }
         let mut sparse = SparseCopy::new();
@@ -5223,6 +5233,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
                 return aot::call(&mut caller, ctx, pc as u64, v as u64);
             }
+            // A SIMD or crypto instruction with no wasm form (`gex_isa::slow`),
+            // carried out on the vector registers the call flushed to the
+            // context; FPSR's saturation bit lands there too.
+            if !gex_abi::X86 && reg == gex_isa::slow::SYSREG {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let at = ctx as u32 as usize;
+                let Some(regs) = data.get_mut(at..at + ctx::SIZE) else { bail!("a thread context outside guest memory") };
+                let mut fpsr = u32::from_le_bytes(regs[ctx::FPSR..ctx::FPSR + 4].try_into().unwrap());
+                if !gex_isa::slow::execute(v as u32, &mut gex_isa::slow::VRegs(&mut regs[ctx::V..ctx::V + 512]), &mut fpsr) {
+                    bail!("instruction {:#010x} at {pc:#x}: the lifter sent the slow path a word it does not know", v as u32);
+                }
+                regs[ctx::FPSR..ctx::FPSR + 4].copy_from_slice(&fpsr.to_le_bytes());
+                return Ok(());
+            }
             // The x86-64 lifter routes `cpuid` here: the leaf and subleaf come
             // in `v`, the four results go back into the context.
             if reg == gex_kernel::x86::SYSREG_CPUID {
@@ -5322,6 +5347,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let end = start + block as usize;
                 if end <= data.len() {
                     data[start..end].fill(0);
+                    // Page write tracking, when on: the zeroed block's page.
+                    GuestMem::new(data).written(start as u64, block);
                 }
             }
             // `ic ivau` tells the translator the bytes here are no longer the

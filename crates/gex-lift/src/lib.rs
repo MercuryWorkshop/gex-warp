@@ -119,6 +119,18 @@ fn order_of(o: IsaOrder) -> Order {
     }
 }
 
+/// The `i`th register of a compare-swap pair whose base is `r`: `r + i`.
+/// The encoding keeps both base registers even, so only `30 + 1` reaches
+/// 31 -- the zero register, which [`Lifter::rd_gp`] reads as 0 and
+/// [`Lifter::wr_gp`] drops.
+fn pair_next(r: RegSel, i: u8) -> RegSel {
+    match r {
+        RegSel::Gp(n) => RegSel::gp(n as u32 + i as u32),
+        // A pair base is always a plain register; the decoder says so.
+        other => other,
+    }
+}
+
 /// Carry input to [`Lifter::add_with_carry`].
 enum Carry {
     Zero,
@@ -560,7 +572,28 @@ impl<'a> Lifter<'a> {
     // -- the dispatcher ----------------------------------------------------
 
     /// Lift one instruction located at `pc`. Returns how the block continues.
+    /// One instruction. A word with no lowering that [`gex_isa::slow`] understands is carried
+    /// out by the host; the rest of the refusals stay refusals, for the caller to make a SIGILL.
     pub fn lift(&mut self, inst: &Inst, pc: u64) -> Flow {
+        let mark = self.b.mark();
+        let flags = self.flags;
+        let flow = self.lift_inst(inst, pc);
+        let raw = self.raw;
+        let refused = self.b.has_inexpressible(mark)
+            || matches!(flow, Flow::End(Term::Illegal { raw: r, pc: p }) if r == raw && p == pc);
+        if !refused || !gex_isa::slow::known(raw) {
+            return flow;
+        }
+        self.b.rewind(mark);
+        self.flags = flags;
+        let pcv = self.b.const_i64(pc);
+        let id = self.b.const_i32(gex_isa::slow::SYSREG as u32);
+        let word = self.b.const_i64(raw as u64);
+        self.b.stmt(Stmt::HostCall { func: HostFunc::SysRegWrite, args: vec![pcv, id, word] });
+        Flow::Next
+    }
+
+    fn lift_inst(&mut self, inst: &Inst, pc: u64) -> Flow {
         let next = pc + INST_BYTES;
         match *inst {
             Inst::Unknown { raw } | Inst::Undefined { raw } => Flow::End(Term::Illegal { raw, pc }),
@@ -944,7 +977,7 @@ impl<'a> Lifter<'a> {
                 Flow::End(Term::Indirect { target, is_ret })
             }
 
-            Inst::Svc { .. } => Flow::End(Term::Syscall { next }),
+            Inst::Svc { imm } => Flow::End(Term::Syscall { next, imm }),
 
             Inst::Brk { imm } => {
                 let pcv = self.b.const_i64(pc);
@@ -1119,6 +1152,24 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // The tag is not kept: zero the granules (STZG / STZ2G) and
+            // write the base back.
+            Inst::TagStore { ref addr, zero } => {
+                let a = self.address(addr);
+                let z = self.b.const_i64(0);
+                for i in 0..(zero as i64 / 8) {
+                    self.b.stmt(Stmt::Store {
+                        addr: a.base,
+                        offset: a.offset + 8 * i,
+                        val: z,
+                        sz: gex_ir::MemSz::B8,
+                        order: Order::Relaxed,
+                    });
+                }
+                self.finish_address(&a);
+                Flow::Next
+            }
+
             // Prefetch is advisory and has no writeback forms, so the whole
             // instruction is a no-op.
             Inst::Prefetch { .. } => Flow::Next,
@@ -1167,6 +1218,108 @@ impl<'a> Lifter<'a> {
                 });
                 // CAS writes the value actually read back into Rs.
                 self.wr_gp(rs, width, old);
+                Flow::Next
+            }
+
+            Inst::CompareSwapPair { sz, rs, rt, rn, .. } => {
+                // The compare pair Rs:Rs+1 receives the pair read from memory;
+                // the swap pair Rt:Rt+1 is written when *both* elements match,
+                // and neither is written otherwise. All four registers are
+                // read before either compare register is written.
+                let addr = self.rd_addr(rn);
+                let (rs1, rt1) = (pair_next(rs, 1), pair_next(rt, 1));
+                if sz != MemSz::D {
+                    // A pair of words is one aligned doubleword (CASP requires
+                    // the pair's alignment): one 64-bit cmpxchg, exact, the
+                    // first element in the low half.
+                    let pack = |l: &mut Self, lo: RegSel, hi: RegSel| {
+                        let lo = l.rd_gp(lo, Sz::W);
+                        let hi = l.rd_gp(hi, Sz::W);
+                        let lo = l.b.extend(lo, false);
+                        let hi = l.b.extend(hi, false);
+                        let k = l.konst(Ty::I64, 32);
+                        let hi = l.b.bin(BinOp::Shl, Ty::I64, hi, k);
+                        l.b.bin(BinOp::Or, Ty::I64, lo, hi)
+                    };
+                    let expected = pack(self, rs, rs1);
+                    let replacement = pack(self, rt, rt1);
+                    let old = self.b.def(Expr::CmpXchg {
+                        addr,
+                        expected,
+                        replacement,
+                        sz: gex_ir::MemSz::B8,
+                        ty: Ty::I64,
+                    });
+                    let lo = self.b.wrap(old);
+                    let k = self.konst(Ty::I64, 32);
+                    let hi = self.b.bin(BinOp::ShrU, Ty::I64, old, k);
+                    let hi = self.b.wrap(hi);
+                    self.wr_gp(rs, Sz::W, lo);
+                    self.wr_gp(rs1, Sz::W, hi);
+                    return Flow::Next;
+                }
+                // A pair of doublewords: wasm has no 128-bit atomic, so the
+                // pair is checked whole first and then swapped one element at
+                // a time, the first undone if the second no longer matches.
+                // With one thread this is exact (no half-written pair, ever);
+                // with several, another thread can still see the first
+                // element swapped for the instant before the second's
+                // cmpxchg, or change the pair between the check and the swap
+                // -- what only a real 128-bit atomic would close.
+                let e0 = self.rd_gp(rs, Sz::X);
+                let e1 = self.rd_gp(rs1, Sz::X);
+                let n0 = self.rd_gp(rt, Sz::X);
+                let n1 = self.rd_gp(rt1, Sz::X);
+                let eight = self.konst(Ty::I64, 8);
+                let a1 = self.b.bin(BinOp::Add, Ty::I64, addr, eight);
+                let load = |l: &mut Self, a: Value| {
+                    l.b.def(Expr::Load {
+                        addr: a,
+                        offset: 0,
+                        sz: gex_ir::MemSz::B8,
+                        signed: false,
+                        ty: Ty::I64,
+                        order: Order::SeqCst,
+                    })
+                };
+                let cas = |l: &mut Self, a: Value, expected: Value, replacement: Value| {
+                    l.b.def(Expr::CmpXchg {
+                        addr: a,
+                        expected,
+                        replacement,
+                        sz: gex_ir::MemSz::B8,
+                        ty: Ty::I64,
+                    })
+                };
+                let l0 = load(self, addr);
+                let l1 = load(self, a1);
+                let m0 = self.b.cmp(CmpOp::Eq, Ty::I64, l0, e0);
+                let m1 = self.b.cmp(CmpOp::Eq, Ty::I64, l1, e1);
+                let matched = self.b.bin(BinOp::And, Ty::I32, m0, m1);
+                // Element 0: swapped only when the whole pair matched (else
+                // a cmpxchg of the expected value with itself, which never
+                // changes memory).
+                let r0_new = self.b.select(matched, n0, e0, Ty::I64);
+                let r0 = cas(self, addr, e0, r0_new);
+                let same0 = self.b.cmp(CmpOp::Eq, Ty::I64, r0, e0);
+                let ok0 = self.b.bin(BinOp::And, Ty::I32, matched, same0);
+                // Element 1: swapped only when element 0 was.
+                let r1_new = self.b.select(ok0, n1, e1, Ty::I64);
+                let r1 = cas(self, a1, e1, r1_new);
+                let differ1 = self.b.cmp(CmpOp::Ne, Ty::I64, r1, e1);
+                // Element 0 swapped but element 1 did not: put element 0
+                // back (else, again, a cmpxchg that cannot change memory).
+                let undo = self.b.bin(BinOp::And, Ty::I32, ok0, differ1);
+                let back = self.b.select(undo, e0, n0, Ty::I64);
+                cas(self, addr, n0, back);
+                // What the guest compares: the pair the decision was made
+                // on. A failed check returns the loads (one of which differs
+                // from Rs:Rs+1); after it, the cmpxchgs' reads (both equal to
+                // Rs:Rs+1 exactly when the pair was swapped).
+                let out0 = self.b.select(matched, r0, l0, Ty::I64);
+                let out1 = self.b.select(matched, r1, l1, Ty::I64);
+                self.wr_gp(rs, Sz::X, out0);
+                self.wr_gp(rs1, Sz::X, out1);
                 Flow::Next
             }
 
@@ -1365,78 +1518,12 @@ impl<'a> Lifter<'a> {
                 neg_product,
                 neg_addend,
             } => {
-                // AArch64 fuses this (one rounding); wasm has no FMA and
-                // rounding the product first is enough to break musl's `pow`,
-                // which is built on it. So the host's FMA is called.
-                let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
                 let b = self.rd_fp(vm, sz);
                 let c = self.rd_fp(va, sz);
                 // Negating an operand of the product is exact, so it can be
                 // done before the fused step without changing the result.
-                let a = if neg_product {
-                    self.b.def(Expr::FpUn {
-                        op: FpUnOp::Neg,
-                        double,
-                        a,
-                    })
-                } else {
-                    a
-                };
-                let c = if neg_addend {
-                    self.b.def(Expr::FpUn {
-                        op: FpUnOp::Neg,
-                        double,
-                        a: c,
-                    })
-                } else {
-                    c
-                };
-                // GEX_INLINE_FMA emits a multiply and an add instead. Not
-                // correct -- it rounds twice -- and exists only to measure
-                // what the fused host call costs.
-                if inline_fma() {
-                    let prod = self.b.def(Expr::FpBin {
-                        op: FpBinOp::Mul,
-                        double,
-                        a,
-                        b,
-                    });
-                    let v = self.b.def(Expr::FpBin {
-                        op: FpBinOp::Add,
-                        double,
-                        a: prod,
-                        b: c,
-                    });
-                    self.wr_fp(vd, sz, v);
-                    return Flow::Next;
-                }
-                let (a64, b64, c64) = if double {
-                    (a, b, c)
-                } else {
-                    // The import speaks in 64-bit words; a single-precision
-                    // pattern rides in the low half.
-                    (
-                        self.b.def(Expr::Extend { a, signed: false }),
-                        self.b.def(Expr::Extend {
-                            a: b,
-                            signed: false,
-                        }),
-                        self.b.def(Expr::Extend {
-                            a: c,
-                            signed: false,
-                        }),
-                    )
-                };
-                let is_double = self.konst(Ty::I32, double as u64);
-                let r = self.b.def(Expr::HostCall {
-                    func: HostFunc::Fma,
-                    args: vec![a64, b64, c64, is_double],
-                    ty: Ty::I64,
-                });
-                let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
-                self.wr_fp(vd, sz, v);
-                Flow::Next
+                self.fused(vd, sz, a, b, c, neg_product, neg_addend)
             }
 
             Inst::VByElement {
@@ -1447,6 +1534,22 @@ impl<'a> Lifter<'a> {
                 vm,
                 index,
             } => {
+                // Scalar `fmla`/`fmls` are fused, as `fmadd` is. (The vector forms round the
+                // product first: wasm has no vector FMA.)
+                if arr.scalar && matches!(op, VOp3::FMla | VOp3::FMls) {
+                    let sz = if arr.lane_bytes == 8 { FpSz::D } else { FpSz::S };
+                    let a = self.rd_fp(vn, sz);
+                    let m = self.b.read(GuestReg::V128(vm.0));
+                    let b = self.b.def(Expr::VExtract {
+                        a: m,
+                        lane: index,
+                        lane_bytes: arr.lane_bytes,
+                        signed: false,
+                        ty: if sz.is_double() { Ty::I64 } else { Ty::I32 },
+                    });
+                    let c = self.rd_fp(vd, sz);
+                    return self.fused(vd, sz, a, b, c, op == VOp3::FMls, false);
+                }
                 // Broadcast the chosen lane, then this is an ordinary
                 // three-same operation.
                 let src = self.b.read(GuestReg::V128(vm.0));
@@ -2193,6 +2296,45 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // `saddlv`/`uaddlv`: wasm's pairwise add widens each pair in place, and the sum of
+            // those cannot overflow the wider lane (16 bytes into 16 bits, 8 halfwords into 32),
+            // so the plain fold below finishes it on them. The upper half of a 64-bit form is
+            // not an input, so it is cleared first. Word lanes would take a 64-bit pairwise add
+            // wasm lacks, and have not been seen: refused, rather than guessed.
+            Inst::VAcross { op: op @ (VAcrossOp::SAddLv | VAcrossOp::UAddLv), arr, vd, vn } => {
+                let signed = op == VAcrossOp::SAddLv;
+                let pairwise = match (arr.lane_bytes, signed) {
+                    (1, true) => VUnOp::ExtAddPairwiseS8,
+                    (1, false) => VUnOp::ExtAddPairwiseU8,
+                    (2, true) => VUnOp::ExtAddPairwiseS16,
+                    (2, false) => VUnOp::ExtAddPairwiseU16,
+                    _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+                };
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let a = self.narrow_to_64(a, arr.q);
+                let mut acc = self.b.def(Expr::VUn { op: pairwise, a });
+                let lb = arr.lane_bytes * 2;
+                let lane = if lb == 2 { VLane::I16 } else { VLane::I32 };
+                let mut span = arr.lanes() / 2;
+                while span > 1 {
+                    let half = span / 2;
+                    let mut lanes = [0u8; 16];
+                    for (i, slot) in lanes.iter_mut().enumerate() {
+                        let i = i as u32;
+                        let l = i / lb;
+                        *slot = if l < half { ((l + half) * lb + i % lb) as u8 } else { i as u8 };
+                    }
+                    let shifted = self.b.def(Expr::VShuffle { a: acc, b: acc, lanes: Box::new(lanes) });
+                    acc = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane, a: acc, b: shifted });
+                    span = half;
+                }
+                let value = self.b.def(Expr::VExtract { a: acc, lane: 0, lane_bytes: lb, signed: false, ty: Ty::I32 });
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: lb, val: value });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VAcross { op, arr, vd, vn } => {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
@@ -2208,6 +2350,7 @@ impl<'a> Lifter<'a> {
                     VAcrossOp::SMin | VAcrossOp::FMin | VAcrossOp::FMinNm => VLaneBinOp::MinS,
                     VAcrossOp::UMax => VLaneBinOp::MaxU,
                     VAcrossOp::UMin => VLaneBinOp::MinU,
+                    VAcrossOp::SAddLv | VAcrossOp::UAddLv => unreachable!("taken above"),
                 };
                 let mut acc = self.b.read(GuestReg::V128(vn.0));
                 let lb = arr.lane_bytes;
@@ -2664,6 +2807,20 @@ impl<'a> Lifter<'a> {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
 
+        // wasm saturates byte and halfword lanes only; wider ones are done here.
+        if matches!(op, VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub)
+            && matches!(lane, VLane::I32 | VLane::I64)
+        {
+            let r = self.sat_add_sub_wide(op, lane, a, b);
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+        if matches!(op, VOp3::SqDmulh | VOp3::SqRdmulh) {
+            let r = self.sat_doubling_mulh(op == VOp3::SqRdmulh, arr, a, b);
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
         let simple = |op| Some(op);
         let bin: Option<VLaneBinOp> = match op {
             VOp3::Add | VOp3::FAdd => simple(VLaneBinOp::Add),
@@ -2895,6 +3052,14 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             // `|a - b|`: for floating point, a subtract and an absolute value.
+            VOp3::FAcGe | VOp3::FAcGt => {
+                let x = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a });
+                let y = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a: b });
+                let cmp = if op == VOp3::FAcGe { VLaneBinOp::GeS } else { VLaneBinOp::GtS };
+                let r = self.b.def(Expr::VLaneBin { op: cmp, lane, a: x, b: y });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             VOp3::FAbd => {
                 let diff = self.b.def(Expr::VLaneBin {
                     op: VLaneBinOp::Sub,
@@ -2945,6 +3110,8 @@ impl<'a> Lifter<'a> {
             // Pairwise: deinterleave the concatenation, then combine.
             VOp3::AddP
             | VOp3::FAddP
+            | VOp3::FMaxP
+            | VOp3::FMinP
             | VOp3::SMaxP
             | VOp3::UMaxP
             | VOp3::SMinP
@@ -2961,9 +3128,10 @@ impl<'a> Lifter<'a> {
                     lanes: Box::new(odds),
                 });
                 let pair = match op {
-                    VOp3::SMaxP => VLaneBinOp::MaxS,
+                    // On float lanes these are wasm's f32x4.max/min, as `FMax` above.
+                    VOp3::SMaxP | VOp3::FMaxP => VLaneBinOp::MaxS,
                     VOp3::UMaxP => VLaneBinOp::MaxU,
-                    VOp3::SMinP => VLaneBinOp::MinS,
+                    VOp3::SMinP | VOp3::FMinP => VLaneBinOp::MinS,
                     VOp3::UMinP => VLaneBinOp::MinU,
                     _ => VLaneBinOp::Add,
                 };
@@ -3488,90 +3656,98 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun => {
-                let wide = VArr {
-                    lane_bytes: arr.lane_bytes * 2,
-                    q: true,
-                    float: false,
-                    scalar: false,
-                };
-                // WebAssembly has signed->signed and unsigned->unsigned
-                // saturating narrows. SQXTUN's signed->unsigned spelling is
-                // the latter after signed-clamping negative lanes to zero.
-                let source = if op == VOp2::SqXtun && arr.lane_bytes != 4 {
-                    let zero = self.b.def(Expr::VConst(Box::new([0; 16])));
-                    self.b.def(Expr::VLaneBin {
-                        op: VLaneBinOp::MaxS,
-                        lane: Self::lane_of(wide),
-                        a,
-                        b: zero,
-                    })
-                } else if op == VOp2::UqXtn && arr.lane_bytes != 4 {
-                    // wasm's unsigned narrow reads its source as signed, so
-                    // an unsigned source is clamped to the narrow maximum
-                    // first; after that both readings agree.
-                    let max = if arr.lane_bytes == 1 { [0xff, 0] } else { [0xff, 0xff] };
-                    let mut bytes = [0u8; 16];
-                    let w = (arr.lane_bytes * 2) as usize;
-                    for l in 0..16 / w {
-                        bytes[l * w] = max[0];
-                        bytes[l * w + 1] = max[1];
-                    }
-                    let limit = self.b.def(Expr::VConst(Box::new(bytes)));
-                    self.b.def(Expr::VLaneBin {
-                        op: VLaneBinOp::MinU,
-                        lane: Self::lane_of(wide),
-                        a,
-                        b: limit,
-                    })
-                } else {
-                    a
-                };
-                let packed = if arr.lane_bytes == 4 {
-                    self.narrow_sat_i64(op, a)
-                } else {
-                    self.b.def(Expr::VCvt {
-                        op: VCvtOp::NarrowSat {
-                            signed: op == VOp2::SqXtn,
-                        },
-                        from: Self::lane_of(wide),
-                        a: source,
-                        b: Some(source),
-                    })
-                };
-                if arr.scalar {
-                    // The scalar forms write one element and zero the rest.
-                    let mut mask = [0u8; 16];
-                    mask[..arr.lane_bytes as usize].fill(0xff);
-                    let m = self.b.def(Expr::VConst(Box::new(mask)));
-                    let r = self.b.def(Expr::VBin {
-                        op: VBinOp::And,
-                        a: packed,
-                        b: m,
-                    });
-                    self.b.write(GuestReg::V128(vd.0), r);
-                    return Flow::Next;
-                }
-                if arr.q {
-                    let old = self.b.read(GuestReg::V128(vd.0));
-                    let mut merge = [0u8; 16];
-                    for i in 0..8 {
-                        merge[i] = i as u8;
-                        merge[i + 8] = (16 + i) as u8;
-                    }
-                    let r = self.b.def(Expr::VShuffle {
-                        a: old,
-                        b: packed,
-                        lanes: Box::new(merge),
-                    });
-                    self.b.write(GuestReg::V128(vd.0), r);
-                } else {
-                    let v = self.narrow_to_64(packed, false);
-                    self.b.write(GuestReg::V128(vd.0), v);
-                }
-                Flow::Next
+                self.sat_narrow(op, arr, vd, a)
             }
             _ => Flow::End(Term::Illegal { raw: self.raw, pc }),
         }
+    }
+
+    /// `sqxtn`, `uqxtn` and `sqxtun` on `a`, whose lanes are twice `arr`'s: the
+    /// saturating narrow into `vd`'s low half, its upper half for the `2` forms, or
+    /// its single element for the scalar ones. The saturating narrowing shifts
+    /// share it after their shift.
+    fn sat_narrow(&mut self, op: VOp2, arr: VArr, vd: gex_isa::VReg, a: Value) -> Flow {
+        let wide = VArr {
+            lane_bytes: arr.lane_bytes * 2,
+            q: true,
+            float: false,
+            scalar: false,
+        };
+        // WebAssembly has signed->signed and unsigned->unsigned
+        // saturating narrows. SQXTUN's signed->unsigned spelling is
+        // the latter after signed-clamping negative lanes to zero.
+        let source = if op == VOp2::SqXtun && arr.lane_bytes != 4 {
+            let zero = self.b.def(Expr::VConst(Box::new([0; 16])));
+            self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::MaxS,
+                lane: Self::lane_of(wide),
+                a,
+                b: zero,
+            })
+        } else if op == VOp2::UqXtn && arr.lane_bytes != 4 {
+            // wasm's unsigned narrow reads its source as signed, so
+            // an unsigned source is clamped to the narrow maximum
+            // first; after that both readings agree.
+            let max = if arr.lane_bytes == 1 { [0xff, 0] } else { [0xff, 0xff] };
+            let mut bytes = [0u8; 16];
+            let w = (arr.lane_bytes * 2) as usize;
+            for l in 0..16 / w {
+                bytes[l * w] = max[0];
+                bytes[l * w + 1] = max[1];
+            }
+            let limit = self.b.def(Expr::VConst(Box::new(bytes)));
+            self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::MinU,
+                lane: Self::lane_of(wide),
+                a,
+                b: limit,
+            })
+        } else {
+            a
+        };
+        let packed = if arr.lane_bytes == 4 {
+            self.narrow_sat_i64(op, a)
+        } else {
+            self.b.def(Expr::VCvt {
+                op: VCvtOp::NarrowSat {
+                    signed: op == VOp2::SqXtn,
+                },
+                from: Self::lane_of(wide),
+                a: source,
+                b: Some(source),
+            })
+        };
+        if arr.scalar {
+            // The scalar forms write one element and zero the rest.
+            let mut mask = [0u8; 16];
+            mask[..arr.lane_bytes as usize].fill(0xff);
+            let m = self.b.def(Expr::VConst(Box::new(mask)));
+            let r = self.b.def(Expr::VBin {
+                op: VBinOp::And,
+                a: packed,
+                b: m,
+            });
+            self.b.write(GuestReg::V128(vd.0), r);
+            return Flow::Next;
+        }
+        if arr.q {
+            let old = self.b.read(GuestReg::V128(vd.0));
+            let mut merge = [0u8; 16];
+            for i in 0..8 {
+                merge[i] = i as u8;
+                merge[i + 8] = (16 + i) as u8;
+            }
+            let r = self.b.def(Expr::VShuffle {
+                a: old,
+                b: packed,
+                lanes: Box::new(merge),
+            });
+            self.b.write(GuestReg::V128(vd.0), r);
+        } else {
+            let v = self.narrow_to_64(packed, false);
+            self.b.write(GuestReg::V128(vd.0), v);
+        }
+        Flow::Next
     }
 
     fn shift_imm(
@@ -3659,6 +3835,72 @@ impl<'a> Lifter<'a> {
                     a: shifted,
                     b: kept,
                 });
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
+            // Saturating shifts left. A lane fits when shifting the result
+            // back gives the lane again (arithmetically for `sqshl`,
+            // logically for the unsigned forms); one that does not takes the
+            // limit on its side: all-ones for the unsigned forms, and for
+            // `sqshl` the signed maximum, or the minimum for a negative lane
+            // (`MAX ^ (a >> (bits-1))`). `sqshlu` clamps negative lanes to
+            // zero, and a lane that is not negative saturates as `uqshl`'s.
+            // FPSR.QC is not kept: it reads back as zero, as for the other
+            // saturating lowerings.
+            VShiftImmOp::SqShl | VShiftImmOp::UqShl | VShiftImmOp::SqShlU => {
+                let signed = op == VShiftImmOp::SqShl;
+                let shifted = self.b.def(Expr::VShift {
+                    op: VShiftOp::Shl,
+                    lane,
+                    a,
+                    amount,
+                });
+                let back = self.b.def(Expr::VShift {
+                    op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                    lane,
+                    a: shifted,
+                    amount,
+                });
+                let fits = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Eq,
+                    lane,
+                    a: back,
+                    b: a,
+                });
+                let top = self.b.const_i32(bits - 1);
+                let sign = self.b.def(Expr::VShift {
+                    op: VShiftOp::ShrS,
+                    lane,
+                    a,
+                    amount: top,
+                });
+                let limit = if signed {
+                    let mut max = [0xffu8; 16];
+                    let width = arr.lane_bytes as usize;
+                    for l in 0..16 / width {
+                        max[l * width + width - 1] = 0x7f;
+                    }
+                    let max = self.b.def(Expr::VConst(Box::new(max)));
+                    self.b.def(Expr::VBin {
+                        op: VBinOp::Xor,
+                        a: max,
+                        b: sign,
+                    })
+                } else {
+                    self.b.def(Expr::VConst(Box::new([0xffu8; 16])))
+                };
+                let mut r = self.b.def(Expr::VBitSelect {
+                    mask: fits,
+                    a: shifted,
+                    b: limit,
+                });
+                if op == VShiftImmOp::SqShlU {
+                    r = self.b.def(Expr::VBin {
+                        op: VBinOp::AndNot,
+                        a: r,
+                        b: sign,
+                    });
+                }
                 self.commit_vector(vd, arr, r);
                 return Flow::Next;
             }
@@ -3783,6 +4025,63 @@ impl<'a> Lifter<'a> {
                 };
                 self.b.write(GuestReg::V128(vd.0), r);
                 return Flow::Next;
+            }
+            // The saturating narrowing shifts: the shift at the wide width
+            // (arithmetic but for the `uq` forms, whose source is unsigned),
+            // rounded as `srshr` is, without overflow; then the saturating
+            // narrow `sqxtn` / `uqxtn` / `sqxtun` does. The shift is 1 up to
+            // the narrow width, always inside the wide lane. FPSR.QC is not
+            // kept, as for the other saturating lowerings.
+            VShiftImmOp::SqShrn
+            | VShiftImmOp::SqRshrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::UqRshrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRshrun => {
+                let wlane = Self::lane_of(VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                });
+                let unsigned = matches!(op, VShiftImmOp::UqShrn | VShiftImmOp::UqRshrn);
+                let rounding = matches!(
+                    op,
+                    VShiftImmOp::SqRshrn | VShiftImmOp::UqRshrn | VShiftImmOp::SqRshrun
+                );
+                let mut shifted = self.b.def(Expr::VShift {
+                    op: if unsigned { VShiftOp::ShrU } else { VShiftOp::ShrS },
+                    lane: wlane,
+                    a,
+                    amount,
+                });
+                if rounding {
+                    let rb = self.b.const_i32(shift - 1);
+                    let dropped = self.b.def(Expr::VShift {
+                        op: VShiftOp::ShrU,
+                        lane: wlane,
+                        a,
+                        amount: rb,
+                    });
+                    let one = self.lane_splat(wlane, 1);
+                    let round = self.b.def(Expr::VBin {
+                        op: VBinOp::And,
+                        a: dropped,
+                        b: one,
+                    });
+                    shifted = self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane: wlane,
+                        a: shifted,
+                        b: round,
+                    });
+                }
+                let narrow = match op {
+                    VShiftImmOp::SqShrn | VShiftImmOp::SqRshrn => VOp2::SqXtn,
+                    VShiftImmOp::UqShrn | VShiftImmOp::UqRshrn => VOp2::UqXtn,
+                    _ => VOp2::SqXtun,
+                };
+                return self.sat_narrow(narrow, arr, vd, shifted);
             }
             VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 // The source lanes are twice as wide as `arr` describes.
@@ -4238,6 +4537,77 @@ impl<'a> Lifter<'a> {
     }
 
     /// Read a scalar float out of a `v` register as its bit pattern.
+    /// `vd = (+/-a) * b + (+/-c)`, with one rounding. AArch64 fuses this; wasm has no FMA, and
+    /// rounding the product first is enough to break musl's `pow`, which is built on it. So the
+    /// host's FMA is called.
+    #[allow(clippy::too_many_arguments)]
+    fn fused(&mut self, vd: gex_isa::VReg, sz: FpSz, a: Value, b: Value, c: Value, neg_product: bool, neg_addend: bool) -> Flow {
+        let double = sz.is_double();
+        let a = if neg_product {
+            self.b.def(Expr::FpUn {
+                op: FpUnOp::Neg,
+                double,
+                a,
+            })
+        } else {
+            a
+        };
+        let c = if neg_addend {
+            self.b.def(Expr::FpUn {
+                op: FpUnOp::Neg,
+                double,
+                a: c,
+            })
+        } else {
+            c
+        };
+        // GEX_INLINE_FMA emits a multiply and an add instead. Not
+        // correct -- it rounds twice -- and exists only to measure
+        // what the fused host call costs.
+        if inline_fma() {
+            let prod = self.b.def(Expr::FpBin {
+                op: FpBinOp::Mul,
+                double,
+                a,
+                b,
+            });
+            let v = self.b.def(Expr::FpBin {
+                op: FpBinOp::Add,
+                double,
+                a: prod,
+                b: c,
+            });
+            self.wr_fp(vd, sz, v);
+            return Flow::Next;
+        }
+        let (a64, b64, c64) = if double {
+            (a, b, c)
+        } else {
+            // The import speaks in 64-bit words; a single-precision
+            // pattern rides in the low half.
+            (
+                self.b.def(Expr::Extend { a, signed: false }),
+                self.b.def(Expr::Extend {
+                    a: b,
+                    signed: false,
+                }),
+                self.b.def(Expr::Extend {
+                    a: c,
+                    signed: false,
+                }),
+            )
+        };
+        let is_double = self.konst(Ty::I32, double as u64);
+        let r = self.b.def(Expr::HostCall {
+            func: HostFunc::Fma,
+            args: vec![a64, b64, c64, is_double],
+            ty: Ty::I64,
+        });
+        let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
+        self.wr_fp(vd, sz, v);
+        Flow::Next
+    }
+
     fn rd_fp(&mut self, v: gex_isa::VReg, sz: FpSz) -> Value {
         let vec = self.b.read(GuestReg::V128(v.0));
         self.b.def(Expr::VExtract {
@@ -4354,6 +4724,114 @@ impl<'a> Lifter<'a> {
             b: clamped,
             lanes: Box::new(lanes),
         })
+    }
+
+    /// A vector with `x` in every lane of `lane`'s width.
+    fn lane_splat(&mut self, lane: VLane, x: u64) -> Value {
+        let w = lane.bytes() as usize;
+        let mut bytes = [0u8; 16];
+        for l in 0..16 / w {
+            bytes[l * w..l * w + w].copy_from_slice(&x.to_le_bytes()[..w]);
+        }
+        self.b.def(Expr::VConst(Box::new(bytes)))
+    }
+
+    /// `sqadd`, `uqadd`, `sqsub` and `uqsub` on word and doubleword lanes, which wasm
+    /// has no saturating add or subtract for. The wrapping result is right unless it
+    /// overflowed: for the signed forms when the operands' signs agree (add) or differ
+    /// (subtract) and the result's sign is not the first operand's, which
+    /// `(r ^ a) & (r ^ b)` / `(a ^ b) & (a ^ r)` shows in the sign bit; such a lane
+    /// takes the limit on `a`'s side, `MAX ^ (a >> (bits-1))`. Unsigned, the sum
+    /// overflowed when it is below `a` (all-ones then), the difference when `a < b`
+    /// (zero then). i64x2 has no unsigned compare, so those lanes compare biased into
+    /// signed order. FPSR.QC is not kept, as for the other saturating lowerings.
+    fn sat_add_sub_wide(&mut self, op: VOp3, lane: VLane, a: Value, b: Value) -> Value {
+        let add = matches!(op, VOp3::SqAdd | VOp3::UqAdd);
+        let r = self.b.def(Expr::VLaneBin {
+            op: if add { VLaneBinOp::Add } else { VLaneBinOp::Sub },
+            lane,
+            a,
+            b,
+        });
+        let bits = lane.bytes() * 8;
+        if matches!(op, VOp3::SqAdd | VOp3::SqSub) {
+            let (x, y, z, t) = if add { (r, a, r, b) } else { (a, b, a, r) };
+            let p = self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: y });
+            let q = self.b.def(Expr::VBin { op: VBinOp::Xor, a: z, b: t });
+            let ov = self.b.def(Expr::VBin { op: VBinOp::And, a: p, b: q });
+            let top = self.b.const_i32(bits - 1);
+            let mask = self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane, a: ov, amount: top });
+            let sign = self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane, a, amount: top });
+            let max = self.lane_splat(lane, u64::MAX >> (65 - bits));
+            let limit = self.b.def(Expr::VBin { op: VBinOp::Xor, a: max, b: sign });
+            return self.b.def(Expr::VBitSelect { mask, a: limit, b: r });
+        }
+        // Unsigned: `lt_u(x, y)`, the sum below `a` or `a` below `b`.
+        let (x, y) = if add { (r, a) } else { (a, b) };
+        let below = if lane == VLane::I64 {
+            let bias = self.lane_splat(lane, 1 << 63);
+            let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: bias });
+            let y = self.b.def(Expr::VBin { op: VBinOp::Xor, a: y, b: bias });
+            self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtS, lane, a: x, b: y })
+        } else {
+            self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtU, lane, a: x, b: y })
+        };
+        if add {
+            self.b.def(Expr::VBin { op: VBinOp::Or, a: r, b: below })
+        } else {
+            self.b.def(Expr::VBin { op: VBinOp::AndNot, a: r, b: below })
+        }
+    }
+
+    /// `sqdmulh` and `sqrdmulh`: `(2*a*b [+ 1 << (bits-1)]) >> bits` per lane, which
+    /// overflows only for `MIN * MIN`. Halfwords: the rounding form is wasm's
+    /// `i16x8.q15mulr_sat_s` exactly, and the plain one `(a*b) >> 15` from the widened
+    /// products, whose one overflow the saturating narrow takes. Words: the products
+    /// widened to i64 (`extmul`), `(p [+ 1 << 30]) >> 31` -- the same value with both
+    /// sides halved -- and the low words of that. Nothing but `MIN * MIN` gives
+    /// `0x8000_0000` there (the extreme products are `-2^62 + 2^31` and
+    /// `2^62 - 2^31`), so turning that one value into `MAX` is the saturation.
+    /// FPSR.QC is not kept, as for the other saturating lowerings.
+    fn sat_doubling_mulh(&mut self, round: bool, arr: VArr, a: Value, b: Value) -> Value {
+        if arr.lane_bytes == 2 {
+            if round {
+                return self.b.def(Expr::VLaneBin { op: VLaneBinOp::Q15MulrSatS, lane: VLane::I16, a, b });
+            }
+            let fifteen = self.b.const_i32(15);
+            let mut half = [None; 2];
+            for (i, op) in [VLaneBinOp::ExtMulLowS, VLaneBinOp::ExtMulHighS].into_iter().enumerate() {
+                let p = self.b.def(Expr::VLaneBin { op, lane: VLane::I16, a, b });
+                half[i] = Some(self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane: VLane::I32, a: p, amount: fifteen }));
+            }
+            return self.b.def(Expr::VCvt {
+                op: VCvtOp::NarrowSat { signed: true },
+                from: VLane::I32,
+                a: half[0].unwrap(),
+                b: half[1],
+            });
+        }
+        // The 64-bit and scalar forms want only the low half.
+        let both = arr.q && !arr.scalar;
+        let bias = if round { Some(self.lane_splat(VLane::I64, 1 << 30)) } else { None };
+        let thirty_one = self.b.const_i32(31);
+        let mut half = Vec::new();
+        for op in [VLaneBinOp::ExtMulLowS, VLaneBinOp::ExtMulHighS].into_iter().take(if both { 2 } else { 1 }) {
+            let mut p = self.b.def(Expr::VLaneBin { op, lane: VLane::I32, a, b });
+            if let Some(bias) = bias {
+                p = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane: VLane::I64, a: p, b: bias });
+            }
+            half.push(self.b.def(Expr::VShift { op: VShiftOp::ShrS, lane: VLane::I64, a: p, amount: thirty_one }));
+        }
+        let (lo, hi) = (half[0], *half.last().unwrap());
+        // Words 0 and 2 of `lo`, then of `hi` (bytes 16.. of the pair).
+        let mut lanes = [0u8; 16];
+        for (i, slot) in lanes.iter_mut().enumerate() {
+            *slot = [0u8, 8, 16, 24][i / 4] + (i % 4) as u8;
+        }
+        let packed = self.b.def(Expr::VShuffle { lanes: Box::new(lanes), a: lo, b: hi });
+        let min = self.lane_splat(VLane::I32, 0x8000_0000);
+        let over = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Eq, lane: VLane::I32, a: packed, b: min });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: packed, b: over })
     }
 
     fn narrow_to_64(&mut self, v: Value, q: bool) -> Value {
@@ -4551,8 +5029,61 @@ impl<'a> Lifter<'a> {
             Dp2Op::Lsrv => self.b.bin(BinOp::ShrU, ty, a, b),
             Dp2Op::Asrv => self.b.bin(BinOp::ShrS, ty, a, b),
             Dp2Op::Rorv => self.b.bin(BinOp::Rotr, ty, a, b),
-            // CRC32 needs a table or a carry-less multiply; not worth an
-            // inline expansion until something in the corpus uses it.
+            Dp2Op::Crc32b
+            | Dp2Op::Crc32h
+            | Dp2Op::Crc32w
+            | Dp2Op::Crc32x
+            | Dp2Op::Crc32cb
+            | Dp2Op::Crc32ch
+            | Dp2Op::Crc32cw
+            | Dp2Op::Crc32cx => {
+                // CRC32 / CRC32C: Wn is the running CRC, updated with the low
+                // 1/2/4/8 bytes of Xm (least significant byte first) and
+                // written to Wd. The reflected bitwise form: XOR the byte in,
+                // then shift 8 times against the reversed polynomial. wasm has
+                // no carry-less multiply and no table to index, so this
+                // expands inline -- a few hundred IR nodes on the widest form.
+                let nbytes = match op {
+                    Dp2Op::Crc32b | Dp2Op::Crc32cb => 1,
+                    Dp2Op::Crc32h | Dp2Op::Crc32ch => 2,
+                    Dp2Op::Crc32w | Dp2Op::Crc32cw => 4,
+                    _ => 8,
+                };
+                // The polynomials in their reversed form, as the bit loop
+                // shifts right: 0x04C11DB7 (IEEE) / 0x1EDC6F41 (Castagnoli).
+                let poly = match op {
+                    Dp2Op::Crc32cb | Dp2Op::Crc32ch | Dp2Op::Crc32cw | Dp2Op::Crc32cx => {
+                        0x82f6_3b78u64
+                    }
+                    _ => 0xedb8_8320u64,
+                };
+                // Wn is 32-bit whatever sf says (on CRC32X only the source is
+                // 64-bit), and Wd is written 32-bit, zero-extending into Xd.
+                let mut acc = if ty == Ty::I64 { self.b.wrap(a) } else { a };
+                let one = self.konst(Ty::I32, 1);
+                let fmask = self.konst(Ty::I32, 0xff);
+                let polyv = self.konst(Ty::I32, poly);
+                for i in 0..nbytes {
+                    let sh = self.konst(ty, 8 * i);
+                    let shifted = self.b.bin(BinOp::ShrU, ty, b, sh);
+                    let byte = if ty == Ty::I64 {
+                        self.b.wrap(shifted)
+                    } else {
+                        shifted
+                    };
+                    let byte = self.b.bin(BinOp::And, Ty::I32, byte, fmask);
+                    acc = self.b.bin(BinOp::Xor, Ty::I32, acc, byte);
+                    for _ in 0..8 {
+                        let lsb = self.b.bin(BinOp::And, Ty::I32, acc, one);
+                        let mask = self.b.un(UnOp::Neg, Ty::I32, lsb);
+                        let hi = self.b.bin(BinOp::ShrU, Ty::I32, acc, one);
+                        let p = self.b.bin(BinOp::And, Ty::I32, polyv, mask);
+                        acc = self.b.bin(BinOp::Xor, Ty::I32, hi, p);
+                    }
+                }
+                self.wr_gp(rd, Sz::W, acc);
+                return Flow::Next;
+            }
             _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
         };
         self.wr_gp(rd, sz, v);

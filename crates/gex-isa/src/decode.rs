@@ -328,9 +328,40 @@ fn decode_branch_sys(raw: u32, pc: u64) -> Inst {
         if op2 != 0b11111 {
             return Inst::Unknown { raw };
         }
-        // op3 != 0 selects the pointer-authentication variants (BRAA etc).
+        // op3 != 0 selects the pointer-authentication variants. gex never
+        // produces or checks a PAC (see the PAC hints in `decode_system`),
+        // so each form is its plain branch with the authentication dropped.
+        // op3 000010/000011 choose key A/B; bit 24 picks the zero-modifier
+        // Z forms (op4 11111) from the register-modifier ones (op4 names
+        // the modifier register, 31 meaning sp).
         if op3 != 0 {
-            return Inst::Unknown { raw };
+            if op3 != 0b000010 && op3 != 0b000011 {
+                return Inst::Unknown { raw };
+            }
+            if bit(raw, 24) == 0 && op4 != 0b11111 {
+                return Inst::Unknown { raw };
+            }
+            return match bits(raw, 23, 21) {
+                // BRAAZ / BRAA.
+                0b000 => Inst::BranchReg {
+                    rn: RegSel::gp(rn),
+                    link: false,
+                    is_ret: false,
+                },
+                // BLRAAZ / BLRAA.
+                0b001 => Inst::BranchReg {
+                    rn: RegSel::gp(rn),
+                    link: true,
+                    is_ret: false,
+                },
+                // RETAA / RETAB: x30, zero-modifier form only.
+                0b010 if bit(raw, 24) == 0 && rn == 0b11111 => Inst::BranchReg {
+                    rn: RegSel::gp(30),
+                    link: false,
+                    is_ret: true,
+                },
+                _ => Inst::Unknown { raw },
+            };
         }
         return match (opc, op4) {
             (0b0000, 0) => Inst::BranchReg {
@@ -609,7 +640,25 @@ fn decode_dp_reg(raw: u32) -> Inst {
         0b1101_0110 => {
             if bit(raw, 30) == 1 {
                 // 1 source: opcode2 in [20:16], opcode in [15:10].
-                if bit(raw, 29) != 0 || rm != 0 {
+                if bit(raw, 29) != 0 {
+                    return Inst::Undefined { raw };
+                }
+                // FEAT_PAuth's PAC/AUT/XPAC (opcode2 00001, the only other
+                // opcode2 in this space): insert, check or strip the
+                // signature gex never produces or checks (see the PAC hints
+                // in decode_system), so each is a no-op. Opcode 000xxx
+                // signs or authenticates Xd with modifier Xn (Rn 31 = sp);
+                // 001xxx is the zero-modifier Z form (Rn must be 31);
+                // 01000x is XPACI/XPACD, which strips the signature again.
+                if rm == 0b00001 && sf == 1 {
+                    return match (bits(raw, 15, 10), rn) {
+                        (0b000000..=0b000111, _) => Inst::Hint { imm: 0 },
+                        (0b001000..=0b001111, 0b11111) => Inst::Hint { imm: 0 },
+                        (0b010000, 0b11111) | (0b010001, 0b11111) => Inst::Hint { imm: 0 },
+                        _ => Inst::Unknown { raw },
+                    };
+                }
+                if rm != 0 {
                     return Inst::Undefined { raw };
                 }
                 let op = match bits(raw, 15, 10) {
@@ -636,6 +685,21 @@ fn decode_dp_reg(raw: u32) -> Inst {
             } else {
                 if bit(raw, 29) != 0 {
                     return Inst::Undefined { raw };
+                }
+                // PACGA (FEAT_PAuth): the PAC of Xn with modifier Xm (31 =
+                // sp) under the generic key, written to Xd[63:32] with
+                // Xd[31:0] zero. The key is a per-process secret, so code
+                // can only recompute a PAC and compare it with one it
+                // computed earlier; a constant zero keeps every such
+                // comparison true.
+                if bits(raw, 15, 10) == 0b001100 && sf == 1 {
+                    return Inst::MoveWide {
+                        sz: Sz::X,
+                        op: MoveOp::Movz,
+                        rd: RegSel::gp(rd),
+                        imm16: 0,
+                        shift: 0,
+                    };
                 }
                 let op = match bits(raw, 15, 10) {
                     0b000010 => Dp2Op::Udiv,
@@ -701,6 +765,53 @@ fn decode_dp_reg(raw: u32) -> Inst {
 // ---------------------------------------------------------------------------
 
 fn decode_load_store(raw: u32, pc: u64) -> Inst {
+    // LDAPR/LDAPRB/LDAPRH (FEAT_LRCPC): a load-acquire RCpc from [Rn].
+    // Ordering::Acquire is stronger than RCpc, hence safe.
+    if (raw & 0x3FFF_FC00) == 0x38BF_C000 {
+        let size = bits(raw, 31, 30);
+        return Inst::Load {
+            sz: MemSz::from_log2(size),
+            dest: if size == 0b11 { Sz::X } else { Sz::W },
+            signed: false,
+            rt: RegSel::gp(bits(raw, 4, 0)),
+            addr: AddrMode::Offset {
+                rn: RegSel::sp(bits(raw, 9, 5)),
+                off: 0,
+            },
+            order: Ordering::Acquire,
+        };
+    }
+    // FEAT_MTE's allocation-tag stores, STG/STZG/ST2G/STZ2G: opc picks the
+    // form, bits[11:10] the addressing (01 post-index, 10 offset, 11
+    // pre-index), imm9 counts 16-byte granules. The tag itself lives beside
+    // memory this world does not have, so it is dropped, but the rest is
+    // kept: the pre- and post-index forms write the base back, and STZG /
+    // STZ2G zero the one or two granules they tag. The tag loads (LDG) are
+    // left out: they write a register.
+    if bits(raw, 31, 24) == 0b1101_1001 && bit(raw, 21) == 1 {
+        let opc = bits(raw, 23, 22);
+        let rn = RegSel::sp(bits(raw, 9, 5));
+        let off = sext(bits(raw, 20, 12), 9) << 4;
+        let addr = match bits(raw, 11, 10) {
+            0b01 => Some(AddrMode::PostIndex { rn, off }),
+            0b10 => Some(AddrMode::Offset { rn, off }),
+            0b11 => Some(AddrMode::PreIndex { rn, off }),
+            _ => None,
+        };
+        if let Some(addr) = addr {
+            let zero = match opc {
+                0b01 => 16,
+                0b11 => 32,
+                _ => 0,
+            };
+            return Inst::TagStore { addr, zero };
+        }
+        // STZGM / STGM / LDGM (bits[11:10] 00, imm9 0, opc 00 / 10 / 11)
+        // are UNDEFINED at EL0.
+        if bits(raw, 20, 12) == 0 && opc != 0b01 {
+            return Inst::Undefined { raw };
+        }
+    }
     // Load/store exclusive: size 001000 o2 L o1 Rs o0 Rt2 Rn Rt
     if bits(raw, 29, 24) == 0b001000 {
         return decode_ldst_exclusive(raw);
@@ -1232,9 +1343,30 @@ fn decode_ldst_exclusive(raw: u32) -> Inst {
                 }
             }
         }
-        // Exclusive pair (LDXP/STXP) and CASP — deferred to the threading
-        // milestone; nothing in T0/T1 userspace emits them.
-        (0, 1) => Inst::Unknown { raw },
+        // CASP/CASPA/CASPL/CASPAL (FEAT_LSE): a pair compare-and-swap. The
+        // compare pair Rs:Rs+1 receives the pair read from memory; the swap
+        // pair Rt:Rt+1 is written when it matches. Both pair base registers
+        // are even (the decode rule), and bits[14:10] are fixed 11111. bit
+        // 31 separates the pair CAS from LDXP/STXP in this space, which
+        // stay deferred to the threading milestone.
+        (0, 1) => {
+            if bit(raw, 31) == 1 || bits(raw, 14, 10) != 0b11111 {
+                return Inst::Unknown { raw };
+            }
+            let rs = bits(raw, 20, 16);
+            let rt = bits(raw, 4, 0);
+            if rs % 2 == 1 || rt % 2 == 1 {
+                return Inst::Undefined { raw };
+            }
+            Inst::CompareSwapPair {
+                sz: if bit(raw, 30) == 1 { MemSz::D } else { MemSz::W },
+                rs: RegSel::gp(rs),
+                rt: RegSel::gp(rt),
+                rn: RegSel::sp(rn),
+                acquire: l == 1,
+                release: o0 == 1,
+            }
+        }
         // Load-acquire / store-release register — ordered but not exclusive.
         // Covers LDAR/STLR (o0=1) and LDLAR/STLLR (o0=0, FEAT_LOR); treating
         // the LOR forms as full acquire/release is stronger, hence safe.
@@ -1542,6 +1674,17 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
         }
     };
 
+    // Floating point by element: 01 U 11111 1 sz L M Rm opcode H 0 Rn Rd. The integer forms
+    // (`sqdmulh` and its family) go on to be refused.
+    if bits(raw, 28, 24) == 0b11111 && bit(raw, 23) == 1 && bit(raw, 10) == 0 {
+        if let Some(Inst::VByElement { op, mut arr, vd, vn, vm, index }) = decode_simd_by_element(raw, true, u) {
+            if arr.float {
+                arr.scalar = true;
+                return Some(Inst::VByElement { op, arr, vd, vn, vm, index });
+            }
+        }
+    }
+
     // Shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
     if bits(raw, 28, 23) == 0b111110 && bit(raw, 10) == 1 {
         let immh = bits(raw, 22, 19);
@@ -1620,6 +1763,7 @@ fn scalar_form_exists(inst: &Inst) -> bool {
     match *inst {
         Inst::VThreeSame { op, arr, .. } => match op {
             VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub => true,
+            VOp3::SqDmulh | VOp3::SqRdmulh => true,
             VOp3::CmGt
             | VOp3::CmGe
             | VOp3::CmHi
@@ -1636,6 +1780,8 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VOp3::FCmGt
             | VOp3::FRecps
             | VOp3::FRSqrts
+            | VOp3::FAcGe
+            | VOp3::FAcGt
             | VOp3::FAbd => true,
             _ => false,
         },
@@ -1673,7 +1819,16 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             VShiftImmOp::Scvtf
             | VShiftImmOp::Ucvtf
             | VShiftImmOp::Fcvtzs
-            | VShiftImmOp::Fcvtzu => true,
+            | VShiftImmOp::Fcvtzu
+            | VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
+            | VShiftImmOp::SqShrn
+            | VShiftImmOp::SqRshrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::UqRshrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRshrun => true,
             VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 false
             }
@@ -1950,6 +2105,10 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (1, 0b11100, false) => VOp3::FCmGe,
             (1, 0b11100, true) => VOp3::FCmGt,
             (1, 0b11111, false) => VOp3::FDiv,
+            (1, 0b11110, false) => VOp3::FMaxP,
+            (1, 0b11110, true) => VOp3::FMinP,
+            (1, 0b11101, false) => VOp3::FAcGe,
+            (1, 0b11101, true) => VOp3::FAcGt,
             _ => return Inst::Unknown { raw },
         };
         // No `.1d` arrangement.
@@ -2008,8 +2167,14 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, _) => VOp3::UMaxP,
         (0b10101, 0) => VOp3::SMinP,
         (0b10101, _) => VOp3::UMinP,
+        (0b10110, 0) => VOp3::SqDmulh,
+        (0b10110, _) => VOp3::SqRdmulh,
         _ => return Inst::Unknown { raw },
     };
+    // The doubling multiplies exist on halfwords and words only.
+    if matches!(op, VOp3::SqDmulh | VOp3::SqRdmulh) && !matches!(lane_bytes, 2 | 4) {
+        return Inst::Undefined { raw };
+    }
     // Doubleword lanes exist only for add, sub, the comparisons, the
     // register shifts and the saturating forms, and only in the 128-bit
     // register (the scalar decoder passes `q` set).
@@ -2249,6 +2414,8 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
         (0b11010, 0) => VAcrossOp::SMin,
         (0b11010, _) => VAcrossOp::UMin,
         (0b11011, 0) => VAcrossOp::Add,
+        (0b00011, 0) => VAcrossOp::SAddLv,
+        (0b00011, _) => VAcrossOp::UAddLv,
         _ => return Inst::Unknown { raw },
     };
     let lane_bytes = match bits(raw, 23, 22) {
@@ -2299,6 +2466,12 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b10100, _) => VShiftImmOp::UShll,
         (0b10000, 0) => VShiftImmOp::Shrn,
         (0b10001, 0) => VShiftImmOp::Rshrn,
+        (0b10010, 0) => VShiftImmOp::SqShrn,
+        (0b10011, 0) => VShiftImmOp::SqRshrn,
+        (0b10010, _) => VShiftImmOp::UqShrn,
+        (0b10011, _) => VShiftImmOp::UqRshrn,
+        (0b10000, _) => VShiftImmOp::SqShrun,
+        (0b10001, _) => VShiftImmOp::SqRshrun,
         (0b00010, 0) => VShiftImmOp::SSra,
         (0b00010, _) => VShiftImmOp::USra,
         (0b00100, 0) => VShiftImmOp::Srshr,
@@ -2307,6 +2480,9 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b00110, _) => VShiftImmOp::Ursra,
         (0b01000, 1) => VShiftImmOp::Sri,
         (0b01010, 1) => VShiftImmOp::Sli,
+        (0b01110, 0) => VShiftImmOp::SqShl,
+        (0b01110, _) => VShiftImmOp::UqShl,
+        (0b01100, 1) => VShiftImmOp::SqShlU,
         // The fixed-point conversions. They are not shifts, but the scale
         // lives in the same `immh:immb` field and counts down from the
         // element width exactly as a right shift does.
@@ -2332,7 +2508,16 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         && (!q
             || matches!(
                 op,
-                VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn
+                VShiftImmOp::SShll
+                    | VShiftImmOp::UShll
+                    | VShiftImmOp::Shrn
+                    | VShiftImmOp::Rshrn
+                    | VShiftImmOp::SqShrn
+                    | VShiftImmOp::SqRshrn
+                    | VShiftImmOp::UqShrn
+                    | VShiftImmOp::UqRshrn
+                    | VShiftImmOp::SqShrun
+                    | VShiftImmOp::SqRshrun
             ))
     {
         return Inst::Undefined { raw };
@@ -2340,7 +2525,13 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     // Left shifts count up from the element size; right shifts count down.
     let left = matches!(
         op,
-        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Sli
+        VShiftImmOp::Shl
+            | VShiftImmOp::SShll
+            | VShiftImmOp::UShll
+            | VShiftImmOp::Sli
+            | VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
     );
     let shift = if left {
         imm.wrapping_sub(esize)
@@ -2416,6 +2607,8 @@ fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
         (0, 0b1001) => VOp3::FMul,
         (1, 0b1001) => VOp3::FMulx,
         (0, 0b1000) => VOp3::Mul,
+        (0, 0b1100) => VOp3::SqDmulh,
+        (0, 0b1101) => VOp3::SqRdmulh,
         (1, 0b0000) => VOp3::Mla,
         (1, 0b0100) => VOp3::Mls,
         _ => return None,
@@ -2890,6 +3083,54 @@ mod tests {
     }
 
     #[test]
+    fn scalar_floating_point_by_element() {
+        // fmul s0, s1, v0.s[0] -- Mario Kart World 1.8.0, main+0x19fc7fc.
+        match d(0x5f809020) {
+            Inst::VByElement { op, arr, vd, vn, vm, index } => {
+                assert_eq!(op, VOp3::FMul);
+                assert!(arr.scalar && arr.float);
+                assert_eq!(arr.lane_bytes, 4);
+                assert_eq!((vd.0, vn.0, vm.0, index), (0, 1, 0, 0));
+            }
+            other => panic!("expected scalar fmul by element, got {other:?}"),
+        }
+        // fmla s2, s1, v0.s[2] -- main+0x28cbe88.
+        match d(0x5f801822) {
+            Inst::VByElement { op, arr, index, .. } => {
+                assert_eq!((op, arr.scalar, index), (VOp3::FMla, true, 2));
+            }
+            other => panic!("expected scalar fmla by element, got {other:?}"),
+        }
+        // fmls s4, s2, v0.s[2] -- main+0x17c2d00.
+        assert!(matches!(d(0x5f805844), Inst::VByElement { op: VOp3::FMls, .. }));
+    }
+
+    #[test]
+    fn floating_point_pairwise_and_absolute_compare() {
+        assert!(matches!(d(0x2e20f400), Inst::VThreeSame { op: VOp3::FMaxP, .. }));
+        assert!(matches!(d(0x2ea0f400), Inst::VThreeSame { op: VOp3::FMinP, .. }));
+        assert!(matches!(d(0x2ea5ee91), Inst::VThreeSame { op: VOp3::FAcGt, .. }));
+        assert!(matches!(d(0x2e25ee91), Inst::VThreeSame { op: VOp3::FAcGe, .. }));
+    }
+
+    #[test]
+    fn add_long_across_lanes() {
+        // uaddlv h0, v0.8b -- Mario Kart World 1.8.0, main+0x1298f20, raised SIGILL as Unknown.
+        match d(0x2e303800) {
+            Inst::VAcross { op, arr, vd, vn } => {
+                assert_eq!(op, VAcrossOp::UAddLv);
+                assert_eq!(arr.lane_bytes, 1);
+                assert!(!arr.q);
+                assert_eq!((vd.0, vn.0), (0, 0));
+            }
+            other => panic!("expected VAcross uaddlv, got {other:?}"),
+        }
+        // saddlv s0, v0.8h, and uaddlv h1, v2.16b.
+        assert!(matches!(d(0x0e703800), Inst::VAcross { op: VAcrossOp::SAddLv, .. }));
+        assert!(matches!(d(0x6e303841), Inst::VAcross { op: VAcrossOp::UAddLv, .. }));
+    }
+
+    #[test]
     fn rounding_shift_right() {
         // ursra v8.8h, v8.8h, #8 -- pixman's alpha blend hit this and it was
         // decoded as Unknown, crashing the guest with an illegal instruction.
@@ -2945,6 +3186,29 @@ mod tests {
     }
 
     #[test]
+    fn crc32_family() {
+        // crc32x w8, w8, x11.
+        match d(0x9acb4d08) {
+            Inst::DataProc2 { sz, op, rd, rn, rm } => {
+                assert_eq!(op, Dp2Op::Crc32x);
+                assert_eq!(sz, Sz::X); // sf: only the source register is 64-bit
+                assert_eq!((rd, rn, rm), (RegSel::Gp(8), RegSel::Gp(8), RegSel::Gp(11)));
+            }
+            other => panic!("expected DataProc2 crc32x, got {other:?}"),
+        }
+        // The eight variants; sf picks the source width and guards the two
+        // 64-bit forms (CRC32X / CRC32CX are unallocated with sf=0).
+        assert!(matches!(d(0x1ac24020), Inst::DataProc2 { op: Dp2Op::Crc32b, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac24420), Inst::DataProc2 { op: Dp2Op::Crc32h, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac24820), Inst::DataProc2 { op: Dp2Op::Crc32w, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25020), Inst::DataProc2 { op: Dp2Op::Crc32cb, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25420), Inst::DataProc2 { op: Dp2Op::Crc32ch, sz: Sz::W, .. }));
+        assert!(matches!(d(0x1ac25820), Inst::DataProc2 { op: Dp2Op::Crc32cw, sz: Sz::W, .. }));
+        assert!(matches!(d(0x9ac25c20), Inst::DataProc2 { op: Dp2Op::Crc32cx, sz: Sz::X, .. }));
+        assert!(matches!(d(0x1ac24c20), Inst::Unknown { .. }));
+    }
+
+    #[test]
     fn nop_and_ret() {
         assert_eq!(d(0xd503201f), Inst::Hint { imm: 0 });
         assert_eq!(
@@ -2955,6 +3219,188 @@ mod tests {
                 is_ret: true
             }
         );
+    }
+
+    #[test]
+    fn pauth_branches_drop_the_authentication() {
+        // retaa / retab are `ret x30`.
+        for w in [0xd65f0bff, 0xd65f0fff] {
+            assert_eq!(
+                d(w),
+                Inst::BranchReg {
+                    rn: RegSel::Gp(30),
+                    link: false,
+                    is_ret: true
+                }
+            );
+        }
+        // braaz x8 / braa x8, x9 / braa x8, sp branch to x8; blraaz links.
+        for w in [0xd61f091f, 0xd71f0909, 0xd71f091f] {
+            assert_eq!(
+                d(w),
+                Inst::BranchReg {
+                    rn: RegSel::Gp(8),
+                    link: false,
+                    is_ret: false
+                }
+            );
+        }
+        assert_eq!(
+            d(0xd63f091f),
+            Inst::BranchReg {
+                rn: RegSel::Gp(8),
+                link: true,
+                is_ret: false
+            }
+        );
+        // The zero-modifier forms reject a register-modifier op4, and the
+        // RET class has no register-modifier form at all.
+        assert!(matches!(d(0xd61f0909), Inst::Unknown { .. }));
+        assert!(matches!(d(0xd75f0b09), Inst::Unknown { .. }));
+    }
+
+    #[test]
+    fn pauth_register_forms_are_noops() {
+        // pacia x16, x9 / autib x30, sp / paciza x26 / xpaci x26.
+        assert_eq!(d(0xdac10130), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac117fe), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac123fa), Inst::Hint { imm: 0 });
+        assert_eq!(d(0xdac143fa), Inst::Hint { imm: 0 });
+        // xpacd x26, and the Z forms keep their Rn 31 requirement.
+        assert_eq!(d(0xdac147fa), Inst::Hint { imm: 0 });
+        assert!(matches!(d(0xdac1213a), Inst::Unknown { .. } | Inst::Undefined { .. }));
+    }
+
+    #[test]
+    fn pacga_writes_zero() {
+        // pacga x2, x19, x17: the PAC is uncomputable here, and what code
+        // does with one is recompute and compare, so 0 keeps both sides in
+        // agreement.
+        assert_eq!(
+            d(0x9ad13262),
+            Inst::MoveWide {
+                sz: Sz::X,
+                op: MoveOp::Movz,
+                rd: RegSel::Gp(2),
+                imm16: 0,
+                shift: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ldapr_is_an_acquire_load() {
+        // ldapr x21, [x8].
+        assert_eq!(
+            d(0xf8bfc115),
+            Inst::Load {
+                sz: MemSz::D,
+                dest: Sz::X,
+                signed: false,
+                rt: RegSel::Gp(21),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(8),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+        // ldaprb w8, [x8] / ldapr w7, [x5].
+        assert_eq!(
+            d(0x38bfc108),
+            Inst::Load {
+                sz: MemSz::B,
+                dest: Sz::W,
+                signed: false,
+                rt: RegSel::Gp(8),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(8),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+        assert_eq!(
+            d(0xb8bfc0a7),
+            Inst::Load {
+                sz: MemSz::W,
+                dest: Sz::W,
+                signed: false,
+                rt: RegSel::Gp(7),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(5),
+                    off: 0
+                },
+                order: Ordering::Acquire,
+            }
+        );
+    }
+
+    #[test]
+    fn casp_swaps_a_pair() {
+        // casp x2, x3, x4, x5, [x1]: compare pair x2:x3, swap pair x4:x5.
+        assert_eq!(
+            d(0x48227c24),
+            Inst::CompareSwapPair {
+                sz: MemSz::D,
+                rs: RegSel::Gp(2),
+                rt: RegSel::Gp(4),
+                rn: RegSel::Gp(1),
+                acquire: false,
+                release: false,
+            }
+        );
+        // caspal w2, w3, w4, w5, [sp]: 32-bit pairs, acquire + release.
+        assert_eq!(
+            d(0x0862ffe4),
+            Inst::CompareSwapPair {
+                sz: MemSz::W,
+                rs: RegSel::Gp(2),
+                rt: RegSel::Gp(4),
+                rn: RegSel::Sp,
+                acquire: true,
+                release: true,
+            }
+        );
+        // An odd pair base is undefined, and ldxp stays undecoded.
+        assert!(matches!(
+            d(0x48227c25),
+            Inst::Undefined { .. } | Inst::Unknown { .. }
+        ));
+        assert!(matches!(d(0xc87f7c22), Inst::Unknown { .. }));
+    }
+
+    #[test]
+    fn tag_stores_keep_writeback_and_zeroing() {
+        let x = |n| RegSel::sp(n);
+        // stg x8, [x8]: the tag only.
+        assert_eq!(
+            d(0xd9200908),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(8), off: 0 }, zero: 0 }
+        );
+        // stzg x4, [x1]: zeroes its granule.
+        assert_eq!(
+            d(0xd9600824),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(1), off: 0 }, zero: 16 }
+        );
+        // stg x4, [x1, #0x10]!: writes x1 back.
+        assert_eq!(
+            d(0xd9201c24),
+            Inst::TagStore { addr: AddrMode::PreIndex { rn: x(1), off: 16 }, zero: 0 }
+        );
+        // stz2g x4, [x1], #-0x20: two granules, then x1 -= 32.
+        assert_eq!(
+            d(0xd9ffe424),
+            Inst::TagStore { addr: AddrMode::PostIndex { rn: x(1), off: -32 }, zero: 32 }
+        );
+        // st2g x4, [sp, #0x40]: sp as the base.
+        assert_eq!(
+            d(0xd9a04be4),
+            Inst::TagStore { addr: AddrMode::Offset { rn: x(31), off: 64 }, zero: 0 }
+        );
+        // stzgm x4, [x1] and stgm x4, [x1]: UNDEFINED at EL0.
+        assert!(matches!(d(0xd9200024), Inst::Undefined { .. }));
+        assert!(matches!(d(0xd9a00024), Inst::Undefined { .. }));
     }
 
     #[test]

@@ -4535,6 +4535,7 @@ impl MapIo<'_> {
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
             let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+            m.written(start, n as u64);
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
@@ -8439,13 +8440,16 @@ fn io_read(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, sha
     let file = fds.get(fd)?;
     let dst = m.read_mut(buf, len)?;
     if !any_shared(shared) || file.handle.is_stream() {
-        return file.read(dst);
+        let n = file.read(dst)?;
+        m.written(buf, n as u64);
+        return Ok(n);
     }
     let (n, off) = {
         let _pos = file.pos_lock();
         let n = file.read_here(dst)?;
         (n, file.offset() - n)
     };
+    m.written(buf, n as u64);
     shared_after_read(shared, m, &file, off, buf, n);
     Ok(n)
 }
@@ -8456,6 +8460,7 @@ fn io_pread(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, of
     let file = fds.get(fd)?;
     let dst = m.read_mut(buf, len)?;
     let n = file.pread(off, dst)?;
+    m.written(buf, n as u64);
     shared_after_read(shared, m, &file, off, buf, n);
     Ok(n)
 }

@@ -140,7 +140,7 @@ const VUNOPS: [VUnOp; 5] = [
     VUnOp::ExtAddPairwiseS8,
     VUnOp::ExtAddPairwiseS16,
 ];
-const VLANEBIN: [VLaneBinOp; 23] = [
+const VLANEBIN: [VLaneBinOp; 26] = [
     VLaneBinOp::Add,
     VLaneBinOp::Sub,
     VLaneBinOp::Mul,
@@ -154,6 +154,9 @@ const VLANEBIN: [VLaneBinOp; 23] = [
     VLaneBinOp::SubSatS,
     VLaneBinOp::SubSatU,
     VLaneBinOp::AvgrU,
+    VLaneBinOp::Q15MulrSatS,
+    VLaneBinOp::ExtMulLowS,
+    VLaneBinOp::ExtMulHighS,
     VLaneBinOp::Eq,
     VLaneBinOp::Ne,
     VLaneBinOp::LtS,
@@ -528,8 +531,9 @@ pub fn term(t: &FTerm) -> String {
         FTerm::TailCall { callee: c } => format!("tailcall {}", callee(c)),
         FTerm::Return { target } => format!("return {}", v(*target)),
         FTerm::Unresolved { target } => format!("unresolved {}", v(*target)),
-        FTerm::Syscall { next_pc, next } => format!(
-            "syscall {next_pc:#x} -> {}",
+        FTerm::Syscall { next_pc, next, imm } => format!(
+            "syscall{} {next_pc:#x} -> {}",
+            if *imm != 0 { format!(" #{imm}") } else { String::new() },
             next.as_ref().map_or("noreturn".to_string(), edge)
         ),
         FTerm::Illegal { raw, pc } => format!("illegal {raw:#x} {pc:#x}"),
@@ -1233,11 +1237,22 @@ fn parse_term(k: &mut Toks) -> Result<FTerm, String> {
         "return" => FTerm::Return { target: k.val()? },
         "unresolved" => FTerm::Unresolved { target: k.val()? },
         "syscall" => {
+            // An immediate-numbered system call prints `syscall #<imm> ...`
+            // (see the printer above); the bare form is a register-numbered
+            // one and reads 0 here.
+            let imm = match k.peek() {
+                Some(t) if t.starts_with('#') => {
+                    let t = k.next()?;
+                    k.wrap(parse_num(&t[1..]))? as u32
+                }
+                _ => 0,
+            };
             let next_pc = k.num()?;
             k.expect("->")?;
             FTerm::Syscall {
                 next_pc,
                 next: opt_edge(k)?,
+                imm,
             }
         }
         "illegal" => FTerm::Illegal {

@@ -98,6 +98,7 @@ pub fn header() -> String {
         ("X87_TAGS", ctx::X87_TAGS),
         ("X87_TMP", ctx::X87_TMP),
         ("SCRATCH", ctx::SCRATCH),
+        ("SYSCALL_IMM", ctx::SYSCALL_IMM),
         ("SIZE", ctx::SIZE),
     ];
     for (name, off) in offs {
@@ -161,9 +162,31 @@ pub fn header() -> String {
     }
     w.push_str(X87_HELPERS);
     w.push_str(MX_HELPERS);
+    // Page write tracking (`gex_abi::set_write_map`, tier-1's `wtrack`): a
+    // unit marks the pages its stores write, after each store. Only when on:
+    // the header is otherwise what it was.
+    if let Some(map) = gex_abi::write_map() {
+        let _ = writeln!(w, "#define GEX_WRITE_MAP 0x{map:x}ull");
+        let _ = writeln!(w, "#define GEX_WRITE_PAGE_SHIFT {}u", gex_abi::WRITE_PAGE_SHIFT);
+        w.push_str(WTRACK_HELPERS);
+    }
     w.push_str("#endif\n");
     h
 }
+
+/// The marks a unit makes with page write tracking on: the first and last
+/// byte's page of an access, every page of a bulk write.
+const WTRACK_HELPERS: &str = r#"
+GEX_INLINE void gex_wmark(const void *p, uint32_t n) {
+    uint64_t a = (uint64_t)(uintptr_t)p;
+    __atomic_store_n((uint8_t *)GEX_P(GEX_WRITE_MAP + (a >> GEX_WRITE_PAGE_SHIFT)), 1, __ATOMIC_RELEASE);
+    if (n > 1) __atomic_store_n((uint8_t *)GEX_P(GEX_WRITE_MAP + ((a + n - 1) >> GEX_WRITE_PAGE_SHIFT)), 1, __ATOMIC_RELEASE);
+}
+GEX_INLINE void gex_wmark_range(uint64_t a, uint64_t n) {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    if (n) __builtin_memset(GEX_P(GEX_WRITE_MAP + (a >> GEX_WRITE_PAGE_SHIFT)), 1, (size_t)(((a + n - 1) >> GEX_WRITE_PAGE_SHIFT) - (a >> GEX_WRITE_PAGE_SHIFT) + 1));
+}
+"#;
 
 /// The x87 helpers, `Stmt::X87`'s lowering (see `emit.rs`).
 const X87_HELPERS: &str = include_str!("../runtime/x87.h");

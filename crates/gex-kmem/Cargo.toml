@@ -7,3 +7,6 @@ description = "Reaching the calling process's memory from the global kernel modu
 
 [lib]
 crate-type = ["rlib"]
+
+[dependencies]
+gex-abi.workspace = true

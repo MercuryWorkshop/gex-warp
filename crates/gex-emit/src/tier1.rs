@@ -260,12 +260,15 @@ fn t1_fold() -> bool {
 
 /// The emitter switches that change tier-1's bytes without showing in the
 /// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD,
-/// GEX_NULL_GUARD, GEX_MXCSR):
+/// GEX_NULL_GUARD, GEX_MXCSR, page write tracking):
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
+/// Write tracking's map address is in the code too: a key with the bit set
+/// takes [`gex_abi::write_map`] beside it.
 pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
         | (gex_ir::mxcsr_exact() as u8) << 4
+        | (crate::wtrack::on() as u8) << 5
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -684,6 +687,10 @@ struct Emitter<'a> {
     cx: &'a Context<'a>,
     /// The `ctx` parameter.
     ctx_local: u32,
+    /// Page write tracking ([`crate::wtrack`]): the local an access's
+    /// address is kept in for its mark, and an i64 scratch for a bulk
+    /// write's. Declared at the first use: none without tracking.
+    wt: Option<(u32, u32)>,
     /// The guest address this block starts at, for `ctx::LAST_SOURCE`.
     block_start: u64,
     /// Scratch for address computation.
@@ -812,6 +819,7 @@ impl<'a> Emitter<'a> {
             f,
             cx,
             ctx_local: 0,
+            wt: None,
             block_start,
             scratch_i64,
             scratch_i32,
@@ -1504,6 +1512,18 @@ impl<'a> Emitter<'a> {
         self.f.store(0x37, 3, ctx::PC as u32);
     }
 
+    /// Write the system-call immediate for the kernel to read at the call
+    /// that follows: the number of a system call whose ISA encodes it in the
+    /// instruction itself (see [`gex_ir::Term::Syscall`]). A register-numbered
+    /// call stores nothing (0 leaves the kernel reading the number register).
+    fn store_syscall_imm(&mut self, imm: u32) {
+        if imm != 0 {
+            self.ctx_base();
+            self.f.i64_const(imm as i64);
+            self.f.store(0x37, 3, ctx::SYSCALL_IMM as u32);
+        }
+    }
+
     // -- addressing --------------------------------------------------------
 
     /// Emit the 32-bit linear-memory address for `addr + offset`, returning
@@ -1902,6 +1922,7 @@ impl<'a> Emitter<'a> {
                 order,
             } => {
                 let static_off = self.emit_address(*addr, *offset);
+                self.wt_keep();
                 self.push(*val);
                 let ty = self.type_of(*val);
                 if *order == Order::SeqCst {
@@ -1913,6 +1934,7 @@ impl<'a> Emitter<'a> {
                     let opcode = store_op(ty, *sz);
                     self.f.store(opcode, natural_align(*sz), static_off);
                 }
+                self.wt_mark(static_off, sz.bytes());
             }
             Stmt::HostCall { func: func @ (HostFunc::Breakpoint | HostFunc::Illegal), args }
                 if self.resumable_pc != 0 && self.fault_next.is_some() && args.len() == 2 =>
@@ -1952,6 +1974,7 @@ impl<'a> Emitter<'a> {
                 bytes,
             } => {
                 let static_off = self.emit_address(*addr, *offset);
+                self.wt_keep();
                 self.push(*val);
                 let align = bytes.trailing_zeros();
                 if *bytes == 16 {
@@ -1965,6 +1988,7 @@ impl<'a> Emitter<'a> {
                     };
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
+                self.wt_mark(static_off, *bytes);
             }
             Stmt::MemCopy { dst, src, len } if copy_loop() => {
                 self.emit_memcopy_loop(*dst, *src, *len);
@@ -1986,6 +2010,7 @@ impl<'a> Emitter<'a> {
                 self.f.u32(code::MEMORY_COPY);
                 self.f.byte(0); // destination memory
                 self.f.byte(0); // source memory
+                self.wt_range(d, !gex_abi::mem64(), self.scratch_i64);
             }
             Stmt::MemFill { dst, val, len } => {
                 let d = if gex_abi::mem64() { self.scratch_addr.0 } else { self.scratch_i32 };
@@ -2000,10 +2025,98 @@ impl<'a> Emitter<'a> {
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
+                self.wt_range(d, !gex_abi::mem64(), self.scratch_i64);
             }
             Stmt::MemCmp { dst, a, b, len } => self.emit_memcmp(*dst, *a, *b, *len),
             Stmt::Fence => self.f.atomic_fence(),
             Stmt::StrOp { .. } => self.emit_strop(s),
+        }
+    }
+
+    // -- page write tracking (crate::wtrack) -------------------------------
+
+    /// The locals the marks use, declared at the first.
+    fn wt_locals(&mut self) -> (u32, u32) {
+        if let Some(l) = self.wt {
+            return l;
+        }
+        let l = (self.f.add_local(crate::wtrack::addr_type()), self.f.add_local(ValType::I64));
+        self.wt = Some(l);
+        l
+    }
+
+    /// With tracking on: keep the address on the stack (the memory's index
+    /// type, as `emit_address` leaves it) for [`Self::wt_mark`].
+    fn wt_keep(&mut self) {
+        if crate::wtrack::on() {
+            let (a, _) = self.wt_locals();
+            self.f.local_tee(a);
+        }
+    }
+
+    /// With tracking on: after the access of `bytes` bytes whose address
+    /// [`Self::wt_keep`] kept, mark its pages.
+    fn wt_mark(&mut self, static_off: u32, bytes: u32) {
+        if crate::wtrack::on() {
+            let (a, _) = self.wt_locals();
+            crate::wtrack::mark_access(&mut self.f, a, static_off, bytes);
+        }
+    }
+
+    /// With tracking on: after a bulk write from the address in local `dst`
+    /// (an i32 when `dst32`, else an i64) of the i64 length in local `len`,
+    /// mark its pages.
+    fn wt_range(&mut self, dst: u32, dst32: bool, len: u32) {
+        if crate::wtrack::on() {
+            let (_, scratch) = self.wt_locals();
+            crate::wtrack::mark_range(&mut self.f, dst, dst32, len, scratch);
+        }
+    }
+
+    /// With tracking on, for an x86 string instruction that stores (`rep
+    /// movs`/`stos`): a copy of its first destination, from the local `ld`
+    /// holding it, for [`Self::wt_strop_end`].
+    fn wt_strop_begin(&mut self, kind: gex_ir::StrKind, ld: u32) -> Option<u32> {
+        if !crate::wtrack::on() || !matches!(kind, gex_ir::StrKind::Movs | gex_ir::StrKind::Stos) {
+            return None;
+        }
+        let first = self.alloc(Ty::I64);
+        self.f.local_get(ld);
+        self.f.local_set(first);
+        Some(first)
+    }
+
+    /// After the instruction, `ld` holding its final destination: mark the
+    /// span between the two, an element past the higher (either direction).
+    fn wt_strop_end(&mut self, first: Option<u32>, ld: u32, bytes: i64) {
+        let Some(first) = first else { return };
+        let (_, scratch) = self.wt_locals();
+        let lo = self.alloc(Ty::I64);
+        let len = self.alloc(Ty::I64);
+        // lo = min(first, ld); len = max(first, ld) - lo + one element
+        self.f.local_get(first);
+        self.f.local_get(ld);
+        self.f.local_get(first);
+        self.f.local_get(ld);
+        self.f.byte(0x54); // i64.lt_u
+        self.f.select();
+        self.f.local_set(lo);
+        self.f.local_get(first);
+        self.f.local_get(ld);
+        self.f.byte(0x7d); // i64.sub
+        self.f.local_get(ld);
+        self.f.local_get(first);
+        self.f.byte(0x7d); // i64.sub
+        self.f.local_get(first);
+        self.f.local_get(ld);
+        self.f.byte(0x56); // i64.gt_u
+        self.f.select();
+        self.f.i64_const(bytes);
+        self.f.byte(0x7c); // i64.add
+        self.f.local_set(len);
+        crate::wtrack::mark_range(&mut self.f, lo, false, len, scratch);
+        for l in [first, lo, len] {
+            self.free_i64.push(l);
         }
     }
 
@@ -2074,6 +2187,7 @@ impl<'a> Emitter<'a> {
         self.f.local_set(lc);
         self.push(*dst);
         self.f.local_set(ld);
+        let wt_first = self.wt_strop_begin(kind, ld);
         self.push(*src);
         self.f.local_set(ls);
         self.push(*val);
@@ -2284,6 +2398,7 @@ impl<'a> Emitter<'a> {
         self.f.end(); // loop
         self.f.end(); // block
         self.f.end(); // $end
+        self.wt_strop_end(wt_first, ld, bytes);
 
         for (v, l) in [(out_count, lc), (out_dst, ld), (out_src, ls), (out_a, la), (out_b, lb)] {
             let i = v.0 as usize;
@@ -2376,6 +2491,7 @@ impl<'a> Emitter<'a> {
 
         self.f.end(); // loop
         self.f.end(); // block
+        self.wt_range(ld, false, llen);
     }
 
     /// Sign-extend the value an atomic (unsigned) load left on the stack from a
@@ -2968,6 +3084,7 @@ impl<'a> Emitter<'a> {
                 ty,
             } => {
                 let static_off = self.emit_address(*addr, 0);
+                self.wt_keep();
                 if gex_abi::X86 && natural_align(*sz) > 0 {
                     self.emit_rmw_any_alignment(*op, *val, *ty, *sz, static_off);
                 } else {
@@ -2975,6 +3092,7 @@ impl<'a> Emitter<'a> {
                     let sub = atomic_rmw_op(*op, *ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
                 }
+                self.wt_mark(static_off, sz.bytes());
             }
             Expr::CmpXchg {
                 addr,
@@ -2984,6 +3102,7 @@ impl<'a> Emitter<'a> {
                 ty,
             } => {
                 let static_off = self.emit_address(*addr, 0);
+                self.wt_keep();
                 if gex_abi::X86 && natural_align(*sz) > 0 {
                     self.emit_cmpxchg_any_alignment(*expected, *replacement, *ty, *sz, static_off);
                 } else {
@@ -2992,6 +3111,7 @@ impl<'a> Emitter<'a> {
                     let sub = atomic_cmpxchg_op(*ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
                 }
+                self.wt_mark(static_off, sz.bytes());
             }
             Expr::HostCall { func, args, .. } => {
                 // Handled here so the result lands in a local like any other
@@ -5084,13 +5204,19 @@ impl<'a> Emitter<'a> {
                 }
                 self.emit_dispatch_tail_call();
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, imm } => {
                 self.flush();
                 // The recorded PC is the instruction *after* the `svc`: it is
                 // where a signal frame must resume, and resuming at the `svc`
                 // itself would re-issue the syscall. The call still receives
                 // the syscall's own address, which is what a trace wants.
                 self.store_pc(next);
+                // An ISA that numbers its system calls in the instruction
+                // (Horizon's `svc #imm`) leaves the number here, so the
+                // kernel does not read the number register the guest's ABI
+                // keeps live across the call (`x8` is AArch64's
+                // result-location register).
+                self.store_syscall_imm(imm);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((block.end - gex_abi::SYSCALL_INST_BYTES) as i64);
                 self.f.call(self.cx.syscall);

@@ -46,10 +46,25 @@ pub fn load_u64(bytes: &mut [u8], off: u64) -> Option<u64> {
     Some(unsafe { AtomicU64::from_ptr(p) }.load(Ordering::SeqCst))
 }
 
+/// Mark the word written, for page write tracking (`gex_abi::set_write_map`),
+/// when it is on: after each write here, as a translated store marks its page.
+fn written(bytes: &mut [u8], off: u64) {
+    if let Some(r) = gex_abi::write_map_range(off, 4) {
+        // (The write above is SeqCst: it is visible before the mark.)
+        if let Some(m) = bytes.get_mut(r.start as usize..r.end as usize) {
+            m.fill(1);
+        }
+    }
+}
+
 /// Compare-and-swap: `Ok(old)` when the word held `expected` and now holds
 /// `new`, `Err(actual)` otherwise.
 pub fn cas_u32(bytes: &mut [u8], off: u64, expected: u32, new: u32) -> Option<Result<u32, u32>> {
-    Some(word(bytes, off)?.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst))
+    let r = word(bytes, off)?.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst);
+    if r.is_ok() {
+        written(bytes, off);
+    }
+    Some(r)
 }
 
 /// An atomic load.
@@ -61,17 +76,22 @@ pub fn load_u32(bytes: &mut [u8], off: u64) -> Option<u32> {
 /// it: a lock word's release).
 pub fn store_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<()> {
     word(bytes, off)?.store(v, Ordering::SeqCst);
+    written(bytes, off);
     Some(())
 }
 
 /// An atomic exchange: the old value.
 pub fn swap_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<u32> {
-    Some(word(bytes, off)?.swap(v, Ordering::SeqCst))
+    let old = word(bytes, off)?.swap(v, Ordering::SeqCst);
+    written(bytes, off);
+    Some(old)
 }
 
 /// An atomic add: the old value.
 pub fn add_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<u32> {
-    Some(word(bytes, off)?.fetch_add(v, Ordering::SeqCst))
+    let old = word(bytes, off)?.fetch_add(v, Ordering::SeqCst);
+    written(bytes, off);
+    Some(old)
 }
 
 #[cfg(test)]

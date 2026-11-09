@@ -658,6 +658,14 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::TagStore { ref addr, zero } => {
+            let m = match zero {
+                16 => "stzg",
+                32 => "stz2g",
+                _ => "stg",
+            };
+            format!("{m} {}", addr_str(addr))
+        }
         Inst::Prefetch { ref addr, hint } => {
             // `Rt` is really three fields: what to prefetch, into which cache
             // level, and whether to keep it there.
@@ -1055,6 +1063,8 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             // rather than `-v`, and their source is still a two-lane vector.
             let m = match (op, arr.scalar) {
                 (VAcrossOp::Add, false) => "addv",
+                (VAcrossOp::SAddLv, _) => "saddlv",
+                (VAcrossOp::UAddLv, _) => "uaddlv",
                 (VAcrossOp::Add, true) if arr.float => "faddp",
                 (VAcrossOp::Add, true) => "addp",
                 (VAcrossOp::SMax, _) => "smaxv",
@@ -1295,8 +1305,17 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::Ursra => "ursra",
                 VShiftImmOp::Sli => "sli",
                 VShiftImmOp::Sri => "sri",
+                VShiftImmOp::SqShl => "sqshl",
+                VShiftImmOp::UqShl => "uqshl",
+                VShiftImmOp::SqShlU => "sqshlu",
                 VShiftImmOp::Shrn => "shrn",
                 VShiftImmOp::Rshrn => "rshrn",
+                VShiftImmOp::SqShrn => "sqshrn",
+                VShiftImmOp::SqRshrn => "sqrshrn",
+                VShiftImmOp::UqShrn => "uqshrn",
+                VShiftImmOp::UqRshrn => "uqrshrn",
+                VShiftImmOp::SqShrun => "sqshrun",
+                VShiftImmOp::SqRshrun => "sqrshrun",
                 VShiftImmOp::Scvtf => "scvtf",
                 VShiftImmOp::Ucvtf => "ucvtf",
                 VShiftImmOp::Fcvtzs => "fcvtzs",
@@ -1335,14 +1354,35 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                         )
                     }
                 }
-                VShiftImmOp::Shrn => format!(
-                    "{m}{} v{}.{}, v{}.{}, #{shift}",
-                    if arr.q { "2" } else { "" },
-                    vd.0,
-                    arr.suffix(),
-                    vn.0,
-                    wide.suffix()
-                ),
+                VShiftImmOp::Shrn
+                | VShiftImmOp::Rshrn
+                | VShiftImmOp::SqShrn
+                | VShiftImmOp::SqRshrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::UqRshrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRshrun
+                    if !arr.scalar =>
+                {
+                    format!(
+                        "{m}{} v{}.{}, v{}.{}, #{shift}",
+                        if arr.q { "2" } else { "" },
+                        vd.0,
+                        arr.suffix(),
+                        vn.0,
+                        wide.suffix()
+                    )
+                }
+                // The scalar narrowing forms: `sqshrn s0, d1, #3`.
+                VShiftImmOp::SqShrn
+                | VShiftImmOp::SqRshrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::UqRshrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRshrun => {
+                    let wide = VArr { scalar: true, ..wide };
+                    format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, wide))
+                }
                 _ => {
                     format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, arr))
                 }
@@ -1604,6 +1644,36 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 reg(rn, Sz::X)
             )
         }
+        Inst::CompareSwapPair {
+            sz,
+            rs,
+            rt,
+            rn,
+            acquire,
+            release,
+        } => {
+            let suffix = match (acquire, release) {
+                (false, false) => "",
+                (true, false) => "a",
+                (false, true) => "l",
+                (true, true) => "al",
+            };
+            let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
+            // The second register of each pair is the base + 1 (the
+            // encoding keeps both bases even).
+            let next = |r: RegSel| match r {
+                RegSel::Gp(n) => RegSel::gp(n as u32 + 1),
+                other => other,
+            };
+            format!(
+                "casp{suffix} {}, {}, {}, {}, [{}]",
+                reg(rs, rsz),
+                reg(next(rs), rsz),
+                reg(rt, rsz),
+                reg(next(rt), rsz),
+                reg(rn, Sz::X)
+            )
+        }
         Inst::AtomicRmw {
             sz,
             op,
@@ -1702,6 +1772,8 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::UqAdd => "uqadd",
         VOp3::SqSub => "sqsub",
         VOp3::UqSub => "uqsub",
+        VOp3::SqDmulh => "sqdmulh",
+        VOp3::SqRdmulh => "sqrdmulh",
         VOp3::SHAdd => "shadd",
         VOp3::UHAdd => "uhadd",
         VOp3::SrHAdd => "srhadd",
@@ -1736,6 +1808,10 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::FMaxNm => "fmaxnm",
         VOp3::FMinNm => "fminnm",
         VOp3::FAddP => "faddp",
+        VOp3::FMaxP => "fmaxp",
+        VOp3::FMinP => "fminp",
+        VOp3::FAcGe => "facge",
+        VOp3::FAcGt => "facgt",
         VOp3::FMla => "fmla",
         VOp3::FMls => "fmls",
         VOp3::FCmEq => "fcmeq",

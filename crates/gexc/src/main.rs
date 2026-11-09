@@ -200,9 +200,12 @@ usage:
                                    through DT_NEEDED, each at the base a
                                    pinned run places it, writing one module
                                    per object and the layout beside them)
-  gexc seed   -o <out.wasm> [--mem64]  write a module that translates nothing, for
+  gexc seed   -o <out.wasm> [--mem64] [--m64-tables-top]
+                                   write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
+                                   (--m64-tables-top: for a host that puts the
+                                   M64 tables at the top of the memory)
   gexc closure <elf> --sysroot DIR
                                    what the program actually consists of:
                                    every object reached through DT_NEEDED,
@@ -888,6 +891,10 @@ fn cmd_seed(args: &[String]) -> Result<()> {
             "--no-shared-memory" => shared_memory = false,
             // The seed for the wasm64 (memory64) browser shim.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
+            // For a host that puts the M64 tables at the top of the memory
+            // (gex_abi::M64Tables::Top): the seed's dispatch reads the
+            // directory at a constant address.
+            "--m64-tables-top" => gex_abi::set_m64_tables(gex_abi::M64Tables::Top),
             other => bail!("unexpected argument {other}"),
         }
         i += 1;

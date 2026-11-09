@@ -390,7 +390,7 @@ pub struct MemoryMap {
     /// `core::fmt` before this).
     generation: u64,
     /// An M64 process's high arena, `[IMAGE_ZONE64, LIMIT64)` less the M64
-    /// tables (64-bit
+    /// tables wherever they are ([`gex_abi::m64_tables`]; 64-bit
     /// Wine's: [`Self::set_high_arena_down`]): non-executable mappings
     /// without a fixed address go there. `None` for every M32 process, whose
     /// map behaves exactly as it always has.
@@ -601,12 +601,12 @@ pub fn note_address_space_short(len: u64) {
 ///   arena: in the browser the shim shares the guest's memory and keeps its
 ///   own stack and data there. Natively it is only unused, and refusing it
 ///   moves a guest's mapping elsewhere, which is harmless.
-/// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
+/// - in an M64 memory, `[dispatch_dir64(), high_tables_end())`: its dense
 ///   directory and patched-page bits.
 pub fn hits_runtime(start: u64, end: u64) -> bool {
     start < gex_abi::DISPATCH_DIR_END
         || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
-        || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
+        || (gex_abi::mem64() && start < gex_abi::high_tables_end() && end > gex_abi::dispatch_dir64())
 }
 
 pub fn page_align_up(v: u64) -> u64 {
@@ -757,7 +757,8 @@ impl MemoryMap {
     /// no relocations, fails to load), as on Windows.
     fn find_high(&self, len: u64) -> Option<u64> {
         let (lo, hi) = self.high?;
-        let tables = |a: u64| gex_abi::mem64() && a < gex_abi::HIGH_TABLES_END && a + len > gex_abi::DISPATCH_DIR64;
+        let (dir, end) = (gex_abi::dispatch_dir64(), gex_abi::high_tables_end());
+        let tables = |a: u64| gex_abi::mem64() && a < end && a + len > dir;
         let found = if self.high_down {
             let mut candidate = hi;
             loop {
@@ -766,7 +767,7 @@ impl MemoryMap {
                 }
                 let start = page_align_down(candidate - len);
                 if tables(start) {
-                    candidate = gex_abi::DISPATCH_DIR64;
+                    candidate = dir;
                     continue;
                 }
                 match self.vmas.iter().filter(|v| v.start < start + len && v.end > start).map(|v| v.start).min() {
@@ -781,7 +782,7 @@ impl MemoryMap {
                     break None;
                 }
                 if tables(candidate) {
-                    candidate = gex_abi::HIGH_TABLES_END;
+                    candidate = end;
                     continue;
                 }
                 match self.vmas.iter().filter(|v| v.start < candidate + len && v.end > candidate).map(|v| v.end).max() {
@@ -2695,6 +2696,27 @@ mod tests {
         assert!(BACKED.load(std::sync::atomic::Ordering::SeqCst) >= exe + 0x10000);
         let data = m.mmap(0, 0x10000, prot::READ | prot::WRITE, 0, "data").unwrap();
         assert_eq!(data, gex_abi::DISPATCH_DIR64 - 0x10000);
+    }
+
+    /// With the M64 tables at the top ([`gex_abi::M64Tables::Top`]), a
+    /// bottom-up arena below them holds gigabytes past 8 GiB in order, as a
+    /// guest that lays out its own world from the bottom up needs: twenty
+    /// reservations of 512 MiB, up to the tables and never over them.
+    #[test]
+    fn a_bottom_up_arena_below_top_tables_takes_the_memory() {
+        let mut m = MemoryMap::new(0x40_0000);
+        m.set_high_arena(gex_abi::IMAGE_ZONE64, gex_abi::DISPATCH_DIR64_TOP);
+        let mut last = 0;
+        for _ in 0..20 {
+            let a = m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").unwrap();
+            assert!(a >= gex_abi::IMAGE_ZONE64 && a + 0x1fff_f000 <= gex_abi::DISPATCH_DIR64_TOP);
+            assert!(a > last);
+            last = a;
+        }
+        assert!(last > gex_abi::DISPATCH_DIR64 + gex_abi::HIGH_TABLES_BYTES);
+        // A fixed executable page past 8 GiB, among them, is honoured.
+        let fixed = 11u64 << 30;
+        assert_eq!(m.mmap(fixed, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Ok(fixed));
     }
 
     /// A full M64 arena says so once and places data below 4 GiB, never

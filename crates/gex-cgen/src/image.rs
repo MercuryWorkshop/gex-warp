@@ -113,6 +113,9 @@ fn unit_inputs() -> String {
     // SSE under MXCSR (`gex_ir::mxcsr_exact`), a per-program opt-in, the
     // same way: the units with it and without it never mix.
     let base = if gex_ir::mxcsr_exact() { format!("{base}:mxcsr") } else { base };
+    // Page write tracking (`gex_abi::set_write_map`), at its map's address,
+    // which the units' marks carry.
+    let base = match gex_abi::write_map() { Some(m) => format!("{base}:wtrack:{m:x}"), None => base };
     // So is the guest memory: a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {

@@ -50,16 +50,20 @@ OUT=$TDIR/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 # It is a reservation, not an allocation: the host still creates the memory at
 # 128 MiB and it grows as files arrive.
 # No build host's paths in the kernel (panic locations): fixed names instead.
-REMAP="--remap-path-prefix=$(pwd)=/gex --remap-path-prefix=$(rustc +nightly --print sysroot)=/rust --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-RUSTFLAGS="$REMAP -C link-arg=--import-memory \
-  -C link-arg=--shared-memory \
-  -C link-arg=--max-memory=4294967296 \
-  -C link-arg=--export-table \
-  -C link-arg=--export=__stack_pointer \
-  -C link-arg=--export=__wasm_init_tls \
-  -C link-arg=--export=__tls_size \
-  -C link-arg=--export=__tls_align \
-  -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
+# CARGO_ENCODED_RUSTFLAGS (0x1f-separated), not RUSTFLAGS: RUSTFLAGS is
+# split on whitespace and a remap whose path has a space in it arrives as
+# two flags (see hosts/browser/build.sh).
+SEP=$'\x1f'
+REMAP="--remap-path-prefix=$(pwd)=/gex${SEP}--remap-path-prefix=$(rustc +nightly --print sysroot)=/rust${SEP}--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+CARGO_ENCODED_RUSTFLAGS="$REMAP${SEP}-Clink-arg=--import-memory${SEP}\
+-Clink-arg=--shared-memory${SEP}\
+-Clink-arg=--max-memory=4294967296${SEP}\
+-Clink-arg=--export-table${SEP}\
+-Clink-arg=--export=__stack_pointer${SEP}\
+-Clink-arg=--export=__wasm_init_tls${SEP}\
+-Clink-arg=--export=__tls_size${SEP}\
+-Clink-arg=--export=__tls_align${SEP}\
+-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
     --release -Z build-std=std,panic_abort --target-dir $TDIR $ARCH_FEATURES
 # Twice, differing only in whether the *process* memory it reaches into is
@@ -103,10 +107,9 @@ node hosts/kernel/add-memory.mjs "$OUT.p32" page/public/gex/gex_kernel$INFIX.pla
 rm -f "$OUT.p32"
 
 # The `.m64` name a 64-bit memory's page loads (runtime.js, run-node.mjs):
-# the same module, since it serves both flavours.
-if [ -n "$ARCH_FEATURES" ]; then
-    cp page/public/gex/gex_kernel$INFIX.wasm page/public/gex/gex_kernel$INFIX.m64.wasm
-fi
+# the same module, since it serves both flavours. Written for every guest
+# ISA, not only an x86 build's.
+cp page/public/gex/gex_kernel$INFIX.wasm page/public/gex/gex_kernel$INFIX.m64.wasm
 
 node page/build-inputs.mjs stamp page/public/gex "gex_kernel$INFIX=$INPUTS_KEY"
 

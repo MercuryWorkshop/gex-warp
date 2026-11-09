@@ -179,7 +179,8 @@ impl<'a> GuestMem<'a> {
         self.slice(r)
     }
 
-    /// A writable slice of guest memory, for a caller that fills it itself.
+    /// A writable slice of guest memory, for a caller that fills it itself
+    /// (and then calls [`Self::written`]).
     ///
     /// Without it a `read` allocates a guest-sized buffer, fills it, and copies
     /// in -- and the guest chooses the size; that made one `apt-get update`
@@ -192,7 +193,23 @@ impl<'a> GuestMem<'a> {
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
         let r = self.range(addr, data.len())?;
         self.slice_mut(r)?.copy_from_slice(data);
+        self.written(addr, data.len() as u64);
         Ok(())
+    }
+
+    /// Mark `[addr, addr + len)` written for page write tracking
+    /// (`gex_abi::set_write_map`), when it is on: every write this type
+    /// makes does, after the bytes, and a caller that fills a
+    /// [`Self::read_mut`] slice calls it when it is done.
+    #[inline]
+    pub fn written(&mut self, addr: u64, len: u64) {
+        if let Some(r) = gex_abi::write_map_range(addr, len) {
+            // The bytes before their marks, for a consumer on another thread.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            if let Some(m) = self.span.get_mut(r.start as usize, (r.end - r.start) as usize) {
+                m.fill(1);
+            }
+        }
     }
 
     #[track_caller]
@@ -200,6 +217,7 @@ impl<'a> GuestMem<'a> {
         big_op("zero", len);
         let r = self.range(addr, len)?;
         self.slice_mut(r)?.fill(0);
+        self.written(addr, len as u64);
         Ok(())
     }
 
@@ -214,6 +232,7 @@ impl<'a> GuestMem<'a> {
         if !self.span.copy_within(s.start, d.start, len) {
             return Err(Errno::EFAULT);
         }
+        self.written(dst, len as u64);
         Ok(())
     }
 
@@ -227,6 +246,7 @@ impl<'a> GuestMem<'a> {
         big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
         zero_dirty_bytes(self.slice_mut(r)?);
+        self.written(addr, len as u64);
         Ok(())
     }
 

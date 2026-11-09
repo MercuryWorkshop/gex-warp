@@ -14,6 +14,7 @@
 
 pub mod decode;
 pub mod fmt;
+pub mod slow;
 
 pub use decode::decode;
 
@@ -1026,6 +1027,11 @@ pub enum Inst {
         rt2: RegSel,
         addr: AddrMode,
     },
+    /// `stg`/`stzg`/`st2g`/`stz2g` — store allocation tags. Tags are not
+    /// kept, so what remains is the base writeback of the pre- and
+    /// post-index forms, and for the Z forms zeroing `zero` bytes (16 or
+    /// 32, one or two granules) at the address.
+    TagStore { addr: AddrMode, zero: u32 },
     /// `prfm` — prefetch; a no-op for us but must not decode as Unknown.
     /// `hint` is the `Rt` field: type, cache level and policy.
     Prefetch { addr: AddrMode, hint: u8 },
@@ -1047,6 +1053,20 @@ pub enum Inst {
     },
     /// `cas`/`casa`/`casl`/`casal` — compare and swap (FEAT_LSE).
     CompareSwap {
+        sz: MemSz,
+        rs: RegSel,
+        rt: RegSel,
+        rn: RegSel,
+        acquire: bool,
+        release: bool,
+    },
+    /// `casp`/`caspa`/`caspal`/`caspl` — compare and swap a *pair* of
+    /// registers against a pair in memory (FEAT_LSE). `rs` is the compare
+    /// pair `rs:rs+1`, which receives the pair read from memory; `rt` is
+    /// the swap pair `rt:rt+1`, written when the pair in memory matches.
+    /// `sz` is the size of each element. The encoding keeps both pair base
+    /// registers even, so `+1` never wraps past 31.
+    CompareSwapPair {
         sz: MemSz,
         rs: RegSel,
         rt: RegSel,
@@ -1205,6 +1225,11 @@ pub enum VOp3 {
     UqAdd,
     SqSub,
     UqSub,
+    /// Saturating doubling multiply returning the high half: `(2 * a * b) >> esize`,
+    /// and `sqrdmulh`'s rounding form, `(2 * a * b + (1 << (esize - 1))) >> esize`.
+    /// Halfword and word lanes only; only `MIN * MIN` saturates.
+    SqDmulh,
+    SqRdmulh,
     SHAdd,
     UHAdd,
     SrHAdd,
@@ -1246,6 +1271,12 @@ pub enum VOp3 {
     FMaxNm,
     FMinNm,
     FAddP,
+    /// `fmaxp`/`fminp`: NaN-propagating maximum and minimum of adjacent lanes.
+    FMaxP,
+    FMinP,
+    /// `facge`/`facgt`: compare absolute values.
+    FAcGe,
+    FAcGt,
     FMla,
     FMls,
     FCmEq,
@@ -1361,6 +1392,9 @@ pub enum VWidenOp {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VAcrossOp {
     Add,
+    /// `saddlv`/`uaddlv`: every lane added into one scalar of twice the lane's width.
+    SAddLv,
+    UAddLv,
     SMax,
     SMin,
     UMax,
@@ -1423,6 +1457,22 @@ pub enum VShiftImmOp {
     /// than being zero, so the shift is a splice of the two registers.
     Sli,
     Sri,
+    /// Saturating shift left: `sqshl` and `uqshl` clamp a lane whose bits
+    /// would leave it to the lane's signed or unsigned limit; `sqshlu` reads
+    /// a signed lane and clamps to the unsigned range (negative lanes are 0).
+    SqShl,
+    UqShl,
+    SqShlU,
+    /// Saturating narrowing shifts right: like `shrn`/`rshrn`, but the shifted
+    /// wide lane is clamped into the narrow one -- signed to signed (`sqshrn`),
+    /// unsigned to unsigned (`uqshrn`), signed to unsigned (`sqshrun`). The `R`
+    /// forms round. The `2` forms (`q`) write the destination's upper half.
+    SqShrn,
+    SqRshrn,
+    UqShrn,
+    UqRshrn,
+    SqShrun,
+    SqRshrun,
     /// Fixed-point to floating point: the lane is an integer with `shift`
     /// fractional bits, so the result is it divided by `2^shift`. Shares the
     /// shift-by-immediate encoding because the scale sits in the same field.

@@ -129,18 +129,30 @@ pub const LIMIT64: u64 = 16 << 30;
 /// Wasm pages in [`LIMIT64`].
 pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 
+/// The byte size of an [`MemFlavor::M64`] process's dense per-page tables
+/// (the directory and the patched-page bits together), rounded up to 1 MiB:
+/// 17 MiB.
+pub const HIGH_TABLES_BYTES: u64 =
+    ((LIMIT64 / DISPATCH_PAGE) * 4 + (LIMIT64 / DISPATCH_PAGE) / 8 + 0xf_ffff) & !0xf_ffff;
+
 /// An M64 process's dense per-page tables: its dispatch
 /// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
 /// anywhere in the memory (a W^X JIT's high pages made executable), and its
-/// [`PATCHED_PAGES`] bits after it. At 8 GiB, so that `[4 GiB, 8 GiB)`
-/// holds nothing of gex's when a process starts (the high arena's data
-/// comes later, and in 64-bit Wine from the top down), and a Windows
-/// image keeps the base it was linked at there -- Free Pascal's x86-64
-/// exe at 0x100000000 (no relocations: at 4 GiB, where these tables were,
-/// such an exe could not start), MSVC's and MinGW's at 0x140000000, a
-/// DLL's at 0x180000000. An M32 process uses the low region's directory
-/// instead; see [`dispatch_dir`].
+/// [`PATCHED_PAGES`] bits after it. By default ([`M64Tables::Middle`]) at
+/// 8 GiB, so that `[4 GiB, 8 GiB)` holds nothing of gex's when a process
+/// starts (the high arena's data comes later, and in 64-bit Wine from the
+/// top down), and a Windows image keeps the base it was linked at there --
+/// Free Pascal's x86-64 exe at 0x100000000 (no relocations: at 4 GiB, where
+/// these tables were, such an exe could not start), MSVC's and MinGW's at
+/// 0x140000000, a DLL's at 0x180000000. A host may put them at the top
+/// instead ([`set_m64_tables`]), so code that reads or places the tables
+/// asks [`dispatch_dir64`]; this constant is the default's address. An M32
+/// process uses the low region's directory instead; see [`dispatch_dir`].
 pub const DISPATCH_DIR64: u64 = 8 << 30;
+
+/// The M64 tables' address at the top of the memory ([`M64Tables::Top`]):
+/// they take its last [`HIGH_TABLES_BYTES`].
+pub const DISPATCH_DIR64_TOP: u64 = LIMIT64 - HIGH_TABLES_BYTES;
 
 /// The bottom of an M64 memory's high arena: the guest's data above
 /// everything a wasm32 process has, filled bottom-up to [`LIMIT64`] around
@@ -149,24 +161,83 @@ pub const DISPATCH_DIR64: u64 = 8 << 30;
 /// bases (0x100000000, 0x140000000) are reached by the data last.
 pub const IMAGE_ZONE64: u64 = 1 << 32;
 
-/// Pages [`DISPATCH_DIR64`] covers: all of [`LIMIT64`].
+/// Where an M64 memory keeps its dense tables.
+///
+/// The tables' address is baked into every translation (a dispatch is a
+/// load at a constant offset), so it is chosen once per run, before
+/// anything is translated or the memory first grows, and the same for
+/// every Worker of it; a precompiled module (the seed) is built for one of
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum M64Tables {
+    /// At [`DISPATCH_DIR64`], 8 GiB: `[4 GiB, 8 GiB)` is left to images at
+    /// their linked bases, and a guest that uses less than 8 GiB never makes
+    /// the memory longer than the tables' end (8 GiB + 17 MiB). The default.
+    Middle,
+    /// At [`DISPATCH_DIR64_TOP`], the last 17 MiB of the memory: for a guest
+    /// that lays its world out from the bottom up with guest address equal
+    /// to memory offset and owns everything it reserves, gigabytes past
+    /// 8 GiB in one piece (a heap that cannot have a hole in it). The
+    /// memory is then [`LIMIT64`] long from the start.
+    Top,
+}
+
+static M64_TABLES_TOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Choose where this process's M64 tables are ([`M64Tables`]). A browser
+/// shim's statics live in the memory every Worker shares, so one call
+/// serves them all; it must come before anything is translated and before
+/// the memory first grows to the tables.
+pub fn set_m64_tables(t: M64Tables) {
+    M64_TABLES_TOP.store(t == M64Tables::Top, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where this process's M64 tables are ([`set_m64_tables`]).
+#[inline]
+pub fn m64_tables() -> M64Tables {
+    if M64_TABLES_TOP.load(core::sync::atomic::Ordering::Relaxed) { M64Tables::Top } else { M64Tables::Middle }
+}
+
+/// The M64 dispatch directory's address: [`DISPATCH_DIR64`] or
+/// [`DISPATCH_DIR64_TOP`] ([`m64_tables`]).
+#[inline]
+pub fn dispatch_dir64() -> u64 {
+    match m64_tables() {
+        M64Tables::Middle => DISPATCH_DIR64,
+        M64Tables::Top => DISPATCH_DIR64_TOP,
+    }
+}
+
+/// Pages [`dispatch_dir64`] covers: all of [`LIMIT64`].
 pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
 
-/// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
-pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
+/// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`],
+/// after the directory.
+#[inline]
+pub fn patched_pages64() -> u64 {
+    dispatch_dir64() + DISPATCH_MAX_PAGES64 * 4
+}
 
-/// End of the M64 tables, rounded to 1 MiB.
-pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
+/// End of the M64 tables, rounded to 1 MiB: what the memory must reach
+/// before the first dispatch.
+#[inline]
+pub fn high_tables_end() -> u64 {
+    dispatch_dir64() + HIGH_TABLES_BYTES
+}
 
 /// The bottom of the part of an M64 process's high arena ([`IMAGE_ZONE64`])
-/// above the M64 tables: what the memory grows over as that part is used.
-pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
+/// above the M64 tables: what the memory grows over as that part is used
+/// (none when the tables are at the top).
+#[inline]
+pub fn high_arena_base() -> u64 {
+    high_tables_end()
+}
 
 /// The dispatch directory of this process's memory flavour: the low region's
-/// [`DISPATCH_DIR`] for M32, [`DISPATCH_DIR64`] for M64. Also [`page_gen`].
+/// [`DISPATCH_DIR`] for M32, [`dispatch_dir64`] for M64. Also [`page_gen`].
 #[inline]
 pub fn dispatch_dir() -> u64 {
-    if mem64() { DISPATCH_DIR64 } else { DISPATCH_DIR }
+    if mem64() { dispatch_dir64() } else { DISPATCH_DIR }
 }
 
 /// Pages [`dispatch_dir`] covers.
@@ -184,7 +255,7 @@ pub fn page_gen() -> u64 {
 /// The [`PATCHED_PAGES`] bits of this flavour.
 #[inline]
 pub fn patched_pages() -> u64 {
-    if mem64() { PATCHED_PAGES64 } else { PATCHED_PAGES }
+    if mem64() { patched_pages64() } else { PATCHED_PAGES }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -489,16 +560,34 @@ pub mod ctx {
     /// which never use the vector registers, so their first 64 bytes.
     pub const COMPAT_SCRATCH: usize = if super::X86 { SCRATCH } else { V };
 
-    /// Total size of the context structure, rounded up. The x87 stack and
-    /// the scratch area are x86-64's; an AArch64 context ends with `v31`.
-    pub const SIZE: usize = if super::X86 {
+    /// The context structure's own registers, before the trailing
+    /// system-call immediate. The x87 stack and the scratch area are
+    /// x86-64's; an AArch64 context ends with `v31`.
+    pub const SIZE_REGS: usize = if super::X86 {
         SCRATCH + 64
     } else {
         V + 32 * 16
     };
 
+    /// The immediate of the `svc` the guest issued, for ISAs that encode the
+    /// system-call number in the instruction itself: AArch64's Horizon ABI
+    /// numbers its calls `svc #imm`, with the arguments in `x0`–`x5` and no
+    /// number register to read. The emitter stores the immediate here before
+    /// it calls `gex.syscall`; an ISA whose number lives in a register
+    /// (Linux `svc #0`, x86's `syscall`) writes nothing and leaves 0, which
+    /// is what the kernel then reads as "take [`Self::SYSCALL_NR`]". A
+    /// system call's own store leaves the register file alone: `x8` is the
+    /// AArch64 result-location register and clobbering it would break the
+    /// guest's ABI across the call.
+    pub const SYSCALL_IMM: usize = SIZE_REGS;
+
+    /// Total size of the context structure, rounded up.
+    pub const SIZE: usize = SIZE_REGS + 16;
+
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
-    /// gex's numbering of x86-64 registers, which is the hardware's).
+    /// gex's numbering of x86-64 registers, which is the hardware's). An
+    /// immediate-numbered call carries its number in
+    /// [`Self::SYSCALL_IMM`] instead.
     pub const SYSCALL_NR: usize = if super::X86 { x(0) } else { x(8) };
     /// Where the six system-call arguments arrive: `x0`–`x5`, or
     /// `rdi, rsi, rdx, r10, r8, r9`.
@@ -922,6 +1011,71 @@ pub mod ftab {
 /// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
 /// one is the guest's low memory (hosts/browser/js/gex.mjs `#workerStack`).
 pub const BOOT_STACK_COUNTER: u64 = RESERVED_END - 192;
+
+// ---------------------------------------------------------------------------
+// Page write tracking
+// ---------------------------------------------------------------------------
+
+/// `log2` of the granule page write tracking marks: 4 KiB pages.
+pub const WRITE_PAGE_SHIFT: u32 = 12;
+
+/// The granule page write tracking marks, in bytes.
+pub const WRITE_PAGE: u64 = 1 << WRITE_PAGE_SHIFT;
+
+/// Where a process keeps its write map's address, a `u64` in the reserved
+/// low region: 0 while tracking is off. What a component that sees only the
+/// process's memory reads (the global kernel, a runtime's C), beside the
+/// translators' own copy ([`set_write_map`]).
+pub const WRITE_MAP_SLOT: u64 = RESERVED_END - 32;
+
+static WRITE_MAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Turn page write tracking on: from now on every guest store a translation
+/// makes also sets the byte of `map` that stands for the 4 KiB page it wrote
+/// (`map + (address >> WRITE_PAGE_SHIFT)`, one byte per page of
+/// [`write_map_bytes`]), and the shims and the kernel mark what they write into
+/// guest memory too. A runtime that keeps a copy of guest memory elsewhere
+/// reads and clears the marks instead of comparing the memory with its copy.
+///
+/// A program's load-time option: set before anything is translated, never
+/// changed after (code translated without the marks would miss writes), and
+/// part of every translation's cache key. Off, the emitters' output is what
+/// it was without the feature. The map is the runtime's: zeroed memory of
+/// [`write_map_bytes`] in the process's memory, whose address the caller
+/// also stores at [`WRITE_MAP_SLOT`] (the browser shim's `gex_write_track`
+/// does both).
+pub fn set_write_map(map: u64) {
+    WRITE_MAP.store(map, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The write map's address, when page write tracking is on ([`set_write_map`]).
+#[inline]
+pub fn write_map() -> Option<u64> {
+    match WRITE_MAP.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        m => Some(m),
+    }
+}
+
+/// The write map's size: a byte per 4 KiB page of everything this flavour's
+/// memory can address (1 MiB for a 32-bit memory, 4 MiB for [`LIMIT64`]).
+pub fn write_map_bytes() -> u64 {
+    if mem64() { LIMIT64 >> WRITE_PAGE_SHIFT } else { (1u64 << 32) >> WRITE_PAGE_SHIFT }
+}
+
+/// The map's bytes for the pages of `[addr, addr + len)`: a byte range of the
+/// memory, `None` for no bytes or a range past the map.
+pub fn write_map_range(addr: u64, len: u64) -> Option<core::ops::Range<u64>> {
+    let map = write_map()?;
+    if len == 0 {
+        return None;
+    }
+    let last = addr.checked_add(len - 1)? >> WRITE_PAGE_SHIFT;
+    if last >= write_map_bytes() {
+        return None;
+    }
+    Some(map + (addr >> WRITE_PAGE_SHIFT)..map + last + 1)
+}
 
 /// Address of the context for thread slot `n`.
 ///
@@ -1351,7 +1505,11 @@ mod tests {
         assert!(ctx::X87 == ctx::v(31) + 16);
         assert!(ctx::X87 % 16 == 0 && ctx::X87_TMP % 16 == 0);
         assert!(!X86 || ctx::SIZE >= ctx::SCRATCH + 64);
-        assert!(X86 || ctx::SIZE == ctx::v(31) + 16);
+        // An AArch64 context's register file ends with `v31`, and the
+        // structure with the system-call immediate slot after it (every ISA's
+        // does; see [`ctx::SYSCALL_IMM`]).
+        assert!(X86 || ctx::SIZE_REGS == ctx::v(31) + 16);
+        assert!(ctx::SYSCALL_IMM == ctx::SIZE_REGS && ctx::SIZE == ctx::SYSCALL_IMM + 16);
         assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);
@@ -1381,6 +1539,8 @@ mod tests {
         assert!(FCACHE + FCACHE_BYTES <= PATCHED_PAGES);
         assert!(FCACHE % 8 == 0 && FCACHE > RESERVED_BASE + 256 * ((ctx::SIZE as u64 + 63) & !63));
         assert!(SPLIT_LOCK + 8 <= EXCLUSIVE_SCRATCH);
+        // A store-exclusive pair's scratch (16 bytes) below the write map's slot.
+        assert!(EXCLUSIVE_SCRATCH + 16 <= WRITE_MAP_SLOT && WRITE_MAP_SLOT + 8 <= RESERVED_END);
         // Every address code may occupy needs a directory entry, including the
         // mmap arena where `ld.so` maps and calls into libraries.
         assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
@@ -1394,11 +1554,40 @@ mod tests {
         assert!(INTERP_BASE < STACK_TOP);
         assert!(STACK_TOP <= MMAP_BOTTOM);
         assert!(MMAP_TOP <= GUEST_LIMIT);
-        // The M64 tables sit above every M32 address and the image zone
-        // `[4 GiB, 8 GiB)`, below the arena.
-        assert!(DISPATCH_DIR64 >= GUEST_LIMIT && DISPATCH_DIR64 >= 8 << 30);
+        // The M64 tables sit above every M32 address. In their default
+        // place they leave the image zone `[4 GiB, 8 GiB)` free, with the
+        // arena around them; at the top they end exactly at the memory's
+        // end. Either way the directory and the bits fit in
+        // [`HIGH_TABLES_BYTES`], which is whole wasm pages.
+        assert!(DISPATCH_DIR64 >= GUEST_LIMIT && DISPATCH_DIR64 >= IMAGE_ZONE64 + (4 << 30));
+        assert!(DISPATCH_DIR64 + HIGH_TABLES_BYTES < LIMIT64);
+        assert!(DISPATCH_DIR64_TOP >= GUEST_LIMIT && DISPATCH_DIR64_TOP + HIGH_TABLES_BYTES == LIMIT64);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
-        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
-        assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
+        assert!(DISPATCH_MAX_PAGES64 * 4 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_BYTES);
+        assert!(HIGH_TABLES_BYTES % WASM_PAGE == 0 && DISPATCH_DIR64 % WASM_PAGE == 0 && DISPATCH_DIR64_TOP % WASM_PAGE == 0);
+        assert!(IMAGE_ZONE64 < DISPATCH_DIR64 && IMAGE_ZONE64 % WASM_PAGE == 0);
+    }
+
+    /// The tables' place is chosen at run time, and every address derived
+    /// from it follows: the patched-page bits right after the directory, the
+    /// tables' end 17 MiB on, at the memory's end when they are at the top.
+    /// (The only test here that sets it, so no other reads it mid-change.)
+    #[test]
+    fn m64_tables_move_as_one() {
+        set_mem_flavor(MemFlavor::M64);
+        assert_eq!(m64_tables(), M64Tables::Middle);
+        assert_eq!(dispatch_dir(), DISPATCH_DIR64);
+        assert_eq!(patched_pages(), DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4);
+        assert_eq!(high_tables_end(), DISPATCH_DIR64 + HIGH_TABLES_BYTES);
+        assert_eq!(HIGH_TABLES_BYTES, 17 << 20);
+        set_m64_tables(M64Tables::Top);
+        assert_eq!(dispatch_dir(), DISPATCH_DIR64_TOP);
+        assert_eq!(page_gen(), DISPATCH_DIR64_TOP);
+        assert_eq!(patched_pages(), DISPATCH_DIR64_TOP + DISPATCH_MAX_PAGES64 * 4);
+        assert_eq!(high_tables_end(), LIMIT64);
+        assert_eq!(high_arena_base(), LIMIT64);
+        set_m64_tables(M64Tables::Middle);
+        assert_eq!(dispatch_dir64(), DISPATCH_DIR64);
+        set_mem_flavor(MemFlavor::M32);
     }
 }

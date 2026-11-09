@@ -2678,7 +2678,7 @@ fn grow_memory_to(end: u64) -> bool {
     // A megabyte at a time past what was asked for: `memory.grow` may copy, so
     // a guest mapping a page at a time should not pay per page.
     let want = (target - have).div_ceil(PAGE).max(16);
-    let prev = warch::memory_grow(0, want as usize);
+    let prev = grow_pages(want);
     if prev == usize::MAX {
         grow_failed(have, have + want * PAGE);
         return false;
@@ -2690,6 +2690,77 @@ fn grow_memory_to(end: u64) -> bool {
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
     true
+}
+
+/// The thread that grows the memory for every other one, when the host runs
+/// one (`gex_grow_server`); zeroed, so until then each thread grows it itself.
+///
+/// Why one thread: V8 counts a shared memory against the garbage collector's
+/// limit of each isolate that grows it, as its new size rounded up to a power
+/// of two (`WasmMemoryObject::Grow`, `UpdateEstimatedSize(bit_ceil(..))`),
+/// and never lowers it; a grow in another isolate leaves the count alone. A
+/// memory past 4 GiB therefore counts as 8 GiB in every Worker that ever
+/// grew it, which is about all a Worker may hold (Chrome 157), so from then
+/// on every 8 MB the Worker's JavaScript promotes start a full mark-compact.
+/// A Worker that grows nothing counts the memory at the size it had when the
+/// Worker was given it. So the host gives the growing to a Worker that
+/// allocates no JavaScript, and the ones that do (the WebGPU replay above
+/// all) never grow.
+#[cfg(feature = "shared-memory")]
+#[repr(C, align(8))]
+pub struct GrowServer {
+    /// 1 while the server answers; 0: grow here.
+    serving: std::sync::atomic::AtomicI32,
+    /// 0 idle, 1 asked, 2 answered. Under `GROW_LOCK`, so one ask at a time.
+    state: std::sync::atomic::AtomicI32,
+    /// The pages asked for.
+    pages: std::sync::atomic::AtomicU64,
+    /// The answer: `memory.grow`'s, the size before in pages or all ones.
+    prev: std::sync::atomic::AtomicU64,
+}
+#[cfg(feature = "shared-memory")]
+static GROW_SERVER: GrowServer = GrowServer {
+    serving: std::sync::atomic::AtomicI32::new(0),
+    state: std::sync::atomic::AtomicI32::new(0),
+    pages: std::sync::atomic::AtomicU64::new(0),
+    prev: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// Where the grow server's block is (`GrowServer`: an i32 serving word at
+/// +0, the i32 state word at +4, the u64 pages at +8 and the u64 answer at
+/// +16), for the host's grower to serve: it sets the serving word to 1, then
+/// waits for state 1, grows the memory by `pages`, stores the answer, sets
+/// state 2 and notifies the state word.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_grow_server() -> usize {
+    &GROW_SERVER as *const GrowServer as usize
+}
+
+/// `memory.grow` by `pages`: through the grow server when one answers, else
+/// here. Answers the size before, in pages, or `usize::MAX`. Called under
+/// `GROW_LOCK`.
+fn grow_pages(pages: u64) -> usize {
+    #[cfg(feature = "shared-memory")]
+    {
+        use std::sync::atomic::Ordering;
+        let s = &GROW_SERVER;
+        if s.serving.load(Ordering::Acquire) == 1 {
+            s.pages.store(pages, Ordering::Relaxed);
+            s.state.store(1, Ordering::Release);
+            // SAFETY: the word is this module's static, in the shared memory.
+            unsafe { warch::memory_atomic_notify(s.state.as_ptr(), 1) };
+            while s.state.load(Ordering::Acquire) != 2 {
+                // SAFETY: as above; a wait wakes on the server's notify, or
+                // returns at once when the answer is already there.
+                unsafe { warch::memory_atomic_wait32(s.state.as_ptr(), 1, -1) };
+            }
+            let prev = s.prev.load(Ordering::Relaxed);
+            s.state.store(0, Ordering::Release);
+            return if prev == u64::MAX { usize::MAX } else { prev as usize };
+        }
+    }
+    warch::memory_grow(0, pages as usize)
 }
 
 /// A grow the engine refused, said (the first few): a failed `memory.grow`
@@ -2716,6 +2787,38 @@ fn grow_failed(have: u64, to: u64) {
     let _ = write!(b, "gex: out of memory: the engine would not grow this process's memory from {} to {} MiB\n", have >> 20, to.div_ceil(1 << 20));
     // SAFETY: `warn` reads the bytes and keeps none.
     unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+}
+
+/// The words the lifter sends to the host's slow path (`gex_isa::slow`), counted by pattern (the
+/// register fields masked off), and every 2^20 the most frequent said: a word hot enough to show
+/// here wants a lowering of its own in `gex-lift`, as the slow module's own note asks.
+fn slow_note(raw: u32) {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    const N: usize = 64;
+    static PAT: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    let pat = raw & 0xffe0_fc00 | 1;   // opcode, size and the Q / U bits; Rd, Rn, Rm out (the 1: never 0, an empty slot)
+    let mut i = (pat.wrapping_mul(0x9e37_79b1) >> 26) as usize % N;
+    for _ in 0..N {
+        let got = PAT[i].load(Ordering::Relaxed);
+        if got == pat || (got == 0 && PAT[i].compare_exchange(0, pat, Ordering::Relaxed, Ordering::Relaxed).is_ok()) || PAT[i].load(Ordering::Relaxed) == pat {
+            CNT[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        i = (i + 1) % N;
+    }
+    let n = ALL.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & ((1 << 20) - 1) != 0 { return; }
+    let mut top: Vec<(u64, u32)> = (0..N).map(|k| (CNT[k].load(Ordering::Relaxed), PAT[k].load(Ordering::Relaxed))).filter(|t| t.1 != 0).collect();
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    use core::fmt::Write as _;
+    let mut line = String::new();
+    let _ = write!(line, "gex: slow-path SIMD words, {} so far; most frequent (pattern: count):", n);
+    for (c, p) in top.iter().take(8) { let _ = write!(line, " {:08x}: {}", p & !1, c); }
+    line.push('\n');
+    // SAFETY: `warn` reads the bytes and keeps none.
+    unsafe { warn(line.as_ptr() as u32, line.len() as u32) };
 }
 
 static GROW_LOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2812,6 +2915,81 @@ pub extern "C" fn gex_set_null_guard(on: u32) {
 #[no_mangle]
 pub extern "C" fn gex_set_mxcsr_exact(on: u32) {
     gex_ir::set_mxcsr_exact(on != 0);
+}
+
+/// Page write tracking (`gex_abi::set_write_map`), a program's load-time
+/// option, off unless its runtime calls this before anything is translated:
+/// the map (a byte per 4 KiB page of the memory, from the shim's heap) is
+/// made, its address recorded at `gex_abi::WRITE_MAP_SLOT`, and every
+/// translation from then on marks the pages its stores write, as this shim
+/// and the kernel mark theirs. Answers the map's address (the same one again
+/// on a second call), or 0 when there was no memory for it.
+#[no_mangle]
+pub extern "C" fn gex_write_track() -> u64 {
+    static ONCE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let mut map = ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    if *map == 0 {
+        let bytes = gex_abi::write_map_bytes() as usize;
+        let Ok(layout) = std::alloc::Layout::from_size_align(bytes, 4096) else { return 0 };
+        // SAFETY: a non-zero size; the map lives as long as the process.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        if p.is_null() {
+            return 0;
+        }
+        *map = p as usize as u64;
+        let _ = guest().write_u64(gex_abi::WRITE_MAP_SLOT, *map);
+        gex_abi::set_write_map(*map);
+    }
+    *map
+}
+
+/// The write map's address, 0 while page write tracking is off.
+#[no_mangle]
+pub extern "C" fn gex_write_map() -> u64 {
+    gex_abi::write_map().unwrap_or(0)
+}
+
+/// Mark the pages of `[addr, addr + len)` written: what a runtime's own code
+/// calls after it writes guest memory, as a translated store marks its page.
+#[no_mangle]
+pub extern "C" fn gex_write_mark(addr: u64, len: u64) {
+    wmark(addr, len);
+}
+
+/// Whether the page holding `addr` was marked, clearing the mark: 1 or 0.
+/// A consumer clears a page's mark before it reads the page, so a write
+/// after the read marks it again.
+#[no_mangle]
+pub extern "C" fn gex_write_take(addr: u64) -> u32 {
+    let Some(r) = gex_abi::write_map_range(addr, 1) else { return 0 };
+    let mut g = guest();
+    let Ok(byte) = g.read_mut(r.start, 1) else { return 0 };
+    let p = byte.as_mut_ptr();
+    // SAFETY: a byte of the map, in bounds; every thread marks it with plain
+    // or atomic byte stores, and this is an atomic exchange on it.
+    unsafe { std::sync::atomic::AtomicU8::from_ptr(p) }.swap(0, std::sync::atomic::Ordering::AcqRel) as u32
+}
+
+/// Clear the marks of the pages of `[addr, addr + len)`.
+#[no_mangle]
+pub extern "C" fn gex_write_clear(addr: u64, len: u64) {
+    if let Some(r) = gex_abi::write_map_range(addr, len) {
+        if let Ok(m) = guest().read_mut(r.start, (r.end - r.start) as usize) {
+            m.fill(0);
+        }
+    }
+}
+
+/// Mark `[addr, addr + len)` written, when tracking is on: this shim's own
+/// writes into guest memory that do not go through `GuestMem`.
+fn wmark(addr: u64, len: u64) {
+    if let Some(r) = gex_abi::write_map_range(addr, len) {
+        // The bytes before their marks, for a consumer on another thread.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        if let Ok(m) = guest().read_mut(r.start, (r.end - r.start) as usize) {
+            m.fill(1);
+        }
+    }
 }
 
 /// `?pinregion=BYTES`: the pin region an ejected project's libraries are
@@ -3291,14 +3469,14 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // Below the tables, from 4 GiB (claimed whole as the guest's, see
     // `memmap::claim_fixed`; the memory is that long from the start, so
     // this only checks).
-    if gex_abi::mem64() && start >= gex_abi::IMAGE_ZONE64 && end <= gex_abi::DISPATCH_DIR64 {
+    if gex_abi::mem64() && start >= gex_abi::IMAGE_ZONE64 && end <= gex_abi::dispatch_dir64() {
         return grow_memory_to(end).then_some(start);
     }
-    if end > gex_abi::HIGH_ARENA_BASE && gex_abi::mem64() {
+    if gex_abi::mem64() && end > gex_abi::high_arena_base() {
         if !grow_memory_to(end) {
             return None;
         }
-        let prev = HIGH_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed).max(gex_abi::HIGH_ARENA_BASE);
+        let prev = HIGH_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed).max(gex_abi::high_arena_base());
         if end > prev {
             memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest mapping (high arena)");
         }
@@ -5042,7 +5220,7 @@ fn slot_span_locked(i: usize) -> Option<u64> {
     // An M64 memory's dense directory is read by every
     // dispatch, so the memory covers it from the start (V8 commits
     // lazily: untouched pages of it cost nothing).
-    if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
+    if gex_abi::mem64() && !grow_memory_to(gex_abi::high_tables_end()) {
         return None;
     }
     Some(base)
@@ -10541,18 +10719,19 @@ pub(crate) fn wine64_top_m64() -> u64 {
     }
 }
 
+/// `[gex_abi::dispatch_dir64(), gex_abi::high_tables_end())` in MiB (the
+/// low half the start, the high half the end), for the page's host, which
+/// reads an M64 memory's directory and copies its tables on a fork: where
+/// this process put them ([`gex_abi::m64_tables`]).
+#[no_mangle]
+pub extern "C" fn gex_m64_tables() -> u32 {
+    const _: () = assert!(gex_abi::LIMIT64 >> 20 <= 0xffff && gex_abi::DISPATCH_DIR64 % (1 << 20) == 0 && gex_abi::DISPATCH_DIR64_TOP % (1 << 20) == 0 && gex_abi::HIGH_TABLES_BYTES % (1 << 20) == 0);
+    ((gex_abi::high_tables_end() >> 20) << 16 | gex_abi::dispatch_dir64() >> 20) as u32
+}
+
 /// `gex.space_top()`: this process's top in 64 KiB units, which 64-bit
 /// Wine's ntdll takes as the end of its space instead of probing; 0 in a
 /// 32-bit memory.
-/// `[gex_abi::DISPATCH_DIR64, gex_abi::HIGH_TABLES_END)` in MiB (the low
-/// half the start, the high half the end), for the page's host, which
-/// reads an M64 memory's directory and copies its tables on a fork.
-#[no_mangle]
-pub extern "C" fn gex_m64_tables() -> u32 {
-    const _: () = assert!(gex_abi::HIGH_TABLES_END >> 20 <= 0xffff && gex_abi::DISPATCH_DIR64 % (1 << 20) == 0 && gex_abi::HIGH_TABLES_END % (1 << 20) == 0);
-    ((gex_abi::HIGH_TABLES_END >> 20) << 16 | gex_abi::DISPATCH_DIR64 >> 20) as u32
-}
-
 #[no_mangle]
 pub extern "C" fn gex_space_top() -> u32 {
     if gex_abi::mem64() { (wine64_top_m64() >> 16) as u32 } else { 0 }
@@ -12908,6 +13087,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
                     data.write(da as u64, &payload[..db - da]).ok()?;
                 }
             }
+            wmark(a as u64, (b - a) as u64);
             h.kernel.mem.lock().adopt(start, end, prot, &name, code);
             ms_copy += now_ns() - began;
             n_copy += end - start;
@@ -13053,8 +13233,8 @@ fn mode_salt(h: &mut impl std::hash::Hasher, alt: bool) {
 /// process with KUSER_SHARED_DATA folded (`gex_abi::kuser_fold`, and the
 /// entry page with it) reads its constant addresses elsewhere, and one
 /// without the fold reads them where Windows has them, past a compact
-/// space's end; the null guard and exact MXCSR change every block they
-/// touch. A process with none of these adds nothing, so its keys stay as
+/// space's end; the null guard, exact MXCSR and page write tracking change
+/// every block they touch. A process with none of these adds nothing, so its keys stay as
 /// they were.
 fn flavour_salt(h: &mut impl std::hash::Hasher) {
     if gex_abi::mem64() {
@@ -13068,6 +13248,12 @@ fn flavour_salt(h: &mut impl std::hash::Hasher) {
     }
     if gex_ir::mxcsr_exact() {
         h.write_u8(8);
+    }
+    // Page write tracking: every store marks its page in the map at this
+    // address.
+    if let Some(map) = gex_abi::write_map() {
+        h.write_u8(4);
+        h.write_u64(map);
     }
 }
 
@@ -15905,6 +16091,21 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    // A SIMD or crypto instruction with no wasm form, on the registers the call flushed. FPSR.QC
+    // lands in the context, the only place that holds it: the lifter's own saturating lowerings
+    // do not record it, and an MRS of FPSR reads 0 either way.
+    if reg == gex_isa::slow::SYSREG {
+        let at = ctx as u32 as u64;
+        let mut g = guest();
+        let mut fpsr = g.read_u32(at + ctx::FPSR as u64).unwrap_or(0);
+        slow_note(val as u32);
+        if let Ok(v) = g.read_mut(at + ctx::V as u64, 512) {
+            let done = gex_isa::slow::execute(val as u32, &mut gex_isa::slow::VRegs(v), &mut fpsr);
+            debug_assert!(done, "the lifter asked only for what `known` said");
+        }
+        let _ = g.write_u32(at + ctx::FPSR as u64, fpsr);
+        return;
+    }
     let pc = fault_pc(pc);
     // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
     // replacement modules to run it with (eject v0 runs them natively only),
@@ -17062,6 +17263,12 @@ pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
 
 fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
+    // Whose registers a report or a fault reads (`ctx_addr_get`). Normally
+    // set at a syscall; a game's very first miss (hz.rs's boot stub) can be
+    // the first thing this Worker's thread ever runs, and a fault before any
+    // syscall would otherwise read ctx 0's zeros and report `sp=0x0` for a
+    // thread whose sp is real.
+    ctx_addr_set(_ctx as u32 as u64);
     // A thread another thread's `execve` took the process from, which got
     // here before a safepoint or syscall stopped it: the code it was running
     // is gone, and the new program's memory is under this address. It goes,
@@ -19437,30 +19644,48 @@ fn note_intrinsics(addr: u64) {
         return;
     }
     let (found, pending) = scan_intrinsics(&path, start);
-    let added = with_jit_only(|j| {
+    with_jit_only(|j| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
         *j.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
-        let before = j.intrinsics.len();
-        let mask = unsafe { INTRINSICS_MASK };
-        for (a, k) in found {
-            let bit = match k {
-                gex_xlate::Intrinsic::MemCpy => 1,
-                gex_xlate::Intrinsic::MemSet => 2,
-                gex_xlate::Intrinsic::MemCmp => 4,
-                gex_xlate::Intrinsic::MemPCpy => 8,
-                gex_xlate::Intrinsic::MemMove => 16,
-                // Never recognised by name, so never reaches this scan.
-                gex_xlate::Intrinsic::Replace(_) | gex_xlate::Intrinsic::Override(_) => 0,
-            };
-            if mask & bit == 0 {
-                continue;
-            }
-            j.intrinsics.insert(a, k);
-        }
-        j.intrinsics.len() - before
+        add_intrinsics(j, found);
     });
-    let _ = added;
+}
+
+/// Bind library functions found by name to their intrinsics, as far as
+/// `gex_set_intrinsic_mask` lets each family through. Answers how many were
+/// new.
+fn add_intrinsics(j: &mut Jit, found: impl IntoIterator<Item = (u64, gex_xlate::Intrinsic)>) -> usize {
+    let before = j.intrinsics.len();
+    let mask = unsafe { INTRINSICS_MASK };
+    for (a, k) in found {
+        let bit = match k {
+            gex_xlate::Intrinsic::MemCpy => 1,
+            gex_xlate::Intrinsic::MemSet => 2,
+            gex_xlate::Intrinsic::MemCmp => 4,
+            gex_xlate::Intrinsic::MemPCpy => 8,
+            gex_xlate::Intrinsic::MemMove => 16,
+            // Never recognised by name, so never reaches this scan.
+            gex_xlate::Intrinsic::Replace(_) | gex_xlate::Intrinsic::Override(_) => 0,
+        };
+        if mask & bit == 0 {
+            continue;
+        }
+        j.intrinsics.insert(a, k);
+    }
+    j.intrinsics.len() - before
+}
+
+/// [`note_intrinsics`] for a program whose images the host placed itself
+/// (the Horizon loader, `hz.rs`), with no file behind them to scan: the
+/// functions named by the modules' own dynamic symbols, at their load
+/// addresses. Before the first translation, so no block of theirs is ever
+/// lifted. Answers how many were bound.
+pub(crate) fn bind_intrinsics(found: Vec<(u64, gex_xlate::Intrinsic)>) -> usize {
+    if !unsafe { INTRINSICS_ON } {
+        return 0;
+    }
+    with_jit_only(|j| add_intrinsics(j, found))
 }
 
 /// Narrate the calls that change what is running: `clone` and `execve`.

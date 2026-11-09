@@ -130,6 +130,36 @@ pub unsafe fn pull(dst: *mut u8, src: PAddr, len: u32) {
 /// As [`pull`], with the roles reversed.
 #[inline]
 pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
+    unsafe { push_bytes(dst, src, len) };
+    written(dst, len);
+}
+
+/// Page write tracking (`gex_abi::set_write_map`): when the calling process
+/// has it on, its map's address is at `gex_abi::WRITE_MAP_SLOT` in its
+/// memory, and a write here marks the pages it wrote there, after the bytes,
+/// as the process's own stores mark theirs.
+fn written(dst: PAddr, len: u32) {
+    if len == 0 {
+        return;
+    }
+    let mut buf = [0u8; 8];
+    unsafe { pull(buf.as_mut_ptr(), gex_abi::WRITE_MAP_SLOT, 8) };
+    let map = u64::from_le_bytes(buf);
+    if map == 0 {
+        return;
+    }
+    let pages = if pages64() != 0 { gex_abi::LIMIT64 } else { 1u64 << 32 } >> gex_abi::WRITE_PAGE_SHIFT;
+    let (first, last) = (dst >> gex_abi::WRITE_PAGE_SHIFT, (dst + len as u64 - 1) >> gex_abi::WRITE_PAGE_SHIFT);
+    if last >= pages || !in_process(map + first, (last - first + 1) as u32) {
+        return;
+    }
+    // The bytes before their marks, for a consumer on another thread.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    unsafe { fill(map + first, 1, (last - first + 1) as u32) };
+}
+
+#[inline]
+unsafe fn push_bytes(dst: PAddr, src: *const u8, len: u32) {
     if pages64() != 0 {
         unsafe {
             core::arch::asm!(
@@ -164,16 +194,27 @@ pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
 /// `dst..dst+len` must be in bounds of the process memory.
 #[inline]
 pub unsafe fn zero(dst: PAddr, len: u32) {
+    unsafe { fill(dst, 0, len) };
+    written(dst, len);
+}
+
+/// Set `len` bytes of the calling process's memory at `dst` to `v`.
+///
+/// # Safety
+/// As [`zero`].
+#[inline]
+unsafe fn fill(dst: PAddr, v: u32, len: u32) {
     if pages64() != 0 {
         // A memory64's `memory.fill` takes its length as an i64, like its address.
         let len = len as u64;
         unsafe {
             core::arch::asm!(
                 "local.get {dst}",
-                "i32.const 0",
+                "local.get {v}",
                 "local.get {len}",
                 "memory.fill 2",
                 dst = in(local) dst,
+                v = in(local) v,
                 len = in(local) len,
             );
         }
@@ -182,10 +223,11 @@ pub unsafe fn zero(dst: PAddr, len: u32) {
         unsafe {
             core::arch::asm!(
                 "local.get {dst}",
-                "i32.const 0",
+                "local.get {v}",
                 "local.get {len}",
                 "memory.fill 1",
                 dst = in(local) dst,
+                v = in(local) v,
                 len = in(local) len,
             );
         }
