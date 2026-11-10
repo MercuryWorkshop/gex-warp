@@ -3,7 +3,8 @@
 // socket. It asks what the compositor has, makes a surface a top-level
 // window with a title, shares a buffer of pixels with the compositor
 // (POSIX shared memory, its descriptor passed over the socket), shows it,
-// and answers the compositor until its input ends.
+// and answers the compositor until its input ends, saying what the pointer
+// and the keyboard do in it.
 //
 //   window TITLE [WIDTH HEIGHT]
 //
@@ -96,7 +97,7 @@ static int event(uint32_t *object, uint32_t *opcode, const uint32_t **args, unsi
     }
 }
 
-enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER };
+enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER, SEAT, POINTER, KEYBOARD };
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -117,7 +118,7 @@ int main(int argc, char **argv) {
     request(DISPLAY, 1, a, 1, -1);
     a[0] = SYNC;
     request(DISPLAY, 0, a, 1, -1);
-    uint32_t compositor = 0, shm = 0, wm = 0, compositor_version = 0, wm_version = 0;
+    uint32_t compositor = 0, shm = 0, wm = 0, seat = 0, compositor_version = 0, wm_version = 0, seat_version = 0;
     uint32_t object, opcode;
     const uint32_t *args;
     unsigned words;
@@ -134,6 +135,7 @@ int main(int argc, char **argv) {
         if (!strcmp(interface, "wl_compositor")) compositor = args[0], compositor_version = version;
         if (!strcmp(interface, "wl_shm")) shm = args[0];
         if (!strcmp(interface, "xdg_wm_base")) wm = args[0], wm_version = version;
+        if (!strcmp(interface, "wl_seat")) seat = args[0], seat_version = version;
     }
     printf("window: a compositor %s, shared memory %s, windows %s\n", compositor ? "yes" : "no", shm ? "yes" : "no", wm ? "yes" : "no");
     if (!compositor || !shm || !wm) return 1;
@@ -141,14 +143,23 @@ int main(int argc, char **argv) {
         uint32_t *name, id;
         const char *interface;
         uint32_t *has, most;
-    } binds[] = {{&compositor, COMPOSITOR, "wl_compositor", &compositor_version, 4}, {&shm, SHM, "wl_shm", 0, 1}, {&wm, WM, "xdg_wm_base", &wm_version, 2}};
-    for (unsigned i = 0; i < 3; i++) {
+    } binds[] = {{&compositor, COMPOSITOR, "wl_compositor", &compositor_version, 4}, {&shm, SHM, "wl_shm", 0, 1}, {&wm, WM, "xdg_wm_base", &wm_version, 2}, {&seat, SEAT, "wl_seat", &seat_version, 5}};
+    for (unsigned i = 0; i < 4; i++) {
+        if (!*binds[i].name) continue;
         unsigned n = 0;
         a[n++] = *binds[i].name;
         n += put_string(a + n, binds[i].interface);
         a[n++] = binds[i].has && *binds[i].has < binds[i].most ? *binds[i].has : binds[i].most;
         a[n++] = binds[i].id;
         request(REGISTRY, 0, a, n, -1);
+    }
+
+    // What there is to point and type with, if there is a seat.
+    if (seat) {
+        a[0] = POINTER;
+        request(SEAT, 0, a, 1, -1);
+        a[0] = KEYBOARD;
+        request(SEAT, 1, a, 1, -1);
     }
 
     // A surface, and its part as a top-level window with a title.
@@ -209,7 +220,10 @@ int main(int argc, char **argv) {
     printf("window: shown, %d by %d\n", width, height);
 
     // Until its input ends: the compositor's pings answered, a new size
-    // acknowledged, and its word that the window is closed heeded.
+    // acknowledged, its word that the window is closed heeded; and what the
+    // pointer and the keyboard do here said: where the pointer is when a
+    // button goes down (in the window or not), and each key by its number.
+    int px = -1, py = -1;
     for (;;) {
         struct pollfd p[2] = {{sock, POLLIN, 0}, {0, POLLIN, 0}};
         if (have < 8 && poll(p, 2, -1) < 0 && errno != EINTR) break;
@@ -236,6 +250,14 @@ int main(int argc, char **argv) {
             printf("window: closed\n");
             return 0;
         }
+        // The pointer comes in (serial, surface, x, y) and moves (time, x,
+        // y), in 24.8 fixed point; a button is (serial, time, which, down).
+        if (object == POINTER && opcode == 0) px = (int32_t)args[2] >> 8, py = (int32_t)args[3] >> 8;
+        if (object == POINTER && opcode == 2) px = (int32_t)args[1] >> 8, py = (int32_t)args[2] >> 8;
+        if (object == POINTER && opcode == 3)
+            printf("window: button %u %s, the pointer %s the window\n", args[2], args[3] ? "down" : "up", px >= 0 && py >= 0 && px < width && py < height ? "in" : "not in");
+        // A key is (serial, time, which, down).
+        if (object == KEYBOARD && opcode == 3) printf("window: key %u %s\n", args[2], args[3] ? "down" : "up");
     }
     printf("window: done\n");
     return 0;

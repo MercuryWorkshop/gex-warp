@@ -2,7 +2,8 @@
 // Wayland client with no library (the protocol by hand, its pixels in POSIX
 // shared memory whose descriptor it passes), run from a Mac root (pyrus's)
 // against the page's compositor. The compositor lists its window by its
-// title, and loses it when the program ends.
+// title, a click and a key pressed in the page reach the program, and the
+// window goes when the program ends.
 //
 // The root and the program are the `darwin-root` image
 // (test/fixtures/images.mjs). SwiftShader here.
@@ -49,6 +50,15 @@ export default async function (t) {
   await until(async () => (seen = await out.describe())?.titles?.includes(TITLE), 'the compositor has the window', 30000).catch(() => {});
   check(`the compositor lists it by its title (${JSON.stringify(seen?.titles)})`, !!seen?.titles?.includes(TITLE), (seen?.log ?? []).slice(-8).join(' / '));
   await t.screenshot?.('window');
+  // A click in the window (the canvas is at the page's margin, the window
+  // at its corner under a title bar), and a key pressed after it.
+  const box = document.getElementById('out').getBoundingClientRect();
+  await t.click(box.left + 200, box.top + 150);
+  await until(() => /^window: button \d+ up/m.test(text), 'the click reached the program', 30000).catch(() => {});
+  check('a click in the page reaches the program, in its window', /^window: button 272 down, the pointer in the window$/m.test(text) && /^window: button 272 up/m.test(text), text.slice(-300));
+  await t.key('KeyA', 'a');
+  await until(() => /^window: key \d+ up/m.test(text), 'the key reached the program', 30000).catch(() => {});
+  check('and a key pressed, by its number', /^window: key 30 down$/m.test(text) && /^window: key 30 up$/m.test(text), text.slice(-300));
   p.kill('SIGTERM');
   await until(async () => !(seen = await out.describe())?.titles?.includes(TITLE), 'the window went', 30000).catch(() => {});
   check('its window goes when it ends', !seen?.titles?.includes(TITLE), (seen?.log ?? []).slice(-8).join(' / '));
