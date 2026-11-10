@@ -46,6 +46,20 @@ pub fn load_u64(bytes: &mut [u8], off: u64) -> Option<u64> {
     Some(unsafe { AtomicU64::from_ptr(p) }.load(Ordering::SeqCst))
 }
 
+/// Compare-and-swap of an 8-aligned 64-bit word: `Ok(old)` when it held
+/// `expected` and now holds `new`, `Err(actual)` otherwise. (Half of a
+/// 16-byte compare-and-swap, which wasm has none of; its caller marks what
+/// it wrote.)
+pub fn cas_u64(bytes: &mut [u8], off: u64, expected: u64, new: u64) -> Option<Result<u64, u64>> {
+    let off = usize::try_from(off).ok()?;
+    if off % 8 != 0 || off.checked_add(8)? > bytes.len() {
+        return None;
+    }
+    let p = bytes[off..off + 8].as_mut_ptr() as *mut u64;
+    // SAFETY: as `word`'s, for an 8-aligned word.
+    Some(unsafe { AtomicU64::from_ptr(p) }.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst))
+}
+
 /// Mark the word written, for page write tracking (`gex_abi::set_write_map`),
 /// when it is on: after each write here, as a translated store marks its page.
 fn written(bytes: &mut [u8], off: u64) {

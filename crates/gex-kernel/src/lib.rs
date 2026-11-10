@@ -174,6 +174,15 @@ impl<'a> GuestMem<'a> {
         self.slice_mut(r).ok()
     }
 
+    /// The 8-aligned 64-bit word at `addr`, for an atomic operation on it.
+    pub fn dword_mut(&mut self, addr: u64) -> Option<&mut [u8]> {
+        if addr % 8 != 0 {
+            return None;
+        }
+        let r = self.range(addr, 8).ok()?;
+        self.slice_mut(r).ok()
+    }
+
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
         let r = self.range(addr, len)?;
         self.slice(r)

@@ -799,10 +799,18 @@ pub fn serve_cpuid(m: &mut GuestMem<'_>, ctx_addr: u64, value: u64) {
 /// sixteen bytes there; equal, rcx:rbx is stored and ZF set; otherwise
 /// rdx:rax receive what was there and ZF is clear.
 ///
-/// Under one lock for every `cmpxchg16b` of every thread (wasm has no
-/// 16-byte atomic): atomic against each other, not against a plain store
-/// racing it. A lock-free list (x64 Windows' SLIST_HEADER) changes its
-/// head only this way, so that is all it needs.
+/// Wasm has no 16-byte atomic, so it is made of two 8-byte ones, under one
+/// lock for every `cmpxchg16b` of every thread. The lock makes them atomic
+/// against each other (a lock-free list, x64 Windows' SLIST_HEADER, changes
+/// its head only this way). The halves being compared and swapped
+/// atomically makes it safe against what else code does to the same
+/// sixteen bytes: an 8-byte `lock cmpxchg` on one half, which is how
+/// libpthread's read-write lock on x86-64 changes two of its three
+/// sequence words where this changes all three. Such a change either makes
+/// this fail, having stored nothing, or comes wholly after it. (One that
+/// lands between the two halves makes this take its first half back; only a
+/// third, changing that half again in the same instant, could leave it
+/// half done.)
 pub fn serve_cmpxchg16b(m: &mut GuestMem<'_>, ctx_addr: u64, addr: u64) {
     use gex_abi::ctx;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -812,11 +820,35 @@ pub fn serve_cmpxchg16b(m: &mut GuestMem<'_>, ctx_addr: u64, addr: u64) {
     }
     let r = |i: u8| m.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
     let (rax, rdx, rbx, rcx) = (r(0), r(2), r(3), r(1));
-    let (lo, hi) = (m.read_u64(addr).unwrap_or(0), m.read_u64(addr + 8).unwrap_or(0));
-    let equal = lo == rax && hi == rdx;
+    // Each half by the host's atomic compare-and-swap, where it is aligned
+    // for one.
+    let mut cas = |at: u64, old: u64, new: u64| gex_atomic::cas_u64(m.dword_mut(at)?, 0, old, new);
+    let (equal, lo, hi) = match cas(addr, rax, rbx) {
+        Some(Err(now)) => (false, now, m.read_u64(addr + 8).unwrap_or(0)),
+        Some(Ok(_)) => match cas(addr + 8, rdx, rcx) {
+            Some(Ok(_)) => (true, rbx, rcx),
+            other => {
+                let _ = cas(addr, rbx, rax);
+                let hi = match other {
+                    Some(Err(now)) => now,
+                    _ => m.read_u64(addr + 8).unwrap_or(0),
+                };
+                (false, m.read_u64(addr).unwrap_or(0), hi)
+            }
+        },
+        // Not aligned for it: compared and stored as plain words.
+        None => {
+            let (lo, hi) = (m.read_u64(addr).unwrap_or(0), m.read_u64(addr + 8).unwrap_or(0));
+            let equal = lo == rax && hi == rdx;
+            if equal {
+                let _ = m.write_u64(addr, rbx);
+                let _ = m.write_u64(addr + 8, rcx);
+            }
+            (equal, lo, hi)
+        }
+    };
     if equal {
-        let _ = m.write_u64(addr, rbx);
-        let _ = m.write_u64(addr + 8, rcx);
+        m.written(addr, 16);
     } else {
         let _ = m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(lo));
         let _ = m.write_u64(ctx_addr + ctx::x(2) as u64, crate::gpr(hi));
