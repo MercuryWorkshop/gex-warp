@@ -15,6 +15,10 @@ pub mod err {
     pub const ENOATTR: u32 = 93;
 }
 
+/// `ENOATTR`, which Linux has no number for (its extended-attribute calls
+/// say `ENODATA`): the kernel's name for it, past Linux's last.
+pub const K_ENOATTR: Errno = Errno(1093);
+
 /// `(linux, darwin)` for every error number the two spell differently.
 /// 1 to 34 are the same in both, but for 11: Linux's `EAGAIN` is Darwin's
 /// `EDEADLK`.
@@ -78,6 +82,9 @@ const ERRNO: &[(i32, u32)] = &[
 /// Darwin spelling is `EIO`.
 pub fn errno_to_darwin(e: Errno) -> u32 {
     let l = e.0;
+    if e == K_ENOATTR {
+        return err::ENOATTR;
+    }
     if let Some(&(_, d)) = ERRNO.iter().find(|(x, _)| *x == l) {
         return d;
     }
@@ -378,6 +385,50 @@ pub fn rlimit(which: u64) -> Option<u64> {
 
 /// Darwin's `RLIM_INFINITY`: the largest signed value, not all ones.
 pub const RLIM_INFINITY: u64 = i64::MAX as u64;
+
+/// Darwin's `struct statfs` (the 64-bit-inode one `statfs64` fills).
+pub const STATFS: usize = 2168;
+
+/// `MNT_LOCAL | MNT_ROOTFS | MNT_JOURNALED`.
+const MNT_FLAGS: u32 = 0x1000 | 0x4000 | 0x80_0000;
+
+/// A Darwin `struct statfs` for the kernel's (`statfs`'s 120 bytes: the
+/// block size at 8, then the five counts). The one filesystem there is
+/// calls itself APFS, mounted on `/`.
+pub fn statfs(k: &[u8]) -> Vec<u8> {
+    let word = |at: usize| k.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let mut out = vec![0u8; STATFS];
+    out[0..4].copy_from_slice(&(word(8) as u32).to_le_bytes());
+    // f_iosize: the best size for a transfer.
+    out[4..8].copy_from_slice(&(1u32 << 20).to_le_bytes());
+    // f_blocks, f_bfree, f_bavail, f_files, f_ffree.
+    out[8..48].copy_from_slice(&k[16..56]);
+    // f_fsid, f_owner; f_type is APFS's.
+    out[48..52].copy_from_slice(&0x0100_0004u32.to_le_bytes());
+    out[52..56].copy_from_slice(&0x1au32.to_le_bytes());
+    out[60..64].copy_from_slice(&0x1au32.to_le_bytes());
+    out[64..68].copy_from_slice(&MNT_FLAGS.to_le_bytes());
+    out[72..76].copy_from_slice(b"apfs");
+    out[88] = b'/';
+    out[1112..1124].copy_from_slice(b"/dev/disk1s1");
+    out
+}
+
+/// Linux's `siginfo_t` for a child (`waitid`'s) as Darwin's: the signal,
+/// then `si_pid`, `si_uid` and `si_status` packed after `si_code`, where
+/// Linux pads to a pointer first. A status that is a signal is renumbered.
+pub fn siginfo_child(l: &[u8]) -> [u8; 104] {
+    let word = |at: usize| u32::from_le_bytes(l[at..at + 4].try_into().unwrap());
+    let (signo, code, status) = (word(0), word(8), word(24));
+    // CLD_EXITED is 1; the others (killed, dumped, trapped, stopped,
+    // continued) carry a signal.
+    let status = if code == 1 { status } else { sig_to_darwin(status) };
+    let mut d = [0u8; 104];
+    for (at, v) in [(0, sig_to_darwin(signo)), (4, word(4)), (8, code), (12, word(16)), (16, word(20)), (20, status)] {
+        d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    d
+}
 
 #[cfg(test)]
 mod tests {

@@ -1966,8 +1966,12 @@ impl FdIo<'_> {
     /// the payload, with the whole header aligned to a pointer: 16 bytes,
     /// or 12 for an i386 process. `msghdr`, `iovec` and `mmsghdr` are
     /// pointer-sized fields too ([`Self::msg_word`]).
+    ///
+    /// Darwin's header is the 12-byte one in a 64-bit process too: its
+    /// length is a `socklen_t`, and it is aligned to four bytes
+    /// ([`Self::cmsg_word`]).
     pub(crate) fn cmsg_hdr(&self) -> u64 {
-        if self.compat {
+        if self.cmsg_word() == 4 {
             12
         } else {
             16
@@ -1975,8 +1979,73 @@ impl FdIo<'_> {
     }
 
     pub(crate) fn cmsg_align(&self, n: u64) -> u64 {
-        let a = self.msg_word();
+        let a = self.cmsg_word();
         n.div_ceil(a) * a
+    }
+
+    /// The width of a control message's length, which is what the message
+    /// is aligned to.
+    pub(crate) fn cmsg_word(&self) -> u64 {
+        if self.compat || darwin::on() {
+            4
+        } else {
+            8
+        }
+    }
+
+    fn cmsg_len_rd(&self, m: &GuestMem<'_>, at: u64) -> Result<u64, Errno> {
+        if self.cmsg_word() == 4 {
+            Ok(m.read_u32(at)? as u64)
+        } else {
+            m.read_u64(at)
+        }
+    }
+
+    fn cmsg_len_wr(&self, m: &mut GuestMem<'_>, at: u64, v: u64) -> Result<(), Errno> {
+        if self.cmsg_word() == 4 {
+            m.write_u32(at, v as u32)
+        } else {
+            m.write_u64(at, v)
+        }
+    }
+
+    /// `SOL_SOCKET`, as a control message's level names it.
+    fn cmsg_sol_socket(&self) -> u32 {
+        if darwin::on() {
+            0xffff
+        } else {
+            1
+        }
+    }
+
+    /// A `struct msghdr`'s `msg_iovlen` (`i` 3) or `msg_controllen` (5):
+    /// pointer-sized words, but for Darwin, whose are 32-bit fields where
+    /// those words begin.
+    pub(crate) fn msg_len_rd(&self, m: &GuestMem<'_>, msg: u64, i: u64) -> Result<u64, Errno> {
+        if darwin::on() {
+            Ok(m.read_u32(msg + 8 * i)? as u64)
+        } else {
+            self.msg_rd(m, msg, i)
+        }
+    }
+
+    pub(crate) fn msg_len_wr(&self, m: &mut GuestMem<'_>, msg: u64, i: u64, v: u64) -> Result<(), Errno> {
+        if darwin::on() {
+            m.write_u32(msg + 8 * i, v as u32)
+        } else {
+            self.msg_wr(m, msg, i, v)
+        }
+    }
+
+    /// Where a `struct msghdr`'s `msg_flags` is.
+    pub(crate) fn msg_flags_at(&self, msg: u64) -> u64 {
+        msg + if self.compat {
+            24
+        } else if darwin::on() {
+            44
+        } else {
+            48
+        }
     }
 
     /// The pointer and `size_t` width of the message structures.
@@ -2016,19 +2085,19 @@ impl FdIo<'_> {
         control: u64,
         len: u64,
     ) -> Result<Vec<Arc<OpenFile>>, Errno> {
-        const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
-        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
+        let sol_socket = self.cmsg_sol_socket();
+        let (hdr, w) = (self.cmsg_hdr(), self.cmsg_word());
         let mut out = Vec::new();
         let mut at = 0u64;
         while at + hdr <= len {
-            let cmsg_len = self.msg_rd(m, control + at, 0)?;
+            let cmsg_len = self.cmsg_len_rd(m, control + at)?;
             if cmsg_len < hdr || at + cmsg_len > len {
                 break;
             }
             let level = m.read_u32(control + at + w)?;
             let ty = m.read_u32(control + at + w + 4)?;
-            if level == SOL_SOCKET && ty == SCM_RIGHTS {
+            if level == sol_socket && ty == SCM_RIGHTS {
                 let n = (cmsg_len - hdr) / 4;
                 for i in 0..n.min(253) {
                     let fd = m.read_u32(control + at + hdr + i * 4)? as i32;
@@ -2052,19 +2121,18 @@ impl FdIo<'_> {
         len: u64,
         files: Vec<Arc<OpenFile>>,
     ) -> Result<u64, Errno> {
-        const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
         if files.is_empty() || control == 0 {
             return Ok(0);
         }
-        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
+        let (hdr, w) = (self.cmsg_hdr(), self.cmsg_word());
         let payload = files.len() as u64 * 4;
         let cmsg_len = hdr + payload;
         if cmsg_len > len {
             return Ok(0);
         }
-        self.msg_wr(m, control, 0, cmsg_len)?;
-        m.write_u32(control + w, SOL_SOCKET)?;
+        self.cmsg_len_wr(m, control, cmsg_len)?;
+        m.write_u32(control + w, self.cmsg_sol_socket())?;
         m.write_u32(control + w + 4, SCM_RIGHTS)?;
         for (i, f) in files.into_iter().enumerate() {
             let fd = self.fds.insert(f, false)?;
@@ -2082,14 +2150,14 @@ impl FdIo<'_> {
     fn write_scm_creds(&self, m: &mut GuestMem<'_>, control: u64, len: u64, peer: Option<unix::Cred>) -> Result<u64, Errno> {
         const SOL_SOCKET: u32 = 1;
         const SCM_CREDENTIALS: u32 = 2;
-        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
+        let (hdr, w) = (self.cmsg_hdr(), self.cmsg_word());
         let cmsg_len = hdr + 12;
         let used = self.cmsg_align(cmsg_len);
         if control == 0 || used > len {
             return Ok(0);
         }
         let c = peer.unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534 });
-        self.msg_wr(m, control, 0, cmsg_len)?;
+        self.cmsg_len_wr(m, control, cmsg_len)?;
         m.write_u32(control + w, SOL_SOCKET)?;
         m.write_u32(control + w + 4, SCM_CREDENTIALS)?;
         m.write_u32(control + hdr, c.pid as u32)?;
@@ -2116,7 +2184,7 @@ impl FdIo<'_> {
                 None
             };
             let iov = self.msg_rd(m, msg, 2)?;
-            let iovlen = self.msg_rd(m, msg, 3)?;
+            let iovlen = self.msg_len_rd(m, msg, 3)?;
             let mut data = Vec::new();
             for i in 0..iovlen.min(1024) {
                 let base = self.msg_rd(m, iov, 2 * i)?;
@@ -2136,7 +2204,7 @@ impl FdIo<'_> {
             }
         }
         let iov = self.msg_rd(m, msg, 2)?;
-        let iovlen = self.msg_rd(m, msg, 3)?;
+        let iovlen = self.msg_len_rd(m, msg, 3)?;
         let mut data = Vec::new();
         for i in 0..iovlen.min(1024) {
             let base = self.msg_rd(m, iov, 2 * i)?;
@@ -2149,7 +2217,7 @@ impl FdIo<'_> {
         // on the socket rather than passed down, so the send attaches them to
         // the first byte it writes and a send that fails attaches nothing.
         let control = self.msg_rd(m, msg, 4)?;
-        let controllen = self.msg_rd(m, msg, 5)?;
+        let controllen = self.msg_len_rd(m, msg, 5)?;
         if control != 0 && controllen >= self.cmsg_hdr() {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
@@ -2215,9 +2283,10 @@ impl FdIo<'_> {
                 }
             }
         }
-        self.msg_wr(m, msg, 5, 0)?;
-        const MSG_TRUNC: u32 = 0x20;
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, if whole > n { MSG_TRUNC } else { 0 })?;
+        self.msg_len_wr(m, msg, 5, 0)?;
+        // Darwin's MSG_TRUNC is another bit.
+        let msg_trunc: u32 = if darwin::on() { 0x10 } else { 0x20 };
+        m.write_u32(self.msg_flags_at(msg), if whole > n { msg_trunc } else { 0 })?;
         Ok(n as u64)
     }
 
@@ -2272,8 +2341,8 @@ impl FdIo<'_> {
         }
         let creds = if sock.passcred() { self.write_scm_creds(m, control, controllen, sock.peer_cred())? } else { 0 };
         let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files)?;
-        self.msg_wr(m, msg, 5, written)?;
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
+        self.msg_len_wr(m, msg, 5, written)?;
+        m.write_u32(self.msg_flags_at(msg), 0)?;
         Ok(n)
     }
 
@@ -2294,9 +2363,9 @@ impl FdIo<'_> {
     pub fn recvmsg(&self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Kernel::MSG_PEEK != 0;
         let iov = self.msg_rd(m, msg, 2)?;
-        let iovlen = self.msg_rd(m, msg, 3)?;
+        let iovlen = self.msg_len_rd(m, msg, 3)?;
         let control = self.msg_rd(m, msg, 4)?;
-        let controllen = self.msg_rd(m, msg, 5)?;
+        let controllen = self.msg_len_rd(m, msg, 5)?;
         // How many descriptors the caller left room for: the rest of a
         // write's are closed (`MSG_CTRUNC`).
         let room = if control != 0 && controllen >= self.cmsg_hdr() {
@@ -2387,12 +2456,12 @@ impl FdIo<'_> {
             _ => 0,
         };
         let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, received)?;
-        self.msg_wr(m, msg, 5, written)?;
+        self.msg_len_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
         // of room.
-        const MSG_CTRUNC: u32 = 0x8;
-        let flags = if cut || (given && written == 0) { MSG_CTRUNC } else { 0 };
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, flags)?;
+        let msg_ctrunc: u32 = if darwin::on() { 0x20 } else { 0x8 };
+        let flags = if cut || (given && written == 0) { msg_ctrunc } else { 0 };
+        m.write_u32(self.msg_flags_at(msg), flags)?;
         Ok(total)
     }
 
@@ -5082,6 +5151,10 @@ impl NetIo<'_> {
             }
             return Ok(0);
         }
+        // One already in the global kernel has its name, or its peer.
+        if io.remote_unix_of(fd).is_ok() {
+            return Err(Errno::EINVAL);
+        }
         let sock = io.unix_of(fd)?;
         let path = Kernel::sockaddr_un(m, addr, len)?;
         // A filesystem socket resolves against the guest's root the way any
@@ -5168,7 +5241,12 @@ impl NetIo<'_> {
         if let Ok(r) = self.host_names.connect(&sock, &name) {
             return Ok(r);
         }
-        self.socket_names.connect(&sock, &name)
+        match self.socket_names.connect(&sock, &name) {
+            // Nobody listening on a name is a refusal; no such name at all
+            // is no such file.
+            Err(Errno::ECONNREFUSED) if !path.starts_with('\0') && matches!(io.ns.metadata(&path), Err(Errno::ENOENT)) => Err(Errno::ENOENT),
+            r => r,
+        }
     }
 }
 
@@ -5301,9 +5379,16 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
     // The read and the sender address it set, as one (`recv_turn`).
     let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };
     let _turn = inet.as_ref().map(|s| s.recv_turn());
+    let peek = flags & Kernel::MSG_PEEK != 0;
     let n = match io.socket_of(fd) {
-        Ok(sock) if flags & Kernel::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
-        _ => io.fds.get(fd)?.read(&mut tmp)?,
+        Ok(sock) if peek => sock.peek(&mut tmp)?,
+        // A unix stream's bytes stay queued for a peek, as `recvmsg`'s do.
+        // (So do those of one in the global kernel.)
+        _ => match (io.unix_of(fd), io.remote_unix_of(fd)) {
+            (Ok(sock), _) if peek => sock.recv_msg(&mut tmp, 0, true)?.0,
+            (_, Ok(sock)) if peek => sock.recv_described(&mut tmp, 0, true, io.pid)?.0,
+            _ => io.fds.get(fd)?.read(&mut tmp)?,
+        },
     };
     m.write(buf, &tmp[..n as usize])?;
     if addr != 0 {
@@ -12501,6 +12586,10 @@ impl Kernel {
             let n = raw.len().min(max);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
             let whole = 2 + n + usize::from(!abstract_name);
+            // BSD's begins with its own length, then the family, a byte each.
+            if darwin::on() {
+                buf[..2].copy_from_slice(&[whole as u8, AF_UNIX as u8]);
+            }
             let room = if len_out != 0 { m.read_u32(len_out)? as usize } else { whole };
             m.write(addr, &buf[..whole.min(room)])?;
         }
@@ -12566,6 +12655,20 @@ impl Kernel {
     /// `getsockopt`. The only one anybody asks: has the connection come up?
     /// An unnamed `sockaddr_un`: the family alone, two bytes long.
     fn write_sockaddr_unnamed(m: &mut GuestMem<'_>, addr: u64, addrlen: u64) -> SysResult {
+        // Darwin's is a whole `struct sockaddr`: its length (16), the
+        // family, and nothing.
+        if darwin::on() {
+            if addr != 0 {
+                let room = if addrlen != 0 { m.read_u32(addrlen)? as usize } else { 16 };
+                let mut sa = [0u8; 16];
+                sa[..2].copy_from_slice(&[16, 1]);
+                m.write(addr, &sa[..room.min(16)])?;
+                if addrlen != 0 {
+                    m.write_u32(addrlen, 16)?;
+                }
+            }
+            return Ok(0);
+        }
         if addr != 0 {
             let room = if addrlen != 0 { m.read_u32(addrlen)? } else { 2 };
             if room >= 2 {

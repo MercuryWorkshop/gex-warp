@@ -20,9 +20,12 @@
 
 pub mod abi;
 mod bsd;
+pub mod info;
 mod mach;
 pub mod nr;
+mod sock;
 pub mod thread;
+pub mod tty;
 
 use super::*;
 
@@ -114,6 +117,19 @@ pub enum Post {
     Unlink,
     /// A Mach trap that waited: its answer as a `kern_return_t`.
     Kern { timed_out: u32 },
+    /// `getsockopt(SO_ERROR)`: the error at `at` is one of Linux's.
+    SoError { at: u64 },
+    /// `statfs64`, once the file is known to be there: Darwin's structure
+    /// at `at`.
+    Statfs { at: u64 },
+    /// An extended-attribute call: no such attribute is `ENOATTR`.
+    Xattr,
+    /// `waitid`: the kernel's `siginfo_t` at `at` as Darwin's, which is
+    /// shorter; `was` is what the caller had there, and past it.
+    Waitid { at: u64, was: [u64; 16] },
+    /// `sigwait`: the signal that came, by Darwin's number, at `at`; the
+    /// call answers zero.
+    Sigwait { at: u64 },
 }
 
 /// The call's class.
@@ -289,6 +305,46 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             Err(Errno::EISDIR) => Err(Errno::EPERM),
             r => r,
         },
+        Post::SoError { at } => {
+            if r.is_ok() {
+                if let Ok(e @ 1..) = m.read_u32(at) {
+                    let _ = m.write_u32(at, abi::errno_to_darwin(Errno(e as i32)));
+                }
+            }
+            r
+        }
+        Post::Statfs { at } => {
+            if r.is_ok() {
+                crate::syscalls::statfs(m, false, at)?;
+                let k = m.read(at, 120)?.to_vec();
+                m.write(at, &abi::statfs(&k))?;
+            }
+            r.map(|_| 0)
+        }
+        Post::Xattr => match r {
+            Err(Errno::ENODATA) => Err(abi::K_ENOATTR),
+            r => r,
+        },
+        Post::Waitid { at, was } => {
+            if at != 0 {
+                let l = m.read(at, 128)?.to_vec();
+                for (i, w) in was.iter().enumerate() {
+                    let _ = m.write_u64(at + 8 * i as u64, *w);
+                }
+                // With nobody to report (WNOHANG), the kernel's is zeroes
+                // and XNU leaves the caller's as it was.
+                if r.is_ok() && l[..4] != [0; 4] {
+                    m.write(at, &abi::siginfo_child(&l))?;
+                }
+            }
+            r.map(|_| 0)
+        }
+        Post::Sigwait { at } => r.and_then(|signo| {
+            if at != 0 {
+                m.write_u32(at, abi::sig_to_darwin(signo as u32))?;
+            }
+            Ok(0)
+        }),
         Post::Kern { timed_out } => Ok(match r {
             Ok(_) => mach::KERN_SUCCESS,
             Err(Errno::ETIMEDOUT) => timed_out as u64,

@@ -70,6 +70,9 @@ impl Kernel {
     /// with `a` its arguments. A call with no canonical form is
     /// `NATIVE + code` ([`Kernel::darwin_native`]).
     pub(super) fn darwin_bsd(&mut self, m: &mut GuestMem<'_>, code: u64, x: [u64; 8], a: &mut [u64; 6]) -> u64 {
+        if let Some(n) = self.darwin_socket_call(m, code, x, a) {
+            return n;
+        }
         let mut set = |n: u64, args: &[u64]| {
             *a = [0; 6];
             a[..args.len()].copy_from_slice(args);
@@ -93,6 +96,9 @@ impl Kernel {
             // (`oflags::from_guest`).
             d::OPEN | d::OPEN_NOCANCEL => set(nr::OPENAT, &[CWD, x[0], x[1], x[2]]),
             d::OPENAT | d::OPENAT_NOCANCEL => set(nr::OPENAT, &[dirfd(x[0]), x[1], x[2], x[3]]),
+            // (path, flags, protection class, protection flags, mode):
+            // files are protected no differently here.
+            d::OPEN_DPROTECTED_NP => set(nr::OPENAT, &[CWD, x[0], x[1], x[4]]),
             d::CLOSE | d::CLOSE_NOCANCEL => set(nr::CLOSE, &x[..1]),
             d::WAIT4 | d::WAIT4_NOCANCEL => {
                 // WNOHANG and WUNTRACED are 1 and 2 in both; WCONTINUED is
@@ -116,6 +122,56 @@ impl Kernel {
             d::MKDIRAT => set(nr::MKDIRAT, &[dirfd(x[0]), x[1], x[2]]),
             d::RENAME => set(nr::RENAMEAT, &[CWD, x[0], CWD, x[1]]),
             d::RENAMEAT => set(nr::RENAMEAT, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3]]),
+            // RENAME_SWAP (2) and RENAME_EXCL (4) are the kernel's
+            // RENAME_EXCHANGE and RENAME_NOREPLACE.
+            d::RENAMEATX_NP if x[4] & !6 == 0 => {
+                let flags = (x[4] & 2) | (x[4] & 4) >> 2;
+                set(nr::RENAMEAT2, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3], flags])
+            }
+            // A file's flags (`chflags`) are not kept; the file must exist.
+            d::CHFLAGS => set(nr::FACCESSAT, &[CWD, x[0], 0]),
+            d::FCHFLAGS => set(nr::FCNTL, &[x[0], 1]),
+            // The kernel's answer is one for every file, there or not: the
+            // call is one that says whether the file is, and the answer is
+            // written when it has ([`Post::Statfs`]).
+            d::STATFS64 => {
+                self.darwin_post = Post::Statfs { at: x[1] };
+                set(nr::FACCESSAT, &[CWD, x[0], 0])
+            }
+            d::FSTATFS64 => {
+                self.darwin_post = Post::Statfs { at: x[1] };
+                set(nr::FCNTL, &[x[0], 1])
+            }
+            // Darwin's calls carry a position (for a resource fork, which
+            // nothing here has) and options: XATTR_NOFOLLOW (1), and for a
+            // set XATTR_CREATE (2) and XATTR_REPLACE (4), the kernel's 1
+            // and 2.
+            d::GETXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(if x[5] & 1 != 0 { nr::LGETXATTR } else { nr::GETXATTR }, &x[..4])
+            }
+            d::FGETXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(nr::FGETXATTR, &x[..4])
+            }
+            d::SETXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(if x[5] & 1 != 0 { nr::LSETXATTR } else { nr::SETXATTR }, &[x[0], x[1], x[2], x[3], (x[5] >> 1) & 3])
+            }
+            d::FSETXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(nr::FSETXATTR, &[x[0], x[1], x[2], x[3], (x[5] >> 1) & 3])
+            }
+            d::LISTXATTR => set(if x[3] & 1 != 0 { nr::LLISTXATTR } else { nr::LISTXATTR }, &x[..3]),
+            d::FLISTXATTR => set(nr::FLISTXATTR, &x[..3]),
+            d::REMOVEXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(if x[2] & 1 != 0 { nr::LREMOVEXATTR } else { nr::REMOVEXATTR }, &x[..2])
+            }
+            d::FREMOVEXATTR => {
+                self.darwin_post = Post::Xattr;
+                set(nr::FREMOVEXATTR, &x[..2])
+            }
             d::SYMLINK => set(nr::SYMLINKAT, &[x[0], CWD, x[1]]),
             d::SYMLINKAT => set(nr::SYMLINKAT, &[x[0], dirfd(x[1]), x[2]]),
             d::READLINK => set(nr::READLINKAT, &[CWD, x[0], x[1], x[2]]),
@@ -188,6 +244,41 @@ impl Kernel {
             },
             // `sigsuspend`'s mask is an argument, not a pointer: the
             // kernel's 64-bit one goes in the scratch.
+            // (idtype, id, siginfo, options). The kernel's `siginfo_t` is
+            // longer than Darwin's: what lies past the caller's is kept.
+            // WNOHANG and WEXITED are the same bits; WUNTRACED (2) and
+            // WSTOPPED (8) are the kernel's WSTOPPED (2), WCONTINUED (0x10)
+            // its 8, WNOWAIT (0x20) its 0x1000000.
+            d::WAITID | d::WAITID_NOCANCEL => {
+                let mut was = [0u64; 16];
+                if x[2] != 0 {
+                    for (i, w) in was.iter_mut().enumerate() {
+                        *w = m.read_u64(x[2] + 8 * i as u64).unwrap_or(0);
+                    }
+                }
+                self.darwin_post = Post::Waitid { at: x[2], was };
+                let o = x[3];
+                let options = (o & 5) | if o & 0xa != 0 { 2 } else { 0 } | (o & 0x10) >> 1 | if o & 0x20 != 0 { 0x100_0000 } else { 0 };
+                set(nr::WAITID, &[x[0], x[1], x[2], options, 0])
+            }
+            // (set, signal): wait for one of a set, which is given by
+            // number through the second.
+            d::SIGWAIT | d::SIGWAIT_NOCANCEL => {
+                let at = self.ctx_addr + SCRATCH_SLOT as u64;
+                match m.read_u32(x[0]) {
+                    Ok(set32) => {
+                        let _ = m.write_u64(at, abi::sigset_to_linux(set32));
+                        self.darwin_post = Post::Sigwait { at: x[1] };
+                        set(nr::RT_SIGTIMEDWAIT, &[at, 0, 0, 8])
+                    }
+                    Err(_) => NATIVE + d::SIGWAIT,
+                }
+            }
+            // `abort`'s last step, and the same asked of another process:
+            // the signal, with a reason nobody is here to read.
+            d::ABORT_WITH_PAYLOAD => set(nr::KILL, &[self.pid as u64, signal::sig::SIGABRT as u64]),
+            d::TERMINATE_WITH_PAYLOAD => set(nr::KILL, &[x[0] as i32 as i64 as u64, signal::sig::SIGKILL as u64]),
+            d::MINHERIT => set(nr::NOOP_OK, &[]),
             d::SIGSUSPEND | d::SIGSUSPEND_NOCANCEL => {
                 let at = self.ctx_addr + SCRATCH_SLOT as u64;
                 let _ = m.write_u64(at, abi::sigset_to_linux(x[0] as u32));
@@ -303,6 +394,47 @@ impl Kernel {
         match code {
             // A signal number Darwin does not have.
             d::KILL => Err(Errno::EINVAL),
+            d::SIGWAIT => Err(Errno::EFAULT),
+            d::SYSCTL => self.darwin_sysctl(m, x),
+            d::SYSCTLBYNAME => self.darwin_sysctlbyname(m, x),
+            d::CSOPS | d::CSOPS_AUDITTOKEN => self.darwin_csops(m, x),
+            d::PROC_INFO => self.darwin_proc_info(m, x),
+            d::IOCTL => self.darwin_ioctl(m, x[0] as i32, x[1], x[2]),
+            // Not a socket.
+            d::SHUTDOWN => Err(Errno::ENOTSOCK),
+            d::SETSOCKOPT => self.darwin_sockopt(m, false, x),
+            d::GETSOCKOPT => self.darwin_sockopt(m, true, x),
+            d::GETFSSTAT64 | d::GETFSSTAT => self.darwin_getfsstat(m, x[0], x[1]),
+            d::PATHCONF => self.darwin_pathconf(x[1]),
+            d::FPATHCONF => self.fds.get(x[0] as i32).and_then(|_| self.darwin_pathconf(x[1])),
+            // Trace points, which nothing collects.
+            d::KDEBUG_TRACE | d::KDEBUG_TRACE64 | d::KDEBUG_TRACE_STRING | d::KDEBUG_TYPEFILTER => Ok(0),
+            // PT_DENY_ATTACH: there is no debugger to deny.
+            d::PTRACE if x[0] == 31 => Ok(0),
+            // The name the session was logged in under.
+            d::GETLOGIN => {
+                let mut name = if self.creds.ruid() == 0 { "root" } else { "user" }.as_bytes().to_vec();
+                name.push(0);
+                if (x[1] as usize) < name.len() {
+                    return Err(Errno::ERANGE);
+                }
+                m.write(x[0], &name)?;
+                Ok(0)
+            }
+            // The machine's identifier: one every gex machine has.
+            d::GETHOSTUUID => {
+                m.write(x[0], b"gex\0\0\0\0\0\0\0\0\0\0\0\0\x01")?;
+                Ok(0)
+            }
+            // The calling thread's own user and group, when it has taken
+            // on another's: none has.
+            d::GETTID => Err(Errno::ESRCH),
+            // Whether the thread has been cancelled (it has not), and its
+            // cancellation switched on or off.
+            d::PTHREAD_CANCELED => if x[0] == 0 { Err(Errno::EINVAL) } else { Ok(0) },
+            // No copy-on-write clones: the caller copies.
+            d::CLONEFILEAT | d::RENAMEATX_NP => Err(Errno::EOPNOTSUPP),
+            d::FSCTL | d::FFSCTL => Err(Errno::ENOTTY),
             // A port that is no thread's.
             d::PTHREAD_KILL => Err(Errno::ESRCH),
             d::BSDTHREAD_REGISTER => self.darwin_bsdthread_register(m, x),
@@ -364,6 +496,43 @@ impl Kernel {
                 Err(Errno::ENOSYS)
             }
         }
+    }
+
+    /// `getfsstat`: the mounted filesystems, of which there is one. No
+    /// buffer asks how many.
+    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> SysResult {
+        if buf == 0 {
+            return Ok(1);
+        }
+        if (size as usize) < abi::STATFS {
+            return Ok(0);
+        }
+        // The kernel's answer is the same for every file: asked of the
+        // caller's buffer, and respelled there.
+        crate::syscalls::statfs(m, false, buf)?;
+        let k = m.read(buf, 120)?.to_vec();
+        m.write(buf, &abi::statfs(&k))?;
+        Ok(1)
+    }
+
+    /// `pathconf` and `fpathconf`: a limit of the filesystem, by Darwin's
+    /// numbers (`<sys/unistd.h>`).
+    fn darwin_pathconf(&mut self, name: u64) -> SysResult {
+        Ok(match name {
+            1 => 32767,       // _PC_LINK_MAX
+            2 | 3 => 1024,    // _PC_MAX_CANON, _PC_MAX_INPUT
+            4 => 255,         // _PC_NAME_MAX
+            5 => 1024,        // _PC_PATH_MAX
+            6 => 512,         // _PC_PIPE_BUF
+            7 | 8 => 200112,  // _PC_CHOWN_RESTRICTED, _PC_NO_TRUNC
+            9 => 255,         // _PC_VDISABLE
+            11 | 12 => 1,     // _PC_CASE_SENSITIVE, _PC_CASE_PRESERVING
+            18 => 64,         // _PC_FILESIZEBITS
+            24 => 1024,       // _PC_SYMLINK_MAX
+            26 => 64,         // _PC_XATTR_SIZE_BITS
+            27 => 8,          // _PC_MIN_HOLE_SIZE: not reported
+            _ => return Err(Errno::EINVAL),
+        })
     }
 
     /// `mmap`. A mapping the caller does not place is placed on Darwin's

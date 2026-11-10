@@ -2173,7 +2173,9 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Result<(u32, u16), Errno> {
     if bytes.len() < 8 {
         return Err(Errno::EINVAL);
     }
-    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+    // BSD's `sockaddr` begins with its own length, then the family, a byte
+    // each.
+    let family = if crate::darwin::on() { bytes[1] as u16 } else { u16::from_le_bytes([bytes[0], bytes[1]]) };
     if family != 2 {
         return Err(Errno::EAFNOSUPPORT);
     }
@@ -2185,7 +2187,7 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Result<(u32, u16), Errno> {
 /// Write a `sockaddr_in`.
 pub fn build_sockaddr(addr: u32, port: u16) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[0..2].copy_from_slice(&2u16.to_le_bytes());
+    out[0..2].copy_from_slice(&if crate::darwin::on() { [16, 2] } else { 2u16.to_le_bytes() });
     out[2..4].copy_from_slice(&port.to_be_bytes());
     out[4..8].copy_from_slice(&addr.to_be_bytes());
     out
