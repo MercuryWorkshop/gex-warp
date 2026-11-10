@@ -167,6 +167,7 @@ const rest = [];
       if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
       const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
       const wholeRoot = guestRoot.replace(/\/$/, '') === '';
+      const rootReal = resolve(hostRoot);
       const walk = (guest, host) => {
         // Unreadable directories are ordinary in a rootfs (mode 0700, root),
         // and one must not take the whole run down.
@@ -200,9 +201,13 @@ const rest = [];
           // `/private/var/select/sh -> /bin/bash` became the host's own
           // shell), or found none and dropped the link. (A directory mounted
           // somewhere else may link to this machine's files on purpose.)
+          // And a link to a name inside the root stays the link it is too:
+          // followed, it was a second file with the first's bytes, where
+          // the root has one file under two names (a library and the name
+          // it is linked by, which a dynamic linker must know for one).
           try {
             const target = wholeRoot && lstatSync(h).isSymbolicLink() ? readlinkSync(h) : '';
-            if (target.startsWith('/')) {
+            if (target.startsWith('/') || (target && `${resolve(host, target)}/`.startsWith(`${rootReal}/`))) {
               symlinks[g] = target;
               continue;
             }
