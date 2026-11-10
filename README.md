@@ -36,15 +36,15 @@ for debugging and for building what a page loads ahead of time.
 - **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
-- **macOS programs for arm64 and x86-64, the static ones so far.** A Mach-O
-  executable enters the same kernel as it would enter XNU (`svc #0x80` or
-  `syscall`, BSD calls and Mach traps, the carry flag for an error), and
-  the kernel answers in
+- **macOS programs for arm64 and x86-64.** A Mach-O executable enters the
+  same kernel as it would enter XNU (`svc #0x80` or `syscall`, BSD calls
+  and Mach traps, the carry flag for an error), and the kernel answers in
   Darwin's numbers and layouts: files, processes, signals through XNU's
-  frame, threads as libpthread asks for them, `sysctl`, terminals, sockets.
-  What is not there yet is what a dynamically linked program starts with:
-  dyld and libSystem need the commpage and more of Mach than there is
-  (below).
+  frame, threads as libpthread asks for them, `sysctl`, terminals, sockets,
+  Mach ports. What a program finds above the kernel -- the dynamic linker,
+  libSystem, the frameworks -- is [pyrus](https://github.com/MercuryWorkshop/pyrus),
+  which is at its beginning: a program built the ordinary way runs if it
+  prints and exits.
 - **Windows programs, through Wine.** `wine` builds Wine's own
   Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
   itself is translated like any other x86 code. The build is 64-bit Wine
@@ -202,10 +202,13 @@ the image low. What works is what a program can do with the kernel alone:
 
 What does not, yet:
 
-- **dyld and libSystem**, and so any program built the ordinary way. They
-  read the commpage, which XNU maps at `0xFFFFFC000`, past the end of any
-  WebAssembly memory, and the system's libraries exist only in the dyld
-  shared cache, which is mapped at 6 GiB.
+- **Apple's own dyld and libSystem.** A dynamically linked program is
+  loaded, slid into the guest's memory, and entered through the dynamic
+  linker its root has at `/usr/lib/dyld` (`gexc run --sysroot ROOT`): pyrus
+  builds such a root, with a linker and a libSystem of its own for now.
+  Apple's read the commpage, which XNU maps at `0xFFFFFC000`, past the end
+  of any WebAssembly memory, and a Mac's own libraries exist only in the
+  dyld shared cache, which is mapped at 6 GiB.
 - **Mach between tasks.** A port's queue lives in its own process, so no
   right crosses a `fork` or reaches another program: no bootstrap port, no
   launchd, no XPC. Within a task, messages carry ports but not memory out
