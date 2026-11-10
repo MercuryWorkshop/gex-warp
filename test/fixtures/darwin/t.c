@@ -21,7 +21,10 @@ __asm__(
     ".text\n.globl _t_syscall\n_t_syscall:\n"
     "  movq %rdi, %rax\n  orq $0x2000000, %rax\n  movq %rsi, %rdi\n  movq %rdx, %rsi\n"
     "  movq %rcx, %rdx\n  movq %r8, %r10\n  movq %r9, %r8\n  movq 8(%rsp), %r9\n"
-    "  syscall\n  jnc 1f\n  negq %rax\n1: ret\n"
+    // The seventh and eighth are read from the stack, past where a stub's
+    // return address would be.
+    "  pushq 24(%rsp)\n  pushq 24(%rsp)\n  pushq $0\n"
+    "  syscall\n  leaq 24(%rsp), %rsp\n  jnc 1f\n  negq %rax\n1: ret\n"
     ".globl _t_syscall2\n_t_syscall2:\n"
     "  movq %rdi, %r11\n  pushq %r11\n  movq %rsi, %rax\n  orq $0x2000000, %rax\n  movq %rdx, %rdi\n"
     "  movq %rcx, %rsi\n  movq %r8, %rdx\n  syscall\n  popq %r11\n  movq %rdx, (%r11)\n"

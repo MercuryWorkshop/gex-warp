@@ -18,6 +18,15 @@ pub mod err {
 /// `ENOATTR`, which Linux has no number for (its extended-attribute calls
 /// say `ENODATA`): the kernel's name for it, past Linux's last.
 pub const K_ENOATTR: Errno = Errno(1093);
+/// Where the error numbers begin that are Darwin's already ([`errno_raw`]).
+const K_RAW: i32 = 2048;
+
+/// An answer that is a Darwin error number with more in it than the number
+/// (`psynch_cvwait`'s, which carries two bits above its error): it reaches
+/// the caller as it is.
+pub fn errno_raw(darwin: u32) -> Errno {
+    Errno(K_RAW + (darwin & 0x7ff) as i32)
+}
 
 /// `(linux, darwin)` for every error number the two spell differently.
 /// 1 to 34 are the same in both, but for 11: Linux's `EAGAIN` is Darwin's
@@ -82,6 +91,9 @@ const ERRNO: &[(i32, u32)] = &[
 /// Darwin spelling is `EIO`.
 pub fn errno_to_darwin(e: Errno) -> u32 {
     let l = e.0;
+    if (K_RAW..K_RAW + 2048).contains(&l) {
+        return (l - K_RAW) as u32;
+    }
     if e == K_ENOATTR {
         return err::ENOATTR;
     }

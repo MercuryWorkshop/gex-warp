@@ -258,6 +258,52 @@ static void kernel_ports(void) {
 #endif
     t_printf("  reply %d, %u bytes, bits %x: code %d, %s\n", m.h.id, m.h.size, m.h.bits, m.body[2], page_ok ? "a page's size" : "something else");
 
+    // host_info(host, flavor, out info, in-out count): what libpthread
+    // asks of the scheduler's priorities as it starts, and what a program
+    // asks of the machine.
+    static const struct {
+        const char *what;
+        u32 flavor, room;
+    } infos[] = {
+        {"its priorities", 5, 8}, {"them, with too little room", 5, 3}, {"them, with more than enough", 5, 64},
+        {"the machine", 1, 12},   {"the machine as it was once told", 1, 5}, {"it, with too little room", 1, 4},
+        {"its scheduler", 3, 2},  {"its preferred architecture", 12, 2},    {"whether it has the message trap", 8, 0},
+        {"a flavor there is none of", 99, 16},
+    };
+    for (unsigned i = 0; i < sizeof infos / sizeof *infos; i++) {
+        t_memset(&m, 0, sizeof m);
+        m.h.id = 200;
+        m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = infos[i].flavor, m.body[3] = infos[i].room;
+        t_printf("ask the host %s", infos[i].what);
+        long r = rpc(&m, host, sizeof m.h + 16);
+        t_printf(": %ld, reply %d, %u bytes, code %d", r, m.h.id, m.h.size, m.body[2]);
+        u32 *w = &m.body[4];
+        if (m.body[2] != 0) {
+            t_printf("\n");
+            continue;
+        }
+        t_printf(", %u words\n", m.body[3]);
+        if (infos[i].flavor == 5) {
+            t_printf(" ");
+            for (u32 k = 0; k < m.body[3]; k++) t_printf(" %u", w[k]);
+            t_printf("\n");
+        } else if (infos[i].flavor == 1) {
+            // The processors and the memory are the machine's own.
+            int ok = w[0] >= 1 && w[1] >= 1 && w[1] <= w[0] && w[2] > 0;
+            if (m.body[3] == 12) ok = ok && w[6] >= 1 && w[9] >= w[6] && (w[10] | w[11]) != 0;
+#if defined(__arm64__)
+            t_printf("  a processor of type %x, %u: %s\n", w[3], w[4], ok ? "some processors and memory" : "nothing");
+#else
+            // (Rosetta says the subtype it is itself.)
+            t_printf("  a processor of type %x: %s\n", w[3], ok ? "some processors and memory" : "nothing");
+#endif
+        } else if (infos[i].flavor == 3) {
+            t_printf("  %u %u\n", w[0], w[1]);
+        } else if (infos[i].flavor == 12) {
+            t_printf("  type %x\n", w[0]);
+        }
+    }
+
     // A routine no port has.
     t_memset(&m, 0, sizeof m);
     m.h.id = 9999;

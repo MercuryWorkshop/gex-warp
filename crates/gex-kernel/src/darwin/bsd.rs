@@ -420,6 +420,20 @@ impl Kernel {
             d::ULOCK_WAIT => return self.darwin_ulock_wait(m, x, false, a),
             d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
             d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
+            d::PSYNCH_MUTEXWAIT
+            | d::PSYNCH_MUTEXDROP
+            | d::PSYNCH_CVBROAD
+            | d::PSYNCH_CVSIGNAL
+            | d::PSYNCH_CVWAIT
+            | d::PSYNCH_CVCLRPREPOST
+            | d::PSYNCH_RW_RDLOCK
+            | d::PSYNCH_RW_WRLOCK
+            | d::PSYNCH_RW_UNLOCK
+            | d::PSYNCH_RW_UNLOCK2
+            | d::PSYNCH_RW_LONGRDLOCK
+            | d::PSYNCH_RW_YIELDWRLOCK
+            | d::PSYNCH_RW_UPGRADE
+            | d::PSYNCH_RW_DOWNGRADE => return self.darwin_psynch(m, code, x, a),
             // (thread port, signal): a signal for one thread of this process.
             d::PTHREAD_KILL => match (super::mach::port_thread(self.pid, x[0] as u32), abi::sig_to_linux(x[1] as u32)) {
                 (Some(tid), l) if l != 0 || x[1] == 0 => set(nr::TGKILL, &[self.pid as u64, tid as u64, l as u64]),
@@ -483,6 +497,8 @@ impl Kernel {
             d::BSDTHREAD_REGISTER => self.darwin_bsdthread_register(m, x),
             // An operation `ulock` does not have.
             d::ULOCK_WAIT => Err(Errno::EINVAL),
+            // A psynch call that did not wait: its answer.
+            d::PSYNCH_RW_LONGRDLOCK..=d::PSYNCH_RW_UNLOCK2 | d::PSYNCH_CVCLRPREPOST => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // Quality-of-service requests: there is one class of thread.
             d::BSDTHREAD_CTL => Ok(0),
             // Signals are delivered to whichever thread does not block

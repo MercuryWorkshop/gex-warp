@@ -24,6 +24,7 @@ pub mod info;
 mod mach;
 pub mod nr;
 pub mod port;
+pub mod psynch;
 mod sock;
 pub mod thread;
 pub mod tty;
@@ -152,6 +153,10 @@ pub enum Post {
     Wake { woken: u32, timed_out: u32 },
     /// `__semwait_signal` likewise, whose answers are error numbers.
     SemWait,
+    /// A psynch call that waited ([`psynch`]): finished by the kernel
+    /// ([`Kernel::darwin_psynch_end`]), or, by a host that finishes its
+    /// waits without one, made again.
+    Psynch,
     /// `getsockopt(SO_ERROR)`: the error at `at` is one of Linux's.
     SoError { at: u64 },
     /// `statfs64`, once the file is known to be there: Darwin's structure
@@ -362,6 +367,7 @@ impl Kernel {
     /// Apply what a rewritten call left to do ([`Post`]) to its answer.
     pub(super) fn darwin_finish(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SysResult {
         let post = std::mem::take(&mut self.darwin_post);
+        let r = if post == Post::Psynch { self.darwin_psynch_end(m, r) } else { r };
         finish(m, self.ctx_addr, post, r)
     }
 }
@@ -433,6 +439,9 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             Ok(_) | Err(Errno::EAGAIN) => Err(Errno::EINTR),
             e => e,
         },
+        // (The kernel's answer already, or a host that makes the call
+        // again and does not come here.)
+        Post::Psynch => r,
         Post::SoError { at } => {
             if r.is_ok() {
                 if let Ok(e @ 1..) = m.read_u32(at) {

@@ -258,6 +258,25 @@ const ABSENT: &[&str] = &[
 ];
 
 /// The top-level number of a name with no fixed one.
+/// The machine, as `sysctl` and the host port both tell of it.
+pub(super) struct Machine {
+    pub cpus: i64,
+    /// Bytes of memory. As `sysinfo` has it.
+    pub mem: i64,
+    /// CPU_TYPE_ARM64 with CPU_SUBTYPE_ARM64E, which every Mac with Apple's
+    /// processor says; or CPU_TYPE_X86 (an Intel Mac says so without the
+    /// 64-bit flag) with CPU_SUBTYPE_X86_64_ALL.
+    pub cputype: i64,
+    pub cpusubtype: i64,
+}
+
+impl Machine {
+    pub fn this() -> Machine {
+        let x86 = gex_abi::X86;
+        Machine { cpus: crate::cpus::count() as i64, mem: 4 << 30, cputype: if x86 { 7 } else { 0x0100_000c }, cpusubtype: if x86 { 3 } else { 2 } }
+    }
+}
+
 fn top_of(name: &str) -> i32 {
     match name.split('.').next() {
         Some("kern") => CTL_KERN,
@@ -300,10 +319,8 @@ impl Kernel {
     fn darwin_sysctl_value(&self, name: &str) -> Option<Val> {
         use Val::*;
         let x86 = gex_abi::X86;
-        let cpus = crate::cpus::count() as i64;
+        let Machine { cpus, mem, cputype, cpusubtype } = Machine::this();
         let page = abi::PAGE_SIZE as i64;
-        // As `sysinfo` has it.
-        let mem: i64 = 4 << 30;
         let nofile = self.rlimits.get()[RLIMIT_NOFILE];
         Some(match name {
             "kern.ostype" => Str("Darwin".into()),
@@ -357,11 +374,9 @@ impl Kernel {
             // An `int`, so no more than it holds.
             "hw.physmem" | "hw.usermem" => Int(mem.min(i32::MAX as i64)),
             "hw.memsize" | "hw.memsize_usable" => Quad(mem),
-            // CPU_TYPE_ARM64 and CPU_SUBTYPE_ARM64_ALL, or CPU_TYPE_X86 (an
-            // Intel Mac says so without the 64-bit flag) and
-            // CPU_SUBTYPE_X86_64_ALL; the family is the M1's, or Skylake's.
-            "hw.cputype" => Int(if x86 { 7 } else { 0x0100_000c }),
-            "hw.cpusubtype" => Int(if x86 { 3 } else { 0 }),
+            // The family is the M1's, or Skylake's.
+            "hw.cputype" => Int(cputype),
+            "hw.cpusubtype" => Int(cpusubtype),
             "hw.cpu64bit_capable" => Int(1),
             "hw.cpufamily" => Int(if x86 { 0x37fc_219f } else { 0x1b58_8bb3 }),
             "hw.cpusubfamily" => Int(if x86 { 0 } else { 2 }),

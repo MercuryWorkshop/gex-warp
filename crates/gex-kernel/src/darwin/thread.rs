@@ -20,6 +20,8 @@ use crate::syscalls::nr;
 const PTHREAD_START_CUSTOM: u64 = 0x0100_0000;
 /// Told to the new thread: its thread pointer is already set.
 const PTHREAD_START_TSD_BASE_SET: u64 = 0x1000_0000;
+/// The slot of a thread's own data that holds its port's name.
+const TSD_MACH_THREAD_SELF: u64 = 3;
 /// Asked and never told: the thread starts suspended.
 const PTHREAD_START_SUSPENDED: u64 = 0x0400_0000;
 
@@ -86,8 +88,8 @@ impl Kernel {
         drop(reg);
         if data != 0 {
             // _pthread_unspecified_priority: no QoS is imposed on the main
-            // thread. No hint for where stacks go; the default mutex policy
-            // (first fit).
+            // thread. No hint for where stacks go; no mutex policy but
+            // libpthread's own (`kern.pthread_mutex_default_policy` is 0).
             if size >= 24 {
                 m.write_u64(data + 16, 0)?;
             }
@@ -95,7 +97,7 @@ impl Kernel {
                 m.write_u64(data + 36, 0)?;
             }
             if size >= 48 {
-                m.write_u32(data + 44, 3)?;
+                m.write_u32(data + 44, 0)?;
             }
         }
         Ok(PTHREAD_FEATURES)
@@ -162,13 +164,18 @@ impl Kernel {
         let req = self.thread_maker(&fs).make(m, self.ctx_addr, [how, stack, 0, 0, 0, 0])?;
         let child = req.ctx_addr;
         let mut flags = flags & !PTHREAD_START_SUSPENDED;
+        let port = super::mach::thread_port(self.pid, req.tid) as u64;
         if reg.tsd_offset != 0 {
+            // Its thread pointer, and in the data that hangs off it the
+            // name of its own port, which libpthread expects to find there
+            // (`__TSD_MACH_THREAD_SELF`).
             flags |= PTHREAD_START_TSD_BASE_SET;
-            m.write_u64(child + ctx::TPIDRRO as u64, pthread + reg.tsd_offset)?;
+            let tsd = pthread + reg.tsd_offset;
+            m.write_u64(child + ctx::TPIDRRO as u64, tsd)?;
+            m.write_u32(tsd + TSD_MACH_THREAD_SELF * 8, port as u32)?;
         } else {
             m.write_u64(child + ctx::TPIDRRO as u64, 0)?;
         }
-        let port = super::mach::thread_port(self.pid, req.tid) as u64;
         // The argument registers: x0-x5, or rdi, rsi, rdx, rcx, r8, r9.
         let regs: [usize; 6] = if gex_abi::X86 { [ctx::x(7), ctx::x(6), ctx::x(2), ctx::x(1), ctx::x(8), ctx::x(9)] } else { [ctx::x(0), ctx::x(1), ctx::x(2), ctx::x(3), ctx::x(4), ctx::x(5)] };
         for (slot, v) in regs.into_iter().zip([pthread, port, func, arg, stack, flags]) {

@@ -7,7 +7,9 @@
 // and Mach's virtual memory traps; the clocks and the calls that wait;
 // signals, delivered through XNU's frame to a handler behind its
 // trampoline; threads, made as libpthread asks for them (on the Mac, by its
-// libpthread), waiting on ulock; what a process asks about itself and its
+// libpthread), waiting on ulock, and on what libpthread's mutexes,
+// conditions and read-write locks ask of the kernel (psynch); what a
+// process asks about itself and its
 // machine (sysctl, csops, proc_info, statfs); the terminal's ioctls, with
 // BSD's termios; sockets, with BSD's sockaddr, msghdr and cmsghdr; and
 // Mach ports within a task: rights, messages, semaphores, and the kernel's
@@ -26,7 +28,7 @@ export default async function (t) {
   await d.compare('files', await d.build('files'));
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
-  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach']) await d.compare(name, await d.build(name), [], { page: true });
+  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch']) await d.compare(name, await d.build(name), [], { page: true });
   // The commpage, where gex puts it and where XNU does.
   await d.compare('commpage', await d.build('commpage'), [], { page: true });
   const sys = await d.build('sys');

@@ -719,6 +719,12 @@ pub struct Kernel {
     pub darwin_ports: Arc<std::sync::Mutex<darwin::port::Space>>,
     /// The answer of a Mach trap that was ready as the call was read.
     pub darwin_ready: Option<u64>,
+    /// The answer of a psynch call that did not wait ([`darwin::psynch`]).
+    pub darwin_answer: Option<SysResult>,
+    /// What the kernel keeps of the task's mutexes, conditions and
+    /// read-write locks ([`darwin::psynch`]), which its threads share and
+    /// a fork does not inherit.
+    pub darwin_psynch: Arc<std::sync::Mutex<darwin::psynch::Psynch>>,
     /// Whether the process's memory has its commpage
     /// ([`darwin::commpage`]): mapped at its first call, and a fork's copy
     /// has its parent's.
@@ -9817,6 +9823,8 @@ impl Kernel {
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
             darwin_ports: Default::default(),
             darwin_ready: None,
+            darwin_answer: None,
+            darwin_psynch: Default::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
             darwin_threads: Default::default(),
@@ -10251,6 +10259,8 @@ impl Kernel {
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
             darwin_ports: Default::default(),
             darwin_ready: None,
+            darwin_answer: None,
+            darwin_psynch: Default::default(),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
             // The child's libpthread is the parent's, registered already.

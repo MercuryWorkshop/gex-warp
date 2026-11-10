@@ -9266,7 +9266,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     write_blocked: std::mem::take(&mut k.write_blocked),
                     reissue: k.retry_accept.take().is_some()
                         | k.retry_recvmsg.take().is_some()
-                        | k.retry_transfer.take().is_some(),
+                        | k.retry_transfer.take().is_some()
+                        | (k.darwin_post == gex_kernel::darwin::Post::Psynch),
                     darwin_post: std::mem::take(&mut k.darwin_post),
                 };
                 {
@@ -15116,8 +15117,12 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // guest made the call): a priority-inheritance lock still held, a
     // stream another reader or writer got to first, or a call that does
     // its real work only once its wait is over (`Owed::reissue`: an
-    // `accept`, a `recvmsg`, a transfer), unless a signal ended it.
-    if res == Err(PI_RETRY) || (owed.reissue && res != Err(Errno::EINTR)) {
+    // `accept`, a `recvmsg`, a transfer), unless a signal ended it. A
+    // Darwin psynch wait is made again however it ended: the kernel
+    // finishes it, and what ended it is the kernel's to say
+    // (`Kernel::darwin_psynch`).
+    let psynch = owed.darwin_post == gex_kernel::darwin::Post::Psynch;
+    if res == Err(PI_RETRY) || (owed.reissue && (psynch || res != Err(Errno::EINTR))) {
         return Done::At(ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES);
     }
     // A parked call's answer never reaches the syscall ring (the

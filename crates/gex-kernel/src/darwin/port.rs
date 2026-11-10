@@ -974,6 +974,59 @@ impl Kernel {
                 }
                 _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             },
+            // host_info(host, flavor, out info, in-out count): the flavor
+            // and the room follow the NDR record. What is told is counted
+            // in 32-bit words; too little room for it is a failure.
+            (Kind::Host, 200) => {
+                let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
+                let mc = super::info::Machine::this();
+                let (cpus, mem) = (mc.cpus as u32, mc.mem as u64);
+                let words: Option<Vec<u32>> = match flavor {
+                    // HOST_BASIC_INFO: the processors and the memory. The
+                    // first five words are what it was before there were
+                    // more, and a caller with room for only those has them.
+                    1 => Some(vec![
+                        cpus,
+                        cpus,
+                        mem.min(i32::MAX as u64) as u32,
+                        mc.cputype as u32,
+                        mc.cpusubtype as u32,
+                        0,
+                        cpus,
+                        cpus,
+                        cpus,
+                        cpus,
+                        mem as u32,
+                        (mem >> 32) as u32,
+                    ])
+                    .map(|mut v| {
+                        if room < v.len() {
+                            v.truncate(5);
+                        }
+                        v
+                    }),
+                    // HOST_SCHED_INFO: the least timeout and quantum, in
+                    // milliseconds.
+                    3 => Some(vec![10, 10]),
+                    // HOST_PRIORITY_INFO: the scheduler's bands, of which
+                    // libpthread reads the user's, the least and the most.
+                    5 => Some(vec![80, 80, 64, 31, 0, 0, 0, 79]),
+                    // HOST_MACH_MSG_TRAP: that there is one.
+                    8 => Some(Vec::new()),
+                    // HOST_PREFERRED_USER_ARCH
+                    12 => Some(vec![mc.cputype as u32, mc.cpusubtype as u32]),
+                    _ => None,
+                };
+                match words {
+                    None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                    Some(w) if room < w.len() => plain(KERN_FAILURE as i32, &[]),
+                    Some(w) => {
+                        let mut b = (w.len() as u32).to_le_bytes().to_vec();
+                        w.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                }
+            }
             // _host_page_size(host, out size)
             (Kind::Host, 202) => plain(0, &abi::PAGE_SIZE.to_le_bytes()),
             // host_get_clock_service(host, clock id, out clock)

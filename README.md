@@ -184,7 +184,11 @@ the image low. What works is what a program can do with the kernel alone:
 - signals, delivered through XNU's frame to a handler behind the libc's
   trampoline, and `sigreturn`;
 - threads: `bsdthread_register`, `bsdthread_create` and
-  `bsdthread_terminate`, thread ports, `ulock_wait` and `ulock_wake`;
+  `bsdthread_terminate`, thread ports, `ulock_wait` and `ulock_wake`, and
+  the `psynch` calls, which are the kernel's half of libpthread's mutexes,
+  condition variables and read-write locks: XNU's own
+  (`libpthread/kern/kern_synch.c`) routine for routine, so that Apple's
+  libpthread, unchanged, is what a program's threads run on;
 - `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
   attributes;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
@@ -203,7 +207,7 @@ the image low. What works is what a program can do with the kernel alone:
   between threads (a reply port, rights in the body, port sets, a receive
   that waits), semaphores (and so `__semwait_signal`, which is how the
   libc sleeps), and the few MIG routines of the task's, the host's and the
-  clock's ports that those need.
+  clock's ports that those and libpthread need (`host_info` among them).
 
 What does not, yet:
 
@@ -218,11 +222,11 @@ What does not, yet:
   right crosses a `fork` or reaches another program: no bootstrap port, no
   launchd, no XPC. Within a task, messages carry ports but not memory out
   of line; nothing is sent when a port dies or loses its senders; and most
-  of what the kernel's own ports are asked (`task_info`, `host_info`,
-  `vm_region`) answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
+  of what the kernel's own ports are asked (`task_info`, `vm_region`)
+  answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
-- `kqueue`, `posix_spawn`, the `psynch` calls behind a contended pthread
-  mutex, work queues, `getattrlist`, `mknod`.
+- `kqueue`, `posix_spawn`, work queues, `getattrlist`, `mknod`; a mutex or
+  condition shared between processes (each is its own process's).
 - **Other Macs.** Three more processors have run Mac OS X, and none is
   here:
   - *i386* (through macOS 10.14). gex translates i386 and its kernel has
