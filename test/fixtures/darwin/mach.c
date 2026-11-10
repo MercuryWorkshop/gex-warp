@@ -369,6 +369,59 @@ static void kernel_ports(void) {
     t_show("signal it now", TRAP(TRAP_semaphore_signal, sem));
 }
 
+#if defined(__arm64__)
+// A timer: a port of the task's that the kernel sends a message to at a
+// moment on mach_absolute_time's clock, which is what a run loop waits
+// on. (Not for x86-64, where the Mac these are checked against is Rosetta
+// and its clock is not the kernel's.)
+enum { TRAP_mk_timer_create = 91, TRAP_mk_timer_destroy = 92, TRAP_mk_timer_arm = 93, TRAP_mk_timer_cancel = 94 };
+
+static void timers(void) {
+    struct {
+        u32 numer, denom;
+    } base = {1, 1};
+    TRAP(TRAP_mach_timebase_info, &base);
+    u64 ms = 1000000ull * base.denom / base.numer;
+    u32 timer = (u32)TRAP(TRAP_mk_timer_create);
+    show_type("a timer", timer);
+    struct message got;
+    t_show("nothing yet", receive(&got, timer, sizeof got));
+    u64 t0 = (u64)TRAP(TRAP_mach_absolute_time);
+    t_show("arm it for 10 ms on", TRAP(TRAP_mk_timer_arm, timer, t0 + 10 * ms));
+    t_show("too soon", receive(&got, timer, sizeof got));
+    got.h.id = 77;
+    long r = msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, timer, 2000);
+    u64 took = ((u64)TRAP(TRAP_mach_absolute_time) - t0) / ms;
+    t_printf("its message: %ld, id %d, %u bytes, for the timer %d\n", r, got.h.id, got.h.size, got.h.local == timer);
+    t_check("  at about that moment", took >= 5 && took < 1500);
+    t_show("once", receive(&got, timer, sizeof got));
+    u64 was = 99;
+    t_show("cancel it, not armed", TRAP(TRAP_mk_timer_cancel, timer, &was));
+    t_printf("  armed for %lu\n", (unsigned long)was);
+    u64 when = (u64)TRAP(TRAP_mach_absolute_time) + 60000 * ms;
+    t_show("arm it for a minute on", TRAP(TRAP_mk_timer_arm, timer, when));
+    t_show("cancel it", TRAP(TRAP_mk_timer_cancel, timer, &was));
+    t_check("  which says it was armed", was != 0);
+    t_show("and nothing comes for 30 ms", msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, timer, 30));
+    // In a set, waited on for ever: the wait ends at the timer's moment.
+    u32 set = allocate(RIGHT_PORT_SET);
+    t_show("put it in a set", TRAP(TRAP_port_insert_member, task, timer, set));
+    t0 = (u64)TRAP(TRAP_mach_absolute_time);
+    TRAP(TRAP_mk_timer_arm, timer, t0 + 10 * ms);
+    r = msg(&got, RCV_MSG, 0, sizeof got, set, 0);
+    took = ((u64)TRAP(TRAP_mach_absolute_time) - t0) / ms;
+    t_printf("through the set: %ld, for the timer %d\n", r, got.h.local == timer);
+    t_check("  at about that moment", took >= 5 && took < 1500);
+    // Armed for a moment already gone: as soon as may be.
+    TRAP(TRAP_mk_timer_arm, timer, t0);
+    t_show("armed for the past", msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, set, 2000));
+    t_show("arm what is no timer", TRAP(TRAP_mk_timer_arm, set, t0));
+    t_show("destroy it", TRAP(TRAP_mk_timer_destroy, timer));
+    show_type("and it is gone", timer);
+    t_show("arm it gone", TRAP(TRAP_mk_timer_arm, timer, t0));
+}
+#endif
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)argc, (void)argv, (void)envp, (void)apple;
     task = (u32)TRAP(TRAP_task_self);
@@ -376,5 +429,8 @@ int main(int argc, char **argv, char **envp, char **apple) {
     messages();
     threads();
     kernel_ports();
+#if defined(__arm64__)
+    timers();
+#endif
     return 0;
 }

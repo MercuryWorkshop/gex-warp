@@ -220,7 +220,8 @@ the image low. What works is what a program can do with the kernel alone:
   there;
 - Mach ports within a task: names and the rights under them, `mach_msg2`
   between threads (a reply port, rights in the body, port sets, a receive
-  that waits), semaphores (and so `__semwait_signal`, which is how the
+  that waits), timers the kernel sends a message for (`mk_timer_create`,
+  what a run loop waits on), semaphores (and so `__semwait_signal`, which is how the
   libc sleeps), and the few MIG routines of the task's, the host's and the
   clock's ports that those and libpthread need (`host_info` among them).
 

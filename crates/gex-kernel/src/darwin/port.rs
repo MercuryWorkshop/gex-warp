@@ -10,7 +10,9 @@
 //!
 //! What is here is one task's ports: threads of a process send to each
 //! other, and to the few ports the kernel itself answers ([`Kind`]): the
-//! task's and the host's, a clock, semaphores. A message's rights and
+//! task's and the host's, a clock, semaphores. And the kernel sends to
+//! one kind of its own making, a timer's (`mk_timer_create`): a message at
+//! the moment the timer is armed for, which is what a run loop waits on. A message's rights and
 //! bytes stay in the kernel between the two calls, so nothing here yet
 //! crosses to another process.
 //!
@@ -23,7 +25,7 @@
 use super::mach::port as names;
 use super::mach::*;
 use super::*;
-use crate::syscalls::nr;
+use crate::syscalls::{clock_ns, nr};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
@@ -55,6 +57,9 @@ mod ty {
     pub const PORT_SET: u32 = 0x8_0000;
     pub const DEAD_NAME: u32 = 0x10_0000;
 }
+
+/// The soonest after it is armed that a timer fires, in nanoseconds.
+const SOONEST: u64 = 100_000;
 
 pub const MACH_MSG_SUCCESS: u64 = 0;
 pub const MACH_SEND_INVALID_DATA: u64 = 0x1000_0002;
@@ -134,6 +139,11 @@ struct State {
     /// The names whose words say this port has something: its receiver's
     /// name for it (a semaphore's own), and each port set it is in.
     wake: Vec<u32>,
+    /// A timer's port (`mk_timer_create`), and the moment it is armed for
+    /// on `mach_absolute_time`'s clock, if it is: a message is queued here
+    /// then, by whoever next looks ([`Kernel::darwin_msg`]).
+    is_timer: bool,
+    timer: Option<u64>,
 }
 
 pub struct Port {
@@ -447,7 +457,60 @@ impl Kernel {
         // Every one of them is asked of a task, which must be this one.
         let own = x[0] as u32 == names::TASK;
         let bad_task = |r: u64| if own { r } else { MACH_SEND_INVALID_DEST };
+        // A timer: a port of the task's that the kernel sends to. These
+        // four are asked of the timer itself, by its name.
+        // (No such name; a name for something this task does not receive
+        // from; a port that is no timer.)
+        let timer = |sp: &Space, name: u32| match sp.names.get(&name) {
+            None => Err(KERN_INVALID_NAME),
+            Some(e) if !e.recv => Err(KERN_INVALID_RIGHT),
+            Some(e) if !e.port.state().is_timer => Err(KERN_INVALID_ARGUMENT),
+            Some(e) => Ok(Arc::clone(&e.port)),
+        };
         Some(match n {
+            t::MK_TIMER_CREATE => {
+                let name = sp.allocate(Kind::User);
+                sp.names[&name].port.state().is_timer = true;
+                name as u64
+            }
+            // (name, when), or (name, flags, when, leeway): armed, and
+            // whoever waits on it told to look at how long for.
+            // (A moment already gone is as soon as a timer can fire, which
+            // is not at once: its message follows the call, a little
+            // after.)
+            t::MK_TIMER_ARM | t::MK_TIMER_ARM_LEEWAY => match timer(&sp, x[0] as u32) {
+                Ok(port) => {
+                    let when = if n == t::MK_TIMER_ARM { x[1] } else { x[2] };
+                    let wake = {
+                        let mut st = port.state();
+                        st.timer = Some(when.max(clock_ns(self.clock, 1) + SOONEST));
+                        st.wake.clone()
+                    };
+                    self.darwin_wake(m, &mut sp, &wake, true);
+                    KERN_SUCCESS
+                }
+                Err(e) => e,
+            },
+            // (name, when*): disarmed; when it was armed for, or 0.
+            t::MK_TIMER_CANCEL => match timer(&sp, x[0] as u32) {
+                Ok(port) => {
+                    let was = port.state().timer.take().unwrap_or(0);
+                    match x[1] {
+                        0 => KERN_SUCCESS,
+                        at => kern(m.write_u64(at, was).map(|_| 0)),
+                    }
+                }
+                Err(e) => e,
+            },
+            t::MK_TIMER_DESTROY => match timer(&sp, x[0] as u32) {
+                Ok(port) => {
+                    port.state().timer = None;
+                    let wake = sp.destroy_receive(x[0] as u32);
+                    self.darwin_wake(m, &mut sp, &wake, true);
+                    KERN_SUCCESS
+                }
+                Err(e) => e,
+            },
             t::MACH_REPLY_PORT | t::THREAD_GET_SPECIAL_REPLY_PORT => sp.allocate(Kind::User) as u64,
             // (task, right, name*)
             t::MACH_PORT_ALLOCATE => bad_task({
@@ -783,6 +846,22 @@ impl Kernel {
             Some(e) if e.recv => vec![(c.rcv_name, Arc::clone(&e.port))],
             _ => return Err(MACH_RCV_INVALID_NAME),
         };
+        // A timer whose moment has come has its message now (24 bytes of
+        // nothing, as `mk_timer_expire` sends); the nearest still to come
+        // is how long a wait may be.
+        let now = clock_ns(self.clock, 1);
+        let mut nearest: Option<u64> = None;
+        for (_, port) in &from {
+            let mut st = port.state();
+            match st.timer {
+                Some(when) if when <= now => {
+                    st.timer = None;
+                    st.queue.push_back(Msg { id: 0, body: vec![0; 24], complex: false, once: false, reply: None, ports: Vec::new() });
+                }
+                Some(when) => nearest = Some(nearest.map_or(when, |n| n.min(when))),
+                None => {}
+            }
+        }
         for (name, port) in from {
             let mut st = port.state();
             let Some(msg) = st.queue.front() else { continue };
@@ -831,14 +910,20 @@ impl Kernel {
                 Err(_) => MACH_RCV_INVALID_DATA,
             });
         }
-        // Nothing there: say so, or wait to be told to look again.
+        // Nothing there: say so, or wait to be told to look again. A wait
+        // that ends at a timer's moment was not timed out: it looks again,
+        // and finds the timer's message.
         let timeout = (c.option & opt::RCV_TIMEOUT != 0).then_some(c.timeout * 1_000_000);
         if timeout == Some(0) {
             return Err(MACH_RCV_TIMED_OUT);
         }
+        let until_timer = nearest.map(|when| (when - now).max(1));
+        let timer_first = until_timer.is_some_and(|t| timeout.is_none_or(|u| t < u));
+        let timeout = if timer_first { until_timer } else { timeout };
         match self.darwin_wait(m, &mut sp, c.rcv_name, timeout, a) {
             Ok(call) => {
-                self.darwin_post = Post::Wake { woken: MACH_RCV_INTERRUPTED as u32, timed_out: MACH_RCV_TIMED_OUT as u32 };
+                let timed_out = if timer_first { MACH_RCV_INTERRUPTED } else { MACH_RCV_TIMED_OUT };
+                self.darwin_post = Post::Wake { woken: MACH_RCV_INTERRUPTED as u32, timed_out: timed_out as u32 };
                 Ok(call)
             }
             Err(_) => Err(MACH_RCV_INVALID_DATA),
