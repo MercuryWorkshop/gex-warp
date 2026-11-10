@@ -250,6 +250,11 @@ impl Kernel {
             req::TIOCEXCL => Some(k::TIOCEXCL),
             req::TIOCNXCL => Some(k::TIOCNXCL),
             req::TIOCSTI => Some(k::TIOCSTI),
+            // (How much there is to read is not asked of a device that is
+            // no terminal: `ENODEV`, its driver's word.)
+            req::FIONREAD if self.fds.get(fd).is_ok_and(|f| f.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::CharDevice)) && self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch).is_err() => {
+                return Err(Errno::ENODEV);
+            }
             req::FIONREAD => Some(k::FIONREAD),
             req::FIONBIO => Some(k::FIONBIO),
             req::FIOASYNC => Some(k::FIOASYNC),
@@ -312,10 +317,23 @@ impl Kernel {
             }
             // What kind of device: a terminal is one (`D_TTY`), and
             // nothing else here is any this asks after.
+            // (XNU answers for any device from its switch table, before
+            // the device is asked: the null and zero devices are of the
+            // kind disks are, `D_DISK`, and the random ones of none. What
+            // is no device has no kind.)
             req::FIODTYPE => {
-                self.fds.get(fd)?;
-                self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch)?;
-                m.write_u32(arg, 3)?;
+                let file = self.fds.get(fd)?;
+                if file.handle.metadata()?.file_type != crate::vfs::FileType::CharDevice {
+                    return Err(Errno::ENOTTY);
+                }
+                let kind = if self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch).is_ok() {
+                    3
+                } else if matches!(file.path.as_str(), "/dev/null" | "/dev/zero") {
+                    2
+                } else {
+                    0
+                };
+                m.write_u32(arg, kind)?;
                 Ok(0)
             }
             // A terminal's line discipline: the one there is (`TTYDISC`),

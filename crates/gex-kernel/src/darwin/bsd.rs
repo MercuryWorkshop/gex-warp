@@ -58,6 +58,24 @@ const SA_FLAGS: [(u64, u64); 7] = [
     (sa::SIGINFO, signal::sa::SIGINFO),
 ];
 
+/// The descriptor a path in `/dev` names, if it names one: `/dev/fd/N`,
+/// and the first three by their own names.
+fn dev_fd(path: &[u8]) -> Option<i32> {
+    match path {
+        b"/dev/stdin" => Some(0),
+        b"/dev/stdout" => Some(1),
+        b"/dev/stderr" => Some(2),
+        p => std::str::from_utf8(p.strip_prefix(b"/dev/fd/")?).ok()?.parse().ok().filter(|n| *n >= 0),
+    }
+}
+
+/// Whether an `open` of the path at `path` with `flags` is more than the
+/// kernel's `openat` does ([`Kernel::darwin_open`]): a descriptor named by
+/// its number, or a lock asked for with the file.
+fn darwin_open_is_more(m: &GuestMem<'_>, path: u64, flags: u64) -> bool {
+    flags & (abi::o::SHLOCK | abi::o::EXLOCK) != 0 || m.read_cstr(path, 64).is_ok_and(|p| dev_fd(&p).is_some())
+}
+
 fn sa_flags_to_kernel(f: u64) -> u64 {
     SA_FLAGS.iter().filter(|(d, _)| f & d != 0).fold(0, |o, (_, k)| o | k)
 }
@@ -98,6 +116,10 @@ impl Kernel {
             d::PWRITE | d::PWRITE_NOCANCEL => set(nr::PWRITE64, &x[..4]),
             // The flags are respelled at the kernel's door
             // (`oflags::from_guest`).
+            // (A descriptor opened by its number, or a file locked as it
+            // is opened, is more than the kernel's `openat`.)
+            d::OPEN | d::OPEN_NOCANCEL if darwin_open_is_more(m, x[0], x[1]) => NATIVE + code,
+            d::OPENAT | d::OPENAT_NOCANCEL if darwin_open_is_more(m, x[1], x[2]) => NATIVE + code,
             d::OPEN | d::OPEN_NOCANCEL => set(nr::OPENAT, &[CWD, x[0], x[1], x[2]]),
             d::OPENAT | d::OPENAT_NOCANCEL => set(nr::OPENAT, &[dirfd(x[0]), x[1], x[2], x[3]]),
             // (path, flags, protection class, protection flags, mode):
@@ -109,6 +131,12 @@ impl Kernel {
                 // 0x10 here and 8 there.
                 let opts = (x[2] & 3) | if x[2] & 0x10 != 0 { 8 } else { 0 };
                 self.darwin_post = Post::WaitStatus { status: x[1] };
+                // (What the child used is not kept apart from its
+                // parent's other children's: none is said, and not
+                // whatever the caller's memory held.)
+                if x[3] != 0 {
+                    let _ = m.write(x[3], &[0u8; 144]);
+                }
                 set(nr::WAIT4, &[x[0] as i32 as i64 as u64, x[1], opts, x[3]])
             }
             d::LINK => set(nr::LINKAT, &[CWD, x[0], CWD, x[1], 0]),
@@ -202,8 +230,14 @@ impl Kernel {
             d::FCHDIR => set(nr::FCHDIR, &x[..1]),
             d::CHROOT => set(nr::CHROOT, &x[..1]),
             d::CHMOD => set(nr::FCHMODAT, &[CWD, x[0], x[1]]),
+            // (`AT_SYMLINK_NOFOLLOW`: a link's own mode, not its file's.)
+            d::FCHMODAT if x[3] & 0x20 != 0 => NATIVE + code,
             d::FCHMODAT => set(nr::FCHMODAT, &[dirfd(x[0]), x[1], x[2]]),
             d::FCHMOD => set(nr::FCHMOD, &x[..2]),
+            // (Only the superuser gives a file away, or to a group that
+            // is not the caller's.)
+            d::CHOWN | d::LCHOWN | d::FCHOWN if self.darwin_chown_refused(x[1], x[2]) => NATIVE + code,
+            d::FCHOWNAT if self.darwin_chown_refused(x[2], x[3]) => NATIVE + code,
             d::CHOWN => set(nr::FCHOWNAT, &[CWD, x[0], x[1], x[2], 0]),
             d::LCHOWN => set(nr::FCHOWNAT, &[CWD, x[0], x[1], x[2], K_NOFOLLOW]),
             d::FCHOWNAT => set(nr::FCHOWNAT, &[dirfd(x[0]), x[1], x[2], x[3], at_flags(x[4])]),
@@ -336,6 +370,8 @@ impl Kernel {
                 None => NATIVE + d::SETRLIMIT,
             },
             d::GETPRIORITY => set(nr::NOOP_OK, &[]),
+            // (`PRIO_PROCESS` of a process there is none of.)
+            d::SETPRIORITY if x[0] == 0 && x[1] as i32 > 0 && x[1] as i32 != self.pid && !self.procs.exists(x[1] as i32) => NATIVE + code,
             d::SETPRIORITY => set(nr::SETPRIORITY, &x[..3]),
             d::GETITIMER => set(nr::GETITIMER, &x[..2]),
             // A `struct timeval`'s microseconds are 32 bits and four of
@@ -516,6 +552,20 @@ impl Kernel {
             // to here.)
             d::KQUEUE | d::GUARDED_KQUEUE_NP => self.darwin_kqueue(),
             d::GUARDED_CLOSE_NP => self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF)),
+            d::OPEN | d::OPEN_NOCANCEL => self.darwin_open(m, CWD, x[0], x[1], x[2]),
+            d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
+            d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),
+            d::SETPRIORITY => Err(Errno::ESRCH),
+            // A link's own mode is not kept: changing it changes nothing,
+            // and its file is left alone.
+            d::FCHMODAT => {
+                let p = self.path_io().at_path(m, dirfd(x[0]) as i32, x[1])?;
+                if self.vfs.metadata_nofollow(&p)?.file_type == crate::vfs::FileType::Symlink {
+                    Ok(0)
+                } else {
+                    self.dispatch(m, nr::FCHMODAT, [dirfd(x[0]), x[1], x[2], 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))
+                }
+            }
             // (path, guard, what it guards against, flags, mode): opened
             // as any file is, if asked as XNU insists -- closed when
             // another program is run, guarded at least against being
@@ -724,6 +774,45 @@ impl Kernel {
     }
 
     /// `fcntl`: Darwin's commands, the descriptor ones as the kernel's.
+    /// Whether only the superuser may give a file to `uid` and `gid`
+    /// (each -1 for no change), and the caller is not: to another owner,
+    /// or to a group that is not the caller's own.
+    fn darwin_chown_refused(&self, uid: u64, gid: u64) -> bool {
+        let (uid, gid, me) = (uid as u32, gid as u32, self.creds.uid());
+        me != 0 && ((uid != u32::MAX && uid != me) || (gid != u32::MAX && gid != self.creds.gid() && gid != self.creds.rgid()))
+    }
+
+    /// `open` of what [`darwin_open_is_more`] says is more than a file
+    /// opened. A descriptor's name in `/dev/fd` (and the first three's own
+    /// names) is that descriptor again, as `dup` gives it, if it was opened
+    /// for what is asked now. `O_SHLOCK` and `O_EXLOCK` are a lock taken as
+    /// the file is opened, as `flock` takes one; a lock that cannot be had
+    /// at once is `EAGAIN`, whether the caller would have waited or not.
+    fn darwin_open(&mut self, m: &mut GuestMem<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
+        if let Some(fd) = dev_fd(&m.read_cstr(path, 64).unwrap_or_default()) {
+            let (have, want) = (self.fds.get(fd)?.flags() & 3, flags & 3);
+            if have != 2 && have != want {
+                return Err(Errno::EACCES);
+            }
+            const F_DUPFD: u64 = 0;
+            const F_DUPFD_CLOEXEC: u64 = 1030;
+            return self.fd_io().fcntl_call(m, fd, if flags & abi::o::CLOEXEC != 0 { F_DUPFD_CLOEXEC } else { F_DUPFD }, 0);
+        }
+        let locks = flags & (abi::o::SHLOCK | abi::o::EXLOCK);
+        let fd = self.dispatch(m, nr::OPENAT, [dirfd, path, flags & !locks, mode, 0, 0]).unwrap_or(Err(Errno::ENOENT))?;
+        if locks != 0 {
+            const LOCK_SH: u64 = 1;
+            const LOCK_EX: u64 = 2;
+            const LOCK_NB: u64 = 4;
+            let how = if locks & abi::o::EXLOCK != 0 { LOCK_EX } else { LOCK_SH } | LOCK_NB;
+            if !matches!(self.dispatch(m, nr::FLOCK, [fd, how, 0, 0, 0, 0]), Ok(Ok(_))) {
+                let _ = self.dispatch(m, nr::CLOSE, [fd, 0, 0, 0, 0, 0]);
+                return Err(Errno::EAGAIN);
+            }
+        }
+        Ok(fd)
+    }
+
     fn darwin_fcntl(&mut self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
         match cmd {
             f::DUPFD | f::GETFD | f::SETFD | f::GETFL | f::SETFL => self.fd_io().fcntl_call(m, fd, cmd, arg),

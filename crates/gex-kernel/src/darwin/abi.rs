@@ -317,7 +317,10 @@ pub fn stat(st: &Stat) -> StatBytes {
     // then): they are on the root's disk.
     let on = if st.dev == 0 { ROOT_DEV } else { dev(st.dev) };
     b[0..4].copy_from_slice(&on.to_le_bytes());
-    b[4..6].copy_from_slice(&(st.mode as u16).to_le_bytes());
+    // (A link's own mode, where the filesystem keeps none and says all
+    // of it: what a link made with the usual mask has.)
+    let mode = if st.mode & 0o170000 == 0o120000 && st.mode & 0o7777 == 0o777 { 0o120755 } else { st.mode };
+    b[4..6].copy_from_slice(&(mode as u16).to_le_bytes());
     b[6..8].copy_from_slice(&(st.nlink.min(u16::MAX as u32) as u16).to_le_bytes());
     b[8..16].copy_from_slice(&st.ino.to_le_bytes());
     b[16..20].copy_from_slice(&st.uid.to_le_bytes());
