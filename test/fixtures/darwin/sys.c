@@ -328,8 +328,19 @@ static void attributes(void) {
     t_show("getxattr of none", SYS(SYS_getxattr, "x", "user.none", buf, sizeof buf, 0, 0));
     t_show("setxattr, to create what is there", SYS(SYS_setxattr, "x", "user.t", "v", 1, 0, XATTR_CREATE));
     t_show("setxattr, to replace what is not", SYS(SYS_setxattr, "x", "user.none", "v", 1, 0, XATTR_REPLACE));
+    // (The names but the system's own: a Mac marks a file with where
+    // the program that made it came from, `com.apple.provenance`, when
+    // that program is one it keeps track of.)
+    char all[128];
+    t_memset(all, 0, sizeof all);
+    long listed = SYS(SYS_listxattr, "x", all, sizeof all, 0), kept = 0;
     t_memset(buf, 0, sizeof buf);
-    t_show("listxattr", SYS(SYS_listxattr, "x", buf, sizeof buf, 0));
+    for (long i = 0; i < listed;) {
+        long n = t_strlen(all + i) + 1;
+        if (t_strncmp(all + i, "com.apple.", 10)) t_memcpy(buf + kept, all + i, n), kept += n;
+        i += n;
+    }
+    t_show("listxattr", listed < 0 ? listed : kept);
     t_printf("  \"%s\"\n", buf);
     t_show("removexattr", SYS(SYS_removexattr, "x", "user.t", 0));
     t_show("and again", SYS(SYS_removexattr, "x", "user.t", 0));
