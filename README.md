@@ -192,7 +192,9 @@ the image low. What works is what a program can do with the kernel alone:
   libpthread, unchanged, is what a program's threads run on;
 - `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
   attributes;
-- `getattrlist` and `setattrlist` (by path, by descriptor and under one):
+- `getattrlist`, `getattrlistbulk` (a directory's entries, which is how
+  Apple's `fts` reads one) and `setattrlist` (by path, by descriptor and
+  under one):
   a file's attributes asked for by bit and answered packed as XNU packs
   them, which is how Apple's libc finds a file's real path and sets its
   times; and the calls that carry an access list beside a mode
@@ -238,7 +240,7 @@ What does not, yet:
   delivering to them); the kqueue filters for a signal, a Mach port and a
   file changing; a queue's descriptor closed in a child of `fork`; on the
   page, a note on another process hearing of its end every time;
-  `getattrlistbulk`, `mknod`; a mutex or condition shared between
+  `mknod`; a mutex or condition shared between
   processes (each is its own process's).
 - A floating-point environment beyond what WebAssembly has: the rounding
   mode and the exception flags a program sets are kept and read back, but

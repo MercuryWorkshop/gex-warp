@@ -576,6 +576,7 @@ impl Kernel {
             },
             d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
+            d::GETATTRLISTBULK => self.darwin_getattrlistbulk(m, x[0] as i32, x[1], x[2], x[3], x[4]),
             d::GETATTRLISTAT => self.darwin_getattrlist(m, dirfd(x[0]) as i32, x[1], x[2], x[3], x[4], x[5]),
             d::SETATTRLIST => self.darwin_setattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FSETATTRLIST => self.darwin_setattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),

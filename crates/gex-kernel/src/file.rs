@@ -340,6 +340,21 @@ impl OpenFile {
         std::ptr::eq(self, other) || (self.path == other.path && self.ino() != 0 && self.ino() == other.ino())
     }
 
+    /// The directory's entries from the cursor on, each handed to `take`
+    /// until it has no room for one (`false`); the cursor moves past the
+    /// ones taken, however many those are.
+    pub fn take_dir_entries(&self, mut take: impl FnMut(&DirEntry) -> bool) -> Result<usize, Errno> {
+        let mut cache = self.dir_cache.lock().unwrap();
+        if cache.is_none() {
+            *cache = Some(self.handle.read_dir()?);
+        }
+        let entries = cache.as_ref().unwrap();
+        let start = self.dir_pos.load(Ordering::Relaxed).min(entries.len());
+        let taken = entries[start..].iter().take_while(|e| take(e)).count();
+        self.dir_pos.store(start + taken, Ordering::Relaxed);
+        Ok(taken)
+    }
+
     /// Fill `buf` with `getdents64` records, advancing the cursor.
     pub fn read_dirents(&self, buf_len: usize) -> Result<Vec<u8>, Errno> {
         let mut cache = self.dir_cache.lock().unwrap();

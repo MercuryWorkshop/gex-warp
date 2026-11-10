@@ -253,8 +253,19 @@ impl Kernel {
         // (A volume's own attributes are its root's.)
         let (md, full) = if volume != 0 { (self.vfs.metadata("/")?, "/".to_string()) } else { (md, full) };
         let full = if full.starts_with('/') { full } else { "/".to_string() };
-        let st = self.path_io().stat_owned(&md);
-        let (parent, name) = split(&full);
+        let out = self.darwin_pack_attrs(&md, &full, [common, volume, dirs, files, fork], options, false);
+        m.write(buf, &out[..out.len().min(size as usize)])?;
+        Ok(0)
+    }
+
+    /// One file's attributes, packed: its length (of all of it, however
+    /// much there turns out to be room for), then what was asked for. One
+    /// of a directory's entries read in bulk (`bulk`) is a multiple of
+    /// eight bytes long.
+    fn darwin_pack_attrs(&self, md: &crate::vfs::Metadata, full: &str, want: [u32; 5], options: u64, bulk: bool) -> Vec<u8> {
+        let [common, volume, dirs, files, fork] = want;
+        let st = self.path_io().stat_owned(md);
+        let (parent, name) = split(full);
         let parent_ino = self.vfs.metadata(parent).map_or(2, |p| p.ino);
         let is_dir = md.file_type == FileType::Directory;
         let fsid = |p: &mut Pack| {
@@ -310,7 +321,7 @@ impl Kernel {
                 cmn::UUID | cmn::GRPUUID => p.bytes(&[0; 16]),
                 cmn::FILEID => p.u64(st.ino),
                 cmn::PARENTID => p.u64(parent_ino),
-                cmn::FULLPATH => p.string(&full),
+                cmn::FULLPATH => p.string(full),
                 _ => unreachable!("every bit below the last is an attribute"),
             }
         }
@@ -323,7 +334,7 @@ impl Kernel {
             for bit in (0..6).map(|i| 1u32 << i).filter(|b| dirs & b != 0) {
                 match bit {
                     dir::LINKCOUNT => p.u32(st.nlink),
-                    dir::ENTRYCOUNT => p.u32(self.darwin_entry_count(&full)),
+                    dir::ENTRYCOUNT => p.u32(self.darwin_entry_count(full)),
                     dir::MOUNTSTATUS => p.u32((full == "/") as u32),
                     dir::ALLOCSIZE => p.u64(st.blocks as u64 * 512),
                     dir::IOBLOCKSIZE => p.u32(st.blksize as u32),
@@ -350,7 +361,7 @@ impl Kernel {
                 ext::RELPATH => p.string(full.trim_start_matches('/')),
                 ext::PRIVATESIZE => p.u64(st.size as u64),
                 ext::LINKID => p.u64(st.ino),
-                ext::NOFIRMLINKPATH => p.string(&full),
+                ext::NOFIRMLINKPATH => p.string(full),
                 ext::REALDEVID => p.u32(abi::ROOT_DEV),
                 ext::REALFSID => fsid(&mut p),
                 // Cloned from nothing; no flags; never changed beneath.
@@ -366,13 +377,62 @@ impl Kernel {
                 p.fixed[returned_at + 4 * i..returned_at + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
-        // The length is of all of it, however much of it there was room
-        // for.
         let mut out = p.finish();
+        if bulk {
+            out.resize(out.len().next_multiple_of(8), 0);
+        }
         let whole = out.len() as u32;
         out[0..4].copy_from_slice(&whole.to_le_bytes());
-        m.write(buf, &out[..out.len().min(size as usize)])?;
-        Ok(0)
+        out
+    }
+
+    /// `getattrlistbulk`: the attributes of a directory's entries, as many
+    /// as fit, from where the descriptor has read to. The answer is how
+    /// many; none at the end.
+    pub(super) fn darwin_getattrlistbulk(&mut self, m: &mut GuestMem<'_>, fd: i32, list: u64, buf: u64, size: u64, options: u64) -> SysResult {
+        let head = m.read(list, 24)?.to_vec();
+        let word = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
+        let (common, volume, dirs, files, fork) = (word(4), word(8), word(12), word(16), word(20));
+        let extended = options & FSOPT_ATTR_CMN_EXTENDED != 0;
+        // Each entry says what it has, since each may have something else;
+        // and a directory's entries are no volumes.
+        if u16::from_le_bytes([head[0], head[1]]) != GROUPS
+            || common & cmn::RETURNED_ATTRS == 0
+            || volume != 0
+            || dirs & !dir::VALID != 0
+            || files & !file::VALID != 0
+            || fork & !(if extended { ext::VALID } else { 0 }) != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        let file = self.fds.get(fd)?;
+        if file.handle.metadata()?.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let dir = file.path.trim_end_matches('/').to_string();
+        let (mut out, mut count, mut full_up) = (Vec::new(), 0u64, false);
+        file.take_dir_entries(|e| {
+            if e.name == "." || e.name == ".." {
+                return true;
+            }
+            let path = format!("{dir}/{}", e.name);
+            // (An entry gone since the directory was read is passed over.)
+            let Ok(md) = self.vfs.metadata_nofollow(&path) else { return true };
+            let entry = self.darwin_pack_attrs(&md, &path, [common, 0, dirs, files, fork], options, true);
+            if out.len() + entry.len() > size as usize {
+                full_up = true;
+                return false;
+            }
+            out.extend_from_slice(&entry);
+            count += 1;
+            true
+        })?;
+        // No room for even one.
+        if count == 0 && full_up {
+            return Err(Errno::ERANGE);
+        }
+        m.write(buf, &out)?;
+        Ok(count)
     }
 
     /// How many entries a directory has, itself and its parent aside.

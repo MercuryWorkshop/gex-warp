@@ -5,7 +5,7 @@
 
 enum { SYS_getattrlist = 220, SYS_fgetattrlist = 228, SYS_getattrlistat = 476, SYS_chmod_extended = 282, SYS_fchmod_extended = 283 };
 enum { SYS_stat64_extended = 341, SYS_lstat64_extended = 342, SYS_fstat64_extended = 343 };
-enum { SYS_setattrlist = 221, SYS_fsetattrlist = 229, SYS_setattrlistat = 524 };
+enum { SYS_setattrlist = 221, SYS_fsetattrlist = 229, SYS_setattrlistat = 524, SYS_getattrlistbulk = 461 };
 
 struct attrlist {
     u16 bitmapcount, reserved;
@@ -185,6 +185,48 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_printf("  mode %o\n", st.st_mode & 07777);
     t_show("chmod_extended of a missing file", SYS(SYS_chmod_extended, "missing", -101, -101, 0600, 0));
     SYS(SYS_close, fd);
+
+    // A directory's entries, read in bulk: each as getattrlist packs one,
+    // and told what it has. (In the order the volume keeps them, which is
+    // its own: said here by name.)
+    fd = SYS(SYS_open, "d/abcde", O_WRONLY | O_CREAT, 0644);
+    SYS(SYS_write, fd, "12345", 5);
+    SYS(SYS_close, fd);
+    SYS(SYS_mkdir, "d/sub", 0755);
+    al = (struct attrlist){5, 0, CMN_NAME | CMN_OBJTYPE | CMN_RETURNED_ATTRS, 0, DIR_ENTRYCOUNT, FILE_TOTALSIZE, 0};
+    fd = SYS(SYS_open, "d", O_RDONLY);
+    long count = SYS(SYS_getattrlistbulk, fd, &al, buf, sizeof buf, 0);
+    t_show("getattrlistbulk", count);
+    static const char *const names[] = {"abcde", "one", "sub", "two"};
+    for (int k = 0; k < 4; k++) {
+        long at = 0;
+        for (long i = 0; i < count; i++, at += w(at)) {
+            const char *name = ref(at + 24);
+            if (t_strlen(name) != t_strlen(names[k]) || name[0] != names[k][0]) continue;
+            t_printf("  \"%s\": length %u, returned 0x%x 0x%x 0x%x 0x%x, type %u, ", name, w(at), w(at + 4), w(at + 8), w(at + 12), w(at + 16), w(at + 32));
+            if (w(at + 32) == 2) t_printf("%u entries\n", w(at + 36));
+            else t_printf("%lu bytes\n", (unsigned long)q(at + 36));
+        }
+    }
+    t_show("and no more", SYS(SYS_getattrlistbulk, fd, &al, buf, sizeof buf, 0));
+    SYS(SYS_close, fd);
+    // With room for one at a time.
+    fd = SYS(SYS_open, "d", O_RDONLY);
+    long each = 0, total = 0;
+    for (int i = 0; i < 8 && (each = SYS(SYS_getattrlistbulk, fd, &al, buf, 56, 0)) > 0; i++) total += each;
+    t_printf("with room for one at a time: %ld in all, then %ld\n", total, each);
+    t_show("with room for none", SYS(SYS_getattrlistbulk, fd, &al, buf, 8, 0));
+    SYS(SYS_close, fd);
+    fd = SYS(SYS_open, "d", O_RDONLY);
+    t_show("with room for none, from the start", SYS(SYS_getattrlistbulk, fd, &al, buf, 8, 0));
+    al.common = CMN_NAME | CMN_OBJTYPE;
+    t_show("not asking what is returned", SYS(SYS_getattrlistbulk, fd, &al, buf, sizeof buf, 0));
+    SYS(SYS_close, fd);
+    al.common = CMN_NAME | CMN_RETURNED_ATTRS;
+    fd = SYS(SYS_open, "a.txt", O_RDONLY);
+    t_show("of what is no directory", SYS(SYS_getattrlistbulk, fd, &al, buf, sizeof buf, 0));
+    SYS(SYS_close, fd);
+    SYS(SYS_unlink, "d/abcde"), SYS(SYS_rmdir, "d/sub");
 
     // Attributes given: the times, in the order of their bits (modified
     // before read), and the mode. This is how the libc sets a file's times.
