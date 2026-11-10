@@ -9970,9 +9970,18 @@ impl Kernel {
         }
     }
 
-    /// Drop the descriptors marked close-on-exec.
+    /// Drop the descriptors marked close-on-exec. (And, of a Darwin
+    /// process, what belonged to the image that is going: its commpage is
+    /// to be mapped again, libpthread has not yet said where its threads
+    /// start, and its Mach ports and what was kept of its locks are gone
+    /// with its memory.)
     pub fn close_on_exec(&mut self) {
         self.fds.close_on_exec();
+        self.darwin_commpage = false;
+        self.darwin_threads = Default::default();
+        self.darwin_ports = Default::default();
+        self.darwin_psynch = Default::default();
+        self.darwin_spawn_at = None;
     }
 
     /// Everything `execve` can fail at before the point of no return.
