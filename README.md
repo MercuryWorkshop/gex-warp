@@ -28,6 +28,13 @@ for debugging and for building what a page loads ahead of time.
 - **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
+- **macOS programs for arm64, the static ones so far.** A Mach-O executable
+  enters the same kernel as it would enter XNU (`svc #0x80`, BSD calls and
+  Mach traps, the carry flag for an error), and the kernel answers in
+  Darwin's numbers and layouts: files, processes, signals through XNU's
+  frame, threads as libpthread asks for them, `sysctl`, terminals, sockets.
+  What is not there yet is what a dynamically linked program starts with:
+  dyld and libSystem need the commpage and Mach messages (below).
 - **Windows programs, through Wine.** `wine` builds Wine's own
   Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
   itself is translated like any other x86 code. The build is 64-bit Wine
@@ -91,8 +98,8 @@ for debugging and for building what a page loads ahead of time.
 | `crates/gex-cgen`, `gex-split` | the function tier, and splitting its units into hot and cold parts |
 | `crates/gex-units` | what a build ships of its function-tier units: whole, instrumented, or cut to a slot set |
 | `crates/gex-xlate` | code discovery and the translation driver |
-| `crates/gex-ld`, `gex-dylink` | ELF and PE loading; shared libraries for wasm32 programs |
-| `crates/gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map, processes |
+| `crates/gex-ld`, `gex-dylink` | ELF, PE and Mach-O loading; shared libraries for wasm32 programs |
+| `crates/gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map, processes; and the Darwin one over it (`src/darwin`) |
 | `crates/gex-abi`, `gex-mem`, `gex-atomic`, `gex-kmem` | the layout contract and guest-memory access |
 | `crates/gex-cache`, `gex-key` | the compiled-module cache and the content keys every host agrees on |
 | `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
@@ -138,6 +145,61 @@ $ gexc disasm <elf>                 # disassemble
 $ gexc ir <elf> --at 0x400abc       # the GIR for one block
 $ gexc run --strace <elf>           # syscall trace
 ```
+
+### Run a macOS program
+
+```console
+$ xcrun clang -arch arm64 -static -nostdlib -ffreestanding -e start \
+    -Wl,-pagezero_size,0x4000 -Wl,-image_base,0x1000000 -o hello hello.c
+$ target/release/gexc run hello
+```
+
+`gexc` and the page take a Mach-O where they take an ELF: a thin arm64
+file, or the arm64 slice of a universal one. The process is a Darwin
+process from then on (`crates/gex-kernel/src/darwin`): its system calls are
+XNU's, numbered from `bsd/kern/syscalls.master` (`make regen-darwin
+XNU_SRC=<an xnu checkout>` regenerates the table), and each is rewritten
+into the kernel's own call with its flags, error numbers and structures
+respelled, or answered there when only Darwin has it.
+
+A guest's memory is 4 GiB, or 16 GiB at most, and Apple's toolchain links
+a program above 4 GiB with everything below unmapped, so the example puts
+the image low. What works is what a program can do with the kernel alone:
+
+- files and directories, `fork`, `execve`, `wait4`, pipes, `mmap` and
+  Mach's `mach_vm_*` traps on Darwin's 16 KiB page, the clocks, `select`
+  and `poll`;
+- signals, delivered through XNU's frame to a handler behind the libc's
+  trampoline, and `sigreturn`;
+- threads: `bsdthread_register`, `bsdthread_create` and
+  `bsdthread_terminate`, thread ports, `ulock_wait` and `ulock_wake`;
+- `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
+  attributes;
+- `ioctl` with BSD's `struct termios`, and pseudo-terminals;
+- sockets: unix and TCP, descriptors passed in a control message.
+
+What does not, yet:
+
+- **dyld and libSystem**, and so any program built the ordinary way. They
+  read the commpage, which XNU maps at `0xFFFFFC000`, past the end of any
+  WebAssembly memory, and the system's libraries exist only in the dyld
+  shared cache, which is mapped at 6 GiB.
+- **Mach messages.** `mach_msg` answers that there is no such destination.
+  A task has the names of its own ports and nothing to send to them, so
+  nothing that is a MIG call works: `semaphore_create` (and with it
+  `nanosleep`), `host_info`, the bootstrap port.
+- `kqueue`, `posix_spawn`, the `psynch` calls behind a contended pthread
+  mutex, work queues, `getattrlist`, `mknod`.
+- x86-64. The entry is written (`syscall`, the class in `rax`'s top byte)
+  and nothing has run through it; there is no signal frame for it.
+- A page fault is not delivered where XNU would deliver one: nothing in a
+  WebAssembly memory is protected, so a write to a read-only page succeeds.
+
+The tests (`test/darwin`) build each program in `test/fixtures/darwin`
+twice: statically for gex, and dynamically for the Mac the tests run on,
+whose kernel is the reference. They pass when the two print the same, under
+`gexc` and on the page's runtime. They need a Mac with Xcode's command-line
+tools, and skip anywhere else.
 
 ### Build the page
 
