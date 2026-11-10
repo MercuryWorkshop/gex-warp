@@ -27,8 +27,8 @@ export default async function (t) {
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
   for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach']) await d.compare(name, await d.build(name), [], { page: true });
-  // The commpage, where gex puts it and where XNU does: arm64's.
-  if (t.arch !== 'x86') await d.compare('commpage', await d.build('commpage'), [], { page: true });
+  // The commpage, where gex puts it and where XNU does.
+  await d.compare('commpage', await d.build('commpage'), [], { page: true });
   const sys = await d.build('sys');
   await d.compare('sys', sys, ['one', 'two'], { page: true });
   // Under gexc the root is the Mac's own, and the system a program is told

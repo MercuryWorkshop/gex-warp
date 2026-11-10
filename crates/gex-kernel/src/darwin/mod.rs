@@ -59,12 +59,12 @@ pub const END: u64 = 0x4_0000;
 /// size, the processors, what the processor can do).
 ///
 /// XNU's is at `0xFFFFFC000` on arm64, with a second, read-only page two
-/// below it at `0xFFFFF4000`: past the end of any memory a guest has. So it
-/// is here, just under where a program is loaded, the two pages the same
-/// distance apart; and a userland built for gex is built with these
-/// addresses where Apple's headers have XNU's
-/// (`_COMM_PAGE64_BASE_ADDRESS`, `_COMM_PAGE64_RO_ADDRESS`). A library
-/// Apple built looks where XNU's is and finds nothing.
+/// below it at `0xFFFFF4000`, and at `0x7FFFFFE00000` on x86-64: past the
+/// end of any memory a guest has. So it is here, just under where a program
+/// is loaded (arm64's two pages the same distance apart); and a userland
+/// built for gex is built with these addresses where Apple's headers have
+/// XNU's (`_COMM_PAGE64_BASE_ADDRESS`, `_COMM_PAGE64_RO_ADDRESS`). A
+/// library Apple built looks where XNU's is and finds nothing.
 pub mod commpage {
     pub const DATA: u64 = 0x00ff_c000;
     pub const RO: u64 = 0x00ff_4000;
@@ -77,6 +77,10 @@ pub mod commpage {
     /// exceptions; and the processor count in bits 16 to 23.
     pub const CAPABILITIES: u64 = 0x40 | 0x80 | 0x100 | 0x400 | 0x2000 | 0x0200_0000 | 0x0400_0000 | 1 << 48 | 1 << 58;
     pub const UP: u64 = 0x8000;
+    /// x86-64's version, and its capabilities: MMX, SSE, SSE2, a 64-byte
+    /// cache line, the thread pointer in a segment register, 64 bits.
+    pub const VERSION_X86: u16 = 14;
+    pub const CAPABILITIES_X86: u64 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x200;
 }
 
 /// The first Mach port name a task allocates.
@@ -253,14 +257,12 @@ impl Kernel {
     }
 
     /// Map the [`commpage`] and fill it in: at a process's first call, which
-    /// comes before anything of libSystem's reads it. arm64's; x86-64's has
-    /// another layout, and a clock a program computes from, and is not here
-    /// yet.
+    /// comes before anything of libSystem's reads it.
     fn darwin_map_commpage(&mut self, m: &mut GuestMem<'_>) {
-        if gex_abi::X86 {
-            return;
-        }
         let cpus = crate::cpus::count().min(255) as u8;
+        if gex_abi::X86 {
+            return self.darwin_map_commpage_x86(m, cpus);
+        }
         let caps = commpage::CAPABILITIES | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
         let mut page = [0u8; 0x100];
         page[..16].copy_from_slice(b"commpage 64-bit\0");
@@ -285,6 +287,43 @@ impl Kernel {
             if self.mem.mmap_anon(m, at, commpage::PAGE, 3, mflags::FIXED_NOREPLACE, false, "[commpage]").is_ok() {
                 let _ = m.write(at, &page);
             }
+        }
+    }
+
+    /// x86-64's page (`osfmk/i386/cpu_capabilities.h`): the same facts at
+    /// other offsets, and the clock. There `mach_absolute_time` does not
+    /// ask the kernel: it reads the processor's counter and scales it by
+    /// what the page says, `((tsc - base) << shift) * scale >> 32 + ns`,
+    /// while a generation there is not zero. gex's counter counts
+    /// nanoseconds, so the scale is one (a half, shifted once), and the
+    /// base is where the kernel's own clock was zero.
+    fn darwin_map_commpage_x86(&mut self, m: &mut GuestMem<'_>, cpus: u8) {
+        let caps = commpage::CAPABILITIES_X86 | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
+        let mut page = [0u8; 0x100];
+        page[..16].copy_from_slice(b"commpage 64-bit\0");
+        page[0x10..0x18].copy_from_slice(&caps.to_le_bytes());
+        page[0x1e..0x20].copy_from_slice(&commpage::VERSION_X86.to_le_bytes());
+        page[0x20..0x24].copy_from_slice(&(caps as u32).to_le_bytes());
+        page[0x22] = cpus;
+        page[0x26..0x28].copy_from_slice(&64u16.to_le_bytes());
+        page[0x34..0x37].fill(cpus);
+        page[0x37] = 1;
+        page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
+        page[0x40..0x44].copy_from_slice(&0x37fc_219fu32.to_le_bytes());
+        // The kernel's and a process's page shift.
+        page[0x4d] = 12;
+        page[0x4e] = 12;
+        // The counter is the wall clock in nanoseconds; the kernel's clock
+        // is that less where it began.
+        let (secs, nanos) = (self.clock)();
+        let base = (secs * 1_000_000_000 + nanos as u64).wrapping_sub(clock_ns(self.clock, 1));
+        page[0x50..0x58].copy_from_slice(&base.to_le_bytes());
+        page[0x58..0x5c].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        page[0x5c..0x60].copy_from_slice(&1u32.to_le_bytes());
+        page[0x68..0x6c].copy_from_slice(&1u32.to_le_bytes());
+        // 0x6c, the time of day's generation, is zero: libSystem asks.
+        if self.mem.mmap_anon(m, commpage::DATA, commpage::PAGE, 3, mflags::FIXED_NOREPLACE, false, "[commpage]").is_ok() {
+            let _ = m.write(commpage::DATA, &page);
         }
     }
 
