@@ -217,6 +217,10 @@ the image low. What works is what a program can do with the kernel alone:
   none), so the version a program sees is a setting of the root it runs
   in, as a Windows version is of a Wine prefix;
 - sockets: unix and TCP, descriptors passed in a control message;
+- POSIX shared memory by name (`shm_open`), with XNU's rules for it (sized
+  once and in whole pages, mapped shared and within its size). It is the
+  kernel's own, a file of `/dev/shm`, so a Linux program and a Mac one
+  that name the same memory share it;
 - the commpage: the page of facts about the machine libSystem reads
   instead of asking, and on x86-64 computes the time from. XNU's is past
   the end of a guest's memory, so it is at `0xFFC000` (arm64's read-only

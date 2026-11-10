@@ -60,6 +60,9 @@ const SA_FLAGS: [(u64, u64); 7] = [
 
 /// The descriptor a path in `/dev` names, if it names one: `/dev/fd/N`,
 /// and the first three by their own names.
+/// Where POSIX shared memory is kept ([`Kernel::darwin_shm_of`]).
+const SHM_DIR: &str = "/dev/shm";
+
 fn dev_fd(path: &[u8]) -> Option<i32> {
     match path {
         b"/dev/stdin" => Some(0),
@@ -277,7 +280,10 @@ impl Kernel {
                 set(nr::LSEEK, &[x[0], x[1], whence])
             }
             d::TRUNCATE => set(nr::TRUNCATE, &x[..2]),
+            // (Shared memory is sized once, in whole pages.)
+            d::FTRUNCATE if self.darwin_shm_of(x[0]).is_some() => NATIVE + code,
             d::FTRUNCATE => set(nr::FTRUNCATE, &x[..2]),
+            d::SHM_OPEN | d::SHM_UNLINK => NATIVE + code,
             // `struct stat` is Darwin's at the kernel's door (`Stat::encode_for`).
             // (A descriptor named by its number is what is open there,
             // not a file of `/dev`'s.)
@@ -285,6 +291,11 @@ impl Kernel {
             d::FSTATAT64 if fd_named(m, x[1], x[3] & 0x20 == 0).is_some() => set(nr::FSTAT, &[fd_named(m, x[1], true).unwrap_or(0), x[2]]),
             d::STAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], 0]),
             d::LSTAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], K_NOFOLLOW]),
+            // (Shared memory is no kind of file.)
+            d::FSTAT64 if self.darwin_shm_of(x[0]).is_some() => {
+                self.darwin_post = Post::NoKind { stat: x[1] };
+                set(nr::FSTAT, &x[..2])
+            }
             d::FSTAT64 => set(nr::FSTAT, &x[..2]),
             d::FSTATAT64 => set(nr::NEWFSTATAT, &[dirfd(x[0]), x[1], x[2], at_flags(x[3])]),
             d::GETPID => set(nr::GETPID, &[]),
@@ -621,6 +632,16 @@ impl Kernel {
             d::ISSETUGID => Ok(0),
             d::THREAD_SELFID => Ok(self.tid as u64),
             d::MMAP => self.darwin_mmap(m, x),
+            d::SHM_OPEN => self.darwin_shm(m, x[0], Some((x[1], x[2]))),
+            d::SHM_UNLINK => self.darwin_shm(m, x[0], None),
+            d::FTRUNCATE => {
+                let shm = self.darwin_shm_of(x[0]).ok_or(Errno::EBADF)?;
+                if shm.handle.metadata()?.size != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let len = x[1].checked_next_multiple_of(abi::PAGE_SIZE).ok_or(Errno::EINVAL)?;
+                self.dispatch(m, nr::FTRUNCATE, [x[0], len, 0, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))
+            }
             d::FCNTL | d::FCNTL_NOCANCEL => self.darwin_fcntl(m, x[0] as i32, x[1], x[2]),
             d::SIGACTION => self.darwin_sigaction(m, x[0] as u32, x[1], x[2]),
             d::SIGPROCMASK | d::PTHREAD_SIGMASK => self.darwin_sigprocmask(m, x[0] as u32, x[1], x[2]),
@@ -746,6 +767,20 @@ impl Kernel {
         if fd != u64::MAX {
             self.fds.get(fd as i32)?;
         }
+        // Shared memory is mapped shared, to write only if it was opened
+        // to, and no further than its size.
+        if let Some(shm) = self.darwin_shm_of(fd).filter(|_| fd != u64::MAX) {
+            if kflags & mflags::SHARED == 0 {
+                return Err(Errno::EINVAL);
+            }
+            if prot_bits & crate::mem::prot::WRITE as u64 != 0 && !shm.writable {
+                return Err(Errno::EPERM);
+            }
+            let size = shm.handle.metadata()?.size;
+            if len == 0 || off.checked_add(len).is_none_or(|end| end > size) {
+                return Err(Errno::EINVAL);
+            }
+        }
         if len == 0 {
             return if unix03 { Err(Errno::EINVAL) } else { Ok(0) };
         }
@@ -830,6 +865,51 @@ impl Kernel {
             }
         }
         Ok(fd)
+    }
+
+    /// The open file at `fd`, if it is POSIX shared memory: a file of the
+    /// directory the kernel keeps that in ([`SHM_DIR`], as Linux does). A
+    /// Mac has no such directory, so a file of it open in a Darwin program
+    /// is shared memory, and follows XNU's rules for it: sized once and in
+    /// whole pages, no kind of file to `fstat`, mapped shared and within
+    /// its size. (XNU does not let it be read, written or sought in by its
+    /// descriptor either; here it is, as the file it is.)
+    fn darwin_shm_of(&self, fd: u64) -> Option<Arc<OpenFile>> {
+        let file = self.fds.get(i32::try_from(fd).ok()?).ok()?;
+        file.path.strip_prefix(SHM_DIR)?.starts_with('/').then_some(file)
+    }
+
+    /// `shm_open` (`open`: its flags and mode) and `shm_unlink` of the
+    /// name at `name`: the file of that name in [`SHM_DIR`], which is what
+    /// a Linux program's `shm_open` names too, so the two kinds of program
+    /// share memory by name. A name is at most 31 bytes; one slash before
+    /// it is dropped, and one inside it is refused (XNU keeps names whole,
+    /// slashes and all, in a table of their own).
+    fn darwin_shm(&mut self, m: &mut GuestMem<'_>, name: u64, open: Option<(u64, u64)>) -> SysResult {
+        let n = m.read_cstr(name, 4096)?;
+        if n.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        if n.len() > 31 {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let leaf = n.strip_prefix(b"/").unwrap_or(&n);
+        if leaf.is_empty() || leaf == b"." || leaf == b".." || leaf.contains(&b'/') {
+            return Err(Errno::EINVAL);
+        }
+        let leaf_at = name + (n.len() - leaf.len()) as u64;
+        // The directory by its name, which fits the scratch, and the file
+        // in it by the caller's own bytes.
+        let at = self.ctx_addr + SCRATCH_SLOT as u64;
+        m.write(at, format!("{SHM_DIR}\0").as_bytes())?;
+        let dir = self.dispatch(m, nr::OPENAT, [CWD, at, abi::o::DIRECTORY | abi::o::CLOEXEC, 0, 0, 0]).unwrap_or(Err(Errno::ENOENT))?;
+        let r = match open {
+            // (Not kept across an exec, as XNU's is not.)
+            Some((flags, mode)) => self.dispatch(m, nr::OPENAT, [dir, leaf_at, flags | abi::o::CLOEXEC | abi::o::NOFOLLOW, mode, 0, 0]),
+            None => self.dispatch(m, nr::UNLINKAT, [dir, leaf_at, 0, 0, 0, 0]),
+        };
+        let _ = self.dispatch(m, nr::CLOSE, [dir, 0, 0, 0, 0, 0]);
+        r.unwrap_or(Err(Errno::ENOENT))
     }
 
     fn darwin_fcntl(&mut self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {

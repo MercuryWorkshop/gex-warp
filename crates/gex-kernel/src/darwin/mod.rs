@@ -156,6 +156,9 @@ pub enum Post {
     UlockWake,
     /// `unlink`: a directory is refused as Darwin refuses one.
     Unlink,
+    /// `fstat` of shared memory: the `stat` at `stat` says no kind of
+    /// file.
+    NoKind { stat: u64 },
     /// A Mach trap that waited: its answer as a `kern_return_t`.
     Kern { timed_out: u32 },
     /// A Mach trap that waited on a word for something to come: told to
@@ -452,6 +455,12 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             Err(Errno::EISDIR) => Err(Errno::EPERM),
             r => r,
         },
+        // (`st_mode` is the sixteen bits after `st_dev`.)
+        Post::NoKind { stat } => r.and_then(|v| {
+            let mode = m.read(stat + 4, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+            m.write(stat + 4, &(mode & 0o7777).to_le_bytes())?;
+            Ok(v)
+        }),
         Post::Wake { woken, timed_out } => Ok(match r {
             Err(Errno::ETIMEDOUT) => timed_out as u64,
             _ => woken as u64,
