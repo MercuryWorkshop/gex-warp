@@ -30,7 +30,8 @@ const DEFAULT_BUDGET: u64 = 4 << 30;
 /// thousands of entries, seconds to list and stat): each store adds its bytes,
 /// each eviction subtracts what it removed, and only a sweep walks. Its text is
 /// "<bytes> <unix seconds a walk last set them> <unix seconds a walk last
-/// started>", rewritten in place under a lock.
+/// started>", each right-aligned in 20 columns, rewritten in place under a
+/// lock.
 const LEDGER: &str = "size";
 
 /// The oldest entries the last walk left, as "<key> <bytes>" lines, oldest
@@ -102,12 +103,17 @@ fn ledger_update(dir: &Path, f: impl FnOnce(Option<Ledger>) -> Ledger) -> Option
         }
     });
     let new = f(old);
-    let line = format!("{} {} {}\n", new.bytes, new.walked, new.started);
-    // Shorter or longer than before; a reader holds the lock, so it never
-    // sees the file between the truncate and the write.
-    let _ = file.set_len(0);
+    // One length always, written over the old in one write: a process may
+    // exit with its sweep thread in here, and a ledger truncated and not yet
+    // rewritten would read as absent (untrusted, no walk started), so the
+    // next store would start a walk of its own.
+    let line = format!("{:>20} {:>20} {:>20}\n", new.bytes, new.walked, new.started);
     let _ = file.seek(std::io::SeekFrom::Start(0));
     let _ = file.write_all(line.as_bytes());
+    // (a ledger from before was shorter)
+    if text.len() > line.len() {
+        let _ = file.set_len(line.len() as u64);
+    }
     Some(new)
 }
 
@@ -357,32 +363,6 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// memory has, named by the sha256 of the image.
 pub fn mem64_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("mem64"))
-}
-
-fn mem64_record(image: &[u8]) -> Option<PathBuf> {
-    let mut h = sha256::Sha256::new();
-    h.update(image);
-    Some(mem64_dir()?.join(sha256::hex(&h.finish())))
-}
-
-/// Whether an earlier run of `image` ran out of a wasm32 memory's address
-/// space, so this one should start with a 64-bit memory.
-pub fn mem64_recorded(image: &[u8]) -> bool {
-    mem64_record(image).and_then(|p| std::fs::read(p).ok()).is_some_and(|b| b.starts_with(MEM64_RECORD_V))
-}
-
-/// The first line of a record: one an earlier gex wrote without it may have
-/// been learned from another image the run exec'd, and is not taken.
-const MEM64_RECORD_V: &[u8] = b"v 2\n";
-
-/// Record that `image` (at `path`, for the record's reader) ran out of
-/// address space asking for `short` bytes. Returns where it was written.
-pub fn record_mem64(image: &[u8], path: &str, short: u64) -> Option<PathBuf> {
-    let p = mem64_record(image)?;
-    std::fs::create_dir_all(p.parent()?).ok()?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    std::fs::write(&p, format!("v 2\nimage {path}\nshort {short}\nwhen {now}\n")).ok()?;
-    Some(p)
 }
 
 /// Where entry-point profiles live.

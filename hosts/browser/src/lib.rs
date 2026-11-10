@@ -529,10 +529,13 @@ extern "C" {
     fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_unlink_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_mkdir_now(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32;
     fn k_fs_add_dir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_rmdir_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
+    fn k_fs_rename_now(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32, now: i64) -> i32;
     fn k_fs_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_hold_renames(handle: i32, owner: i32, on: u32) -> i32;
     fn k_fs_rename_epoch() -> i32;
@@ -543,9 +546,12 @@ extern "C" {
     fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_symlink_now(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
+    fn k_fs_link_now(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, now: i64) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_fs_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_mksocket_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
+    fn k_fs_mkfifo_now(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32;
     fn k_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_part(path: gex_kernel::PAddr, path_len: u32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
@@ -698,10 +704,12 @@ extern "C" {
     // and with a Worker per process those are two memories -- so the name has
     // to be somewhere neither of them owns.
     // With the caller's pid, uid and gid: what the far end's SO_PEERCRED
-    // reports (`k_sock_peer_cred`).
+    // reports (`k_sock_peer_cred`); `connect` also with the IPv4 address and
+    // port a loopback TCP end connects from (`k_sock_peer_addr`, 0 for none).
     fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
-    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32;
     fn k_sock_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32;
+    fn k_sock_peer_addr(id: i32, out: gex_kernel::PAddr) -> i32;
     fn k_sock_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32);
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
@@ -1191,7 +1199,7 @@ extern "C" fn rf_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_k
 }
 extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_unlink(path, path_len) };
+    let r = unsafe { k_fs_unlink_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
@@ -1203,13 +1211,13 @@ extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i
 }
 extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_rmdir(path, path_len) };
+    let r = unsafe { k_fs_rmdir_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) };
+    let r = unsafe { k_fs_rename_now(from, from_len, to, to_len, noreplace, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
@@ -1275,18 +1283,18 @@ extern "C" fn rf_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: 
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_symlink(target, target_len, path, path_len) };
+    let r = unsafe { k_fs_symlink_now(target, target_len, path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_link(from, from_len, to, to_len) };
+    let r = unsafe { k_fs_link_now(from, from_len, to, to_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_mkfifo(path, path_len, mode) }
+    unsafe { k_fs_mkfifo_now(path, path_len, mode, browser_clock().0 as i64) }
 }
 extern "C" fn rp_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32 {
     let id = unsafe { k_fifo(path, path_len, how, pid) };
@@ -1295,7 +1303,7 @@ extern "C" fn rp_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32
 }
 extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_mksocket(path, path_len) };
+    let r = unsafe { k_fs_mksocket_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
@@ -1700,11 +1708,14 @@ extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32
 extern "C" fn rs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) {
     unsafe { k_sock_rename(from, from_len, to, to_len) }
 }
-extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    unsafe { k_sock_connect(path, path_len, pid, uid, gid) }
+extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
+    unsafe { k_sock_connect(path, path_len, pid, uid, gid, addr, port) }
 }
 extern "C" fn rs_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32 {
     unsafe { k_sock_peer_cred(id, out) }
+}
+extern "C" fn rs_peer_addr(id: i32, out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_peer_addr(id, out) }
 }
 extern "C" fn rs_accept(listener: i32) -> i32 {
     unsafe { k_sock_accept(listener) }
@@ -1865,6 +1876,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         bind: rs_bind,
         connect: rs_connect,
         peer_cred: rs_peer_cred,
+        peer_addr: rs_peer_addr,
         accept: rs_accept,
         pending: rs_pending,
         read: rs_read,
@@ -4487,6 +4499,13 @@ fn install_panic_hook() {
         // the process's stderr beside the guest's own complaint: a Worker's
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
+        // A 64-bit guest that outgrew the lowered memory gets the 64-bit
+        // one at its next start, where the page runs both.
+        gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
+            reachable: || !gex_abi::mem64() && vfork::page_runs_mem64(),
+            debug: |s| trace_line(&format!("[gex] {s}")),
+            say: |s| warn_line(&format!("[gex-info] {s}")),
+        });
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported
             // through it (std aborts at once, its line on a stderr that
@@ -4582,6 +4601,8 @@ fn set_host(host: Host) {
     // A new process: its registry starts empty, whatever a fork copied.
     regview::reset();
     regview::publish_marks(&jit_lock().lock().page_table);
+    // Before the program's first call, free or locked.
+    install_panic_hook();
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -4605,6 +4626,8 @@ fn set_host(host: Host) {
 fn set_host(host: Host) {
     regview::reset();
     regview::publish_marks(&jit_lock().lock().page_table);
+    // Before the program's first call, free or locked.
+    install_panic_hook();
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -10833,6 +10856,18 @@ pub extern "C" fn gex_space_top() -> u32 {
     if gex_abi::mem64() { (wine64_top_m64() >> 16) as u32 } else { 0 }
 }
 
+/// Where this module's own space below 4 GiB starts, in 64 KiB units, for a
+/// 64-bit Wine in a 64-bit memory: the shim's heap climbs from 2 GiB once
+/// the Windows space is taken (`winspace::host_floor`), and no Windows
+/// view lies above it, so Wine reports `[it, 4 GiB)` as reserved rather
+/// than free (VirtualQuery, GlobalMemoryStatusEx's available virtual
+/// memory). 0 when there is no such space (a 32-bit memory).
+#[no_mangle]
+pub extern "C" fn gex_host_space() -> u32 {
+    let lo = winspace::host_floor();
+    if gex_abi::mem64() && lo < gex_abi::IMAGE_ZONE64 { (lo >> 16) as u32 } else { 0 }
+}
+
 /// In the compact space (`winspace::wine64_compact`) the window is the top
 /// of the island Wine's images are kept in (`winspace::island`), above
 /// every image Wine places there and within 4 GiB of them, so that it does
@@ -12007,7 +12042,7 @@ thread_local! {
 /// claimed, so nothing of it is torn down or published -- the process goes
 /// on, its descriptors and signal state carried, in the Worker the host
 /// starts with the other flavour's runtime (host.mjs `execAway`).
-fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
+pub(crate) fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
     let ctx = h.threads[cur()].ctx_addr() as u32;
     vfork::stage_exec_parts(h, path, argv, envp);
     EXEC_AWAY.with(|c| c.set(Some((h.kernel.pid, ctx))));
@@ -20829,6 +20864,10 @@ fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
     if let Some(home) = sigs::home() {
+        // Whether it outgrew its memory, for its next start.
+        // (`status` is an exit code, or a signal's number negated)
+        let word = if status < 0 { (-status) & 0x7f } else { (status & 0xff) << 8 };
+        gex_kernel::syscalls::outgrow_ending(pid, word, home.procs());
         home.procs().exit(pid, status);
     }
 }
