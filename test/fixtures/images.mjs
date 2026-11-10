@@ -10,6 +10,10 @@
 //            file's bytes (one test's each), and rt-side.so, a side module
 //            rt-dlstatic loads (a lazy file's). Kept
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
+//   darwin-root  darwin-root.aarch64.tar and darwin-root.x86.tar: a Mac's root
+//            for each architecture there is one of (GEX_TEST_DARWIN_ROOT,
+//            GEX_TEST_DARWIN_ROOT_X86; by default pyrus's out/root and
+//            out/root-x86_64 beside this repository).
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
@@ -190,6 +194,20 @@ export const images = {
       }
     }
     return null;
+  },
+
+  async 'darwin-root'(work) {
+    let made = 0;
+    for (const [arch, env, dir] of [['aarch64', 'GEX_TEST_DARWIN_ROOT', 'root'], ['x86', 'GEX_TEST_DARWIN_ROOT_X86', 'root-x86_64']]) {
+      const root = process.env[env] || join(ROOT, '..', 'pyrus', 'out', dir);
+      const out = join(work, `darwin-root.${arch}.tar`);
+      rmSync(out, { force: true });
+      if (!existsSync(join(root, 'usr/lib/dyld'))) continue;
+      // (No `._` files for what a Mac keeps beside a file's bytes.)
+      execFileSync('tar', ['-cf', out, '-C', root, '.'], { env: { ...process.env, COPYFILE_DISABLE: '1' } });
+      made++;
+    }
+    return made ? null : 'no Mac root (GEX_TEST_DARWIN_ROOT, GEX_TEST_DARWIN_ROOT_X86: pyrus builds one)';
   },
 
   async busybox(work) {

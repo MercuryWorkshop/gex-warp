@@ -166,6 +166,7 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
       const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
+      const wholeRoot = guestRoot.replace(/\/$/, '') === '';
       const walk = (guest, host) => {
         // Unreadable directories are ordinary in a rootfs (mode 0700, root),
         // and one must not take the whole run down.
@@ -193,6 +194,21 @@ const rest = [];
           // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and
           // `stat` follows links so it throws on them. Skipping matches what a
           // guest sees: the link resolves to nothing there too.
+          // In a whole root, a link to an absolute name arrives as the link
+          // it is: the name is the guest's, and following it here read this
+          // machine's file of that name (a Mac root's
+          // `/private/var/select/sh -> /bin/bash` became the host's own
+          // shell), or found none and dropped the link. (A directory mounted
+          // somewhere else may link to this machine's files on purpose.)
+          try {
+            const target = wholeRoot && lstatSync(h).isSymbolicLink() ? readlinkSync(h) : '';
+            if (target.startsWith('/')) {
+              symlinks[g] = target;
+              continue;
+            }
+          } catch {
+            continue;
+          }
           let st;
           try {
             st = statSync(h);

@@ -318,6 +318,10 @@ process has a kernel of its own; `gexc` runs programs of one kind at a
 time, and a Mac program there is given its root with `--sysroot`. A
 system whose own tree is a Mac's enters nothing.
 
+A page whose whole tree is a Mac's starts its shell as it starts any
+program (`runProgram`): `test/darwin/terminal.test.js` runs Apple's bash
+from such a root on a terminal in a browser tab, typing at its prompt.
+
 ### Build the page
 
 ```console
