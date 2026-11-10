@@ -312,7 +312,11 @@ pub const PAGE_SIZE: u64 = if gex_abi::X86 { 0x1000 } else { 0x4000 };
 /// ```
 pub fn stat(st: &Stat) -> StatBytes {
     let mut b = StatBytes::zeroed(144);
-    b[0..4].copy_from_slice(&dev(st.dev).to_le_bytes());
+    // The kernel's files are on no device (0), which Darwin's libc takes for
+    // a file it cannot trust the numbers of (`getcwd` walks the tree by hand
+    // then): they are on the root's disk.
+    let on = if st.dev == 0 { ROOT_DEV } else { dev(st.dev) };
+    b[0..4].copy_from_slice(&on.to_le_bytes());
     b[4..6].copy_from_slice(&(st.mode as u16).to_le_bytes());
     b[6..8].copy_from_slice(&(st.nlink.min(u16::MAX as u32) as u16).to_le_bytes());
     b[8..16].copy_from_slice(&st.ino.to_le_bytes());
@@ -335,6 +339,10 @@ pub fn stat(st: &Stat) -> StatBytes {
     b[112..116].copy_from_slice(&st.blksize.to_le_bytes());
     b
 }
+
+/// The disk every file is on that the kernel gives no device for: major 1,
+/// as a Mac's root volume has.
+pub const ROOT_DEV: u32 = (1 << 24) | 4;
 
 /// A Linux device number (major in bits 8 to 19, minor in the rest) as
 /// Darwin's 32-bit `dev_t`: major in the top byte, minor in the low 24 bits.
