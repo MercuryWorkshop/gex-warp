@@ -99,11 +99,14 @@ pub struct DevFs {
     /// lists them and `stat` answers for each (and for `/dev/ptmx`). Opening
     /// one is the kernel's (`open_pty`), not this filesystem's.
     pts: Option<Arc<dyn Fn() -> Vec<u32> + Send + Sync>>,
+    /// The modes of the pts that were given one (`chmod`, as `mesg n`
+    /// does to the terminal it is run at); the rest have a terminal's.
+    pts_modes: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
 }
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None }
+        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None, pts_modes: Default::default() }
     }
 
     /// `/dev/ptmx` and `/dev/pts`, with `list` saying which pts numbers exist.
@@ -117,10 +120,14 @@ impl DevFs {
             (crate::pty::PTMX_INO, crate::pty::PTMX_RDEV, 0o666)
         } else {
             let n: u32 = path.strip_prefix("pts/").and_then(|n| n.parse().ok()).or_else(|| crate::pty::mac_name(path))?;
-            if !list().contains(&n) {
+            let live = list();
+            // (A mode is its terminal's, not the next one's of that number.)
+            let mut modes = self.pts_modes.lock().unwrap_or_else(|e| e.into_inner());
+            modes.retain(|n, _| live.contains(n));
+            if !live.contains(&n) {
                 return None;
             }
-            (crate::pty::pts_ino(n), crate::pty::pts_rdev(n), 0o620)
+            (crate::pty::pts_ino(n), crate::pty::pts_rdev(n), modes.get(&n).copied().unwrap_or(0o620))
         };
         Some(Metadata {
             file_type: FileType::CharDevice,
@@ -175,6 +182,17 @@ impl Default for DevFs {
 impl FileSystem for DevFs {
     fn fs_type(&self) -> &'static str {
         "devtmpfs"
+    }
+    /// A terminal's mode is kept; a device's is not, and the change is
+    /// taken as made.
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let n: Option<u32> = path.strip_prefix("pts/").and_then(|n| n.parse().ok()).or_else(|| crate::pty::mac_name(path));
+        if let (Some(list), Some(n)) = (&self.pts, n) {
+            if list().contains(&n) {
+                self.pts_modes.lock().unwrap_or_else(|e| e.into_inner()).insert(n, mode & 0o7777);
+            }
+        }
+        Ok(())
     }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         // A directory opens for reading only.

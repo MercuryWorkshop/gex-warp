@@ -155,6 +155,25 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_write, slave, "a\nb", 3);
     show_read("output, untouched", master);
 
+    // Made a line at a time again, what is there to read is to be gone over
+    // again, and the terminal says so until more is typed.
+    t.c_lflag = ISIG | ICANON | ECHO;
+    t_show("TIOCSETA, canonical again", SYS(SYS_ioctl, slave, TIOCSETA, &t));
+    SYS(SYS_ioctl, slave, TIOCGETA, &got);
+    t_printf("  lflag %lx\n", got.c_lflag);
+    SYS(SYS_write, master, "x\n", 2);
+    show_read("a line typed", slave);
+    SYS(SYS_ioctl, slave, TIOCGETA, &got);
+    t_printf("  lflag %lx\n", got.c_lflag);
+
+    // The terminal's mode is its own, and kept (`mesg n` changes it).
+    struct t_stat st;
+    SYS(SYS_stat64, name, &st);
+    t_printf("the terminal's mode: %o\n", st.st_mode & 07777);
+    t_show("chmod", SYS(SYS_chmod, name, 0600));
+    SYS(SYS_stat64, name, &st);
+    t_printf("  now %o\n", st.st_mode & 07777);
+
     // A session of its own has no controlling terminal until it takes one,
     // and `/dev/tty` is that: no device, for it.
     long second = 0;

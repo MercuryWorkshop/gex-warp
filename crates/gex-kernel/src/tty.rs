@@ -476,6 +476,13 @@ impl Tty {
     pub fn input(&self, bytes: &[u8]) -> Input {
         let mut out = Input::default();
         let mut s = self.lock();
+        // What was pending is gone over as more comes, and is pending no
+        // more: PENDIN, which a Mac's terminal sets itself when it is made
+        // canonical again (darwin/tty.rs) and Linux's never does.
+        if !bytes.is_empty() && s.lflag() & lflag::PENDIN != 0 {
+            let l = s.lflag() & !lflag::PENDIN;
+            s.termios[12..16].copy_from_slice(&l.to_le_bytes());
+        }
         for &raw in bytes {
             let l = s.lflag();
             let i = s.iflag();

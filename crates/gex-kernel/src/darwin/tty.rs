@@ -287,7 +287,24 @@ impl Kernel {
             req::TIOCSETA | req::TIOCSETAW | req::TIOCSETAF => {
                 self.fds.get(fd)?;
                 let was: [u8; TERMIOS] = m.read(arg, TERMIOS)?.try_into().unwrap();
-                m.write(arg, &termios_to_kernel(&was))?;
+                // A terminal made canonical again has its input to go over
+                // again, and says so (PENDIN) until more is typed
+                // (`Tty::input`): `stty` shows it after a shell's line
+                // editor. Its own to say: what the caller asks of it is
+                // only kept while the terminal stays canonical.
+                const ICANON: u32 = 0x2;
+                const PENDIN: u32 = 0x4000;
+                let old = match self.sys_ioctl(m, fd, k::TCGETS, arg) {
+                    Ok(_) => m.read_u32(arg + 12).unwrap_or(0),
+                    Err(_) => 0,
+                };
+                let mut new = termios_to_kernel(&was);
+                let lflag = u32::from_le_bytes(new[12..16].try_into().unwrap());
+                if lflag & ICANON != 0 {
+                    let pending = if old & ICANON == 0 { PENDIN } else { old & PENDIN };
+                    new[12..16].copy_from_slice(&(lflag | pending).to_le_bytes());
+                }
+                m.write(arg, &new)?;
                 let r = self.sys_ioctl(m, fd, k::TCSETS + (request - req::TIOCSETA), arg);
                 m.write(arg, &was)?;
                 r
