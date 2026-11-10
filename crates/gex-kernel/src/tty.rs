@@ -533,10 +533,10 @@ impl Tty {
                     None
                 };
                 if let Some(sig) = sig {
+                    // (The character and no more: the new line a shell is
+                    // seen to start after `^C` is the shell's own.)
                     if l & lflag::ECHO != 0 {
                         s.echo_of(b, &mut out.echo);
-                        // Onto its own line: what follows is the next prompt.
-                        out.echo.extend_from_slice(b"\r\n");
                     }
                     if l & lflag::NOFLSH == 0 {
                         s.line.clear();
@@ -962,7 +962,7 @@ mod tests {
         let c = typed(&t, "\x03");
         assert_eq!(c.signals, vec![crate::signal::sig::SIGINT]);
         assert!(c.flush);
-        assert_eq!(c.echo, b"^C\r\n");
+        assert_eq!(c.echo, b"^C");
         // And the abandoned line is not waiting to be delivered later.
         assert_eq!(typed(&t, "\r").to_reader, b"\n");
     }

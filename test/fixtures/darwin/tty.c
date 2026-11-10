@@ -91,6 +91,29 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_check("and ends lines as a terminal does", (t.c_oflag & (OPOST | ONLCR)) == (OPOST | ONLCR) && t.c_iflag & ICRNL);
     t_check("eight bits", (t.c_cflag & CS8) == CS8);
     t_check("^C and ^D", t.c_cc[VINTR] == 3 && t.c_cc[VEOF] == 4);
+    // As a Mac sets a new one, all of it (ttydefaults.h).
+    show_termios("new", &t);
+    t_printf("  dsusp %x status %x\n", t.c_cc[11], t.c_cc[18]);
+    // Its name is one of /dev's own, where ttyname looks for the device a
+    // descriptor says it is.
+    struct t_stat by_name, by_fd;
+    t_show("its name asked about", SYS(SYS_stat64, name, &by_name));
+    SYS(SYS_fstat64, slave, &by_fd);
+    t_check("the device the descriptor is", by_name.st_rdev == by_fd.st_rdev && (by_name.st_mode & 0170000) == 0020000);
+    t_check("named ttysNNN", !t_strncmp(name, "/dev/ttys", 9));
+    {
+        static char buf[8192];
+        long dev = SYS(SYS_open, "/dev", O_RDONLY), base = 0, got, listed = 0;
+        while ((got = SYS(SYS_getdirentries64, dev, buf, sizeof buf, &base)) > 0)
+            for (long at = 0; at < got; at += *(u16 *)(buf + at + 16))
+                if (!t_strcmp(buf + at + 21, name + 5)) listed = 1;
+        SYS(SYS_close, dev);
+        t_check("and listed in /dev", listed);
+    }
+    // What the terminal echoes of an interrupt: the character, and no
+    // line after it.
+    SYS(SYS_write, master, "\x03", 1);
+    show_read("^C echoed", master);
 
     // Set every field, and read them back.
     t_memset(&t, 0, sizeof t);

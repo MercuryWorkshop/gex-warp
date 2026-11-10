@@ -243,6 +243,9 @@ const rest = [];
                 files[g] = readFileSync(h);
               }
               mtimes[g] = Math.trunc(st.mtimeMs / 1000);
+              // A whole root's programs are executable in it, as they are
+              // here (what is not keeps the mode a file has by default).
+              if (wholeRoot && st.mode & 0o111) modes[g] = st.mode & 0o7777;
             } catch {
               // Unreadable, or a name the host rejects. One file is not the
               // run.

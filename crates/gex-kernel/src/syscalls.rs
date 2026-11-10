@@ -3383,8 +3383,7 @@ impl PathIo<'_> {
                 return Some(Err(Errno::ENOSPC));
             }
             (packed >> 16, true)
-        } else if let Some(n) = p.strip_prefix("/dev/pts/") {
-            let ptn: i32 = n.parse().ok()?;
+        } else if let Some(ptn) = p.strip_prefix("/dev/pts/").and_then(|n| n.parse::<i32>().ok()).or_else(|| crate::pty::mac_name(p.strip_prefix("/dev/")?).map(|n| n as i32)) {
             let id = (r.open_slave)(ptn);
             if id == -1 {
                 return None; // no such pts -- let the VFS answer ENOENT
@@ -10115,6 +10114,15 @@ impl Kernel {
                 Ok(to) if to.starts_with('/') => path = to,
                 _ => break,
             }
+        }
+        // A file nobody may execute is refused for that before it is asked
+        // what it is: a shell takes `ENOEXEC` to mean a script with no `#!`
+        // line, and runs it. (Where files have their modes, which a tree a
+        // page made may not: if the program asking is itself a file nobody
+        // may execute, the modes here say nothing.)
+        let nobody_may = |p: &str| self.vfs.metadata(p).ok().filter(|md| md.file_type == crate::vfs::FileType::Regular).map(|md| md.mode & 0o111 == 0);
+        if crate::darwin::on() && nobody_may(&path) == Some(true) && nobody_may(&self.exe_path) == Some(false) {
+            return Err(Errno::EACCES);
         }
         let (path, argv) = self.resolve_interpreter_as(path, argv, given)?;
         // Its head only: the loader reads the whole file once it is past the

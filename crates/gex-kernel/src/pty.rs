@@ -248,6 +248,14 @@ fn drain(q: &mut VecDeque<u8>, buf: &mut [u8]) -> u64 {
     n as u64
 }
 
+/// The pts number of a name a Mac has for one, `ttysNNN` (in `/dev`): the
+/// same device as `pts/N`, which a Mac program is told by this name
+/// (`ptsname`) and finds by it (`ttyname`).
+pub fn mac_name(name: &str) -> Option<u32> {
+    let n = name.strip_prefix("ttys")?;
+    (n.len() >= 3 && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse().ok())?
+}
+
 /// `st_rdev` of `/dev/pts/N` (major 136), in Linux's encoding.
 pub const fn pts_rdev(n: u32) -> u64 {
     let (major, minor) = (136u64, n as u64);

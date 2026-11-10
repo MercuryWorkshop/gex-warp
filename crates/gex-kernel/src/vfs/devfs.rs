@@ -116,7 +116,7 @@ impl DevFs {
         let (ino, rdev, mode) = if path == "ptmx" {
             (crate::pty::PTMX_INO, crate::pty::PTMX_RDEV, 0o666)
         } else {
-            let n: u32 = path.strip_prefix("pts/")?.parse().ok()?;
+            let n: u32 = path.strip_prefix("pts/").and_then(|n| n.parse().ok()).or_else(|| crate::pty::mac_name(path))?;
             if !list().contains(&n) {
                 return None;
             }
@@ -194,6 +194,7 @@ impl FileSystem for DevFs {
             return Ok(Arc::new(DevDir {
                 extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
                 pts: self.pts.is_some(),
+                ttys: self.pts.as_ref().filter(|_| crate::darwin::on()).map(|list| list()).unwrap_or_default(),
             }));
         }
         if let (Some(list), "pts") = (self.pts.as_ref(), path) {
@@ -293,6 +294,10 @@ struct DevDir {
     extra: Vec<String>,
     /// Whether `ptmx` and `pts` exist.
     pts: bool,
+    /// The pts numbers a Mac program is shown by the names a Mac has for
+    /// them, `ttysNNN`: its `ttyname` looks for a terminal's device among
+    /// the names of `/dev` itself, and no deeper.
+    ttys: Vec<u32>,
 }
 
 /// `/dev/input`: the connected game controllers (`evdev`).
@@ -382,6 +387,9 @@ impl FileHandle for DevDir {
         if self.pts {
             out.push(DirEntry { name: "ptmx".into(), file_type: FileType::CharDevice, ino: crate::pty::PTMX_INO });
             out.push(DirEntry { name: "pts".into(), file_type: FileType::Directory, ino: 1 });
+        }
+        for &n in &self.ttys {
+            out.push(DirEntry { name: format!("ttys{n:03}"), file_type: FileType::CharDevice, ino: crate::pty::pts_ino(n) });
         }
         for name in ["stdin", "stdout", "stderr", "fd"] {
             out.push(DirEntry {

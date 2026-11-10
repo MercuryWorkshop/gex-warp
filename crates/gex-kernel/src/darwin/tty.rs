@@ -130,7 +130,8 @@ const LFLAG: &[(u64, u32)] = &[
 ];
 
 /// Each `(darwin, kernel)` pair of indices into `c_cc`. Darwin has two the
-/// kernel does not (`VDSUSP` 11, `VSTATUS` 18).
+/// kernel does not (`VDSUSP` 11, `VSTATUS` 18), which are kept in the two
+/// of the kernel's nineteen it has no use for and do nothing.
 const CC: &[(usize, usize)] = &[
     (0, 4),   // VEOF
     (1, 11),  // VEOL
@@ -142,12 +143,14 @@ const CC: &[(usize, usize)] = &[
     (8, 0),   // VINTR
     (9, 1),   // VQUIT
     (10, 10), // VSUSP
+    (11, 17), // VDSUSP, which the kernel has none of: kept where it keeps nothing
     (12, 8),  // VSTART
     (13, 9),  // VSTOP
     (14, 15), // VLNEXT
     (15, 13), // VDISCARD
     (16, 6),  // VMIN
     (17, 5),  // VTIME
+    (18, 18), // VSTATUS, as VDSUSP
 ];
 /// `VMIN` and `VTIME` are counts; every other entry is a character, which
 /// is disabled by `0xff` on Darwin and by zero in the kernel.
@@ -310,7 +313,9 @@ impl Kernel {
             }
             req::TIOCPTYGNAME => {
                 self.sys_ioctl(m, fd, k::TIOCGPTN, scratch)?;
-                let mut name = format!("/dev/pts/{}", m.read_u32(scratch)?).into_bytes();
+                // (By the name a Mac has for it, in `/dev` itself, where
+                // `ttyname` looks: `crate::pty::mac_name`.)
+                let mut name = format!("/dev/ttys{:03}", m.read_u32(scratch)?).into_bytes();
                 name.resize(128, 0);
                 m.write(arg, &name)?;
                 Ok(0)

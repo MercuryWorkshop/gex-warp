@@ -2972,7 +2972,9 @@ fn say_killed(pid: i32, exit: &Exit) {
     }
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let all = *ALL.get_or_init(|| std::env::var("GEX_LOG_CHILD_SIGNALS").is_ok_and(|v| v == "1"));
-    if !all && *signal != 9 {
+    // (Nor a SIGKILL where gex is to say nothing of its own, `GEX_LOG=off`:
+    // a program that kills its child that way has its output compared.)
+    if !all && (*signal != 9 || log_quiet()) {
         return;
     }
     let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };

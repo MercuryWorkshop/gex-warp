@@ -84,8 +84,11 @@ fn fd_named(m: &GuestMem<'_>, path: u64, follow: bool) -> Option<u64> {
 /// Whether an `open` of the path at `path` with `flags` is more than the
 /// kernel's `openat` does ([`Kernel::darwin_open`]): a descriptor named by
 /// its number, or a lock asked for with the file.
+/// Where a pseudoterminal is made by being opened.
+const PTMX: &str = "/dev/ptmx";
+
 fn darwin_open_is_more(m: &GuestMem<'_>, path: u64, flags: u64) -> bool {
-    flags & (abi::o::SHLOCK | abi::o::EXLOCK) != 0 || m.read_cstr(path, 64).is_ok_and(|p| dev_fd(&p).is_some())
+    flags & (abi::o::SHLOCK | abi::o::EXLOCK) != 0 || m.read_cstr(path, 64).is_ok_and(|p| dev_fd(&p).is_some() || p == PTMX.as_bytes())
 }
 
 fn sa_flags_to_kernel(f: u64) -> u64 {
@@ -859,6 +862,36 @@ impl Kernel {
         }
         let locks = flags & (abi::o::SHLOCK | abi::o::EXLOCK);
         let fd = self.dispatch(m, nr::OPENAT, [dirfd, path, flags & !locks, mode, 0, 0]).unwrap_or(Err(Errno::ENOENT))?;
+        // A new terminal is set as a Mac's is (`ttydefaults.h`), which is
+        // not quite as the kernel's are: any character starts output
+        // again, input is not taken for UTF-8, a kill does not echo a new
+        // line, the line hangs up at the last close, at 9600 baud, and the
+        // two characters only a Mac has are ^Y and ^T.
+        if m.read_cstr(path, 64).is_ok_and(|p| p == PTMX.as_bytes()) {
+            let id = self.fds.get(fd as i32).ok().and_then(|f| f.path.strip_prefix("pty:[")?.split_once(':')?.0.parse::<i32>().ok());
+            if let (Some(r), Some(id)) = (self.ptys, id) {
+                const IXANY: u32 = 0x800;
+                const IUTF8: u32 = 0x4000;
+                const CBAUD: u32 = 0x100f;
+                const B9600: u32 = 13;
+                const HUPCL: u32 = 0x400;
+                const ECHOK: u32 = 0x20;
+                let mut t = [0u8; 60];
+                if (r.get_termios)(id, &mut t) >= 0 {
+                    let mut word = |i: usize, f: &dyn Fn(u32) -> u32| {
+                        let v = f(u32::from_le_bytes(t[4 * i..4 * i + 4].try_into().unwrap()));
+                        t[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+                    };
+                    word(0, &|i| (i | IXANY) & !IUTF8);
+                    word(2, &|c| (c & !CBAUD) | B9600 | HUPCL);
+                    word(3, &|l| l & !ECHOK);
+                    // (`c_cc` is at 17; `tty::CC` says where the two are kept.)
+                    t[17 + 17] = 25;
+                    t[17 + 18] = 20;
+                    (r.set_termios)(id, &t[..36], 0);
+                }
+            }
+        }
         if locks != 0 {
             const LOCK_SH: u64 = 1;
             const LOCK_EX: u64 = 2;
