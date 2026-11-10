@@ -5256,11 +5256,67 @@ impl<'a> Lifter<'a> {
                 (RmwOp::And, inv)
             }
             IsaRmw::Swp => (RmwOp::Xchg, operand),
-            // The min/max variants need a compare-and-swap retry loop, which
-            // block-local GIR cannot express. They are vanishingly rare in
-            // real userspace, so trap precisely rather than guess.
+            // The min/max variants are a compare-and-swap with a retry,
+            // and a block cannot loop: so the retry is a branch back to
+            // this instruction. What is there is read; the one to keep of
+            // it and the operand is stored if nothing else was stored
+            // meanwhile, and Rt has what was read; if something was, nothing
+            // of the guest's has changed, and the instruction runs again.
+            // (Darwin's libsyscall keeps a ring's low-water mark this way,
+            // `os_atomic_min`.)
             IsaRmw::Smax | IsaRmw::Smin | IsaRmw::Umax | IsaRmw::Umin => {
-                return Flow::End(Term::Illegal { raw: self.raw, pc })
+                let old = self.b.def(Expr::Load {
+                    addr,
+                    offset: 0,
+                    sz: mem_sz(sz),
+                    signed: false,
+                    ty,
+                    order: Order::SeqCst,
+                });
+                let signed = matches!(op, IsaRmw::Smax | IsaRmw::Smin);
+                // Compared as wide as the access, each with its sign.
+                let narrow = match sz {
+                    MemSz::B => 8,
+                    MemSz::H => 16,
+                    _ => 0,
+                };
+                let (a, b) = if narrow == 0 {
+                    (old, operand)
+                } else if signed {
+                    let k = self.konst(ty, 32 - narrow);
+                    let fit = |l: &mut Self, v: Value| {
+                        let up = l.b.bin(BinOp::Shl, ty, v, k);
+                        l.b.bin(BinOp::ShrS, ty, up, k)
+                    };
+                    (fit(self, old), fit(self, operand))
+                } else {
+                    let mask = self.konst(ty, (1u64 << narrow) - 1);
+                    (old, self.b.bin(BinOp::And, ty, operand, mask))
+                };
+                let keep_old = match op {
+                    IsaRmw::Smax => CmpOp::GtS,
+                    IsaRmw::Smin => CmpOp::LtS,
+                    IsaRmw::Umax => CmpOp::GtU,
+                    _ => CmpOp::LtU,
+                };
+                let keep = self.b.cmp(keep_old, ty, a, b);
+                let new = self.b.select(keep, old, operand, ty);
+                let got = self.b.def(Expr::CmpXchg {
+                    addr,
+                    expected: old,
+                    replacement: new,
+                    sz: mem_sz(sz),
+                    ty,
+                });
+                let stored = self.b.cmp(CmpOp::Eq, ty, got, old);
+                let was = self.rd_gp(rt, width);
+                let out = self.b.select(stored, old, was, ty);
+                self.wr_gp(rt, width, out);
+                return Flow::End(Term::Branch {
+                    cond: stored,
+                    taken: pc + 4,
+                    not_taken: pc,
+                });
             }
         };
         let old = self.b.def(Expr::Rmw {
