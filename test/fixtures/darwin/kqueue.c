@@ -312,6 +312,46 @@ int main(int argc, char **argv, char **envp, char **apple) {
     struct kevent_qos eq = {9, USER, ADD | CLEAR, 0, 71, TRIGGER, 0, 0, {0, 0, 0, 0}}, gq[2];
     n = SYS(SYS_kevent_qos, kq, &eq, 1, gq, 2, 0, 0, 1);
     t_printf("kevent_qos: %ld [%lu filter %d udata %lu]\n", n, (unsigned long)gq[0].ident, gq[0].filter, (unsigned long)gq[0].udata);
+    // A note of the kind libdispatch makes -- told once and then off, one
+    // of several told apart -- is not removed while it is off: it goes
+    // when it is next put on, and says so.
+    SYS(SYS_close, kq);
+    kq = SYS(SYS_kqueue);
+    enum { D2 = DISPATCH | SPECIFIC };
+    t_show("a note told once and then off", change(1, USER, ADD | D2 | CLEAR, 0, 0, 11));
+    t_show("removed before it says anything", change(1, USER, DELETE | SPECIFIC, 0, 0, 11));
+    change(1, USER, ADD | D2 | CLEAR, 0, 0, 11);
+    change(1, USER, SPECIFIC, TRIGGER, 0, 11);
+    say("it says its thing", ready(0));
+    t_show("removed while off", change(1, USER, DELETE | SPECIFIC, 0, 0, 11));
+    say("and nothing of it", ready(0));
+    t_show("removed again", change(1, USER, DELETE | SPECIFIC, 0, 0, 11));
+    t_show("posted, on its way out", change(1, USER, SPECIFIC, TRIGGER, 0, 11));
+    say("which is not said", ready(0));
+    t_show("put on", change(1, USER, ENABLE | SPECIFIC, 0, 0, 11));
+    say("it says it is gone", ready(0));
+    say("once", ready(0));
+    t_show("and it is", change(1, USER, DELETE | SPECIFIC, 0, 0, 11));
+    change(2, USER, ADD | D2 | CLEAR, 0, 0, 22);
+    change(2, USER, SPECIFIC, TRIGGER, 0, 22);
+    say("another says its thing", ready(0));
+    t_show("removed and put on at once", change(2, USER, DELETE | ENABLE | SPECIFIC, 0, 0, 22));
+    say("gone without a word", ready(0));
+    change(4, USER, ADD | D2 | CLEAR, 0, 0, 44);
+    t_show("one switched off by hand", change(4, USER, DISABLE | SPECIFIC, 0, 0, 44));
+    t_show("removed", change(4, USER, DELETE | SPECIFIC, 0, 0, 44));
+    t_show("put on", change(4, USER, ENABLE | SPECIFIC, 0, 0, 44));
+    say("it says it is gone", ready(0));
+    t_show("a timer of that kind, for once", change(7, TIMER, ADD | D2 | ONESHOT, 0, 0, 77));
+    say("it fires", ready(1000));
+    t_show("removed", change(7, TIMER, DELETE | SPECIFIC, 0, 0, 77));
+    t_show("put on", change(7, TIMER, ENABLE | SPECIFIC, 0, 0, 77));
+    say("it says it is gone", ready(0));
+    t_show("a timer for once, of the plain kind", change(8, TIMER, ADD | ONESHOT, 0, 0, 88));
+    say("it fires", ready(1000));
+    t_show("and is gone", change(8, TIMER, DELETE, 0, 0, 88));
+    SYS(SYS_close, kq);
+    kq = SYS(SYS_kqueue);
     // Two changes at once, each 72 bytes: the second is of no note, and
     // is all that is answered; what the first posted is told after, with
     // another.

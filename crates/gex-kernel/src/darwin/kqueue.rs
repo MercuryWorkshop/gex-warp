@@ -89,6 +89,11 @@ mod ev {
     pub const EOF: u16 = 0x8000;
     /// What a note keeps of the flags it was added with.
     pub const KEPT: u16 = ONESHOT | CLEAR | DISPATCH | UDATA_SPECIFIC;
+    /// A note of the kind libdispatch makes (`EV_DISPATCH2`): told once
+    /// and then off, and one of several told apart. Such a note is not
+    /// removed while it is off: it goes when it is next put on, and says
+    /// so then.
+    pub const DISPATCH2: u16 = DISPATCH | UDATA_SPECIFIC;
 }
 
 /// `fflags`, by filter.
@@ -256,6 +261,10 @@ struct Note {
     qos: u32,
     ext: [u64; 4],
     what: What,
+    /// To be removed when it is next put on, with an event that says so:
+    /// it was removed while off, or said its one thing, and is of the kind
+    /// that waits (`ev::DISPATCH2`).
+    going: bool,
 }
 
 /// A file a note is to watch, as the caller's descriptor table has it.
@@ -485,7 +494,14 @@ impl Kqueue {
         let specific = e.flags & ev::UDATA_SPECIFIC;
         let at = notes.iter().position(|n| n.ident == e.ident && n.filter == e.filter && n.flags & ev::UDATA_SPECIFIC == specific && (specific == 0 || n.udata == e.udata));
         if e.flags & ev::DELETE != 0 {
-            let n = notes.remove(at.ok_or(Errno::ENOENT)?);
+            let at = at.ok_or(Errno::ENOENT)?;
+            // (XNU's deferred delete: the note is on its way out, and the
+            // caller is told it is not out yet.)
+            if e.flags & ev::ENABLE == 0 && notes[at].flags & ev::DISPATCH2 == ev::DISPATCH2 && notes[at].disabled {
+                notes[at].going = true;
+                return Err(Errno::EINPROGRESS);
+            }
+            let n = notes.remove(at);
             self.retire(&notes, n);
             return Ok(());
         }
@@ -580,12 +596,12 @@ impl Kqueue {
                     _ => return Err(Errno::EINVAL),
                 };
                 // (A timer tells of each firing once, asked to or not, as a
-                // signal's note does of each raising; and a timer for a
-                // moment fires once.)
+                // signal's note does of each raising and a process's of
+                // its ending; and a timer for a moment fires once.)
                 let flags = e.flags & ev::KEPT
-                    | if e.filter == filt::TIMER || e.filter == filt::SIGNAL { ev::CLEAR } else { 0 }
+                    | if matches!(e.filter, filt::TIMER | filt::SIGNAL | filt::PROC) { ev::CLEAR } else { 0 }
                     | if matches!(what, What::Timer { period: 0, .. }) { ev::ONESHOT } else { 0 };
-                notes.push(Note { ident: e.ident, filter: e.filter, flags, disabled: false, fflags, udata: e.udata, qos: e.qos, ext: e.ext, what });
+                notes.push(Note { ident: e.ident, filter: e.filter, flags, disabled: false, fflags, udata: e.udata, qos: e.qos, ext: e.ext, what, going: false });
                 notes.len() - 1
             }
         };
@@ -711,7 +727,7 @@ impl Kqueue {
         let nothing = Found::new();
         let mut notes = self.notes();
         self.hear(&mut notes);
-        notes.iter().any(|n| !n.disabled && Kqueue::ready(n, mono, wall, &nothing, &mut false).is_some())
+        notes.iter().any(|n| !n.disabled && (n.going || Kqueue::ready(n, mono, wall, &nothing, &mut false).is_some()))
     }
 
     /// Up to `max` events, from the notes that have something to say. A
@@ -725,6 +741,13 @@ impl Kqueue {
         let mut out = Vec::new();
         let mut i = 0;
         while i < notes.len() && out.len() < max {
+            // A note on its way out, put on: gone, and this says so.
+            if notes[i].going && !notes[i].disabled {
+                let n = notes.remove(i);
+                out.push(Event { ident: n.ident, filter: n.filter, flags: ev::DELETE | ev::ONESHOT | ev::DISPATCH2, udata: n.udata, ..Event::default() });
+                self.retire(&notes, n);
+                continue;
+            }
             let mut dead = false;
             let said = if notes[i].disabled { None } else { Kqueue::ready(&notes[i], mono, wall, found, &mut dead) };
             let Some((flags, fflags, data)) = said else {
@@ -763,6 +786,12 @@ impl Kqueue {
                 }
             }
             if (n.flags | flags) & ev::ONESHOT != 0 {
+                // (Its one thing said: it goes now, or when it is put on.)
+                if n.flags & ev::DISPATCH2 == ev::DISPATCH2 {
+                    (n.going, n.disabled) = (true, true);
+                    i += 1;
+                    continue;
+                }
                 let n = notes.remove(i);
                 self.retire(&notes, n);
                 continue;
