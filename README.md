@@ -192,6 +192,11 @@ the image low. What works is what a program can do with the kernel alone:
   libpthread, unchanged, is what a program's threads run on;
 - `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
   attributes;
+- `getattrlist` and `setattrlist` (by path, by descriptor and under one):
+  a file's attributes asked for by bit and answered packed as XNU packs
+  them, which is how Apple's libc finds a file's real path and sets its
+  times; and the calls that carry an access list beside a mode
+  (`stat64_extended`, `chmod_extended`), of which no file has one;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
 - which system it is: `kern.osproductversion`, `kern.osversion` and
   `kern.osrelease` are what the root's
@@ -226,8 +231,11 @@ What does not, yet:
   of what the kernel's own ports are asked (`task_info`, `vm_region`)
   answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
-- `kqueue`, work queues, `getattrlist`, `mknod`; a mutex or condition
+- `kqueue`, work queues, `getattrlistbulk`, `mknod`; a mutex or condition
   shared between processes (each is its own process's).
+- A floating-point environment beyond what WebAssembly has: the rounding
+  mode and the exception flags a program sets are kept and read back, but
+  arithmetic is to nearest and raises none.
 - **Other Macs.** Three more processors have run Mac OS X, and none is
   here:
   - *i386* (through macOS 10.14). gex translates i386 and its kernel has

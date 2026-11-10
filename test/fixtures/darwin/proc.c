@@ -37,8 +37,10 @@ int main(int argc, char **argv, char **envp, char **apple) {
         t_check("child: its parent", SYS(SYS_getppid) == me);
         t_exit(3);
     }
-    t_check("fork", pid > 0 && pid != me);
+    // (Said once the child has had its say and gone: the two write to the
+    // same place, in whichever order they run.)
     waited("exit 3", pid);
+    t_check("fork", pid > 0 && pid != me);
 
     // A pipe from the child, which the parent reads to the end.
     long wr = -1;

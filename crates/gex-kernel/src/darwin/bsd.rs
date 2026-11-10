@@ -113,9 +113,12 @@ impl Kernel {
                 self.darwin_post = Post::Unlink;
                 set(nr::UNLINKAT, &[CWD, x[0], 0])
             }
+            // (`AT_REMOVEDIR_DATALESS`, 0x100, is a directory removed
+            // without its contents being fetched first, which `rm` asks
+            // for: a directory removed.)
             d::UNLINKAT => {
                 self.darwin_post = Post::Unlink;
-                set(nr::UNLINKAT, &[dirfd(x[0]), x[1], at_flags(x[2])])
+                set(nr::UNLINKAT, &[dirfd(x[0]), x[1], at_flags(x[2]) | if x[2] & 0x100 != 0 { K_REMOVEDIR } else { 0 }])
             }
             d::RMDIR => set(nr::UNLINKAT, &[CWD, x[0], K_REMOVEDIR]),
             d::MKDIR => set(nr::MKDIRAT, &[CWD, x[0], x[1]]),
@@ -243,7 +246,7 @@ impl Kernel {
             d::SETEGID => set(nr::SETRESGID, &[u64::MAX, x[0], u64::MAX]),
             d::SETREUID => set(nr::SETREUID, &x[..2]),
             d::SETREGID => set(nr::SETREGID, &x[..2]),
-            d::GETGROUPS => set(nr::GETGROUPS, &x[..2]),
+            d::GETGROUPS => NATIVE + d::GETGROUPS,
             d::SETGROUPS => set(nr::SETGROUPS, &x[..2]),
             d::GETPGRP => set(nr::GETPGID, &[0]),
             d::GETPGID => set(nr::GETPGID, &x[..1]),
@@ -548,6 +551,32 @@ impl Kernel {
                 Ok(0)
             }
             d::GETDIRENTRIES64 => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2], x[3], false),
+            // The groups a process is in: the kernel's list, which is of
+            // the ones beside its own and empty until given; Darwin's
+            // always has the process's own group, first.
+            d::GETGROUPS => {
+                let n = self.dispatch(m, nr::GETGROUPS, [x[0], x[1], 0, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))?;
+                if n == 0 && x[0] as i32 > 0 {
+                    m.write_u32(x[1], self.creds.gid())?;
+                }
+                Ok(n.max(1))
+            }
+            // System Integrity Protection: on, and letting nothing past
+            // (`csr_check` is refused, the configuration allows nothing).
+            d::CSRCTL => match x[0] {
+                0 => Err(Errno::EPERM),
+                1 if x[2] >= 4 => m.write_u32(x[1], 0).map(|_| 0),
+                _ => Err(Errno::EINVAL),
+            },
+            d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
+            d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
+            d::GETATTRLISTAT => self.darwin_getattrlist(m, dirfd(x[0]) as i32, x[1], x[2], x[3], x[4], x[5]),
+            d::SETATTRLIST => self.darwin_setattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
+            d::FSETATTRLIST => self.darwin_setattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
+            d::SETATTRLISTAT => self.darwin_setattrlist(m, dirfd(x[0]) as i32, x[1], x[2], x[3], x[4], x[5]),
+            d::STAT64_EXTENDED | d::LSTAT64_EXTENDED | d::FSTAT64_EXTENDED => self.darwin_stat_extended(m, code, x),
+            d::CHMOD_EXTENDED => self.darwin_chmod_extended(m, None, x[0], x[1] as u32, x[2] as u32, x[3] as u32, x[4]),
+            d::FCHMOD_EXTENDED => self.darwin_chmod_extended(m, Some(x[0] as i32), 0, x[1] as u32, x[2] as u32, x[3] as u32, x[4]),
             _ => {
                 if !self.unimplemented.contains(&(NATIVE + code)) {
                     self.unimplemented.push(NATIVE + code);

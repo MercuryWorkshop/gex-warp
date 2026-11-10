@@ -27,6 +27,8 @@ export default async function (t) {
   // size, a name's longest length): the Mac's own under gexc, and so not
   // the page's in-memory one.
   await d.compare('files', await d.build('files'));
+  // (And getattrlist: a file's numbers are the filesystem's.)
+  await d.compare('attr', await d.build('attr'));
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
   for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch']) await d.compare(name, await d.build(name), [], { page: true });

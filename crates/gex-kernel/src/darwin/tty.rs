@@ -18,6 +18,8 @@ mod req {
     pub const TIOCSETAF: u64 = 0x8048_7416;
     pub const TIOCGWINSZ: u64 = 0x4008_7468;
     pub const TIOCSWINSZ: u64 = 0x8008_7467;
+    pub const TIOCGETD: u64 = 0x4004_741a;
+    pub const TIOCSETD: u64 = 0x8004_741b;
     pub const TIOCGPGRP: u64 = 0x4004_7477;
     pub const TIOCSPGRP: u64 = 0x8004_7476;
     pub const TIOCSCTTY: u64 = 0x2000_7461;
@@ -308,10 +310,24 @@ impl Kernel {
                 m.write(arg, &name)?;
                 Ok(0)
             }
-            // What kind of device: none of the ones this asks after.
+            // What kind of device: a terminal is one (`D_TTY`), and
+            // nothing else here is any this asks after.
             req::FIODTYPE => {
                 self.fds.get(fd)?;
-                Err(Errno::ENOTTY)
+                self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch)?;
+                m.write_u32(arg, 3)?;
+                Ok(0)
+            }
+            // A terminal's line discipline: the one there is (`TTYDISC`),
+            // and no other may be set.
+            req::TIOCGETD => {
+                self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch)?;
+                m.write_u32(arg, 0)?;
+                Ok(0)
+            }
+            req::TIOCSETD => {
+                self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch)?;
+                if m.read_u32(arg)? == 0 { Ok(0) } else { Err(Errno::ENXIO) }
             }
             _ => {
                 self.fds.get(fd)?;
