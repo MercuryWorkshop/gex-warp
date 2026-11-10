@@ -5083,6 +5083,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     state.resume_at = Some(target);
                 }
                 _ => {
+                    // (A program that ends itself with a trap, as a Mac's
+                    // libraries do, has ended itself: GEX_DUMP_ABORT says
+                    // where from, as for an abort.)
+                    if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+                        let (ctx_addr, tid) = (state.thread.ctx_addr, state.thread.tid);
+                        let vmas = state.with_kernel(|k| k.mem.lock().vmas().to_vec());
+                        dump_guest(&mut gm, ctx_addr, tid, &vmas);
+                    }
                     // Where the last indirect branch was aimed, and how the
                     // dispatch directory names its page and this one: an
                     // illegal instruction at an address no branch should
