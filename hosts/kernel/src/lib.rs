@@ -3022,10 +3022,10 @@ pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mo
 pub extern "C" fn k_fs_open_now(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
     use gex_kernel::fs::oflags::{O_CREAT, O_TRUNC};
     let p = path_of(path, path_len);
-    let opened = match pagefs::find(&p) {
+    let opened = gex_kernel::vfs::tmpfs::at_time(now, || match pagefs::find(&p) {
         Some((m, rel)) => m.open_mode(&rel, flags, mode),
         None => rootfs().open_mode(&p, flags, mode),
-    };
+    });
     match opened {
         Ok(h) => {
             if flags & (O_CREAT | O_TRUNC) != 0 {
@@ -3530,6 +3530,42 @@ pub extern "C" fn k_fs_mkdir_now(path: gex_kmem::PAddr, path_len: u32, mode: u32
         return as_unit(m.mkdir(&rel, mode));
     }
     as_unit(rootfs().mkdir_now(&p, mode, now))
+}
+
+/// [`k_fs_unlink`] at `now`, the caller's clock: the directory's time.
+#[no_mangle]
+pub extern "C" fn k_fs_unlink_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_unlink(path, path_len))
+}
+
+/// [`k_fs_rmdir`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_rmdir_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_rmdir(path, path_len))
+}
+
+/// [`k_fs_rename`] at `now`, the caller's clock: both directories' times.
+#[no_mangle]
+pub extern "C" fn k_fs_rename_now(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, noreplace: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_rename(from, from_len, to, to_len, noreplace))
+}
+
+/// [`k_fs_symlink`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_symlink_now(target: gex_kmem::PAddr, target_len: u32, path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_symlink(target, target_len, path, path_len))
+}
+
+/// [`k_fs_link`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_link_now(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_link(from, from_len, to, to_len))
+}
+
+/// [`k_fs_mksocket`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_mksocket_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_mksocket(path, path_len))
 }
 
 /// A directory put into the shared root with every missing one above it
@@ -4183,13 +4219,18 @@ pub extern "C" fn k_sock_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_km
 /// Connect to a name, as `pid`, `uid` and `gid` (what the server's
 /// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    sock_connect(path_of_raw(path, path_len), Cred { pid, uid, gid })
+pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
+    sock_connect(path_of_raw(path, path_len), Cred { pid, uid, gid }, addr, port)
 }
 
-fn sock_connect(p: String, cred: Cred) -> i32 {
+/// `addr` and `port`: the IPv4 address a loopback TCP end connects from,
+/// for the accepted end's `k_sock_peer_addr` (both 0: none).
+fn sock_connect(p: String, cred: Cred, addr: u32, port: u32) -> i32 {
     let s = std::sync::Arc::new(UnixSocket::new(true));
     s.set_cred(cred);
+    if addr != 0 || port != 0 {
+        s.set_addr((addr, port as u16));
+    }
     match names().connect(&s, &p) {
         // The listener's queue is notified by the connect itself.
         Ok(_) => keep(s),
@@ -4320,6 +4361,19 @@ pub extern "C" fn k_sock_peer_cred(id: i32, out: gex_kmem::PAddr) -> i32 {
     0
 }
 
+/// The far end's IPv4 address and port as its connect gave them: two `u32`s
+/// at `out` in the caller's memory. `-ENOTCONN` when it gave none.
+#[no_mangle]
+pub extern "C" fn k_sock_peer_addr(id: i32, out: gex_kmem::PAddr) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let Some((a, p)) = s.peer_addr() else { return -107 };
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&a.to_le_bytes());
+    bytes[4..].copy_from_slice(&(p as u32).to_le_bytes());
+    unsafe { gex_kmem::push_checked(out, bytes.as_ptr(), 8) };
+    0
+}
+
 /// A connected stream pair, for `socketpair` by `pid`, `uid` and `gid`:
 /// both ids as two `u32`s at `out`.
 #[no_mangle]
@@ -4400,8 +4454,16 @@ extern "C" fn kl_sock_bind(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: 
     sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid })
 }
 
-extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid })
+extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
+    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid }, addr, port)
+}
+
+extern "C" fn kl_sock_peer_addr(id: i32, out: gex_kmem::PAddr) -> i32 {
+    let Some((a, p)) = sock_at(id).and_then(|s| s.peer_addr()) else { return -107 };
+    let b = unsafe { kernel_bytes_mut(out, 8) };
+    b[..4].copy_from_slice(&a.to_le_bytes());
+    b[4..].copy_from_slice(&(p as u32).to_le_bytes());
+    0
 }
 
 extern "C" fn kl_sock_peer_cred(id: i32, out: gex_kmem::PAddr) -> i32 {
@@ -4470,6 +4532,7 @@ fn kernel_sockets() -> gex_kernel::unix::Remote {
         bind: kl_sock_bind,
         connect: kl_sock_connect,
         peer_cred: kl_sock_peer_cred,
+        peer_addr: kl_sock_peer_addr,
         accept: k_sock_accept,
         pending: k_sock_pending,
         read: kl_sock_read,
