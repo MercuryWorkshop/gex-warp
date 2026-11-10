@@ -221,7 +221,10 @@ the image low. What works is what a program can do with the kernel alone:
   `SIGTTIN` and `SIGTTOU` in a job a shell controls) holds each of its
   threads at its next call or poll until `SIGCONT`, and its parent's
   `wait` is told of the stop and of the continuing where it asks
-  (`WUNTRACED`, `WCONTINUED`): a shell's `^Z`, `jobs`, `fg` and `bg`;
+  (`WUNTRACED`, `WCONTINUED`): a shell's `^Z`, `jobs`, `fg` and `bg`.
+  A job in the background that reads its terminal is sent `SIGTTIN` and
+  stops until it is brought forward (one that writes is not stopped,
+  whatever `tostop` says);
 - sockets: unix and TCP, descriptors passed in a control message;
 - POSIX shared memory by name (`shm_open`), with XNU's rules for it (sized
   once and in whole pages, mapped shared and within its size). It is the

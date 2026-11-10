@@ -6931,6 +6931,42 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
     }
 }
 
+/// A read of its controlling terminal by a process in the background (job
+/// control): the process's group is sent `SIGTTIN`, which stops it until
+/// its shell brings it to the foreground, and the read is made again
+/// then: the signal ends the wait the read goes on to make (what is there
+/// to read already, it reads first). Whether it was sent. Not where the
+/// signal would do nothing or the stop
+/// would be refused -- the caller ignores or blocks it, or nobody controls
+/// its job (its own parent is not of another group of its session) --
+/// where the read is let through. (Linux answers `EIO` there.)
+fn background_read(file: &OpenFile, tty: &crate::tty::TtyRef, ptys: Option<crate::pty::Remote>, procs: &ProcTable, pid: i32, signals: &Signals) -> bool {
+    const SIGTTIN: u32 = 21;
+    if !file.is_tty() {
+        return false;
+    }
+    // The terminal's session and foreground group: a pseudoterminal's
+    // slave's, or the console's.
+    let (tty_sid, fg) = match file.path.strip_prefix("pty:[").and_then(|p| p.strip_suffix(":s]")).and_then(|id| id.parse::<i32>().ok()) {
+        Some(id) => match ptys {
+            Some(r) => ((r.sid)(id), (r.fg)(id)),
+            None => return false,
+        },
+        None if file.path.starts_with("pty:[") => return false,
+        None => (tty.sid(), tty.fg()),
+    };
+    let (Ok(sid), Ok(pgid)) = (procs.sid(pid, 0), procs.pgid(pid, 0)) else { return false };
+    if fg <= 0 || tty_sid != sid || pgid == fg {
+        return false;
+    }
+    if signals.action(SIGTTIN).handler == crate::signal::SIG_IGN || signals.blocked() & (1 << (SIGTTIN - 1)) != 0 {
+        return false;
+    }
+    let ppid = procs.ppid(pid);
+    let controlled = ppid > 0 && procs.sid(pid, ppid) == Ok(sid) && procs.pgid(pid, ppid).is_ok_and(|g| g != pgid);
+    controlled && procs.kill_group(pid, pgid, SIGTTIN).is_ok()
+}
+
 /// `waitid(idtype, id, infop, options, rusage)` as `wait4`'s park: `P_ALL`
 /// and `P_PID` (and `P_PGID`, as any child: process groups are not told
 /// apart, as for `wait4`), `WEXITED` with `WNOHANG` and `WNOWAIT`. No child
@@ -8179,6 +8215,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             }
         }
     } else {
+        // (A read of the terminal from the background: job control. The
+        // signal ends the read's own wait.)
+        if matches!(n, nr::READ | nr::READV) {
+            if let Ok(file) = f.io.fds.get(a[0] as i32) {
+                background_read(&file, f.tty, f.path.ptys, f.procs, f.pid, f.signals);
+            }
+        }
         if let Some(op) = f.io.blocking_op(m, n, a) {
             return FreeOutcome::Blocking(op, None);
         }
@@ -11078,6 +11121,13 @@ impl Kernel {
         if let Some(want) = call_mask {
             self.restore_sigmask = Some(self.signals.blocked());
             self.signals.set_blocked(want & !UNBLOCKABLE);
+        }
+        // A read of the terminal from the background (job control): the
+        // signal is sent, and ends the read's own wait.
+        if matches!(n, nr::READ | nr::READV) {
+            if let Ok(file) = self.fds.get(a[0] as i32) {
+                background_read(&file, &self.tty, self.ptys, &self.procs, self.pid, &self.signals);
+            }
         }
         // A syscall that sleeps must do so with the kernel unlocked, or the
         // thread that would wake it can never get in.
