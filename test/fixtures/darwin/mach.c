@@ -372,6 +372,73 @@ static void regions(void) {
     SYS(SYS_munmap, at - PAGE, 7 * PAGE);
 }
 
+// Memory out of line: a message that carries an address and a size, and
+// whose receiver has those bytes at an address of its own.
+static void out_of_line(void) {
+#if defined(__arm64__)
+    enum { PAGE = 16384 };
+#else
+    enum { PAGE = 4096 };
+#endif
+    enum { OOL = 1 << 24, DEALLOCATE = 1, VIRTUAL_COPY = 1 << 8 };
+    static struct message m;
+    u32 p = allocate(RIGHT_RECEIVE);
+    long size = 2 * PAGE + 100;
+    u8 *buf = (u8 *)SYS(SYS_mmap, 0, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    for (long i = 0; i < size; i++) buf[i] = (u8)(i * 7 + i / 251);
+    // { count, { address, how, size }, a word }
+    for (int pass = 0; pass < 4; pass++) {
+        static const char *const what[] = {"memory out of line", "and the sender's memory with it", "none of it", "from where there is none"};
+        u64 from = pass == 3 ? 0x10 : (u64)buf;
+        u32 len = pass == 2 ? 0 : (u32)size;
+        t_memset(&m, 0, sizeof m);
+        m.h.bits = COMPLEX | MAKE_SEND, m.h.remote = p, m.h.id = 500 + pass;
+        m.body[0] = 1, m.body[1] = (u32)from, m.body[2] = (u32)(from >> 32), m.body[3] = OOL | VIRTUAL_COPY | (pass == 1 ? DEALLOCATE : 0), m.body[4] = len, m.body[5] = 0xabcd;
+        t_printf("send %s", what[pass]);
+        long r = send(&m, sizeof m.h + 24);
+        if (r) {
+            t_printf(": %lx\n", r);
+            continue;
+        }
+        t_memset(&m, 0, sizeof m);
+        r = receive(&m, p, sizeof m);
+        u8 *got = (u8 *)(m.body[1] | (u64)m.body[2] << 32);
+        t_printf(": received %ld, id %d of %u bytes, %s, %u descriptors, how %x, %u bytes, the word %x\n", r, m.h.id, m.h.size, m.h.bits & COMPLEX ? "complex" : "plain", m.body[0], m.body[3], m.body[4],
+                 m.body[5]);
+        if (!len) {
+            t_check("  at no address", got == 0);
+            continue;
+        }
+        // (The sender's memory gone with it may be where it arrives: this
+        // is the one task.)
+        t_check("  at an address of its own, on a page", (pass == 1 || got != buf) && got && (u64)got % PAGE == 0);
+        int same = 1;
+        for (long i = 0; i < size; i++) same &= got[i] == (u8)(i * 7 + i / 251);
+        t_check("  the same bytes", same);
+        if (pass == 0) {
+            got[0] ^= 0xff;
+            t_check("  and not the sender's", buf[0] == 0);
+        }
+        t_show("  given back", SYS(SYS_munmap, got, size));
+        if (pass == 1) t_show("  and the sender's memory is gone", SYS(SYS_mprotect, buf, PAGE, PROT_READ));
+    }
+    // With a right before it in the same message.
+    buf = (u8 *)SYS(SYS_mmap, 0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    buf[0] = 'o', buf[1] = 'k';
+    u32 q = allocate(RIGHT_RECEIVE);
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COMPLEX | MAKE_SEND, m.h.remote = p, m.h.id = 600;
+    m.body[0] = 2;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){q, 0, 0, MAKE_SEND, 0};
+    m.body[4] = (u32)(u64)buf, m.body[5] = (u32)((u64)buf >> 32), m.body[6] = OOL | VIRTUAL_COPY, m.body[7] = 2, m.body[8] = 0x1234;
+    t_show("send a right and memory", send(&m, sizeof m.h + 36));
+    t_memset(&m, 0, sizeof m);
+    long r = receive(&m, p, sizeof m);
+    u8 *got = (u8 *)(m.body[4] | (u64)m.body[5] << 32);
+    t_printf("received %ld: %u descriptors, the right %s, %u bytes \"%c%c\", the word %x\n", r, m.body[0], ((struct port_desc *)(m.body + 1))->name == q ? "by its name" : "by another name", m.body[7],
+             got ? got[0] : '?', got ? got[1] : '?', m.body[8]);
+}
+
 // mach_port_request_notification(task, name, which, sync, notify): a
 // message asked for, to a port of the caller's, when something becomes of
 // a right. The reply hands back what was asked for before.
@@ -857,6 +924,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     kernel_ports();
     infos();
     regions();
+    out_of_line();
     notifications();
     queues();
 #if defined(__arm64__)

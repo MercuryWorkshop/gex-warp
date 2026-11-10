@@ -67,6 +67,7 @@ pub const MACH_SEND_MSG_TOO_SMALL: u64 = 0x1000_0008;
 pub const MACH_SEND_INVALID_REPLY: u64 = 0x1000_0009;
 pub const MACH_SEND_INVALID_RIGHT: u64 = 0x1000_000a;
 pub const MACH_SEND_INVALID_TYPE: u64 = 0x1000_000f;
+pub const MACH_SEND_INVALID_MEMORY: u64 = 0x1000_000c;
 pub const MACH_RCV_INVALID_NAME: u64 = 0x1000_4002;
 pub const MACH_RCV_TIMED_OUT: u64 = 0x1000_4003;
 pub const MACH_RCV_TOO_LARGE: u64 = 0x1000_4004;
@@ -132,6 +133,10 @@ struct Msg {
     /// Each port descriptor in the body: its offset there, the right, and
     /// the type the receiver is told (`disp::MOVE_*`).
     ports: Vec<(usize, Arc<Port>, u32)>,
+    /// Each descriptor of memory out of line: its offset in the body, and
+    /// the bytes, which are the receiver's at an address of its own once
+    /// it has the message.
+    memory: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Default)]
@@ -360,7 +365,7 @@ impl Space {
             body.extend_from_slice(&NDR);
             body.extend_from_slice(&word.to_le_bytes());
         }
-        st.queue.push_back(Msg { id, body, complex: false, once: true, reply: None, ports: Vec::new() });
+        st.queue.push_back(Msg { id, body, complex: false, once: true, reply: None, ports: Vec::new(), memory: Vec::new() });
         self.told.extend(st.wake.iter().copied());
     }
 
@@ -1193,7 +1198,7 @@ impl Kernel {
             match st.timer {
                 Some(when) if when <= now => {
                     st.timer = None;
-                    st.queue.push_back(Msg { id: 0, body: vec![0; 24], complex: false, once: false, reply: None, ports: Vec::new() });
+                    st.queue.push_back(Msg { id: 0, body: vec![0; 24], complex: false, once: false, reply: None, ports: Vec::new(), memory: Vec::new() });
                 }
                 Some(when) => nearest = Some(nearest.map_or(when, |n| n.min(when))),
                 None => {}
@@ -1234,6 +1239,17 @@ impl Kernel {
                 put32(&mut out, HEADER as usize + at, given);
                 out[HEADER as usize + at + 10] = got as u8;
             }
+            // Memory out of line arrives in memory newly the receiver's.
+            for (at, bytes) in msg.memory {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let Ok(address) = self.darwin_vm_map_at(m, 0, bytes.len() as u64, 0, 1, 3) else { return Received::BadBuffer };
+                if m.write(address, &bytes).is_err() {
+                    return Received::BadBuffer;
+                }
+                out[HEADER as usize + at..HEADER as usize + at + 8].copy_from_slice(&address.to_le_bytes());
+            }
             let dest_type = if msg.once { disp::MOVE_SEND_ONCE } else { disp::MOVE_SEND };
             put32(&mut out, 0, reply_type | dest_type << 8 | if msg.complex { COMPLEX } else { 0 });
             put32(&mut out, 4, size as u32);
@@ -1271,6 +1287,8 @@ impl Kernel {
         // The body's descriptors are checked before any right moves: a
         // message refused is one that changed nothing.
         let mut descs = Vec::new();
+        let mut memory = Vec::new();
+        let mut gone = Vec::new();
         if complex {
             let count = get32(&body, 0) as usize;
             let mut at = 4;
@@ -1278,14 +1296,39 @@ impl Kernel {
                 if at + 12 > body.len() {
                     return MACH_SEND_MSG_TOO_SMALL;
                 }
-                // A port descriptor: the name, then its disposition and
-                // type in the last two bytes. Memory out of line, and
-                // arrays of ports, are not carried yet.
-                if body[at + 11] != 0 {
-                    return MACH_SEND_INVALID_TYPE;
+                match body[at + 11] {
+                    // A port descriptor: the name, then its disposition
+                    // and type in the last two bytes.
+                    0 => {
+                        descs.push((at, get32(&body, at), body[at + 10] as u32));
+                        at += 12;
+                    }
+                    // Memory out of line (and what may be changed under
+                    // the message, which here is the same): an address,
+                    // whether the sender's own memory goes with it, how
+                    // it is carried, the type, and its size. The bytes are
+                    // the message's from now on.
+                    1 | 3 => {
+                        if at + 16 > body.len() {
+                            return MACH_SEND_MSG_TOO_SMALL;
+                        }
+                        let address = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+                        let size = get32(&body, at + 12) as u64;
+                        // (Memory the task has mapped to read, not only
+                        // memory that can be read from here.)
+                        if !self.mem.lock().check_access(address, size, crate::mem::prot::READ) {
+                            return MACH_SEND_INVALID_MEMORY;
+                        }
+                        let Ok(bytes) = m.read(address, size as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        if body[at + 8] != 0 && size != 0 {
+                            gone.push((address, size));
+                        }
+                        memory.push((at, bytes));
+                        at += 16;
+                    }
+                    // An array of ports out of line is not carried yet.
+                    _ => return MACH_SEND_INVALID_TYPE,
                 }
-                descs.push((at, get32(&body, at), body[at + 10] as u32));
-                at += 12;
             }
         }
         let Some((dest, dest_got)) = sp.take(pid, c.remote, c.bits & 0x1f) else {
@@ -1315,7 +1358,17 @@ impl Kernel {
                 None => return MACH_SEND_INVALID_RIGHT,
             }
         }
-        let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports };
+        // The sender's memory that was to go with the message goes.
+        for (address, size) in gone {
+            let (lo, hi) = (address & !(abi::PAGE_SIZE - 1), (address + size).next_multiple_of(abi::PAGE_SIZE));
+            let _ = self.map_io().call(m, nr::MUNMAP, [lo, hi - lo, 0, 0, 0, 0]);
+        }
+        // (Wherever it arrives, it is its receiver's to give back.)
+        for (at, _) in &memory {
+            body[*at..*at + 8].fill(0);
+            body[*at + 8] = 1;
+        }
+        let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory };
         match dest.kind {
             Kind::User => {
                 let wake = {
@@ -1349,7 +1402,7 @@ impl Kernel {
     /// server answers: the routine by the message's number, the reply
     /// numbered a hundred more. A routine there is none of is `MIG_BAD_ID`.
     fn darwin_mig(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kind: Kind, req: &Msg) -> Msg {
-        let reply = |body: Vec<u8>, ports: Vec<(usize, Arc<Port>, u32)>| Msg { id: req.id + 100, complex: !ports.is_empty(), body, once: false, reply: None, ports };
+        let reply = |body: Vec<u8>, ports: Vec<(usize, Arc<Port>, u32)>| Msg { id: req.id + 100, complex: !ports.is_empty(), body, once: false, reply: None, ports, memory: Vec::new() };
         // { NDR, RetCode }, then what the routine returns.
         let plain = |code: i32, rest: &[u8]| {
             let mut b = NDR.to_vec();

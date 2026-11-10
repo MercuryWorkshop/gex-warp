@@ -261,10 +261,10 @@ What does not, yet:
   dyld shared cache, which is mapped at 6 GiB.
 - **Mach between tasks.** A port's queue lives in its own process, so no
   right crosses a `fork` or reaches another program: no bootstrap port, no
-  launchd, no XPC. Within a task, messages carry ports but not memory out
-  of line, so what the kernel's own ports would answer with that
-  (`task_threads`, `host_processor_info`) is `MIG_BAD_ID`, as much else
-  of theirs is. The older `mach_msg_trap` is written
+  launchd, no XPC. Within a task, messages carry ports and memory out of
+  line but not arrays of ports, and what the kernel's own ports would
+  answer with either (`task_threads`, `host_processor_info`) is
+  `MIG_BAD_ID`, as much else of theirs is. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - A kqueue's events delivered to a work queue's threads, and workloops;
   a file made longer by `ftruncate`
