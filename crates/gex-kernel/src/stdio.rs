@@ -25,6 +25,19 @@ pub enum Stream {
 /// stops dead).
 pub static STDIN_READY: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
 
+/// Whether the host has a terminal for the guest's console to be: one of
+/// its own standard streams is one. (A page's console is its terminal.)
+pub fn host_has_terminal() -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::io::IsTerminal;
+        static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *HAS.get_or_init(|| std::io::stdin().is_terminal() || std::io::stdout().is_terminal() || std::io::stderr().is_terminal())
+    }
+    #[cfg(target_family = "wasm")]
+    true
+}
+
 /// A standard stream, optionally reported as a terminal.
 #[derive(Debug)]
 pub struct StdStream {

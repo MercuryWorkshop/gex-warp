@@ -154,5 +154,17 @@ int main(int argc, char **argv, char **envp, char **apple) {
     show_read("a key, unechoed", slave);
     SYS(SYS_write, slave, "a\nb", 3);
     show_read("output, untouched", master);
+
+    // A session of its own has no controlling terminal until it takes one,
+    // and `/dev/tty` is that: no device, for it.
+    long second = 0;
+    long pid = t_syscall2(&second, SYS_fork, 0, 0, 0);
+    if (second) {
+        t_check("a session of its own", SYS(SYS_setsid) > 0);
+        t_show("/dev/tty with no controlling terminal", SYS(SYS_open, "/dev/tty", O_RDWR));
+        t_exit(0);
+    }
+    int status = -1;
+    SYS(SYS_wait4, pid, &status, 0, 0);
     return 0;
 }

@@ -679,6 +679,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             creds: &home.creds,
             procs: &home.procs,
             ptys: home.ptys,
+            tty: &home.tty,
             tmpfiles: &home.tmpfiles,
             fs,
             clock: home.clock,

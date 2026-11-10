@@ -3202,6 +3202,8 @@ pub struct PathIo<'a> {
     pub creds: &'a Creds,
     pub procs: &'a ProcTable,
     pub ptys: Option<crate::pty::Remote>,
+    /// The console, which `/dev/tty` is for a session that has it.
+    pub tty: &'a crate::tty::TtyRef,
     /// `O_TMPFILE`'s names, numbered per process.
     pub tmpfiles: &'a std::sync::atomic::AtomicU64,
     /// The calling thread's fs_struct: `chdir`'s, `umask`'s, and what
@@ -3428,6 +3430,18 @@ impl PathIo<'_> {
         Some(self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0))
     }
 
+    /// Whether the console is the caller's controlling terminal (one with
+    /// a pseudoterminal for it was answered before this is asked): it is
+    /// the first process's session's, where the host has a terminal at all,
+    /// and a session made since has it only by claiming it (`TIOCSCTTY`).
+    fn has_console(&self) -> bool {
+        let sid = self.procs.sid(self.pid, 0).unwrap_or(0);
+        if sid != 0 && self.tty.sid() == sid {
+            return true;
+        }
+        crate::stdio::host_has_terminal() && self.procs.sid(self.pid, crate::proc::INIT_PID).is_ok_and(|first| first == sid)
+    }
+
     pub fn openat(
         &self,
         m: &GuestMem<'_>,
@@ -3443,6 +3457,13 @@ impl PathIo<'_> {
         // different Workers. Intercepted before the VFS, which has no such nodes.
         if let Some(res) = self.open_pty(&p, flags) {
             return res;
+        }
+        // `/dev/tty` with no controlling terminal is no device: a program
+        // that asks for one (a shell, for the size of its window; one that
+        // would read a password) is told there is none, and does not take
+        // the console for a terminal it has.
+        if p == "/dev/tty" && !self.has_console() {
+            return Err(Errno::ENXIO);
         }
         // `/proc/self/fd/N` (and `/dev/stdin`, `/dev/fd/N`, which lead there)
         // names the descriptor's file itself, as Linux's magic link does,
@@ -11056,6 +11077,7 @@ impl Kernel {
             creds: &self.creds,
             procs: &self.procs,
             ptys: self.ptys,
+            tty: &self.tty,
             tmpfiles: &self.tmpfiles,
             fs: std::borrow::Cow::Owned(self.fs_of(self.ctx_addr)),
             clock: self.clock,
