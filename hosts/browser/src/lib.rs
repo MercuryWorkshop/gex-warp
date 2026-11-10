@@ -15885,6 +15885,13 @@ pub extern "C" fn gex_set_compat(on: i32) {
     }
     gex_xlate::set_compat(compat);
     gex_kernel::darwin::set(darwin);
+    // What a Darwin fork leaves in its child beyond the zero
+    // `gex_adopt_child` wrote, before this Worker knew its process for a
+    // Darwin one: the second result, or a `posix_spawn` copy's way back
+    // into the kernel.
+    if darwin {
+        let _ = gex_kernel::darwin::set_fork_child(&mut guest(), my_ctx());
+    }
 }
 
 /// An adopted i386-ABI child's stack, from `ctx::SP` (where its adoption

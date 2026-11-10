@@ -178,7 +178,8 @@ A guest's memory is 4 GiB, or 16 GiB at most, and Apple's toolchain links
 a program above 4 GiB with everything below unmapped, so the example puts
 the image low. What works is what a program can do with the kernel alone:
 
-- files and directories, `fork`, `execve`, `wait4`, pipes, `mmap` and
+- files and directories, `fork`, `execve`, `posix_spawn` (with its file
+  actions and attributes), `wait4`, pipes, `mmap` and
   Mach's `mach_vm_*` traps on Darwin's 16 KiB page, the clocks, `select`
   and `poll`;
 - signals, delivered through XNU's frame to a handler behind the libc's
@@ -225,8 +226,8 @@ What does not, yet:
   of what the kernel's own ports are asked (`task_info`, `vm_region`)
   answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
-- `kqueue`, `posix_spawn`, work queues, `getattrlist`, `mknod`; a mutex or
-  condition shared between processes (each is its own process's).
+- `kqueue`, work queues, `getattrlist`, `mknod`; a mutex or condition
+  shared between processes (each is its own process's).
 - **Other Macs.** Three more processors have run Mac OS X, and none is
   here:
   - *i386* (through macOS 10.14). gex translates i386 and its kernel has

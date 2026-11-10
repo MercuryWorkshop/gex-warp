@@ -719,8 +719,16 @@ pub struct Kernel {
     pub darwin_ports: Arc<std::sync::Mutex<darwin::port::Space>>,
     /// The answer of a Mach trap that was ready as the call was read.
     pub darwin_ready: Option<u64>,
-    /// The answer of a psynch call that did not wait ([`darwin::psynch`]).
+    /// The answer of a psynch call that did not wait ([`darwin::psynch`]),
+    /// or of a `posix_spawn` that failed.
     pub darwin_answer: Option<SysResult>,
+    /// Where the `posix_spawn` in hand wants its child's pid: the fork it
+    /// is answers zero, and the pid goes there.
+    pub darwin_spawn_at: Option<u64>,
+    /// Where the Darwin call in hand was made from: a `posix_spawn` made
+    /// from the kernel's own page of code is its copy's ([`darwin`]'s
+    /// `spawn`).
+    pub darwin_pc: u64,
     /// What the kernel keeps of the task's mutexes, conditions and
     /// read-write locks ([`darwin::psynch`]), which its threads share and
     /// a fork does not inherit.
@@ -9824,6 +9832,8 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_ready: None,
             darwin_answer: None,
+            darwin_spawn_at: None,
+            darwin_pc: 0,
             darwin_psynch: Default::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
@@ -10260,6 +10270,8 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_ready: None,
             darwin_answer: None,
+            darwin_spawn_at: None,
+            darwin_pc: 0,
             darwin_psynch: Default::default(),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
@@ -10422,6 +10434,7 @@ impl Kernel {
         } else if self.darwin {
             // A Darwin thread's call, as the canonical call that does its
             // work (or one of `darwin`'s own).
+            self.darwin_pc = pc;
             self.darwin_translate(m, raw, &mut a)
         } else if gex_abi::X86 {
             crate::x86::translate(
@@ -10585,6 +10598,14 @@ impl Kernel {
             // The parent sees the child's pid; the child sees zero, which the
             // host writes into the copy it makes.
             let _ = set_result(m, self.ctx_addr, pid as u64);
+            // (Darwin's `posix_spawn`: the pid where it was asked for, and
+            // zero for the call.)
+            if let Some(at) = self.darwin_spawn_at.take() {
+                if at != 0 {
+                    let _ = m.write_u32(at, pid as u32);
+                }
+                let _ = set_result(m, self.ctx_addr, 0);
+            }
             if self.trace {
                 eprintln!(
                     "[gex] clone(flags={:#x}, stack={:#x}) = {pid} (new process)",

@@ -26,6 +26,7 @@ pub mod nr;
 pub mod port;
 pub mod psynch;
 mod sock;
+mod spawn;
 pub mod thread;
 pub mod tty;
 
@@ -69,6 +70,10 @@ pub const END: u64 = 0x4_0000;
 pub mod commpage {
     pub const DATA: u64 = 0x00ff_c000;
     pub const RO: u64 = 0x00ff_4000;
+    /// A page of code the kernel keeps for a task, between the two: where
+    /// a `posix_spawn`'s copy is sent back into the kernel from
+    /// (`spawn`). Made at a process's first `posix_spawn`.
+    pub const TEXT: u64 = 0x00ff_8000;
     pub const PAGE: u64 = 0x4000;
     /// `_COMM_PAGE_THIS_VERSION`.
     pub const VERSION: u16 = 3;
@@ -547,6 +552,11 @@ fn ulock_no_errno(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> bool {
 /// A forked child's second result: one (its parent's is zero), which is
 /// how libsyscall's `fork` tells the two apart.
 pub fn set_fork_child(m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<(), Errno> {
+    // (A `posix_spawn`'s copy makes its call again, with the arguments it
+    // was made with: no second result is written over one of them.)
+    if spawn::send_back(m, ctx_addr)? {
+        return Ok(());
+    }
     m.write_u64(ctx_addr + RET2_SLOT as u64, 1)
 }
 

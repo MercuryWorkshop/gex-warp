@@ -420,6 +420,7 @@ impl Kernel {
             d::ULOCK_WAIT => return self.darwin_ulock_wait(m, x, false, a),
             d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
             d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
+            d::POSIX_SPAWN => return self.darwin_posix_spawn(m, x, a),
             d::PSYNCH_MUTEXWAIT
             | d::PSYNCH_MUTEXDROP
             | d::PSYNCH_CVBROAD
@@ -497,6 +498,8 @@ impl Kernel {
             d::BSDTHREAD_REGISTER => self.darwin_bsdthread_register(m, x),
             // An operation `ulock` does not have.
             d::ULOCK_WAIT => Err(Errno::EINVAL),
+            // A `posix_spawn` that failed before anything was made.
+            d::POSIX_SPAWN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // A psynch call that did not wait: its answer.
             d::PSYNCH_RW_LONGRDLOCK..=d::PSYNCH_RW_UNLOCK2 | d::PSYNCH_CVCLRPREPOST => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // Quality-of-service requests: there is one class of thread.
