@@ -1531,6 +1531,62 @@ impl Kernel {
                     _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
                 }
             }
+            // mach_vm_region(task, in-out address, out size, flavor, out
+            // info, in-out count, out object name) and vm_region_64: the
+            // region of the task's memory the address is in, or the next
+            // above it, and what may be done there. The reply begins with
+            // the name of the region's object, of which there is none.
+            (Kind::Task, 4816 | 3824) => {
+                let address = u64::from_le_bytes(req.body.get(8..16).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (flavor, room) = (get32(&req.body, 16), get32(&req.body, 20));
+                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (v.start, v.end, v.prot));
+                match found {
+                    // VM_REGION_BASIC_INFO_64: its protection and the most
+                    // it may be given, how a child inherits it (a copy),
+                    // whether it is shared, its offset in its object, how
+                    // it is used, how often wired.
+                    Some((start, end, prot)) if flavor == 9 && room >= 9 => {
+                        let mut b = vec![0u8; 16];
+                        put32(&mut b, 0, 1);
+                        b[4 + 10] = disp::MOVE_SEND as u8;
+                        b.extend_from_slice(&NDR);
+                        b.extend_from_slice(&start.to_le_bytes());
+                        b.extend_from_slice(&(end - start).to_le_bytes());
+                        for word in [9, prot & 7, 7, 1, 0, 0, 0, 0, 0, 0] {
+                            b.extend_from_slice(&word.to_le_bytes());
+                        }
+                        Msg { complex: true, ..reply(b, Vec::new()) }
+                    }
+                    Some(_) => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                    None => plain(KERN_INVALID_ADDRESS as i32, &[]),
+                }
+            }
+            // mach_vm_region_recurse(task, in-out address, out size,
+            // in-out depth, out info, in-out count) and
+            // vm_region_recurse_64: the same region, with what is known of
+            // its pages (all resident and its own) and no submaps to go
+            // down into.
+            (Kind::Task, 4815 | 3822) => {
+                let address = u64::from_le_bytes(req.body.get(8..16).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let room = get32(&req.body, 20);
+                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (v.start, v.end, v.prot));
+                match found {
+                    Some((start, end, prot)) if room >= 17 => {
+                        const SM_PRIVATE: u32 = 2;
+                        let pages = if prot == 0 { 0 } else { ((end - start) / abi::PAGE_SIZE) as u32 };
+                        let mut info = vec![prot & 7, 7, 1, 0, 0, 0, pages, 0, 0, pages, 1, SM_PRIVATE << 24, 0, 0, 0, 0, 0, 0, 0];
+                        info.truncate(if room >= 19 { 19 } else { 17 });
+                        let mut b = start.to_le_bytes().to_vec();
+                        b.extend_from_slice(&(end - start).to_le_bytes());
+                        b.extend_from_slice(&0u32.to_le_bytes());
+                        b.extend_from_slice(&(info.len() as u32).to_le_bytes());
+                        info.iter().for_each(|w| b.extend_from_slice(&w.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                    Some(_) => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                    None => plain(KERN_INVALID_ADDRESS as i32, &[]),
+                }
+            }
             // thread_info(thread, flavor, out info, in-out count), likewise:
             // a thread's times and state, and which thread it is.
             (Kind::Thread(tid), 3612) => {

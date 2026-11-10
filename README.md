@@ -234,6 +234,7 @@ the image low. What works is what a program can do with the kernel alone:
   clock's ports that those and libpthread need (`host_info` among them),
   what a task and a thread say of themselves (`task_info`,
   `thread_info`: their memory and times, who they run as, which thread),
+  the regions of a task's memory (`mach_vm_region`, and `_recurse`),
   and the kernel's notifications (`mach_port_request_notification`): that
   a port has no senders left, that the port a name was a right to has
   died or the name has gone, that a send-once right was never used;
@@ -261,8 +262,9 @@ What does not, yet:
 - **Mach between tasks.** A port's queue lives in its own process, so no
   right crosses a `fork` or reaches another program: no bootstrap port, no
   launchd, no XPC. Within a task, messages carry ports but not memory out
-  of line; and much of what the kernel's own ports are asked (`vm_region`,
-  `task_threads`) answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
+  of line, so what the kernel's own ports would answer with that
+  (`task_threads`, `host_processor_info`) is `MIG_BAD_ID`, as much else
+  of theirs is. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - A kqueue's events delivered to a work queue's threads, and workloops;
   a file made longer by `ftruncate`

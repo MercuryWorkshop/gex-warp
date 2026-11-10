@@ -304,6 +304,74 @@ static void infos(void) {
     }
 }
 
+// mach_vm_region and mach_vm_region_recurse: the region of the task's
+// memory an address is in, or the next one above it, with what may be done
+// there.
+static void regions(void) {
+#if defined(__arm64__)
+    enum { PAGE = 16384 };
+#else
+    enum { PAGE = 4096 };
+#endif
+    static struct {
+        struct header h;
+        u32 body[64];
+    } m;
+    static const u32 ndr[2] = {0, 1};
+    // Five pages: the second read-only, the fourth unmapped; with a page
+    // that may not be touched before them and a sixth after, so that they
+    // begin and end where they do whatever is mapped around them (a kernel
+    // may tell two mappings that touch and are alike as one region).
+    long at = SYS(SYS_mmap, 0, 7 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) + PAGE;
+    SYS(SYS_mprotect, at - PAGE, PAGE, PROT_NONE);
+    SYS(SYS_mprotect, at + PAGE, PAGE, PROT_READ);
+    SYS(SYS_munmap, at + 3 * PAGE, PAGE);
+    SYS(SYS_mprotect, at + 5 * PAGE, PAGE, PROT_NONE);
+    static const struct {
+        const char *what;
+        long page, more;
+        u32 flavor, room;
+    } asks[] = {
+        {"the first page", 0, 0, 9, 9},          {"inside the second", 1, 100, 9, 9}, {"the third", 2, 0, 9, 9},  {"the hole", 3, 0, 9, 9},
+        {"the fifth", 4, 0, 9, 9},               {"the sixth", 5, 0, 9, 9},  {"the second, the older way", 1, 0, 10, 8}, {"with too little room", 1, 0, 9, 8}, {"a flavor there is none of", 1, 0, 99, 9},
+    };
+    for (unsigned i = 0; i < sizeof asks / sizeof *asks; i++) {
+        t_memset(&m, 0, sizeof m);
+        m.h.id = 4816;
+        u64 address = (u64)(at + asks[i].page * PAGE + asks[i].more);
+        m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = (u32)address, m.body[3] = (u32)(address >> 32), m.body[4] = asks[i].flavor, m.body[5] = asks[i].room;
+        u32 reply = (u32)TRAP(TRAP_mach_reply_port);
+        m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = task, m.h.local = reply;
+        long r = msg((struct message *)&m, SEND_MSG | RCV_MSG | KOBJECT_CALL, sizeof m.h + 24, sizeof m, reply, 0);
+        TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
+        t_printf("the region of %s: %ld", asks[i].what, r);
+        if (r || !(m.h.bits & COMPLEX)) {
+            t_printf(", code %d\n", (int)m.body[2]);
+            continue;
+        }
+        // { one descriptor (the object's name: none), NDR, address, size, count, info }
+        const u32 *w = m.body + 6;
+        u64 start = w[0] | (u64)w[1] << 32, size = w[2] | (u64)w[3] << 32;
+        t_printf(", from page %ld for %ld pages, %u words: protection %u of %u, inherited %u, shared %u\n", (long)((long)start - at) / PAGE, (long)(size / PAGE), w[4], w[5], w[6], w[7], w[8]);
+    }
+    // And by mach_vm_region_recurse, which says more and has no flavors.
+    for (int page = 1; page <= 3; page += 2) {
+        t_memset(&m, 0, sizeof m);
+        m.h.id = 4815;
+        u64 address = (u64)(at + page * PAGE);
+        m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = (u32)address, m.body[3] = (u32)(address >> 32), m.body[4] = 0, m.body[5] = 19;
+        u32 reply = (u32)TRAP(TRAP_mach_reply_port);
+        m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = task, m.h.local = reply;
+        long r = msg((struct message *)&m, SEND_MSG | RCV_MSG | KOBJECT_CALL, sizeof m.h + 24, sizeof m, reply, 0);
+        TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
+        const u32 *w = m.body + 3;
+        u64 start = w[0] | (u64)w[1] << 32, size = w[2] | (u64)w[3] << 32;
+        t_printf("and in depth, page %d: %ld, code %d, from page %ld for %ld pages, depth %u, %u words: protection %u of %u, a submap %u\n", page, r, (int)m.body[2], (long)((long)start - at) / PAGE,
+                 (long)(size / PAGE), w[4], w[5], w[6], w[7], w[6 + 12]);
+    }
+    SYS(SYS_munmap, at - PAGE, 7 * PAGE);
+}
+
 // mach_port_request_notification(task, name, which, sync, notify): a
 // message asked for, to a port of the caller's, when something becomes of
 // a right. The reply hands back what was asked for before.
@@ -788,6 +856,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     threads();
     kernel_ports();
     infos();
+    regions();
     notifications();
     queues();
 #if defined(__arm64__)
