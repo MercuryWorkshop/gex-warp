@@ -51,6 +51,9 @@ pub struct StdStream {
     /// file`, `pcre2grep -m`) and concurrent writers to one log file share
     /// the offset as on Linux.
     host_file: bool,
+    /// What the host's descriptor is when it is no terminal and no file:
+    /// a pipe or a socket is told of as one, anything else as a device.
+    host_kind: FileType,
 }
 
 /// The host's own descriptor for a stream: a duplicate, which shares the
@@ -74,7 +77,18 @@ impl StdStream {
         let host_file = !tty && host(stream).is_some_and(|f| f.metadata().is_ok_and(|m| m.is_file()));
         #[cfg(target_family = "wasm")]
         let host_file = false;
-        StdStream { stream, tty, host_file }
+        // A pipe or a socket the host was started with (`prog | cat`) says
+        // what it is:
+        // a libc asks what its standard output is before it writes.
+        #[cfg(not(target_family = "wasm"))]
+        let host_kind = match host(stream).filter(|_| !tty).and_then(|f| f.metadata().ok()).map(|m| m.file_type()) {
+            Some(t) if std::os::unix::fs::FileTypeExt::is_fifo(&t) => FileType::Fifo,
+            Some(t) if std::os::unix::fs::FileTypeExt::is_socket(&t) => FileType::Socket,
+            _ => FileType::CharDevice,
+        };
+        #[cfg(target_family = "wasm")]
+        let host_kind = FileType::CharDevice;
+        StdStream { stream, tty, host_file, host_kind }
     }
 }
 
@@ -146,9 +160,9 @@ impl FileHandle for StdStream {
             }
         }
         Ok(Metadata {
-            file_type: FileType::CharDevice,
+            file_type: self.host_kind,
             size: 0,
-            mode: 0o620,
+            mode: if self.host_kind == FileType::CharDevice { 0o620 } else { 0o600 },
             ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,

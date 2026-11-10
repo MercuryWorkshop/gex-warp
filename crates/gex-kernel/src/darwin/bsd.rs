@@ -757,7 +757,7 @@ impl Kernel {
             18 => 64,         // _PC_FILESIZEBITS
             24 => 1024,       // _PC_SYMLINK_MAX
             26 => 64,         // _PC_XATTR_SIZE_BITS
-            27 => 8,          // _PC_MIN_HOLE_SIZE: not reported
+            27 => 4096,       // _PC_MIN_HOLE_SIZE: as APFS says, of files with no holes known
             _ => return Err(Errno::EINVAL),
         })
     }

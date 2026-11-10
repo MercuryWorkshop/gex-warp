@@ -289,6 +289,18 @@ impl OpenFile {
             return Err(Errno::ESPIPE);
         }
         let _pos = self.pos_lock();
+        // `SEEK_DATA` and `SEEK_HOLE` of a file with no holes known: its
+        // data is all of it, and its one hole is at its end. Past the end
+        // there is neither.
+        if whence == 3 || whence == 4 {
+            let size = self.handle.metadata()?.size;
+            if offset < 0 || offset as u64 >= size {
+                return Err(Errno::ENXIO);
+            }
+            let to = if whence == 3 { offset as u64 } else { size };
+            self.offset.store(to, Ordering::Relaxed);
+            return Ok(to);
+        }
         let base = match whence {
             0 => 0,
             1 => self.offset.load(Ordering::Relaxed),

@@ -4136,6 +4136,16 @@ impl PathIo<'_> {
     /// to create the file. A NULL path is `futimens` on `dirfd`, whose
     /// descriptor is validated; its time is not kept (an open file's name
     /// is not tracked).
+    /// Set an open file's times (`futimens`). An open directory keeps none
+    /// of its own to set, so its are set by the name it was opened by: what
+    /// an archiver does to each directory once it has filled it.
+    pub fn set_times_of(&self, file: &OpenFile, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        if file.path.starts_with('/') && file.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Directory) {
+            return self.ns.set_times(&file.path, atime, mtime, true);
+        }
+        file.handle.set_times(atime, mtime)
+    }
+
     pub fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, times: u64, flags: u32) -> SysResult {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
         const UTIME_NOW: u64 = (1 << 30) - 1;
@@ -4162,7 +4172,7 @@ impl PathIo<'_> {
         };
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
-            self.map.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
+            self.set_times_of(&*self.map.fds.get(dirfd)?, atime, mtime)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;

@@ -328,8 +328,15 @@ impl FileHandle for HostDir {
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
         Err(Errno::EISDIR)
     }
+    /// As the directory is now (its times are set and its entries come and
+    /// go while it is open); as it was at the open if the host no longer
+    /// says.
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(self.md.clone())
+        let now = match &self.held {
+            Some((f, _, _)) => f.metadata(),
+            None => std::fs::metadata(&self.host),
+        };
+        Ok(now.map(|m| convert(&m)).unwrap_or_else(|_| self.md.clone()))
     }
     /// Listed when asked, not at the open, as Linux reads a directory at
     /// `getdents`: an open for `fstatfs` or an ioctl lists nothing. The

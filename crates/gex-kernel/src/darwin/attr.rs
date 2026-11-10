@@ -581,7 +581,8 @@ impl Kernel {
         }
         if atime.is_some() || mtime.is_some() {
             if path == 0 {
-                self.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
+                let file = self.fds.get(dirfd)?;
+                self.path_io().set_times_of(&*file, atime, mtime)?;
             } else {
                 self.vfs.set_times(&full, atime, mtime, options & FSOPT_NOFOLLOW == 0)?;
             }

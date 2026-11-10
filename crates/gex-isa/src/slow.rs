@@ -266,6 +266,30 @@ pub fn execute(raw: u32, v: &mut VRegs, fpsr: &mut u32) -> bool {
     let lanes = nb / bytes;
     let high0 = |x: u128| if q { x } else { x & u64::MAX as u128 };
 
+    // UDOT and SDOT (FEAT_DotProd), by vector `0 Q U 01110 10 0 Rm 1 0010 1 Rn Rd`
+    // and by element `0 Q U 01111 10 L M Rm 1110 H 0 Rn Rd`: to each 32-bit lane
+    // of Vd, the sum of its four bytes of Vn each times a byte of Vm -- its own
+    // four, or the four of the one group the index names.
+    let by_vector = raw & 0x9fe0_fc00 == 0x0e80_9400;
+    if by_vector || raw & 0x9fc0_f400 == 0x0f80_e000 {
+        let (d, n, m) = (v.get(rd), v.get(rn), v.get(rm));
+        let group = bits(raw, 11, 11) << 1 | bits(raw, 21, 21);
+        let byte = |x: u128, i: u32| -> i64 {
+            let b = (x >> (8 * i)) as u8;
+            if u { b as i64 } else { b as i8 as i64 }
+        };
+        let mut r = 0u128;
+        for e in 0..if q { 4 } else { 2 } {
+            let mut sum = (d >> (32 * e)) as u32;
+            for i in 0..4 {
+                let with = if by_vector { 4 * e + i } else { 4 * group + i };
+                sum = sum.wrapping_add((byte(n, 4 * e + i) * byte(m, with)) as u32);
+            }
+            r |= (sum as u128) << (32 * e);
+        }
+        v.set(rd, r);
+        return true;
+    }
     // AES: 0100 1110 0010 1000 0 opcode 10 Rn Rd
     if raw & 0xffff_cc00 == 0x4e28_4800 {
         let d = v.get(rd);
@@ -657,6 +681,37 @@ mod tests {
 
     fn zeroed() -> [u128; 32] {
         [0; 32]
+    }
+
+    /// UDOT and SDOT: each 32-bit lane takes the sum of four byte products,
+    /// unsigned or signed, by vector and by one group of the other operand;
+    /// the 64-bit form leaves the upper half zero.
+    #[test]
+    fn dot_products_sum_four_bytes_to_a_lane() {
+        let n = u128::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8, 0xff, 0x80, 9, 10, 11, 12, 13, 14]);
+        let m = u128::from_le_bytes([2, 2, 2, 2, 1, 0, 0xff, 3, 0xff, 0x80, 1, 1, 0, 0, 0, 1]);
+        let lanes = |x: u128| [x as u32, (x >> 32) as u32, (x >> 64) as u32, (x >> 96) as u32];
+        let mut r = zeroed();
+        (r[0], r[1], r[2]) = (0x0000_0001_0000_0000_ffff_ffff_0000_0064, n, m);
+        // udot v0.4s, v1.16b, v2.16b
+        run(0x6e82_9420, &mut r);
+        assert_eq!(lanes(r[0]), [100 + 20, (5 + 7 * 255 + 8 * 3u32).wrapping_sub(1), 255 * 255 + 128 * 128 + 9 + 10, 1 + 14]);
+        // sdot v0.4s, v1.16b, v2.16b: the same bytes, signed.
+        r[0] = 0;
+        run(0x4e82_9420, &mut r);
+        assert_eq!(lanes(r[0]), [20, (5 - 7 + 24) as u32, (1 + 128 * 128 + 9 + 10) as u32, 14]);
+        // udot v0.2s, v1.8b, v2.8b: two lanes, the rest zero.
+        r[0] = u128::MAX;
+        run(0x2e82_9420, &mut r);
+        assert_eq!(lanes(r[0]), [19, (5 + 7 * 255 + 8 * 3u32).wrapping_sub(1), 0, 0]);
+        // udot v0.4s, v1.16b, v2.4b[1]: every lane by Vm's second group (1, 0, 255, 3).
+        r[0] = 0;
+        run(0x6fa2_e020, &mut r);
+        assert_eq!(lanes(r[0]), [1 + 3 * 255 + 4 * 3, 5 + 7 * 255 + 8 * 3, 255 + 9 * 255 + 10 * 3, 11 + 13 * 255 + 14 * 3]);
+        // sdot v0.4s, v1.16b, v2.4b[3] (H set): by its fourth group (0, 0, 0, 1).
+        r[0] = 0;
+        run(0x4fa2_e820, &mut r);
+        assert_eq!(lanes(r[0]), [4, 8, 10, 14]);
     }
 
     /// FIPS-197 appendix A.1's cipher example, by `aese` and `aesmc`: the whole block.
