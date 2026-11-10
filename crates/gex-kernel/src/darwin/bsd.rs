@@ -122,12 +122,10 @@ impl Kernel {
             d::MKDIRAT => set(nr::MKDIRAT, &[dirfd(x[0]), x[1], x[2]]),
             d::RENAME => set(nr::RENAMEAT, &[CWD, x[0], CWD, x[1]]),
             d::RENAMEAT => set(nr::RENAMEAT, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3]]),
-            // RENAME_SWAP (2) and RENAME_EXCL (4) are the kernel's
-            // RENAME_EXCHANGE and RENAME_NOREPLACE.
-            d::RENAMEATX_NP if x[4] & !6 == 0 => {
-                let flags = (x[4] & 2) | (x[4] & 4) >> 2;
-                set(nr::RENAMEAT2, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3], flags])
-            }
+            // RENAME_EXCL (4) is the kernel's RENAME_NOREPLACE. RENAME_SWAP
+            // (2) is not something its filesystems do, which is ENOTSUP
+            // ([`Kernel::darwin_native`]) as it is of a volume that cannot.
+            d::RENAMEATX_NP if x[4] & !4 == 0 => set(nr::RENAMEAT2, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3], x[4] >> 2]),
             // A file's flags (`chflags`) are not kept; the file must exist.
             d::CHFLAGS => set(nr::FACCESSAT, &[CWD, x[0], 0]),
             d::FCHFLAGS => set(nr::FCNTL, &[x[0], 1]),
@@ -432,7 +430,8 @@ impl Kernel {
             // Whether the thread has been cancelled (it has not), and its
             // cancellation switched on or off.
             d::PTHREAD_CANCELED => if x[0] == 0 { Err(Errno::EINVAL) } else { Ok(0) },
-            // No copy-on-write clones: the caller copies.
+            // No copy-on-write clones, and no exchange of two names: the
+            // caller does without.
             d::CLONEFILEAT | d::RENAMEATX_NP => Err(Errno::EOPNOTSUPP),
             d::FSCTL | d::FFSCTL => Err(Errno::ENOTTY),
             // A port that is no thread's.

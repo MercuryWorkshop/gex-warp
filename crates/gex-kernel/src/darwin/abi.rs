@@ -97,6 +97,10 @@ pub fn errno_from_darwin(d: i32) -> Errno {
     if d == 102 {
         return Errno::EOPNOTSUPP;
     }
+    // No such attribute, which Linux's calls say as no data.
+    if d == err::ENOATTR as i32 {
+        return Errno::ENODATA;
+    }
     if let Some(&(l, _)) = ERRNO.iter().find(|(_, x)| *x as i32 == d) {
         return Errno(l);
     }

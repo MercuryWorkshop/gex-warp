@@ -238,6 +238,43 @@ static void filesystem(void) {
     SYS(SYS_close, fd);
 }
 
+// Extended attributes, with Darwin's extra arguments (a position, and
+// options), and renameatx_np's two flags.
+static void attributes(void) {
+    enum { SYS_getxattr = 234, SYS_setxattr = 236, SYS_removexattr = 238, SYS_listxattr = 240, SYS_renameatx_np = 488 };
+    enum { XATTR_CREATE = 2, XATTR_REPLACE = 4, RENAME_EXCL = 4 };
+    long fd = SYS(SYS_open, "x", O_CREAT | O_WRONLY, 0644);
+    SYS(SYS_write, fd, "ex", 2);
+    SYS(SYS_close, fd);
+    char buf[32];
+    t_show("setxattr", SYS(SYS_setxattr, "x", "user.t", "value", 5, 0, 0));
+    t_memset(buf, 0, sizeof buf);
+    t_show("getxattr", SYS(SYS_getxattr, "x", "user.t", buf, sizeof buf, 0, 0));
+    t_printf("  \"%s\"\n", buf);
+    t_show("its size alone", SYS(SYS_getxattr, "x", "user.t", 0, 0, 0, 0));
+    t_show("getxattr of none", SYS(SYS_getxattr, "x", "user.none", buf, sizeof buf, 0, 0));
+    t_show("setxattr, to create what is there", SYS(SYS_setxattr, "x", "user.t", "v", 1, 0, XATTR_CREATE));
+    t_show("setxattr, to replace what is not", SYS(SYS_setxattr, "x", "user.none", "v", 1, 0, XATTR_REPLACE));
+    t_memset(buf, 0, sizeof buf);
+    t_show("listxattr", SYS(SYS_listxattr, "x", buf, sizeof buf, 0));
+    t_printf("  \"%s\"\n", buf);
+    t_show("removexattr", SYS(SYS_removexattr, "x", "user.t", 0));
+    t_show("and again", SYS(SYS_removexattr, "x", "user.t", 0));
+    t_show("getxattr of no file", SYS(SYS_getxattr, "nothing", "user.t", buf, sizeof buf, 0, 0));
+
+    fd = SYS(SYS_open, "y", O_CREAT | O_WRONLY, 0644);
+    SYS(SYS_write, fd, "why", 3);
+    SYS(SYS_close, fd);
+    t_show("renameatx_np onto a file, exclusively", SYS(SYS_renameatx_np, AT_FDCWD, "x", AT_FDCWD, "y", RENAME_EXCL));
+    t_show("and onto none", SYS(SYS_renameatx_np, AT_FDCWD, "x", AT_FDCWD, "z", RENAME_EXCL));
+    struct t_stat st;
+    t_show("the old name", SYS(SYS_stat64, "x", &st));
+    SYS(SYS_stat64, "z", &st);
+    t_printf("  the new one is %lld bytes\n", st.st_size);
+    // (RENAME_SWAP is the volume's to offer: APFS does, gex's do not.)
+    SYS(SYS_unlink, "z"), SYS(SYS_unlink, "y");
+}
+
 static void children(void) {
     static struct t_siginfo info;
     static u64 guard[4];
@@ -299,6 +336,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     by_name();
     process(argc, argv);
     filesystem();
+    attributes();
     children();
     return 0;
 }

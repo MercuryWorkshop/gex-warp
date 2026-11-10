@@ -17,7 +17,7 @@ mod sys {
     //! operation, with an `options` argument whose `XATTR_NOFOLLOW` stands in
     //! for the `l` prefix, and its own flag values for create/replace.
 
-    pub const XATTR_NOFOLLOW: i32 = 0x0008;
+    pub const XATTR_NOFOLLOW: i32 = 0x0001;
     /// Linux's `XATTR_CREATE`/`XATTR_REPLACE` are 1/2; macOS's are 2/4.
     pub fn set_flags(flags: i32) -> i32 {
         let mut out = 0;
@@ -30,11 +30,17 @@ mod sys {
         out
     }
 
+    /// A buffer of no length asks for the size, which macOS answers only
+    /// when there is no buffer at all (Linux goes by the length).
+    fn sized<T>(b: *mut T, l: usize) -> *mut T {
+        if l == 0 { std::ptr::null_mut() } else { b }
+    }
+
     pub unsafe fn get(path: *const libc::c_char, name: *const libc::c_char, b: *mut libc::c_void, l: usize) -> isize {
-        libc::getxattr(path, name, b, l, 0, XATTR_NOFOLLOW)
+        libc::getxattr(path, name, sized(b, l), l, 0, XATTR_NOFOLLOW)
     }
     pub unsafe fn fget(fd: i32, name: *const libc::c_char, b: *mut libc::c_void, l: usize) -> isize {
-        libc::fgetxattr(fd, name, b, l, 0, 0)
+        libc::fgetxattr(fd, name, sized(b, l), l, 0, 0)
     }
     pub unsafe fn set(path: *const libc::c_char, name: *const libc::c_char, v: *const libc::c_void, l: usize, flags: i32) -> isize {
         libc::setxattr(path, name, v, l, 0, set_flags(flags) | XATTR_NOFOLLOW) as isize
@@ -43,10 +49,10 @@ mod sys {
         libc::fsetxattr(fd, name, v, l, 0, set_flags(flags)) as isize
     }
     pub unsafe fn list(path: *const libc::c_char, b: *mut libc::c_char, l: usize) -> isize {
-        libc::listxattr(path, b, l, XATTR_NOFOLLOW)
+        libc::listxattr(path, sized(b, l), l, XATTR_NOFOLLOW)
     }
     pub unsafe fn flist(fd: i32, b: *mut libc::c_char, l: usize) -> isize {
-        libc::flistxattr(fd, b, l, 0)
+        libc::flistxattr(fd, sized(b, l), l, 0)
     }
     pub unsafe fn remove(path: *const libc::c_char, name: *const libc::c_char) -> isize {
         libc::removexattr(path, name, XATTR_NOFOLLOW) as isize
