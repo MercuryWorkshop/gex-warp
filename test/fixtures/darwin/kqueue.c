@@ -1,0 +1,224 @@
+// kqueue and kevent: descriptors to read and write, timers, events a
+// program posts to itself, a process ending; added, switched off and on,
+// told once or each time; and waited for, for a while or for ever.
+#include "t.h"
+
+enum { SYS_kqueue = 362, SYS_kevent = 363, SYS_kevent64 = 369, SYS_kevent_qos = 374 };
+enum { READ = -1, WRITE = -2, PROC = -5, SIGNAL = -6, TIMER = -7, USER = -10 };
+enum { ADD = 1, DELETE = 2, ENABLE = 4, DISABLE = 8, ONESHOT = 0x10, CLEAR = 0x20, RECEIPT = 0x40, DISPATCH = 0x80, ERROR = 0x4000, EOF_ = 0x8000 };
+enum { TRIGGER = 0x01000000, FFOR = 0x80000000, FFCOPY = 0xc0000000, NOTE_EXIT = 0x80000000, USECONDS = 2 };
+
+struct kevent {
+    u64 ident;
+    short filter;
+    u16 flags;
+    u32 fflags;
+    i64 data;
+    u64 udata;
+};
+struct kevent64 {
+    u64 ident;
+    short filter;
+    u16 flags;
+    u32 fflags;
+    i64 data;
+    u64 udata, ext[2];
+};
+struct kevent_qos {
+    u64 ident;
+    short filter;
+    u16 flags;
+    int qos;
+    u64 udata;
+    u32 fflags, xflags;
+    i64 data;
+    u64 ext[4];
+};
+
+static long kq;
+static struct kevent got[8];
+static const struct t_timespec now_ = {0, 0};
+
+// One change, and nothing waited for.
+static long change(u64 ident, int filter, int flags, u32 fflags, i64 data, u64 udata) {
+    struct kevent e = {ident, (short)filter, (u16)flags, fflags, data, udata};
+    return SYS(SYS_kevent, kq, &e, 1, 0, 0, &now_);
+}
+// What is ready now, or within `ms` (-1: however long it takes).
+static long ready(int ms) {
+    struct t_timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
+    for (int i = 0; i < 8; i++) got[i] = (struct kevent){0xeeee, 0, 0, 0, 0, 0};
+    return SYS(SYS_kevent, kq, 0, 0, got, 8, ms < 0 ? 0 : &t);
+}
+static void say(const char *what, long n) {
+    t_printf("%s: %ld", what, n);
+    for (long i = 0; i < n && i < 8; i++)
+        t_printf(" [%s%lu filter %d flags 0x%x fflags 0x%x data %ld udata %lu]", "", (unsigned long)got[i].ident % 1000, got[i].filter, got[i].flags, got[i].fflags, (long)got[i].data, (unsigned long)got[i].udata);
+    t_printf("\n");
+}
+
+int main(int argc, char **argv, char **envp, char **apple) {
+    (void)argc, (void)argv, (void)envp, (void)apple;
+    kq = SYS(SYS_kqueue);
+    t_check("kqueue", kq >= 3);
+    say("an empty queue", ready(0));
+    long wr = -1;
+    long rd = t_syscall2(&wr, SYS_pipe, 0, 0, 0);
+    // (The descriptors' numbers are told apart by what is asked to be
+    // handed back with them.)
+#define R 1000 + rd - rd
+#define W 2000 + wr - wr
+
+    // A pipe to read: nothing, then what is written, each time asked.
+    t_show("add a read", change(rd, READ, ADD, 0, 0, 11));
+    say("nothing to read", ready(0));
+    SYS(SYS_write, wr, "hello", 5);
+    say("five bytes", ready(0));
+    say("still there", ready(0));
+    char buf[64];
+    SYS(SYS_read, rd, buf, 2);
+    say("three left", ready(0));
+    SYS(SYS_read, rd, buf, 3);
+    say("read dry", ready(0));
+
+    // Told once of each change.
+    t_show("the same, told once (the note is changed, not added twice)", change(rd, READ, ADD | CLEAR, 0, 0, 12));
+    SYS(SYS_write, wr, "ab", 2);
+    say("written to", ready(0));
+    say("not told again", ready(0));
+    SYS(SYS_write, wr, "c", 1);
+    say("written to again", ready(0));
+    SYS(SYS_read, rd, buf, 3);
+
+    // Off, on, once, and until asked again.
+    t_show("switched off", change(rd, READ, DISABLE, 0, 0, 0));
+    SYS(SYS_write, wr, "x", 1);
+    say("off", ready(0));
+    t_show("switched on", change(rd, READ, ENABLE, 0, 0, 0));
+    say("on", ready(0));
+    t_show("once", change(rd, READ, ADD | ONESHOT, 0, 0, 13));
+    say("once", ready(0));
+    say("and gone", ready(0));
+    t_show("delete what is gone", change(rd, READ, DELETE, 0, 0, 0));
+    t_show("until asked again", change(rd, READ, ADD | DISPATCH, 0, 0, 14));
+    say("said", ready(0));
+    say("and silent", ready(0));
+    t_show("asked again", change(rd, READ, ENABLE, 0, 0, 0));
+    say("said again", ready(0));
+    t_show("delete", change(rd, READ, DELETE, 0, 0, 0));
+    SYS(SYS_read, rd, buf, 1);
+
+    // A pipe to write is ready while there is room.
+    t_show("add a write", change(wr, WRITE, ADD, 0, 0, 21));
+    long n = ready(0);
+    t_printf("room to write: %ld, filter %d flags 0x%x udata %lu, some room %d\n", n, got[0].filter, got[0].flags, (unsigned long)got[0].udata, got[0].data > 0);
+    t_show("delete", change(wr, WRITE, DELETE, 0, 0, 0));
+
+    // What goes wrong is said in an event when there is room for one, and
+    // by the call when there is not.
+    struct kevent bad[2] = {{99, READ, ADD, 0, 0, 1}, {rd, READ, DELETE, 0, 0, 2}};
+    n = SYS(SYS_kevent, kq, bad, 2, got, 8, &now_);
+    t_printf("two that fail, with room: %ld [flags 0x%x data %ld udata %lu] [flags 0x%x data %ld udata %lu]\n", n, got[0].flags, (long)got[0].data, (unsigned long)got[0].udata, got[1].flags,
+        (long)got[1].data, (unsigned long)got[1].udata);
+    t_show("one that fails, without", SYS(SYS_kevent, kq, bad, 1, 0, 0, &now_));
+    struct kevent told = {rd, READ, ADD | RECEIPT, 0, 0, 3};
+    n = SYS(SYS_kevent, kq, &told, 1, got, 8, &now_);
+    t_printf("one that asks how it went: %ld [flags 0x%x data %ld udata %lu]\n", n, got[0].flags, (long)got[0].data, (unsigned long)got[0].udata);
+    t_show("delete", change(rd, READ, DELETE, 0, 0, 0));
+    t_show("a filter there is none of", change(1, 5, ADD, 0, 0, 0));
+    t_show("kevent on what is no queue", SYS(SYS_kevent, rd, 0, 0, got, 8, &now_));
+    t_show("kevent on nothing", SYS(SYS_kevent, 99, 0, 0, got, 8, &now_));
+
+    // An event the program posts to itself.
+    t_show("add a user event", change(7, USER, ADD | CLEAR, 0, 0, 31));
+    say("not posted", ready(0));
+    t_show("post it, with flags", change(7, USER, 0, TRIGGER | FFOR | 0x5, 0, 0));
+    say("posted", ready(0));
+    say("once", ready(0));
+    t_show("post it twice", change(7, USER, 0, TRIGGER | FFOR | 0x2, 0, 0) + change(7, USER, 0, TRIGGER | FFOR | 0x8, 0, 0));
+    say("posted, the flags together", ready(0));
+    t_show("delete", change(7, USER, DELETE, 0, 0, 0));
+
+    // Time: none to wait, a little, and a timer's.
+    u64 t0 = t_nanos();
+    say("nothing for 30 ms", ready(30));
+    u64 waited = (t_nanos() - t0) / 1000000;
+    t_check("  which were waited", waited >= 25 && waited < 2000);
+    t_show("a timer, every 20 ms", change(1, TIMER, ADD, 0, 20, 41));
+    say("too soon", ready(0));
+    t0 = t_nanos();
+    n = ready(-1);
+    waited = (t_nanos() - t0) / 1000000;
+    t_printf("waited for: %ld, filter %d udata %lu, fired %d\n", n, got[0].filter, (unsigned long)got[0].udata, got[0].data >= 1);
+    t_check("  about that long", waited >= 10 && waited < 2000);
+    n = ready(1000);
+    t_printf("and again: %ld, fired %d\n", n, got[0].data >= 1);
+    t_show("delete", change(1, TIMER, DELETE, 0, 0, 0));
+    t_show("a timer, once, in microseconds", change(2, TIMER, ADD | ONESHOT, USECONDS, 5000, 42));
+    n = ready(1000);
+    t_printf("fired: %ld, filter %d flags 0x%x data %ld\n", n, got[0].filter, got[0].flags, (long)got[0].data);
+    say("and not again", ready(30));
+    // A timer sooner than the time given to wait.
+    t_show("a timer, once", change(3, TIMER, ADD | ONESHOT, 0, 10, 43));
+    t0 = t_nanos();
+    n = ready(5000);
+    t_check("a wait ends at the first timer", n == 1 && (t_nanos() - t0) / 1000000 < 2000);
+
+    // Another process: what it writes wakes a wait, its end is an end of
+    // file, and its ending is an event.
+    t_show("add a read", change(rd, READ, ADD, 0, 0, 51));
+    long second = -1;
+    long pid = t_syscall2(&second, SYS_fork, 0, 0, 0);
+    if (pid >= 0 && second) {
+        // (select's time is seconds and microseconds: 20 ms.)
+        struct t_timespec nap = {0, 20000};
+        SYS(SYS_close, rd);
+        SYS(SYS_select, 0, 0, 0, 0, &nap);
+        SYS(SYS_write, wr, "child", 5);
+        SYS(SYS_select, 0, 0, 0, 0, &nap);
+        t_exit(7);
+    }
+    SYS(SYS_close, wr);
+    t_show("watch the child end", change(pid, PROC, ADD, NOTE_EXIT, 0, 52));
+    // What it writes, its end and its pipe's are three events, the last
+    // two in either order, and any of them together if it is quick.
+    int wrote = 0, ended = 0, eof = 0;
+    for (int tries = 0; tries < 8 && !(wrote && ended && eof); tries++) {
+        n = ready(tries ? 2000 : -1);
+        for (long i = 0; i < n; i++) {
+            if (got[i].filter == PROC) ended = (got[i].fflags & NOTE_EXIT) != 0 && got[i].udata == 52 && got[i].ident == (u64)pid;
+            if (got[i].filter == READ && got[i].data == 5 && got[i].udata == 51 && !wrote) wrote = SYS(SYS_read, rd, buf, 5) == 5;
+            else if (got[i].filter == READ) eof = (got[i].flags & EOF_) != 0 && got[i].data == 0;
+        }
+        // (An end of file is said each time asked, until it is not wanted.)
+        if (eof) change(rd, READ, DELETE, 0, 0, 0);
+    }
+    t_check("the child wrote", wrote);
+    t_check("the child ended", ended);
+    t_check("its pipe is at its end", eof);
+    int status = 0;
+    SYS(SYS_wait4, pid, &status, 0, 0);
+    t_show("watch a process there is none of", change(99999, PROC, ADD, NOTE_EXIT, 0, 0));
+
+    // The wider calls, each with a queue of its own: a queue is for the
+    // call it was first used with.
+    struct kevent64 e64 = {8, USER, ADD | CLEAR, 0, 0, 61, {0xa, 0xb}}, g64[2];
+    t_show("kevent64 on a queue kevent has used", SYS(SYS_kevent64, kq, &e64, 1, 0, 0, 0, &now_));
+    t_show("close the queue", SYS(SYS_close, kq));
+    t_show("kevent on it closed", SYS(SYS_kevent, kq, 0, 0, got, 8, &now_));
+    kq = SYS(SYS_kqueue);
+    t_show("kevent64: add", SYS(SYS_kevent64, kq, &e64, 1, 0, 0, 0, &now_));
+    t_show("kevent on a queue kevent64 has used", ready(0));
+    e64 = (struct kevent64){8, USER, 0, TRIGGER, 0, 0, {0, 0}};
+    n = SYS(SYS_kevent64, kq, &e64, 1, g64, 2, 0, &now_);
+    t_printf("kevent64: %ld [%lu filter %d fflags 0x%x udata %lu ext 0x%lx 0x%lx]\n", n, (unsigned long)g64[0].ident, g64[0].filter, g64[0].fflags & 0xffffff, (unsigned long)g64[0].udata,
+        (unsigned long)g64[0].ext[0], (unsigned long)g64[0].ext[1]);
+    t_show("kevent64: nothing, and not waiting (KEVENT_FLAG_IMMEDIATE)", SYS(SYS_kevent64, kq, 0, 0, g64, 2, 1, 0));
+    SYS(SYS_close, kq);
+    kq = SYS(SYS_kqueue);
+    struct kevent_qos eq = {9, USER, ADD | CLEAR, 0, 71, TRIGGER, 0, 0, {0, 0, 0, 0}}, gq[2];
+    n = SYS(SYS_kevent_qos, kq, &eq, 1, gq, 2, 0, 0, 1);
+    t_printf("kevent_qos: %ld [%lu filter %d udata %lu]\n", n, (unsigned long)gq[0].ident, gq[0].filter, (unsigned long)gq[0].udata);
+    SYS(SYS_close, kq);
+    return 0;
+}

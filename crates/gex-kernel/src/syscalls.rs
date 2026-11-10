@@ -733,6 +733,11 @@ pub struct Kernel {
     /// read-write locks ([`darwin::psynch`]), which its threads share and
     /// a fork does not inherit.
     pub darwin_psynch: Arc<std::sync::Mutex<darwin::psynch::Psynch>>,
+    /// The threads in a Darwin `kevent` that have made their changes and
+    /// wait ([`darwin::kqueue`]), and the page their waits are given
+    /// their arguments in (0 until one is needed).
+    pub darwin_kevents: std::collections::HashMap<i32, darwin::kqueue::Waiting>,
+    pub darwin_kevent_pages: std::collections::HashMap<i32, u64>,
     /// Whether the process's memory has its commpage
     /// ([`darwin::commpage`]): mapped at its first call, and a fork's copy
     /// has its parent's.
@@ -9835,6 +9840,8 @@ impl Kernel {
             darwin_spawn_at: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
+            darwin_kevents: Default::default(),
+            darwin_kevent_pages: Default::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
             darwin_threads: Default::default(),
@@ -9981,6 +9988,8 @@ impl Kernel {
         self.darwin_threads = Default::default();
         self.darwin_ports = Default::default();
         self.darwin_psynch = Default::default();
+        self.darwin_kevents.clear();
+        self.darwin_kevent_pages.clear();
         self.darwin_spawn_at = None;
     }
 
@@ -10282,6 +10291,8 @@ impl Kernel {
             darwin_spawn_at: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
+            darwin_kevents: Default::default(),
+            darwin_kevent_pages: Default::default(),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
             // The child's libpthread is the parent's, registered already.
@@ -11089,6 +11100,13 @@ impl Kernel {
                 // Linux sends it as the writer itself sending it (SI_USER).
                 crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
             );
+        }
+        // A Darwin `kevent` that waited is made again, to collect what
+        // ended its wait or to wait out the rest of its time.
+        if self.darwin && self.darwin_kevent_again(r) {
+            if let Some(back) = restart_call(m, self.ctx_addr, ret_pc, false) {
+                return SyscallOutcome::Resume(back);
+            }
         }
         let r = if self.darwin { self.darwin_finish(m, r) } else { r };
         let ret = encode(r);

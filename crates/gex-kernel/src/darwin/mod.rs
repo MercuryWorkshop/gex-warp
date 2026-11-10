@@ -22,6 +22,7 @@ pub mod abi;
 mod attr;
 mod bsd;
 pub mod info;
+pub mod kqueue;
 mod mach;
 pub mod nr;
 pub mod port;
@@ -173,6 +174,11 @@ pub enum Post {
     OldStat { at: u64, was: [u64; 3] },
     /// An extended-attribute call: no such attribute is `ENOATTR`.
     Xattr,
+    /// A `kevent` that waited on its queue ([`kqueue`]): to be made again,
+    /// by the kernel ([`Kernel::finish_blocking`]) or by a host that
+    /// finishes its waits without one. `slot` is the thread's, whose mark
+    /// says the call is one being made again.
+    Kevent { slot: u64 },
     /// `waitid`: the kernel's `siginfo_t` at `at` as Darwin's, which is
     /// shorter; `was` is what the caller had there, and past it.
     Waitid { at: u64, was: [u64; 16] },
@@ -374,6 +380,9 @@ impl Kernel {
     pub(super) fn darwin_finish(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SysResult {
         let post = std::mem::take(&mut self.darwin_post);
         let r = if post == Post::Psynch { self.darwin_psynch_end(m, r) } else { r };
+        if matches!(post, Post::Kevent { .. }) {
+            self.darwin_kevents.remove(&self.tid);
+        }
         finish(m, self.ctx_addr, post, r)
     }
 }
@@ -478,6 +487,12 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             Err(Errno::ENODATA) => Err(abi::K_ENOATTR),
             r => r,
         },
+        // Not made again (a signal ended the wait, or the host could not):
+        // the thread's next `kevent` is a new one.
+        Post::Kevent { slot } => {
+            let _ = m.write_u32(slot + 16, 0);
+            r.and(Err(Errno::EINTR))
+        }
         Post::Waitid { at, was } => {
             if at != 0 {
                 let l = m.read(at, 128)?.to_vec();

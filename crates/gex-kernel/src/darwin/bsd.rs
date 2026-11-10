@@ -424,6 +424,9 @@ impl Kernel {
             d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
             d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
             d::POSIX_SPAWN => return self.darwin_posix_spawn(m, x, a),
+            d::KEVENT => return self.darwin_kevent(m, kqueue::Form::Plain, x, a),
+            d::KEVENT64 => return self.darwin_kevent(m, kqueue::Form::Wide, x, a),
+            d::KEVENT_QOS => return self.darwin_kevent(m, kqueue::Form::Qos, x, a),
             d::PSYNCH_MUTEXWAIT
             | d::PSYNCH_MUTEXDROP
             | d::PSYNCH_CVBROAD
@@ -503,6 +506,9 @@ impl Kernel {
             d::ULOCK_WAIT => Err(Errno::EINVAL),
             // A `posix_spawn` that failed before anything was made.
             d::POSIX_SPAWN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
+            d::KQUEUE => self.darwin_kqueue(),
+            // A `kevent` that did not wait: its answer.
+            d::KEVENT => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // A psynch call that did not wait: its answer.
             d::PSYNCH_RW_LONGRDLOCK..=d::PSYNCH_RW_UNLOCK2 | d::PSYNCH_CVCLRPREPOST => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // Quality-of-service requests: there is one class of thread.

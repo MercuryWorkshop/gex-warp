@@ -496,6 +496,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a Darwin kqueue, when it is one.
+    fn as_kqueue(self: Arc<Self>) -> Option<Arc<crate::darwin::kqueue::Kqueue>> {
+        None
+    }
+
     /// The process a process descriptor names (`crate::pidfd`), when this
     /// handle is one.
     fn pidfd(&self) -> Option<i32> {

@@ -9267,7 +9267,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     reissue: k.retry_accept.take().is_some()
                         | k.retry_recvmsg.take().is_some()
                         | k.retry_transfer.take().is_some()
-                        | (k.darwin_post == gex_kernel::darwin::Post::Psynch),
+                        | (k.darwin_post == gex_kernel::darwin::Post::Psynch)
+                        | matches!(k.darwin_post, gex_kernel::darwin::Post::Kevent { .. }),
                     darwin_post: std::mem::take(&mut k.darwin_post),
                 };
                 {

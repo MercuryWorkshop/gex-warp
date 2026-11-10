@@ -197,6 +197,9 @@ the image low. What works is what a program can do with the kernel alone:
   them, which is how Apple's libc finds a file's real path and sets its
   times; and the calls that carry an access list beside a mode
   (`stat64_extended`, `chmod_extended`), of which no file has one;
+- `kqueue` and `kevent` (and `kevent64`, `kevent_qos`): a descriptor to
+  read or write, timers, events a program posts to itself, a process
+  ending; told each time or once, and waited for;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
 - which system it is: `kern.osproductversion`, `kern.osversion` and
   `kern.osrelease` are what the root's
@@ -231,8 +234,12 @@ What does not, yet:
   of what the kernel's own ports are asked (`task_info`, `vm_region`)
   answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
-- `kqueue`, work queues, `getattrlistbulk`, `mknod`; a mutex or condition
-  shared between processes (each is its own process's).
+- Work queues (the threads XNU makes for libdispatch, and `kevent`
+  delivering to them); the kqueue filters for a signal, a Mach port and a
+  file changing; a queue's descriptor closed in a child of `fork`; on the
+  page, a note on another process hearing of its end every time;
+  `getattrlistbulk`, `mknod`; a mutex or condition shared between
+  processes (each is its own process's).
 - A floating-point environment beyond what WebAssembly has: the rounding
   mode and the exception flags a program sets are kept and read back, but
   arithmetic is to nearest and raises none.
