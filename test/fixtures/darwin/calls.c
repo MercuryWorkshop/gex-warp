@@ -62,6 +62,23 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_show("opened to write, of one open to read", SYS(SYS_open, name, O_WRONLY));
     t_show("a number that is no descriptor's", SYS(SYS_open, "/dev/fd/99", O_RDONLY));
 
+    // And asked about by its number: what is open there, not a file of
+    // `/dev`'s; the first three have names too, which are links.
+    struct t_stat ds;
+    t_show("the first descriptor asked about by its name", SYS(SYS_stat64, "/dev/stdin", &ds));
+    t_printf("  a pipe: %o\n", ds.st_mode & 0170000);
+    t_show("the name itself", SYS(SYS_lstat64, "/dev/stdin", &ds));
+    t_printf("  a link: %o\n", ds.st_mode & 0170000);
+    name[8] = (char)('0' + f % 10), name[9] = 0;
+    if (f >= 10) name[8] = (char)('0' + f / 10), name[9] = (char)('0' + f % 10), name[10] = 0;
+    t_show("a file's descriptor asked about by its number", SYS(SYS_stat64, name, &ds));
+    t_printf("  a file: %o, of %ld bytes\n", ds.st_mode & 0170000, (long)ds.st_size);
+    t_show("and with no link followed", SYS(SYS_lstat64, name, &ds));
+    t_printf("  a file: %o, of %ld bytes\n", ds.st_mode & 0170000, (long)ds.st_size);
+    t_show("a number that is no descriptor's", SYS(SYS_stat64, "/dev/fd/99", &ds));
+    t_show("whether it is there", SYS(SYS_access, name, 0));
+    t_show("whether one that is not is", SYS(SYS_access, "/dev/fd/99", 0));
+
     // A file locked as it is opened.
     long e = SYS(SYS_open, "lk", O_CREAT | O_EXLOCK | O_NONBLOCK | O_RDWR, 0644);
     t_check("a new file, locked as it is made", e >= 0);

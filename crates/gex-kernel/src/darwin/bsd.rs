@@ -69,6 +69,15 @@ fn dev_fd(path: &[u8]) -> Option<i32> {
     }
 }
 
+/// The descriptor the path at `path` names: `/dev/fd/N` is the open file
+/// itself, whether or not links are followed, and `/dev/stdin` and its like
+/// are links to those.
+fn fd_named(m: &GuestMem<'_>, path: u64, follow: bool) -> Option<u64> {
+    let p = m.read_cstr(path, 64).ok()?;
+    let fd = dev_fd(&p)?;
+    (follow || p.starts_with(b"/dev/fd/")).then_some(fd as u64)
+}
+
 /// Whether an `open` of the path at `path` with `flags` is more than the
 /// kernel's `openat` does ([`Kernel::darwin_open`]): a descriptor named by
 /// its number, or a lock asked for with the file.
@@ -242,6 +251,8 @@ impl Kernel {
             d::LCHOWN => set(nr::FCHOWNAT, &[CWD, x[0], x[1], x[2], K_NOFOLLOW]),
             d::FCHOWNAT => set(nr::FCHOWNAT, &[dirfd(x[0]), x[1], x[2], x[3], at_flags(x[4])]),
             d::FCHOWN => set(nr::FCHOWN, &x[..3]),
+            // (A descriptor named by its number is there or is not.)
+            d::ACCESS if fd_named(m, x[0], true).is_some() => NATIVE + code,
             d::ACCESS => set(nr::FACCESSAT, &[CWD, x[0], x[1]]),
             d::FACCESSAT => set(nr::FACCESSAT, &[dirfd(x[0]), x[1], x[2]]),
             d::UMASK => set(nr::UMASK, &x[..1]),
@@ -268,6 +279,10 @@ impl Kernel {
             d::TRUNCATE => set(nr::TRUNCATE, &x[..2]),
             d::FTRUNCATE => set(nr::FTRUNCATE, &x[..2]),
             // `struct stat` is Darwin's at the kernel's door (`Stat::encode_for`).
+            // (A descriptor named by its number is what is open there,
+            // not a file of `/dev`'s.)
+            d::STAT64 | d::LSTAT64 if fd_named(m, x[0], code == d::STAT64).is_some() => set(nr::FSTAT, &[fd_named(m, x[0], true).unwrap_or(0), x[1]]),
+            d::FSTATAT64 if fd_named(m, x[1], x[3] & 0x20 == 0).is_some() => set(nr::FSTAT, &[fd_named(m, x[1], true).unwrap_or(0), x[2]]),
             d::STAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], 0]),
             d::LSTAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], K_NOFOLLOW]),
             d::FSTAT64 => set(nr::FSTAT, &x[..2]),
@@ -552,6 +567,7 @@ impl Kernel {
             // to here.)
             d::KQUEUE | d::GUARDED_KQUEUE_NP => self.darwin_kqueue(),
             d::GUARDED_CLOSE_NP => self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF)),
+            d::ACCESS => self.fds.get(fd_named(m, x[0], true).ok_or(Errno::ENOENT)? as i32).map(|_| 0),
             d::OPEN | d::OPEN_NOCANCEL => self.darwin_open(m, CWD, x[0], x[1], x[2]),
             d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
             d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),
@@ -790,8 +806,11 @@ impl Kernel {
     /// at once is `EAGAIN`, whether the caller would have waited or not.
     fn darwin_open(&mut self, m: &mut GuestMem<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
         if let Some(fd) = dev_fd(&m.read_cstr(path, 64).unwrap_or_default()) {
-            let (have, want) = (self.fds.get(fd)?.flags() & 3, flags & 3);
-            if have != 2 && have != want {
+            // (What the open file can do, not what its flags say: the
+            // streams a process is born with keep no access mode there.)
+            let file = self.fds.get(fd)?;
+            let want = flags & 3;
+            if (want != 1 && !file.readable) || (want != 0 && !file.writable) {
                 return Err(Errno::EACCES);
             }
             const F_DUPFD: u64 = 0;
