@@ -226,10 +226,11 @@ What does not, yet:
   - *x86_64h* is x86-64 for Haswell and later: its slice is taken only
     when a file has no plain one, and runs as far as the translator knows
     the instructions.
-- **Old systems' programs** otherwise ask for what old kernels had: the
-  calls from before 64-bit inodes (`stat`, `getdirentries`, `statfs` under
-  their first numbers) are not answered, and a program linked against an
-  old libSystem needs that libSystem.
+- **Old systems' programs.** The calls from before 64-bit inodes are
+  answered (`stat`, `fstat`, `lstat`, `fstatat`, `getdirentries`, `statfs`,
+  `fstatfs` and `getfsstat` under their first numbers, with the structures
+  they had). What an old program needs beyond the kernel is the libSystem
+  it was linked against, which is the userland's to provide.
 - A page fault is not delivered where XNU would deliver one: nothing in a
   WebAssembly memory is protected, so a write to a read-only page succeeds.
 

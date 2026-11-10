@@ -364,6 +364,32 @@ pub fn dirents(linux: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The same records in the layout from before 64-bit inodes
+/// (`getdirentries`): a 32-bit inode number, the record's length, the type
+/// and a one-byte name length, then the name, each padded to four bytes.
+pub fn dirents_old(linux: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(linux.len());
+    let mut at = 0;
+    while at + 19 <= linux.len() {
+        let reclen = u16::from_le_bytes([linux[at + 16], linux[at + 17]]) as usize;
+        if reclen < 19 || at + reclen > linux.len() {
+            break;
+        }
+        let name = &linux[at + 19..at + reclen];
+        let name = &name[..name.iter().position(|c| *c == 0).unwrap_or(name.len()).min(255)];
+        let len = (8 + name.len() + 1).next_multiple_of(4);
+        let start = out.len();
+        out.resize(start + len, 0);
+        out[start..start + 4].copy_from_slice(&linux[at..at + 4]);
+        out[start + 4..start + 6].copy_from_slice(&(len as u16).to_le_bytes());
+        out[start + 6] = linux[at + 18];
+        out[start + 7] = name.len() as u8;
+        out[start + 8..start + 8 + name.len()].copy_from_slice(name);
+        at += reclen;
+    }
+    out
+}
+
 /// How many bytes of Linux records to ask for so that their Darwin form
 /// fits `len`: a Darwin record is at most eight bytes longer, and a Linux
 /// one is at least twenty-four.
@@ -416,6 +442,47 @@ pub fn statfs(k: &[u8]) -> Vec<u8> {
     out[88] = b'/';
     out[1112..1124].copy_from_slice(b"/dev/disk1s1");
     out
+}
+
+/// `struct statfs` as it was before 64-bit inodes (`statfs`, `fstatfs`,
+/// `getfsstat` under their first numbers).
+pub const STATFS_OLD: usize = 336;
+
+/// The old `struct statfs` for the kernel's: the counts as longs, the names
+/// in fifteen and ninety bytes.
+pub fn statfs_old(k: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; STATFS_OLD];
+    // f_bsize, f_iosize, then f_blocks to f_ffree.
+    out[8..16].copy_from_slice(&k[8..16]);
+    out[16..24].copy_from_slice(&(1u64 << 20).to_le_bytes());
+    out[24..64].copy_from_slice(&k[16..56]);
+    // f_fsid; f_type is APFS's; f_flags.
+    out[64..68].copy_from_slice(&0x0100_0004u32.to_le_bytes());
+    out[68..72].copy_from_slice(&0x1au32.to_le_bytes());
+    out[78..80].copy_from_slice(&0x1au16.to_le_bytes());
+    out[80..88].copy_from_slice(&(MNT_FLAGS as u64).to_le_bytes());
+    out[104..108].copy_from_slice(b"apfs");
+    out[119] = b'/';
+    out[209..221].copy_from_slice(b"/dev/disk1s1");
+    out
+}
+
+/// `struct stat` as it was before 64-bit inodes: the fields of the one
+/// [`stat`] writes (`d`, 144 bytes), in the old order, with the inode
+/// number's low half and no birth time.
+pub const STAT_OLD: usize = 120;
+
+pub fn stat_old(d: &[u8]) -> [u8; STAT_OLD] {
+    let mut o = [0u8; STAT_OLD];
+    // st_dev; st_ino; st_mode and st_nlink; st_uid, st_gid, st_rdev.
+    o[0..4].copy_from_slice(&d[0..4]);
+    o[4..8].copy_from_slice(&d[8..12]);
+    o[8..12].copy_from_slice(&d[4..8]);
+    o[12..24].copy_from_slice(&d[16..28]);
+    // The three times; then the size to the spares, past the birth time.
+    o[24..72].copy_from_slice(&d[32..80]);
+    o[72..120].copy_from_slice(&d[96..144]);
+    o
 }
 
 /// Linux's `siginfo_t` for a child (`waitid`'s) as Darwin's: the signal,

@@ -11,7 +11,8 @@
 // machine (sysctl, csops, proc_info, statfs); the terminal's ioctls, with
 // BSD's termios; sockets, with BSD's sockaddr, msghdr and cmsghdr; and
 // Mach ports within a task: rights, messages, semaphores, and the kernel's
-// own ports answering MIG requests.
+// own ports answering MIG requests. And the calls an old program makes:
+// stat, statfs and getdirentries as they were before 64-bit inodes.
 import { darwin } from '../lib/darwin.mjs';
 
 export const meta = { hosts: ['node'], arches: ['a64', 'x86'], timeout: 600 };
@@ -23,6 +24,8 @@ export default async function (t) {
   // size, a name's longest length): the Mac's own under gexc, and so not
   // the page's in-memory one.
   await d.compare('files', await d.build('files'));
+  // (Likewise the calls from before 64-bit inodes: it lists a directory.)
+  await d.compare('old', await d.build('old'));
   for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach']) await d.compare(name, await d.build(name), [], { page: true });
   await d.compare('sys', await d.build('sys'), ['one', 'two'], { page: true });
   // A closed port on the loopback refuses under gexc; on the page the

@@ -126,8 +126,11 @@ pub enum Post {
     /// `getsockopt(SO_ERROR)`: the error at `at` is one of Linux's.
     SoError { at: u64 },
     /// `statfs64`, once the file is known to be there: Darwin's structure
-    /// at `at`.
-    Statfs { at: u64 },
+    /// at `at`, or (`old`) the one from before 64-bit inodes.
+    Statfs { at: u64, old: bool },
+    /// `stat` under its first number: the structure at `at` as it was
+    /// before 64-bit inodes, which is shorter; `was` is what lay past it.
+    OldStat { at: u64, was: [u64; 3] },
     /// An extended-attribute call: no such attribute is `ENOATTR`.
     Xattr,
     /// `waitid`: the kernel's `siginfo_t` at `at` as Darwin's, which is
@@ -334,13 +337,23 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             }
             r
         }
-        Post::Statfs { at } => {
+        Post::Statfs { at, old } => {
             if r.is_ok() {
                 crate::syscalls::statfs(m, false, at)?;
                 let k = m.read(at, 120)?.to_vec();
-                m.write(at, &abi::statfs(&k))?;
+                m.write(at, &if old { abi::statfs_old(&k) } else { abi::statfs(&k) })?;
             }
             r.map(|_| 0)
+        }
+        Post::OldStat { at, was } => {
+            if r.is_ok() {
+                let d = m.read(at, 144)?.to_vec();
+                m.write(at, &abi::stat_old(&d))?;
+            }
+            for (i, w) in was.iter().enumerate() {
+                let _ = m.write_u64(at + abi::STAT_OLD as u64 + 8 * i as u64, *w);
+            }
+            r
         }
         Post::Xattr => match r {
             Err(Errno::ENODATA) => Err(abi::K_ENOATTR),

@@ -300,6 +300,18 @@ impl OpenFile {
             return Err(Errno::EINVAL);
         }
         self.offset.store(new as u64, Ordering::Relaxed);
+        // A directory being read: its position is which entry comes next
+        // (a record's `d_off`), and a seek to the start is `rewinddir`,
+        // which reads the directory afresh.
+        if whence == 0 {
+            let mut cache = self.dir_cache.lock().unwrap();
+            if cache.is_some() || self.dir_pos.load(Ordering::Relaxed) != 0 {
+                self.dir_pos.store(new as usize, Ordering::Relaxed);
+                if new == 0 {
+                    *cache = None;
+                }
+            }
+        }
         Ok(new as u64)
     }
 

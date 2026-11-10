@@ -132,13 +132,30 @@ impl Kernel {
             // The kernel's answer is one for every file, there or not: the
             // call is one that says whether the file is, and the answer is
             // written when it has ([`Post::Statfs`]).
-            d::STATFS64 => {
-                self.darwin_post = Post::Statfs { at: x[1] };
+            d::STATFS64 | d::STATFS => {
+                self.darwin_post = Post::Statfs { at: x[1], old: code == d::STATFS };
                 set(nr::FACCESSAT, &[CWD, x[0], 0])
             }
-            d::FSTATFS64 => {
-                self.darwin_post = Post::Statfs { at: x[1] };
+            d::FSTATFS64 | d::FSTATFS => {
+                self.darwin_post = Post::Statfs { at: x[1], old: code == d::FSTATFS };
                 set(nr::FCNTL, &[x[0], 1])
+            }
+            // The four from before 64-bit inodes, which an old program
+            // still makes: the same calls, their structure the old one
+            // ([`Post::OldStat`]). What lies past it is the caller's.
+            d::STAT | d::LSTAT | d::FSTAT | d::FSTATAT => {
+                let at = if code == d::FSTATAT { x[2] } else { x[1] };
+                let mut was = [0u64; 3];
+                for (i, w) in was.iter_mut().enumerate() {
+                    *w = m.read_u64(at + abi::STAT_OLD as u64 + 8 * i as u64).unwrap_or(0);
+                }
+                self.darwin_post = Post::OldStat { at, was };
+                match code {
+                    d::STAT => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], 0]),
+                    d::LSTAT => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], K_NOFOLLOW]),
+                    d::FSTAT => set(nr::FSTAT, &x[..2]),
+                    _ => set(nr::NEWFSTATAT, &[dirfd(x[0]), x[1], x[2], at_flags(x[3])]),
+                }
             }
             // Darwin's calls carry a position (for a resource fork, which
             // nothing here has) and options: XATTR_NOFOLLOW (1), and for a
@@ -428,7 +445,8 @@ impl Kernel {
             d::SHUTDOWN => Err(Errno::ENOTSOCK),
             d::SETSOCKOPT => self.darwin_sockopt(m, false, x),
             d::GETSOCKOPT => self.darwin_sockopt(m, true, x),
-            d::GETFSSTAT64 | d::GETFSSTAT => self.darwin_getfsstat(m, x[0], x[1]),
+            d::GETFSSTAT64 | d::GETFSSTAT => self.darwin_getfsstat(m, x[0], x[1], code == d::GETFSSTAT),
+            d::GETDIRENTRIES => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2] & 0xffff_ffff, x[3], true),
             d::PATHCONF => self.darwin_pathconf(x[1]),
             d::FPATHCONF => self.fds.get(x[0] as i32).and_then(|_| self.darwin_pathconf(x[1])),
             // Trace points, which nothing collects.
@@ -510,7 +528,7 @@ impl Kernel {
                 }
                 Ok(0)
             }
-            d::GETDIRENTRIES64 => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2], x[3]),
+            d::GETDIRENTRIES64 => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2], x[3], false),
             _ => {
                 if !self.unimplemented.contains(&(NATIVE + code)) {
                     self.unimplemented.push(NATIVE + code);
@@ -525,18 +543,18 @@ impl Kernel {
 
     /// `getfsstat`: the mounted filesystems, of which there is one. No
     /// buffer asks how many.
-    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> SysResult {
+    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64, old: bool) -> SysResult {
         if buf == 0 {
             return Ok(1);
         }
-        if (size as usize) < abi::STATFS {
+        if (size as usize) < if old { abi::STATFS_OLD } else { abi::STATFS } {
             return Ok(0);
         }
         // The kernel's answer is the same for every file: asked of the
         // caller's buffer, and respelled there.
         crate::syscalls::statfs(m, false, buf)?;
         let k = m.read(buf, 120)?.to_vec();
-        m.write(buf, &abi::statfs(&k))?;
+        m.write(buf, &if old { abi::statfs_old(&k) } else { abi::statfs(&k) })?;
         Ok(1)
     }
 
@@ -739,11 +757,14 @@ impl Kernel {
 
     /// `getdirentries64`: Darwin's directory records, and at `basep` where
     /// the read began.
-    fn darwin_getdirentries(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, basep: u64) -> SysResult {
+    fn darwin_getdirentries(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, basep: u64, old: bool) -> SysResult {
         let file = self.fds.get(fd)?;
         let before = file.seek(0, 1).unwrap_or(0);
-        let linux = file.read_dirents(abi::dirents_room(len) as usize)?;
-        let out = abi::dirents(&linux);
+        // What is no directory is an invalid argument to this call (as is
+        // a buffer with no room for one record, which the read says).
+        let linux = file.read_dirents(abi::dirents_room(len) as usize).map_err(|e| if e == Errno::ENOTDIR { Errno::EINVAL } else { e })?;
+        // `old`: the records of before 64-bit inodes (`getdirentries`).
+        let out = if old { abi::dirents_old(&linux) } else { abi::dirents(&linux) };
         m.write(buf, &out)?;
         if basep != 0 {
             m.write_u64(basep, before)?;
