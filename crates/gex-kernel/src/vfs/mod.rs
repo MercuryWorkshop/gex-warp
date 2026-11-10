@@ -801,6 +801,14 @@ pub trait FileSystem: Send + Sync {
     fn fs_type(&self) -> &'static str {
         "tmpfs"
     }
+    /// Whether a link among a path's directories is a name for the
+    /// namespace to follow when this is mounted somewhere other than the
+    /// root (`Vfs::through_dir_links`): so for a filesystem that is a map
+    /// of whole paths, which finds nothing past a link by itself. Not for
+    /// one that resolves its own names (/proc, /dev, a host directory).
+    fn links_are_names(&self) -> bool {
+        false
+    }
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     /// [`FileSystem::open`] for a program's `open` (or the page's, which has
@@ -1538,8 +1546,10 @@ impl Namespace {
     /// `abs` with every symlink among its directories followed (not the
     /// final component: each caller decides about that). A filesystem here
     /// is a map of whole paths, so `/bin/sh` under a merged /usr (`/bin ->
-    /// usr/bin`) names nothing until the `/bin` link is followed. Only the
-    /// root filesystem's links: /proc and /dev resolve their own names.
+    /// usr/bin`) names nothing until the `/bin` link is followed. The root
+    /// filesystem's links, and those of a mount that keeps its links as
+    /// names to be followed here ([`FileSystem::links_are_names`]: a tmpfs
+    /// at `/tmp`); /proc and /dev resolve their own names.
     fn through_dir_links(&self, mut abs: String) -> Result<String, Errno> {
         'again: for _ in 0..40 {
             let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
@@ -1548,10 +1558,18 @@ impl Namespace {
                 prefix.push('/');
                 prefix.push_str(c);
                 let (at, fs) = self.mount_at(&prefix)?;
-                if at != "/" {
+                let rel = if at == "/" {
+                    prefix.trim_start_matches('/')
+                } else if !fs.links_are_names() {
                     break;
-                }
-                if let Ok(target) = fs.read_link(prefix.trim_start_matches('/')) {
+                } else {
+                    // (Where it is mounted is no link of its own.)
+                    match prefix[at.len()..].trim_start_matches('/') {
+                        "" => continue,
+                        rel => rel,
+                    }
+                };
+                if let Ok(target) = fs.read_link(rel) {
                     let base = if target.starts_with('/') {
                         normalize(&target, "/")
                     } else {
@@ -2244,6 +2262,29 @@ mod tests {
         assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
         assert!(vfs.metadata("/bin/sh").is_ok());
         assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
+    }
+
+    #[test]
+    fn a_mounted_tmpfs_has_its_directory_links_followed() {
+        // A `/tmp` of its own (a sysroot's, hosts/native): a link to a
+        // directory in it is gone through, whether it names its target
+        // from where it is or from the root, and one link through another.
+        let mut vfs = Vfs::new();
+        vfs.mount("/", Arc::new(TmpFs::new()));
+        let tmp = Arc::new(TmpFs::new());
+        tmp.add_file("t/A/f", b"x".to_vec());
+        vfs.mount("/tmp", tmp);
+        vfs.symlink("A", "/tmp/t/B").unwrap();
+        vfs.symlink("B/f", "/tmp/t/C").unwrap();
+        vfs.symlink("B", "/tmp/t/D").unwrap();
+        vfs.symlink("/tmp/t/A", "/tmp/t/E").unwrap();
+        assert_eq!(vfs.resolve("/tmp/t/B/f").unwrap().1, "t/A/f");
+        assert_eq!(vfs.resolve("/tmp/t/D/f").unwrap().1, "t/A/f");
+        assert_eq!(vfs.resolve("/tmp/t/E/f").unwrap().1, "t/A/f");
+        assert!(vfs.metadata("/tmp/t/C").is_ok());
+        // The final component is the caller's, and the mount point no link.
+        assert_eq!(vfs.resolve("/tmp/t/B").unwrap().1, "t/B");
+        assert_eq!(vfs.resolve("/tmp/t").unwrap().1, "t");
     }
 
     #[test]

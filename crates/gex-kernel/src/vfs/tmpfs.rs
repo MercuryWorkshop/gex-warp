@@ -2001,6 +2001,9 @@ impl TmpFs {
 }
 
 impl FileSystem for TmpFs {
+    fn links_are_names(&self) -> bool {
+        true
+    }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         self.open_as(path, flags, None)
     }
