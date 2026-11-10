@@ -840,8 +840,23 @@ pub fn engine() -> Result<Engine> {
     Ok(e)
 }
 
+/// Leaves the system unwinder's tables out of compiled code where they cost
+/// more than they are worth. Nothing here unwinds through guest frames by
+/// them (a trap and a wasm exception are wasmtime's own to unwind, by frame
+/// pointers), and macOS's libunwind takes each function's entry out one at a
+/// time, looking through every entry there is: a process that had compiled
+/// tens of thousands of functions spent seconds of every exec, and minutes
+/// of a long shell script's, dropping the program it replaced.
+/// `GEX_NATIVE_UNWIND=1` keeps them, for a debugger's stacks.
+pub(crate) fn leave_unwind_tables_out(config: &mut Config) {
+    if cfg!(target_os = "macos") && std::env::var_os("GEX_NATIVE_UNWIND").is_none() {
+        config.native_unwind_info(false);
+    }
+}
+
 fn new_engine() -> Result<Engine> {
     let mut config = Config::new();
+    leave_unwind_tables_out(&mut config);
     // Deep guest call chains are wasm recursion (units call units): room for
     // them, on threads with stacks to match (`guest_thread_stack`).
     config.max_wasm_stack(wasm_stack_bytes());

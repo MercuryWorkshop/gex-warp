@@ -513,6 +513,7 @@ impl ReplacementModule {
 /// The engine features translated code and replacements both need.
 fn engine_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
+    crate::leave_unwind_tables_out(&mut config);
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
