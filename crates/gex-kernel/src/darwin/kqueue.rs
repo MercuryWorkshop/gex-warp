@@ -1233,7 +1233,11 @@ mod tests {
         assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
         assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
         assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EBADF));
-        assert_eq!(kq.change(&Event { filter: -9, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EOPNOTSUPP));
+        assert_eq!(kq.change(&Event { filter: -11, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EOPNOTSUPP));
+        // (What never happens here may be watched; a port that is no name cannot.)
+        assert_eq!(kq.change(&Event { filter: filt::FS, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Ok(()));
+        assert_eq!(kq.change(&Event { filter: filt::MACHPORT, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&Event { filter: -3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EPERM));
         assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EINVAL));
     }
 
