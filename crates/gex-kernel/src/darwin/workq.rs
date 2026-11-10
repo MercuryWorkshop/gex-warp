@@ -90,6 +90,10 @@ struct Worker {
     given: Option<u32>,
     /// Whether it has yet run (its first entry sets its `pthread_t` up).
     fresh: bool,
+    /// The work it last had: the class it is of, which it is entered with
+    /// again to be told to end (libpthread stops a thread entered with no
+    /// class at all, "Missing priority").
+    last: u32,
 }
 
 /// A process's work queue.
@@ -204,6 +208,7 @@ impl Kernel {
                     // (its thread pointer set already) or one used again.
                     let how = if std::mem::take(&mut w.fresh) { flag::TSD_BASE_SET } else { flag::REUSE };
                     w.parked = None;
+                    w.last = work;
                     wq.workers.insert(tid, w);
                     self.darwin_workq_does = Some(Does::Enter(work | how, 0));
                     return NATIVE + d::WORKQ_KERNRETURN;
@@ -214,7 +219,7 @@ impl Kernel {
                     // Long enough without: it is told to end, and ends
                     // itself, freeing its stack as it goes.
                     wq.workers.remove(&tid);
-                    self.darwin_workq_does = Some(Does::Enter(flag::NEWSPI | flag::REUSE, EXIT));
+                    self.darwin_workq_does = Some(Does::Enter(w.last | flag::REUSE, EXIT));
                     return NATIVE + d::WORKQ_KERNRETURN;
                 }
                 // Wait for work on the thread's word, for what is left of
@@ -282,7 +287,7 @@ impl Kernel {
                     m.write_u64(child + first as u64, op::NEXT)?;
                     m.write_u64(child + ctx::PC as u64, STUB)?;
                     let mut wq = self.darwin_workq.lock().unwrap_or_else(|e| e.into_inner());
-                    wq.workers.insert(req.tid, Worker { stack, parked: None, given: Some(work), fresh: true });
+                    wq.workers.insert(req.tid, Worker { stack, parked: None, given: Some(work), fresh: true, last: work });
                     wq.starting.insert(req.tid);
                     Ok(req)
                 })();

@@ -951,29 +951,47 @@ impl Kernel {
                     }
                 }
             }),
-            // (task, name, set): a receive right into a port set, or (set 0)
-            // out of the one it is in.
+            // (task, name, set): a receive right into a port set beside the
+            // sets it is in already (insert), into that one and out of every
+            // other (move; set 0: out of them all), or out of that one
+            // (extract). A port may be in several: a run loop's port to wake
+            // it by is in the set of each of its modes.
             t::MACH_PORT_INSERT_MEMBER | t::MACH_PORT_MOVE_MEMBER | t::MACH_PORT_EXTRACT_MEMBER => bad_task({
-                let set = if n == t::MACH_PORT_EXTRACT_MEMBER { 0 } else { x[2] as u32 };
+                const KERN_ALREADY_IN_SET: u64 = 11;
+                const KERN_NOT_IN_SET: u64 = 12;
+                let set = x[2] as u32;
                 let member = sp.names.get(&name).filter(|e| e.recv).map(|e| Arc::clone(&e.port));
-                let is_set = set == 0 || sp.names.get(&set).is_some_and(Entry::is_set);
+                let is_set = (set == 0 && n == t::MACH_PORT_MOVE_MEMBER) || sp.names.get(&set).is_some_and(Entry::is_set);
+                let inside = sp.names.get(&set).is_some_and(|e| e.is_set() && e.members.contains(&name));
                 match member {
                     None if !sp.names.contains_key(&name) => KERN_INVALID_NAME,
                     None => KERN_INVALID_RIGHT,
                     Some(_) if !is_set => KERN_INVALID_RIGHT,
+                    Some(_) if n == t::MACH_PORT_INSERT_MEMBER && inside => KERN_ALREADY_IN_SET,
+                    Some(_) if n == t::MACH_PORT_EXTRACT_MEMBER && !inside => KERN_NOT_IN_SET,
                     Some(port) => {
-                        for e in sp.names.values_mut().filter(|e| e.is_set()) {
-                            e.members.retain(|m| *m != name);
+                        // Out of what it leaves, and into what it joins.
+                        let (leaves_all, joins) = (n == t::MACH_PORT_MOVE_MEMBER, n != t::MACH_PORT_EXTRACT_MEMBER && set != 0);
+                        for (at, e) in sp.names.iter_mut().filter(|(_, e)| e.is_set()) {
+                            if leaves_all || (n == t::MACH_PORT_EXTRACT_MEMBER && *at == set) {
+                                e.members.retain(|m| *m != name);
+                            }
                         }
                         let ready = {
                             let mut st = port.state();
-                            st.wake.truncate(1);
-                            if set != 0 {
+                            // (Its first to wake is itself; the rest are its sets.)
+                            if leaves_all {
+                                st.wake.truncate(1);
+                            } else if n == t::MACH_PORT_EXTRACT_MEMBER {
+                                let own = st.wake.first().copied();
+                                st.wake.retain(|w| Some(*w) == own || *w != set);
+                            }
+                            if joins {
                                 st.wake.push(set);
                             }
                             !st.queue.is_empty()
                         };
-                        if set != 0 {
+                        if joins {
                             sp.names.get_mut(&set).unwrap().members.push(name);
                             if ready {
                                 self.darwin_wake(m, &mut sp, &[set], true);

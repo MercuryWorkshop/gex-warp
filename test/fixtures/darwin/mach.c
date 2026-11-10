@@ -190,6 +190,31 @@ static void messages(void) {
     t_show("send to the set", ({ m.h = (struct header){COPY_SEND, 0, set, 0, 0, 4}; send(&m, sizeof m.h); }));
     t_show("take it out", TRAP(TRAP_port_extract_member, task, p, set));
     t_show("put a name that is no port in", TRAP(TRAP_port_insert_member, task, 0x123457, set));
+
+    // A port in two sets at once (a run loop's port to wake it by is in
+    // the set of each of its modes): a message for it is there by either,
+    // and it leaves one without leaving the other.
+    u32 other = allocate(RIGHT_PORT_SET);
+    t_show("put the port in a set", TRAP(TRAP_port_insert_member, task, p, set));
+    t_show("and in another beside it", TRAP(TRAP_port_insert_member, task, p, other));
+    t_show("and in that one again", TRAP(TRAP_port_insert_member, task, p, other));
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 5};
+    send(&m, sizeof m.h);
+    t_show("receive from the first", receive(&got, set, sizeof got));
+    t_printf("  id %d\n", got.h.id);
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 6};
+    send(&m, sizeof m.h);
+    t_show("receive from the second", receive(&got, other, sizeof got));
+    t_printf("  id %d\n", got.h.id);
+    t_show("take it out of the second", TRAP(TRAP_port_extract_member, task, p, other));
+    t_show("and out of it again", TRAP(TRAP_port_extract_member, task, p, other));
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 7};
+    send(&m, sizeof m.h);
+    t_show("receive from the second, which it has left", receive(&got, other, sizeof got));
+    t_show("receive from the first, which it is still in", receive(&got, set, sizeof got));
+    t_printf("  id %d\n", got.h.id);
+    t_show("take it out of the first", TRAP(TRAP_port_extract_member, task, p, set));
+    t_show("out of a set that is none", TRAP(TRAP_port_extract_member, task, p, p));
 }
 
 static u32 shared_port, shared_sem;
