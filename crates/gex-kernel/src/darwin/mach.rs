@@ -48,8 +48,14 @@ pub mod port {
     pub const TASK: u32 = 0x203;
     /// `mach_host_self()`.
     pub const HOST: u32 = 0xa03;
-    /// The first thread's port; thread `n` after it has `THREAD + n * 0x100`.
+    /// The first thread's port.
     pub const THREAD: u32 = 0x103;
+    /// Thread `n` after the first has `LATER_THREADS + n * 0x100`: past
+    /// the names a task is born with, so that none is the task's or the
+    /// host's (as counting on from the first thread's would make the
+    /// second and the tenth), and of their generation, so that none is one
+    /// the task allocates.
+    pub const LATER_THREADS: u32 = 0x1003;
     /// Where the names a task allocates start (reply ports, receive rights).
     /// A name is an index and, in its low byte, a generation: these are of
     /// a later generation than the ports a task is born with, so none is
@@ -58,15 +64,22 @@ pub mod port {
 }
 
 /// The name of thread `tid`'s port in process `pid`: the first thread's is
-/// [`port::THREAD`], and each later one's a step further.
+/// [`port::THREAD`], and each later one's a step past
+/// [`port::LATER_THREADS`].
 pub fn thread_port(pid: i32, tid: i32) -> u32 {
-    port::THREAD.wrapping_add((tid - pid).unsigned_abs().wrapping_mul(0x100))
+    match (tid - pid).unsigned_abs() {
+        0 => port::THREAD,
+        n => port::LATER_THREADS.wrapping_add(n.wrapping_mul(0x100)),
+    }
 }
 
 /// The thread of process `pid` a port name is for, if it is a thread's.
 pub fn port_thread(pid: i32, name: u32) -> Option<i32> {
-    let step = name.checked_sub(port::THREAD)?;
-    (step % 0x100 == 0 && step / 0x100 < 1 << 20).then(|| pid + (step / 0x100) as i32)
+    if name == port::THREAD {
+        return Some(pid);
+    }
+    let step = name.checked_sub(port::LATER_THREADS)?;
+    (step % 0x100 == 0 && (1..1 << 20).contains(&(step / 0x100))).then(|| pid + (step / 0x100) as i32)
 }
 
 pub(super) fn kern(r: Result<u64, Errno>) -> u64 {
