@@ -10019,6 +10019,9 @@ impl Kernel {
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let (mut path, argv, envp) = self.read_exec_args(m, a)?;
+        // (As the caller named it, which is what a script's interpreter is
+        // given to open: `./s.sh` is `$0` in it, not where that is.)
+        let given = (!path.starts_with("/proc/")).then(|| path.clone());
         // The program as `/proc/self/exe` will name it: absolute, from the
         // caller's working directory, as Linux records it. ld.so asserts that
         // the link starts with `/` when it works out `$ORIGIN` (a launcher
@@ -10038,7 +10041,7 @@ impl Kernel {
                 _ => break,
             }
         }
-        let (path, argv) = self.resolve_interpreter(path, argv)?;
+        let (path, argv) = self.resolve_interpreter_as(path, argv, given)?;
         // Its head only: the loader reads the whole file once it is past the
         // point of no return (apt's methods are one 14 MB program, read
         // three times over per exec while every check read all of it).
@@ -10069,10 +10072,17 @@ impl Kernel {
     /// Linux either.
     ///
     /// Nesting is bounded. A script naming itself would otherwise loop.
-    pub fn resolve_interpreter(
+    pub fn resolve_interpreter(&mut self, path: String, argv: Vec<String>) -> Result<(String, Vec<String>), Errno> {
+        self.resolve_interpreter_as(path, argv, None)
+    }
+
+    /// [`Self::resolve_interpreter`], the script named to its interpreter
+    /// as `given` (what `execve` was called with) where there is one.
+    pub fn resolve_interpreter_as(
         &mut self,
         mut path: String,
         mut argv: Vec<String>,
+        mut given: Option<String>,
     ) -> Result<(String, Vec<String>), Errno> {
         for _ in 0..4 {
             let head = self.read_head(&path, 256).ok_or(Errno::ENOENT)?;
@@ -10102,7 +10112,7 @@ impl Kernel {
             if !arg.is_empty() {
                 next.push(arg.to_string());
             }
-            next.push(path.clone());
+            next.push(given.take().unwrap_or_else(|| path.clone()));
             next.extend(argv.into_iter().skip(1));
             argv = next;
             path = self.vfs.absolute(interp);
