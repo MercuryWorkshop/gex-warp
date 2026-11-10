@@ -9657,6 +9657,13 @@ fn clock_syscall(ctx: i32) -> bool {
     if abi == 0 || exited() {
         return false;
     }
+    // A Darwin program's calls are numbered otherwise, and in another
+    // register: what Linux's number register holds at one is whatever the
+    // program left there (bash's `'|'`, 124, read as `sched_yield`, where
+    // it was asking for a pipe). All of them are the kernel's.
+    if gex_kernel::darwin::on() {
+        return false;
+    }
     let mut gm = guest();
     let started = CLOCK_STARTED.load(Acquire) as u128;
     let at = ctx as u32 as u64;
