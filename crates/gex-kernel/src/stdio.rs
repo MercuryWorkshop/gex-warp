@@ -172,7 +172,17 @@ impl FileHandle for StdStream {
             // terminal by the name it was told has its terminal. (With
             // no number of its own it was taken for the first device
             // there with none, which is no terminal.)
-            rdev: if self.tty { 0x500 } else { 0 },
+            // And a device that is no terminal is taken for the null
+            // device (1:3), which is what a program started with nothing
+            // to read has there: a Mac's `dd` asks what kind of device it
+            // reads from.
+            rdev: if self.tty {
+                0x500
+            } else if self.host_kind == FileType::CharDevice {
+                0x103
+            } else {
+                0
+            },
             times: Default::default(),
         })
     }

@@ -345,12 +345,15 @@ impl Kernel {
             // is no device has no kind.)
             req::FIODTYPE => {
                 let file = self.fds.get(fd)?;
-                if file.handle.metadata()?.file_type != crate::vfs::FileType::CharDevice {
+                let md = file.handle.metadata()?;
+                if md.file_type != crate::vfs::FileType::CharDevice {
                     return Err(Errno::ENOTTY);
                 }
+                // (By their numbers, 1:3 and 1:5: one a process was
+                // started with has no name here.)
                 let kind = if self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch).is_ok() {
                     3
-                } else if matches!(file.path.as_str(), "/dev/null" | "/dev/zero") {
+                } else if matches!(md.rdev, 0x103 | 0x105) {
                     2
                 } else {
                     0
