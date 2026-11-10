@@ -5946,7 +5946,16 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         const MAX_RETRIES: u32 = 16;
-        if retired && RETRIES.with(|r| r.get()) < MAX_RETRIES {
+        // Or the unit had the block, and another thread has taken it back
+        // since it was published: its own older copy of the block failed
+        // its page check, and it withdrew the address to translate it
+        // again (`cache_op::PAGE_STALE`), as happens when several threads
+        // first run, at the same moment, code that crosses onto a page none
+        // of them had slots for, each having allocated that page its own.
+        // That is no failure of this translation either, and settles once
+        // the page's slots do.
+        let withdrawn = !retired && translated_module.exported_blocks.iter().any(|(a, _)| *a == pc);
+        if (retired || withdrawn) && RETRIES.with(|r| r.get()) < MAX_RETRIES {
             jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RETRIES.with(|r| r.set(r.get() + 1));
             let again = translate_and_install(caller, pc);
