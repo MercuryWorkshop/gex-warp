@@ -10236,8 +10236,11 @@ impl Kernel {
         // pass one on, and a queue's notes are of the parent's doing.
         if self.darwin {
             for (fd, file, _) in child.fds.entries() {
-                if Arc::clone(&file.handle).as_kqueue().is_some() {
+                if let Some(kq) = Arc::clone(&file.handle).as_kqueue() {
                     let _ = child.fds.close(fd);
+                    for held in kq.holds() {
+                        let _ = child.fds.close(held);
+                    }
                 }
             }
         }

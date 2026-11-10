@@ -192,7 +192,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         size: u64at(8),
         ino: u64at(16),
         mtime: u64at(24) as i64,
-        nlink: u32at(32).max(1),
+        nlink: u32at(32),
         rdev: 0,
         times: super::Times {
             mtime_ns: u32at(36),
@@ -321,7 +321,10 @@ impl FileSystem for RemoteFs {
         let (a, n) = at(p);
         let mut buf = [0u8; META_BYTES];
         ok((self.remote.path_meta)(a, n, buf.as_mut_ptr() as crate::PAddr))?;
-        Ok(decode_meta(&buf))
+        // (What has a name has at least the one; an open file may have
+        // none left.)
+        let md = decode_meta(&buf);
+        Ok(Metadata { nlink: md.nlink.max(1), ..md })
     }
 
     /// The global kernel's `TmpFs` answers for a link itself.

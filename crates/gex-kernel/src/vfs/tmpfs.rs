@@ -1614,12 +1614,15 @@ impl FileHandle for TmpHandle {
         if let Some(file) = &self.file {
             // Its mode by the name it was opened under while that still
             // names it, else by any name it has now, else the last one's.
-            let mode = {
+            // (And as many names as it has now: none, once the last is
+            // removed, which is how a program holding it open finds out.)
+            let (mode, nlink) = {
                 let inner = self.inner.read().unwrap();
-                match self.here(&inner) {
+                let mode = match self.here(&inner) {
                     Some(p) => inner.modes.get(&p).copied().unwrap_or(0o644),
                     None => file.gone_mode.load(Ordering::Relaxed),
-                }
+                };
+                (mode, inner.nlink(file.ino))
             };
             return Ok(Metadata {
                 file_type: FileType::Regular,
@@ -1627,7 +1630,7 @@ impl FileHandle for TmpHandle {
                 mode,
                 ino: file.ino,
                 mtime: file.mtime.load(Ordering::Relaxed),
-                nlink: 1,
+                nlink,
                 rdev: 0,
                 times: file.times(),
             });

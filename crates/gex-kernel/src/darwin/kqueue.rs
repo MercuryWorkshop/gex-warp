@@ -25,11 +25,23 @@
 //!
 //! The filters here are the ones a program meets first: a descriptor
 //! readable or writable, a timer, an event a program posts to itself
-//! (`EVFILT_USER`), a process ending, and a signal raised for the process
+//! (`EVFILT_USER`), a process ending, a signal raised for the process
 //! (counted, whatever the process does with it; one sent to a single
-//! thread is not). The others (a Mach port, a file changing, the kernel's
-//! work queues delivering events to threads it makes) are refused by name,
-//! `ENOTSUP`.
+//! thread is not), and a file or directory changing (`EVFILT_VNODE`). The
+//! others (a Mach port, the kernel's work queues delivering events to
+//! threads it makes) are refused by name, `ENOTSUP`.
+//!
+//! A file's changes are heard as the kernel's `inotify` hears them
+//! ([`crate::inotify`]): a queue with such a note holds one instance, on a
+//! descriptor of the kernel's that the program can see among its own (put
+//! high, out of the way), and each note is a watch of it. What that says is
+//! respelled: `IN_MODIFY` is `NOTE_WRITE`, with `NOTE_EXTEND` if the file
+//! grew, and is `NOTE_ATTRIB` if it shrank, which is how XNU tells of a
+//! truncation (a file made longer by `ftruncate` is taken for one written
+//! to); `IN_ATTRIB` is `NOTE_ATTRIB`, or `NOTE_LINK` with a name more, or
+//! that and `NOTE_DELETE` with one fewer; a directory's entries coming and
+//! going are `NOTE_WRITE` to it, with `NOTE_LINK` when they are
+//! directories.
 use super::nr as d;
 use super::*;
 use crate::syscalls::{clock_ns, nr, ClockFn};
@@ -40,6 +52,7 @@ use std::sync::{Mutex, Weak};
 mod filt {
     pub const READ: i16 = -1;
     pub const WRITE: i16 = -2;
+    pub const VNODE: i16 = -4;
     pub const PROC: i16 = -5;
     pub const SIGNAL: i16 = -6;
     pub const TIMER: i16 = -7;
@@ -86,6 +99,13 @@ mod note {
     // A process: it ended, and how.
     pub const EXIT: u32 = 0x8000_0000;
     pub const EXITSTATUS: u32 = 0x0400_0000;
+    // A file: what happened to it.
+    pub const DELETE: u32 = 0x1;
+    pub const WRITE: u32 = 0x2;
+    pub const EXTEND: u32 = 0x4;
+    pub const ATTRIB: u32 = 0x8;
+    pub const LINK: u32 = 0x10;
+    pub const RENAME: u32 = 0x20;
 }
 
 /// `kevent64`'s and `kevent_qos`'s flags: do not wait; say only what went
@@ -198,6 +218,11 @@ enum What {
     /// process's signals, and how many of this one had been raised when
     /// the note last said.
     Signal { of: Arc<crate::signal::ProcSig>, signal: u32, seen: u32 },
+    /// A file or directory, to change: the file (while anything has it
+    /// open), its watch in the queue's `inotify` instance, how long it was
+    /// and how many names it had when last looked at, and what has
+    /// happened to it that is yet to be said.
+    Vnode { file: Weak<crate::file::OpenFile>, wd: i32, dir: bool, size: u64, nlink: u64, pending: u32 },
 }
 
 /// A registration: a thing, a filter, and what the caller wants back.
@@ -230,6 +255,9 @@ pub struct Kqueue {
     /// The descriptors of notes that are gone, for whoever has the table
     /// to close ([`Kqueue::take_closed`]).
     closed: Mutex<Vec<i32>>,
+    /// What hears the changes to the files its notes watch, and the
+    /// descriptor it is on.
+    watcher: Mutex<Option<(i32, Arc<crate::inotify::Inotify>)>>,
 }
 
 /// What a `ppoll` found of the descriptors it was given, by descriptor.
@@ -251,7 +279,43 @@ impl std::fmt::Debug for Kqueue {
 
 impl Kqueue {
     pub fn new(clock: ClockFn) -> Kqueue {
-        Kqueue { queue: crate::wait::Queue::new(), clock, notes: Mutex::new(Vec::new()), form: Mutex::new(None), closed: Mutex::new(Vec::new()) }
+        Kqueue { queue: crate::wait::Queue::new(), clock, notes: Mutex::new(Vec::new()), form: Mutex::new(None), closed: Mutex::new(Vec::new()), watcher: Mutex::new(None) }
+    }
+
+    /// What hears the changes to files for this queue, and its descriptor.
+    pub fn watcher(&self) -> Option<(i32, Arc<crate::inotify::Inotify>)> {
+        self.watcher.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// It is this from now on (or, the same one, on this descriptor).
+    pub fn set_watcher(&self, fd: i32, inst: Arc<crate::inotify::Inotify>) {
+        crate::wait::chain(inst.wait_queue(), self.queue.id());
+        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some((fd, inst));
+    }
+
+    /// Every descriptor of the kernel's that the queue holds: its notes'
+    /// and its watcher's. (What a child process, which has no queue of its
+    /// parent's, has no use for either.)
+    pub fn holds(&self) -> Vec<i32> {
+        let mut out: Vec<i32> = self.notes().iter().filter_map(|n| if let What::Proc { fd, .. } = n.what { Some(fd) } else { None }).collect();
+        out.extend(self.watcher().map(|w| w.0));
+        out
+    }
+
+    /// The queue is closed: its notes are gone, and what it held is
+    /// returned to be closed.
+    pub fn shut(&self) -> Vec<i32> {
+        let mut notes = self.notes();
+        while let Some(n) = notes.pop() {
+            self.retire(&notes, n);
+        }
+        drop(notes);
+        let mut out = self.take_closed();
+        if let Some((fd, inst)) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::wait::unchain(inst.wait_queue(), self.queue.id());
+            out.push(fd);
+        }
+        out
     }
 
     /// The descriptors notes held that are gone, to be closed.
@@ -263,8 +327,83 @@ impl Kqueue {
     /// to be closed.
     fn retire(&self, left: &[Note], gone: Note) {
         self.unchain(left, &gone);
-        if let What::Proc { fd, .. } = gone.what {
-            self.closed.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+        match gone.what {
+            What::Proc { fd, .. } => self.closed.lock().unwrap_or_else(|e| e.into_inner()).push(fd),
+            // (A watch is of a file, and may be more than one note's.)
+            What::Vnode { wd, .. } => {
+                if !left.iter().any(|n| matches!(n.what, What::Vnode { wd: other, .. } if other == wd)) {
+                    if let Some((_, inst)) = self.watcher() {
+                        let _ = inst.rm_watch(wd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What the watcher has heard since it was last asked, to the notes it
+    /// is about.
+    fn hear(&self, notes: &mut [Note]) {
+        use crate::inotify::mask as im;
+        if !notes.iter().any(|n| matches!(n.what, What::Vnode { .. })) {
+            return;
+        }
+        let Some((_, inst)) = self.watcher() else { return };
+        let mut buf = [0u8; 4096];
+        while let Ok(got) = inst.read_at(0, &mut buf) {
+            let mut at = 0;
+            while at + 16 <= got as usize {
+                let w = |o: usize| u32::from_le_bytes(buf[at + o..at + o + 4].try_into().unwrap());
+                let (wd, mask, named) = (w(0) as i32, w(4), w(12) != 0);
+                at += 16 + w(12) as usize;
+                for n in notes.iter_mut() {
+                    let interest = n.fflags;
+                    let What::Vnode { file, wd: own, dir, size, nlink, pending } = &mut n.what else { continue };
+                    if *own != wd {
+                        continue;
+                    }
+                    // What happened, each thing as XNU says it: all of one
+                    // is said to a note that asked for any of it.
+                    let mut said = [0u32; 5];
+                    if named {
+                        // An entry of the directory came or went (and
+                        // nothing is said of what happens inside one).
+                        if *dir && mask & (im::CREATE | im::DELETE | im::MOVED_FROM | im::MOVED_TO) != 0 {
+                            said[0] = note::WRITE | if mask & im::ISDIR != 0 { note::LINK } else { 0 };
+                        }
+                    } else {
+                        let md = file.upgrade().and_then(|f| f.handle.metadata().ok());
+                        if mask & im::MODIFY != 0 {
+                            let now = md.as_ref().map_or(*size, |md| md.size);
+                            (said[0], said[1]) = match now.cmp(size) {
+                                std::cmp::Ordering::Less => (note::ATTRIB, 0),
+                                std::cmp::Ordering::Equal => (note::WRITE, 0),
+                                std::cmp::Ordering::Greater => (note::WRITE, note::EXTEND),
+                            };
+                            *size = now;
+                        }
+                        if mask & im::ATTRIB != 0 {
+                            let now = md.as_ref().map_or(*nlink, |md| md.nlink as u64);
+                            said[2] = match now.cmp(nlink) {
+                                std::cmp::Ordering::Less => note::DELETE | note::LINK,
+                                std::cmp::Ordering::Equal => note::ATTRIB,
+                                std::cmp::Ordering::Greater => note::LINK,
+                            };
+                            *nlink = now;
+                        }
+                        if mask & im::MOVE_SELF != 0 {
+                            said[3] = note::RENAME;
+                        }
+                        if mask & im::DELETE_SELF != 0 {
+                            said[4] = note::DELETE | if *dir { note::LINK } else { 0 };
+                        }
+                    }
+                    *pending |= said.iter().filter(|s| *s & interest != 0).fold(0, |all, s| all | s);
+                }
+            }
+            if got == 0 {
+                break;
+            }
         }
     }
 
@@ -276,6 +415,10 @@ impl Kqueue {
             let (fd, events) = match n.what {
                 What::File { .. } => (n.ident as i32, if n.filter == filt::READ { poll::IN } else { poll::OUT }),
                 What::Proc { fd, .. } => (fd, poll::IN),
+                What::Vnode { .. } => match self.watcher() {
+                    Some((fd, _)) => (fd, poll::IN),
+                    None => continue,
+                },
                 _ => continue,
             };
             match out.iter_mut().find(|w| w.0 == fd) {
@@ -303,13 +446,15 @@ impl Kqueue {
 
     /// One change: a note added, changed, switched on or off, or removed.
     /// `file` finds an open file by its descriptor, `process` opens a
-    /// descriptor for a process to watch, by its id; `signals` are the
+    /// descriptor for a process to watch, by its id, `watch` is the watch
+    /// the queue's watcher has on a descriptor's file; `signals` are the
     /// calling process's.
     pub fn change(
         &self,
         e: &Event,
         file: &dyn Fn(i32) -> Result<Arc<crate::file::OpenFile>, Errno>,
         process: &mut dyn FnMut(i32) -> Result<(i32, Arc<dyn FileHandle>), Errno>,
+        watch: &dyn Fn(i32) -> Result<i32, Errno>,
         signals: &Arc<crate::signal::ProcSig>,
     ) -> Result<(), Errno> {
         let mut notes = self.notes();
@@ -338,6 +483,14 @@ impl Kqueue {
                             n.fflags = e.fflags;
                         }
                         What::User { .. } => {}
+                        // (Watched anew: a watch ends with its file's
+                        // last name.)
+                        What::Vnode { wd, .. } => {
+                            if let Ok(now) = watch(e.ident as i32) {
+                                *wd = now;
+                            }
+                            n.fflags = e.fflags;
+                        }
                         _ => n.fflags = e.fflags,
                     }
                 }
@@ -370,6 +523,13 @@ impl Kqueue {
                         let signal = if e.ident > abi::NSIG as u64 { 0 } else { abi::sig_to_linux(e.ident as u32) };
                         crate::wait::chain(signals.raised_queue(), self.queue.id());
                         (What::Signal { of: Arc::clone(signals), signal, seen: signals.raised(signal) }, e.fflags)
+                    }
+                    filt::VNODE => {
+                        let f = file(e.ident as i32)?;
+                        let wd = watch(e.ident as i32)?;
+                        let md = f.handle.metadata()?;
+                        let dir = md.file_type == FileType::Directory;
+                        (What::Vnode { file: Arc::downgrade(&f), wd, dir, size: md.size, nlink: md.nlink as u64, pending: 0 }, e.fflags)
                     }
                     // A filter Darwin has and this does not yet; or none.
                     -15..=-3 => return Err(Errno::EOPNOTSUPP),
@@ -431,6 +591,13 @@ impl Kqueue {
     /// file is asked.
     fn ready(n: &Note, mono: u64, wall: u64, found: &Found, dead: &mut bool) -> Option<(u16, u32, i64)> {
         match &n.what {
+            What::Vnode { file, pending, .. } => {
+                if file.strong_count() == 0 {
+                    *dead = true;
+                    return None;
+                }
+                (*pending != 0).then_some((0, *pending, 0))
+            }
             What::File { file, seen, .. } => {
                 let Some(f) = file.upgrade() else {
                     *dead = true;
@@ -491,7 +658,9 @@ impl Kqueue {
     pub fn any_ready(&self) -> bool {
         let (mono, wall) = self.now();
         let nothing = Found::new();
-        self.notes().iter().any(|n| !n.disabled && Kqueue::ready(n, mono, wall, &nothing, &mut false).is_some())
+        let mut notes = self.notes();
+        self.hear(&mut notes);
+        notes.iter().any(|n| !n.disabled && Kqueue::ready(n, mono, wall, &nothing, &mut false).is_some())
     }
 
     /// Up to `max` events, from the notes that have something to say. A
@@ -501,6 +670,7 @@ impl Kqueue {
     pub fn collect(&self, max: usize, found: &Found) -> Vec<Event> {
         let (mono, wall) = self.now();
         let mut notes = self.notes();
+        self.hear(&mut notes);
         let mut out = Vec::new();
         let mut i = 0;
         while i < notes.len() && out.len() < max {
@@ -534,6 +704,12 @@ impl Kqueue {
                 }
                 What::Signal { of, signal, seen } => *seen = of.raised(*signal),
                 What::Proc { .. } => {}
+                // (Said, and said again until it is cleared.)
+                What::Vnode { pending, .. } => {
+                    if n.flags & ev::CLEAR != 0 {
+                        *pending = 0;
+                    }
+                }
             }
             if (n.flags | flags) & ev::ONESHOT != 0 {
                 let n = notes.remove(i);
@@ -721,6 +897,8 @@ impl Kernel {
                     if e.filter == filt::PROC && e.flags & ev::ADD != 0 {
                         opened = Some(self.dispatch(m, nr::PIDFD_OPEN, [e.ident, 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::ESRCH)).map(|fd| fd as i32));
                     }
+                    // (And a file to watch is watched first.)
+                    let watch = (e.filter == filt::VNODE && e.flags & ev::ADD != 0).then(|| self.darwin_vnode_watch(&kq, e.ident as i32));
                     let fds = &self.fds;
                     let mut taken = false;
                     let r = kq.change(
@@ -731,6 +909,7 @@ impl Kernel {
                             taken = true;
                             Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
                         },
+                        &|_| watch.unwrap_or(Err(Errno::EBADF)),
                         self.signals.process(),
                     );
                     if let (Some(Ok(fd)), false) = (opened, taken) {
@@ -788,6 +967,7 @@ impl Kernel {
         // posted) and on what its notes watch, until its time or the
         // nearest timer's, and then begin again.
         let left = [deadline.map(|d| d - now), kq.next_timer()].into_iter().flatten().min();
+        self.darwin_vnode_watcher(&kq, false)?;
         let mut ask = vec![(fd, poll::IN)];
         ask.extend(kq.watched());
         ask.truncate(((abi::PAGE_SIZE - FDS) / 8) as usize);
@@ -805,6 +985,72 @@ impl Kernel {
         self.darwin_post = Post::Kevent { slot };
         *a = [slot + FDS, ask.len() as u64, if left.is_some() { slot } else { 0 }, 0, 8, 0];
         Ok(Some(nr::PPOLL))
+    }
+
+    /// What hears of files changing for `kq`, made at its first need, on a
+    /// descriptor of this process's: a high one, out of the way of the
+    /// program's own. A program that closes every descriptor it does not
+    /// know closes this one too; it is then put back (unless there is
+    /// none yet and none is being `made`).
+    fn darwin_vnode_watcher(&self, kq: &Arc<Kqueue>, made: bool) -> Result<Option<Arc<crate::inotify::Inotify>>, Errno> {
+        let inst = match kq.watcher() {
+            Some((fd, inst)) => {
+                let there = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_inotify()).is_some_and(|i| Arc::ptr_eq(&i, &inst));
+                if there {
+                    return Ok(Some(inst));
+                }
+                inst
+            }
+            None if made => Arc::new(crate::inotify::Inotify::new()?),
+            None => return Ok(None),
+        };
+        let handle: Arc<dyn FileHandle> = inst.clone();
+        let file = crate::file::OpenFile::new(handle, "anon_inode:[kqueue]".into(), crate::syscalls::oflags::O_NONBLOCK, true, false);
+        let high = (self.fds.limit() as i32 - 8).clamp(0, 240);
+        let fd = self.fds.insert_at(Arc::clone(&file), high, true).or_else(|_| self.fds.insert(file, true))?;
+        kq.set_watcher(fd as i32, Arc::clone(&inst));
+        Ok(Some(inst))
+    }
+
+    /// The watch `kq`'s watcher has on the file open as `fd`, for a note
+    /// (`EVFILT_VNODE`): on the file its name names now, if that is still
+    /// the file, and otherwise one that hears nothing.
+    fn darwin_vnode_watch(&self, kq: &Arc<Kqueue>, fd: i32) -> Result<i32, Errno> {
+        use crate::inotify::mask as im;
+        let f = self.fds.get(fd)?;
+        let md = f.handle.metadata()?;
+        // (A pipe or a socket is no file to watch.)
+        if matches!(md.file_type, FileType::Fifo | FileType::Socket) {
+            return Err(Errno::EINVAL);
+        }
+        let Some(inst) = self.darwin_vnode_watcher(kq, true)? else { return Err(Errno::ENOMEM) };
+        let all = im::MODIFY | im::ATTRIB | im::MOVE_SELF | im::DELETE_SELF | im::CREATE | im::DELETE | im::MOVED_FROM | im::MOVED_TO;
+        let dir = md.file_type == FileType::Directory;
+        let wd = match self.vfs.watch_target(&f.path, true) {
+            Ok((fs, rel)) if fs.metadata(&rel).is_ok_and(|now| now.ino == md.ino) => {
+                if fs.watched_remotely() {
+                    inst.add_remote(&rel, dir, all)
+                } else {
+                    let (key, dir) = fs.watch_key(&rel)?;
+                    inst.add_local(key, dir, all)
+                }
+            }
+            _ => inst.add_local(None, dir, all),
+        }?;
+        Ok(wd as i32)
+    }
+
+    /// Descriptor `fd` is about to be closed: if it is the last of a
+    /// queue's, the queue's notes go with it, and what it held.
+    pub(super) fn darwin_kqueue_closing(&mut self, fd: i32) {
+        let Ok(file) = self.fds.get(fd) else { return };
+        let Some(kq) = Arc::clone(&file.handle).as_kqueue() else { return };
+        if self.fds.entries().iter().filter(|(_, other, _)| Arc::ptr_eq(other, &file)).count() > 1 {
+            return;
+        }
+        for held in kq.shut() {
+            let _ = self.sys_close(held);
+        }
     }
 
     /// Whether the call whose wait just ended as `r` is one to be made
@@ -838,6 +1084,9 @@ mod tests {
     fn nobody(_: i32) -> Result<(i32, Arc<dyn FileHandle>), Errno> {
         Err(Errno::ESRCH)
     }
+    fn unwatched(_: i32) -> Result<i32, Errno> {
+        Err(Errno::EBADF)
+    }
     fn quiet() -> Arc<crate::signal::ProcSig> {
         Arc::clone(crate::signal::Signals::new().process())
     }
@@ -848,9 +1097,9 @@ mod tests {
     #[test]
     fn a_user_event_is_said_when_posted_and_once_if_cleared() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody, &quiet()).unwrap();
+        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody, &unwatched, &quiet()).unwrap();
         assert!(kq.collect(8, &Found::new()).is_empty());
-        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody, &quiet()).unwrap();
+        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody, &unwatched, &quiet()).unwrap();
         let got = kq.collect(8, &Found::new());
         assert_eq!((got.len(), got[0].ident, got[0].fflags, got[0].udata), (1, 1, 5, 7));
         assert!(kq.collect(8, &Found::new()).is_empty());
@@ -859,22 +1108,22 @@ mod tests {
     #[test]
     fn a_note_that_is_not_there_cannot_be_changed() {
         let kq = Kqueue::new(clock);
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EBADF));
-        assert_eq!(kq.change(&Event { filter: -4, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EOPNOTSUPP));
-        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EINVAL));
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EBADF));
+        assert_eq!(kq.change(&Event { filter: -9, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EOPNOTSUPP));
+        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EINVAL));
     }
 
     #[test]
     fn once_is_once_and_dispatch_waits_to_be_switched_on() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody, &quiet()).unwrap();
-        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody, &quiet()).unwrap();
+        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody, &unwatched, &quiet()).unwrap();
+        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody, &unwatched, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 2);
         assert!(kq.collect(8, &Found::new()).is_empty());
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
-        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody, &quiet()).unwrap();
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
+        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 1);
     }
 }
@@ -891,7 +1140,7 @@ mod signal_tests {
         // Darwin's SIGUSR1 is 30, the kernel's 10.
         p.raise(10, None);
         let watch = Event { ident: 30, filter: filt::SIGNAL, flags: ev::ADD, udata: 9, ..Event::default() };
-        kq.change(&watch, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), p).unwrap();
+        kq.change(&watch, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), p).unwrap();
         assert!(kq.collect(8, &Found::new()).is_empty());
         p.raise(10, None);
         p.raise(10, None);
@@ -899,7 +1148,7 @@ mod signal_tests {
         let got = kq.collect(8, &Found::new());
         assert_eq!((got.len(), got[0].ident, got[0].data, got[0].flags & ev::CLEAR), (1, 30, 2, ev::CLEAR));
         assert!(kq.collect(8, &Found::new()).is_empty());
-        assert_eq!(kq.change(&Event { ident: 99, filter: filt::SIGNAL, flags: ev::ADD, ..Event::default() }, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), p), Ok(()));
+        assert_eq!(kq.change(&Event { ident: 99, filter: filt::SIGNAL, flags: ev::ADD, ..Event::default() }, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), p), Ok(()));
         assert!(kq.collect(8, &Found::new()).is_empty());
     }
 }
