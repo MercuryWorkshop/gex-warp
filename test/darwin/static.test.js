@@ -27,7 +27,11 @@ export default async function (t) {
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
   for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach']) await d.compare(name, await d.build(name), [], { page: true });
-  await d.compare('sys', await d.build('sys'), ['one', 'two'], { page: true });
+  const sys = await d.build('sys');
+  await d.compare('sys', sys, ['one', 'two'], { page: true });
+  // Under gexc the root is the Mac's own, and the system a program is told
+  // it is on is the one that root's SystemVersion.plist names: the Mac's.
+  await d.compare('sys, which system', sys, ['version']);
   // A closed port on the loopback refuses under gexc; on the page the
   // loopback is the proxy's to answer for, so that question is asked only
   // here.

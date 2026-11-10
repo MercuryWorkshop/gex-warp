@@ -188,6 +188,11 @@ the image low. What works is what a program can do with the kernel alone:
 - `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
   attributes;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
+- which system it is: `kern.osproductversion`, `kern.osversion` and
+  `kern.osrelease` are what the root's
+  `/System/Library/CoreServices/SystemVersion.plist` says (macOS 26.0 with
+  none), so the version a program sees is a setting of the root it runs
+  in, as a Windows version is of a Wine prefix;
 - sockets: unix and TCP, descriptors passed in a control message;
 - Mach ports within a task: names and the rights under them, `mach_msg2`
   between threads (a reply port, rights in the body, port sets, a receive

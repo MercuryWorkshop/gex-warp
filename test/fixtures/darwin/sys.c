@@ -337,8 +337,24 @@ static void children(void) {
     SYS(SYS_sigprocmask, SIG_SETMASK, &old, 0);
 }
 
+// Which system this is, as the kernel says it: asked for by an argument,
+// where the root is the Mac's own and the answers are its version file's.
+static void version(void) {
+    static const char *names[] = {"kern.ostype", "kern.osrelease", "kern.osversion", "kern.osproductversion"};
+    for (int i = 0; i < 4; i++) {
+        char buf[64] = "";
+        size_t len = sizeof buf;
+        long r = byname(names[i], buf, &len);
+        t_printf("%s: %ld, \"%s\"\n", names[i], r, buf);
+    }
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)envp, (void)apple;
+    if (argc > 1 && !t_strcmp(argv[1], "version")) {
+        version();
+        return 0;
+    }
     by_number();
     by_name();
     process(argc, argv);

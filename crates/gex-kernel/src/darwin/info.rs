@@ -10,12 +10,59 @@
 use super::nr as d;
 use super::*;
 
-/// The Darwin this is: XNU's version, the release `uname` reports and the
-/// macOS that shipped it ([`super::nr`]'s source).
+/// The XNU whose system calls [`super::nr`] was generated from.
 pub const XNU: &str = "xnu-12377.1.9";
-pub const OSRELEASE: &str = "25.0.0";
-pub const OSVERSION: &str = "25A354";
-pub const OSPRODUCTVERSION: &str = "26.0";
+
+/// Where a Mac says which system it is. The file is the userland's, and
+/// what a program is told of the kernel follows it: the version is a
+/// setting of the root a program runs in, as a Windows version is of a Wine
+/// prefix.
+pub const SYSTEM_VERSION: &str = "/System/Library/CoreServices/SystemVersion.plist";
+
+/// The system a process is told it is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Os {
+    /// `kern.osproductversion`: the macOS version, "26.0".
+    pub product: String,
+    /// `kern.osversion`: its build, "25A354".
+    pub build: String,
+    /// `kern.osrelease`: Darwin's own version, "25.0.0".
+    pub release: String,
+}
+
+impl Default for Os {
+    /// The macOS that shipped [`XNU`].
+    fn default() -> Os {
+        Os { product: "26.0".into(), build: "25A354".into(), release: "25.0.0".into() }
+    }
+}
+
+impl Os {
+    /// The system a `SystemVersion.plist` describes: its `ProductVersion`
+    /// and `ProductBuildVersion`, and the Darwin release that macOS was.
+    pub fn from_plist(plist: &[u8]) -> Option<Os> {
+        let text = String::from_utf8_lossy(plist);
+        let value = |key: &str| {
+            let rest = &text[text.find(&format!("<key>{key}</key>"))?..];
+            let rest = &rest[rest.find("<string>")? + 8..];
+            Some(rest[..rest.find("</string>")?].trim().to_string())
+        };
+        let product = value("ProductVersion")?;
+        let mut parts = product.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+        let (major, minor, patch) = (parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+        // Mac OS X 10.x was Darwin x + 4, its updates Darwin's minor
+        // versions; macOS 11 to 15 were Darwin 20 to 24; macOS 26 was
+        // Darwin 25; from 27 the two agree.
+        let (darwin, sub) = match major {
+            10 => (minor + 4, patch),
+            11..=15 => (major + 9, minor),
+            16..=26 => (major - 1, minor),
+            _ => (major, minor),
+        };
+        let build = value("ProductBuildVersion").unwrap_or_else(|| format!("{darwin}A1"));
+        Some(Os { product, build, release: format!("{darwin}.{sub}.0") })
+    }
+}
 
 const CTL_KERN: i32 = 1;
 const CTL_VM: i32 = 2;
@@ -243,6 +290,12 @@ fn name_of(oid: &[i32]) -> Option<&'static str> {
 }
 
 impl Kernel {
+    /// The system this process is told it is on: what its root's
+    /// [`SYSTEM_VERSION`] says, read once, or with none the default.
+    pub fn darwin_os(&self) -> &Os {
+        self.darwin_os.get_or_init(|| self.read_file(SYSTEM_VERSION).and_then(|p| Os::from_plist(&p)).unwrap_or_default())
+    }
+
     /// The value of the name `name`, if this kernel has one.
     fn darwin_sysctl_value(&self, name: &str) -> Option<Val> {
         use Val::*;
@@ -254,11 +307,11 @@ impl Kernel {
         let nofile = self.rlimits.get()[RLIMIT_NOFILE];
         Some(match name {
             "kern.ostype" => Str("Darwin".into()),
-            "kern.osrelease" => Str(OSRELEASE.into()),
+            "kern.osrelease" => Str(self.darwin_os().release.clone()),
             "kern.osrevision" => Int(199506),
-            "kern.version" => Str(darwin_version()),
-            "kern.osversion" => Str(OSVERSION.into()),
-            "kern.osproductversion" => Str(OSPRODUCTVERSION.into()),
+            "kern.version" => Str(darwin_version(&self.darwin_os().release)),
+            "kern.osversion" => Str(self.darwin_os().build.clone()),
+            "kern.osproductversion" => Str(self.darwin_os().product.clone()),
             "kern.osproductversioncompat" => Str("16.0".into()),
             "kern.osreleasetype" => Str("User".into()),
             "kern.hostname" => Str("gex".into()),
@@ -701,7 +754,28 @@ impl Kernel {
 }
 
 /// `kern.version`, as `uname -v` prints it.
-pub fn darwin_version() -> String {
+pub fn darwin_version(release: &str) -> String {
     let soc = if gex_abi::X86 { "X86_64" } else { "ARM64_T8103" };
-    format!("Darwin Kernel Version {OSRELEASE}: gex; root:{XNU}/RELEASE_{soc}")
+    format!("Darwin Kernel Version {release}: gex; root:{XNU}/RELEASE_{soc}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plist(product: &str, build: &str) -> Vec<u8> {
+        format!("<plist><dict>\n<key>ProductBuildVersion</key>\n<string>{build}</string>\n<key>ProductName</key><string>macOS</string>\n<key>ProductVersion</key>\n\t<string>{product}</string></dict></plist>").into_bytes()
+    }
+
+    #[test]
+    fn the_system_is_the_one_its_version_file_names() {
+        let os = |p: &str, b: &str| Os::from_plist(&plist(p, b)).unwrap();
+        assert_eq!(os("10.6.8", "10K549"), Os { product: "10.6.8".into(), build: "10K549".into(), release: "10.8.0".into() });
+        assert_eq!(os("10.14.6", "18G103").release, "18.6.0");
+        assert_eq!(os("11.6", "20G165").release, "20.6.0");
+        assert_eq!(os("15.1", "24B83").release, "24.1.0");
+        assert_eq!(os("26.0", "25A354"), Os::default());
+        assert_eq!(os("27.0.1", "26A434").release, "27.0.0");
+        assert_eq!(Os::from_plist(b"not a plist"), None);
+    }
 }
