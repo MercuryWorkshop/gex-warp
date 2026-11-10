@@ -312,6 +312,21 @@ int main(int argc, char **argv, char **envp, char **apple) {
     struct kevent_qos eq = {9, USER, ADD | CLEAR, 0, 71, TRIGGER, 0, 0, {0, 0, 0, 0}}, gq[2];
     n = SYS(SYS_kevent_qos, kq, &eq, 1, gq, 2, 0, 0, 1);
     t_printf("kevent_qos: %ld [%lu filter %d udata %lu]\n", n, (unsigned long)gq[0].ident, gq[0].filter, (unsigned long)gq[0].udata);
+    // Two changes at once, each 72 bytes: the second is of no note, and
+    // is all that is answered; what the first posted is told after, with
+    // another.
+    struct kevent_qos two[2] = {{10, USER, ADD | CLEAR, 0, 72, TRIGGER, 0, 0, {0, 0, 0, 0}}, {11, USER, DELETE, 0, 73, 0, 0, 0, {0, 0, 0, 0}}}, g3[3];
+    t_memset(g3, 0, sizeof g3);
+    n = SYS(SYS_kevent_qos, kq, two, 2, g3, 3, 0, 0, 1);
+    t_printf("kevent_qos, two changes: %ld [%lu flags 0x%x data %ld udata %lu]\n", n, (unsigned long)g3[0].ident, g3[0].flags, (long)g3[0].data, (unsigned long)g3[0].udata);
+    struct kevent_qos more = {12, USER, ADD | CLEAR, 0, 74, TRIGGER, 0, 0, {1, 2, 3, 4}};
+    t_memset(g3, 0, sizeof g3);
+    n = SYS(SYS_kevent_qos, kq, &more, 1, g3, 3, 0, 0, 1);
+    t_printf("kevent_qos, two events: %ld", n);
+    for (int k = 10; k <= 12; k++)
+        for (long i = 0; i < n && i < 3; i++)
+            if (g3[i].ident == (u64)k) t_printf(" [%d udata %lu ext %lu %lu %lu %lu]", k, (unsigned long)g3[i].udata, (unsigned long)g3[i].ext[0], (unsigned long)g3[i].ext[1], (unsigned long)g3[i].ext[2], (unsigned long)g3[i].ext[3]);
+    t_printf("\n");
     SYS(SYS_close, kq);
     return 0;
 }

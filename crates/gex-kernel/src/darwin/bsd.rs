@@ -24,6 +24,7 @@ mod f {
     pub const SETFL: u64 = 4;
     pub const GETOWN: u64 = 5;
     pub const SETOWN: u64 = 6;
+    pub const RDADVISE: u64 = 44;
     pub const RDAHEAD: u64 = 45;
     pub const NOCACHE: u64 = 48;
     pub const GETPATH: u64 = 50;
@@ -515,6 +516,18 @@ impl Kernel {
             // to here.)
             d::KQUEUE | d::GUARDED_KQUEUE_NP => self.darwin_kqueue(),
             d::GUARDED_CLOSE_NP => self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF)),
+            // (path, guard, what it guards against, flags, mode): opened
+            // as any file is, if asked as XNU insists -- closed when
+            // another program is run, guarded at least against being
+            // duplicated, and by a guard that is not nothing.
+            d::GUARDED_OPEN_NP => {
+                const O_CLOEXEC: u64 = 0x100_0000;
+                if x[3] & O_CLOEXEC == 0 || x[2] & 2 == 0 || x[2] & !0x1f != 0 || m.read_u64(x[1])? == 0 {
+                    Err(Errno::EINVAL)
+                } else {
+                    self.dispatch(m, nr::OPENAT, [CWD, x[0], x[3], x[4], 0, 0]).unwrap_or(Err(Errno::EINVAL))
+                }
+            }
             // A work queue is there for the asking.
             d::WORKQ_OPEN => Ok(0),
             d::WORKQ_KERNRETURN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
@@ -733,6 +746,12 @@ impl Kernel {
             // no less of anyway.
             f::RDAHEAD | f::NOCACHE | f::FULLFSYNC | f::BARRIERFSYNC | f::SETNOSIGPIPE | f::SETOWN => self.fds.get(fd).map(|_| 0),
             f::GETNOSIGPIPE | f::GETOWN => self.fds.get(fd).map(|_| 0),
+            // A part of a file that will be read soon: advice a file takes,
+            // and nothing else can.
+            f::RDADVISE => match self.fds.get(fd)?.handle.metadata()?.file_type {
+                crate::vfs::FileType::Regular => Ok(0),
+                _ => Err(Errno::ENODEV),
+            },
             _ => {
                 self.fds.get(fd)?;
                 if self.trace {

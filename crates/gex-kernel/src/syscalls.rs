@@ -10802,6 +10802,17 @@ impl Kernel {
                 );
             }
         }
+        // A Darwin call that became a wait and had none to do (what it was
+        // to wait for came between its looking and its waiting) is made
+        // again, as one that waited is ([`Self::finish_blocking`]).
+        if self.darwin {
+            if let Ok(r) = &outcome {
+                if self.darwin_again(*r) {
+                    let _ = m.write_u64(self.ctx_addr + ctx::PC as u64, pc);
+                    return SyscallOutcome::Resume(pc);
+                }
+            }
+        }
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),

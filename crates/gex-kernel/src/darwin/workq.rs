@@ -160,6 +160,12 @@ impl Kernel {
                         self.darwin_answer = Some(Err(Errno::EINVAL));
                         return NATIVE + d::WORKQ_KERNRETURN;
                     }
+                    // (Some threads, at a priority that names a class:
+                    // the event manager's own names none.)
+                    if x[2] as i32 <= 0 || (x[3] >> 8) & 0x3f == 0 {
+                        self.darwin_answer = Some(Err(Errno::EINVAL));
+                        return NATIVE + d::WORKQ_KERNRETURN;
+                    }
                     let flags = flags_of(x[3]);
                     for _ in 0..(x[2] as i32).clamp(0, MOST as i32) {
                         wq.pending.push_back(flags);

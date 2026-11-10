@@ -27,9 +27,17 @@
 //! readable or writable, a timer, an event a program posts to itself
 //! (`EVFILT_USER`), a process ending, a signal raised for the process
 //! (counted, whatever the process does with it; one sent to a single
-//! thread is not), and a file or directory changing (`EVFILT_VNODE`). The
-//! others (a Mach port, the kernel's work queues delivering events to
-//! threads it makes) are refused by name, `ENOTSUP`.
+//! thread is not), a file or directory changing (`EVFILT_VNODE`), and a
+//! Mach port or a set of them with a message to receive
+//! (`EVFILT_MACHPORT`). The kernel's work queues delivering events to
+//! threads it makes are not here, and are refused by name, `ENOTSUP`.
+//!
+//! A port's note says whose message waits, or, asked to (`MACH_RCV_MSG`
+//! in its `fflags`), receives it: into the buffer the note was given, or
+//! one cut from what `kevent_qos` was handed for the purpose, the event
+//! saying where and how much. The receiving is the kernel's
+//! ([`Kernel::darwin_kevent`]), which has the task's memory and its
+//! names; the queue only knows that there is something.
 //!
 //! A file's changes are heard as the kernel's `inotify` hears them
 //! ([`crate::inotify`]): a queue with such a note holds one instance, on a
@@ -55,8 +63,13 @@ mod filt {
     pub const VNODE: i16 = -4;
     pub const PROC: i16 = -5;
     pub const SIGNAL: i16 = -6;
+    pub const MACHPORT: i16 = -8;
     pub const TIMER: i16 = -7;
+    pub const FS: i16 = -9;
     pub const USER: i16 = -10;
+    pub const SOCK: i16 = -13;
+    pub const MEMORYSTATUS: i16 = -14;
+    pub const EXCEPT: i16 = -15;
 }
 
 /// An event's flags: what to do with a note, and what one says.
@@ -123,7 +136,8 @@ pub(super) enum Form {
     Plain,
     /// `struct kevent64_s`, with two words of the caller's.
     Wide,
-    /// `struct kevent_qos_s`, with a quality of service and four.
+    /// `struct kevent_qos_s`, 72 bytes, with a quality of service and
+    /// four.
     Qos,
 }
 
@@ -132,7 +146,7 @@ impl Form {
         match self {
             Form::Plain => 32,
             Form::Wide => 48,
-            Form::Qos => 64,
+            Form::Qos => 72,
         }
     }
 }
@@ -165,15 +179,14 @@ impl Event {
             }
             Form::Qos => {
                 (e.qos, e.udata, e.fflags, e.data) = (h(12), w(16), h(24), w(32) as i64);
-                e.ext = [w(40), w(48), w(56), 0];
-                e.ext[3] = 0;
+                e.ext = [w(40), w(48), w(56), w(64)];
             }
         }
         Ok(e)
     }
 
     fn write(&self, m: &mut GuestMem<'_>, at: u64, form: Form) -> Result<(), Errno> {
-        let mut b = [0u8; 64];
+        let mut b = [0u8; 72];
         b[0..8].copy_from_slice(&self.ident.to_le_bytes());
         b[8..10].copy_from_slice(&self.filter.to_le_bytes());
         b[10..12].copy_from_slice(&self.flags.to_le_bytes());
@@ -190,7 +203,7 @@ impl Event {
                 b[16..24].copy_from_slice(&self.udata.to_le_bytes());
                 b[24..28].copy_from_slice(&self.fflags.to_le_bytes());
                 b[32..40].copy_from_slice(&self.data.to_le_bytes());
-                for (i, x) in self.ext.iter().take(3).enumerate() {
+                for (i, x) in self.ext.iter().enumerate() {
                     b[40 + 8 * i..48 + 8 * i].copy_from_slice(&x.to_le_bytes());
                 }
             }
@@ -223,6 +236,12 @@ enum What {
     /// and how many names it had when last looked at, and what has
     /// happened to it that is yet to be said.
     Vnode { file: Weak<crate::file::OpenFile>, wd: i32, dir: bool, size: u64, nlink: u64, pending: u32 },
+    /// Something XNU would tell of that does not happen here: memory
+    /// running short, a filesystem mounted.
+    Never,
+    /// A Mach port, or a set of them, with a message to receive: the
+    /// task's names, and the one it is.
+    Port { space: Arc<Mutex<super::port::Space>>, name: u32 },
 }
 
 /// A registration: a thing, a filter, and what the caller wants back.
@@ -329,6 +348,7 @@ impl Kqueue {
         self.unchain(left, &gone);
         match gone.what {
             What::Proc { fd, .. } => self.closed.lock().unwrap_or_else(|e| e.into_inner()).push(fd),
+            What::Port { space, name } => space.lock().unwrap_or_else(|e| e.into_inner()).unwatch(name, self.queue.id()),
             // (A watch is of a file, and may be more than one note's.)
             What::Vnode { wd, .. } => {
                 if !left.iter().any(|n| matches!(n.what, What::Vnode { wd: other, .. } if other == wd)) {
@@ -447,14 +467,16 @@ impl Kqueue {
     /// One change: a note added, changed, switched on or off, or removed.
     /// `file` finds an open file by its descriptor, `process` opens a
     /// descriptor for a process to watch, by its id, `watch` is the watch
-    /// the queue's watcher has on a descriptor's file; `signals` are the
-    /// calling process's.
+    /// the queue's watcher has on a descriptor's file, `ports` the task's
+    /// names if the one given is a port's to receive from; `signals` are
+    /// the calling process's.
     pub fn change(
         &self,
         e: &Event,
         file: &dyn Fn(i32) -> Result<Arc<crate::file::OpenFile>, Errno>,
         process: &mut dyn FnMut(i32) -> Result<(i32, Arc<dyn FileHandle>), Errno>,
         watch: &dyn Fn(i32) -> Result<i32, Errno>,
+        ports: &dyn Fn(u32) -> Result<Arc<Mutex<super::port::Space>>, Errno>,
         signals: &Arc<crate::signal::ProcSig>,
     ) -> Result<(), Errno> {
         let mut notes = self.notes();
@@ -476,6 +498,12 @@ impl Kqueue {
                 // timer is set again, and the others take the new `fflags`.
                 let n = &mut notes[at];
                 n.udata = e.udata;
+                // (A port's note takes what any change says of how and
+                // where it is to receive.)
+                if let What::Port { .. } = n.what {
+                    n.fflags = e.fflags;
+                    n.ext = e.ext;
+                }
                 if e.flags & ev::ADD != 0 {
                     match &mut n.what {
                         What::Timer { .. } => {
@@ -483,6 +511,7 @@ impl Kqueue {
                             n.fflags = e.fflags;
                         }
                         What::User { .. } => {}
+                        What::Port { .. } => {}
                         // (Watched anew: a watch ends with its file's
                         // last name.)
                         What::Vnode { wd, .. } => {
@@ -531,6 +560,21 @@ impl Kqueue {
                         let dir = md.file_type == FileType::Directory;
                         (What::Vnode { file: Arc::downgrade(&f), wd, dir, size: md.size, nlink: md.nlink as u64, pending: 0 }, e.fflags)
                     }
+                    filt::MACHPORT => {
+                        let space = ports(e.ident as u32)?;
+                        space.lock().unwrap_or_else(|e| e.into_inner()).watch(e.ident as u32, self.queue.id());
+                        (What::Port { space, name: e.ident as u32 }, e.fflags)
+                    }
+                    filt::FS | filt::MEMORYSTATUS => (What::Never, e.fflags),
+                    // (What a socket alone can be asked.)
+                    filt::SOCK | filt::EXCEPT => {
+                        if file(e.ident as i32)?.handle.metadata()?.file_type != FileType::Socket {
+                            return Err(Errno::EINVAL);
+                        }
+                        (What::Never, e.fflags)
+                    }
+                    // (Asynchronous I/O's are the kernel's own to add.)
+                    -3 => return Err(Errno::EPERM),
                     // A filter Darwin has and this does not yet; or none.
                     -15..=-3 => return Err(Errno::EOPNOTSUPP),
                     _ => return Err(Errno::EINVAL),
@@ -597,6 +641,13 @@ impl Kqueue {
                     return None;
                 }
                 (*pending != 0).then_some((0, *pending, 0))
+            }
+            What::Never => None,
+            // (What is to be done about it is the note's `fflags`, for
+            // the kernel; whose message it is, the data.)
+            What::Port { space, name } => {
+                let (whose, _) = space.lock().unwrap_or_else(|e| e.into_inner()).pending(*name, mono);
+                whose.map(|member| (0, n.fflags, member as i64))
             }
             What::File { file, seen, .. } => {
                 let Some(f) = file.upgrade() else {
@@ -703,7 +754,7 @@ impl Kqueue {
                     }
                 }
                 What::Signal { of, signal, seen } => *seen = of.raised(*signal),
-                What::Proc { .. } => {}
+                What::Proc { .. } | What::Never | What::Port { .. } => {}
                 // (Said, and said again until it is cleared.)
                 What::Vnode { pending, .. } => {
                     if n.flags & ev::CLEAR != 0 {
@@ -730,8 +781,10 @@ impl Kqueue {
         self.notes()
             .iter()
             .filter(|n| !n.disabled)
-            .filter_map(|n| match n.what {
-                What::Timer { next, absolute, .. } => Some(next.saturating_sub(if absolute { wall } else { mono })),
+            .filter_map(|n| match &n.what {
+                What::Timer { next, absolute, .. } => Some(next.saturating_sub(if *absolute { wall } else { mono })),
+                // (A port that is a timer's has its message at its moment.)
+                What::Port { space, name } => space.lock().unwrap_or_else(|e| e.into_inner()).pending(*name, mono).1.map(|when| when.saturating_sub(mono).max(1)),
                 _ => None,
             })
             .min()
@@ -910,6 +963,10 @@ impl Kernel {
                             Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
                         },
                         &|_| watch.unwrap_or(Err(Errno::EBADF)),
+                        &|name| {
+                            self.darwin_ports.lock().unwrap_or_else(|e| e.into_inner()).watchable(self.pid, name)?;
+                            Ok(Arc::clone(&self.darwin_ports))
+                        },
                         self.signals.process(),
                     );
                     if let (Some(Ok(fd)), false) = (opened, taken) {
@@ -951,6 +1008,12 @@ impl Kernel {
         }
         if out.is_empty() && nevents > 0 {
             out = kq.collect(nevents as usize, &found);
+            // What a port's note has to say is the kernel's to finish:
+            // whose message waits, or the message received.
+            let room = if form == Form::Qos && x[5] != 0 && x[6] != 0 { Some((x[5], m.read_u64(x[6])?)) } else { None };
+            if let Some(left) = self.darwin_kevent_ports(m, &mut out, room) {
+                m.write_u64(x[6], left)?;
+            }
         }
         for fd in kq.take_closed() {
             let _ = self.sys_close(fd);
@@ -985,6 +1048,62 @@ impl Kernel {
         self.darwin_post = Post::Kevent { slot };
         *a = [slot + FDS, ask.len() as u64, if left.is_some() { slot } else { 0 }, 0, 8, 0];
         Ok(Some(nr::PPOLL))
+    }
+
+    /// Finish the events `out` that are of Mach ports
+    /// (`EVFILT_MACHPORT`), each as its note asked: told whose message
+    /// waits, or the message received -- into the note's own buffer
+    /// (`ext[0]`, of `ext[1]` bytes), or with none the next of `room`,
+    /// what `kevent_qos` was given for the call's messages (where, and
+    /// how much). How much of `room` is left, if there was any.
+    fn darwin_kevent_ports(&mut self, m: &mut GuestMem<'_>, out: &mut Vec<Event>, room: Option<(u64, u64)>) -> Option<u64> {
+        use super::port::{opt, Received, MACH_RCV_TOO_LARGE};
+        let (mut at, mut left) = room.unwrap_or((0, 0));
+        let space = Arc::clone(&self.darwin_ports);
+        let mut i = 0;
+        while i < out.len() {
+            let e = &mut out[i];
+            if e.filter != filt::MACHPORT || e.flags & ev::ERROR != 0 {
+                i += 1;
+                continue;
+            }
+            let options = e.fflags as u64;
+            if options & opt::RCV_MSG == 0 {
+                (e.fflags, e.ext) = (0, [0; 4]);
+                i += 1;
+                continue;
+            }
+            // (A message with no room in a buffer of the call's own stays
+            // where it is, and whose it is is said: the caller receives
+            // it itself.)
+            let own = e.ext[1] != 0;
+            let (to, size) = if own { (e.ext[0], e.ext[1]) } else { (at, left) };
+            let large = !own || options & opt::RCV_LARGE != 0;
+            let got = {
+                let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
+                self.darwin_port_receive(m, &mut sp, e.ident as u32, to, size, large)
+            };
+            let e = &mut out[i];
+            match got {
+                Received::Got(n) => {
+                    (e.fflags, e.data, e.ext) = (0, 0, [to, n, 0, 0]);
+                    if !own {
+                        (at, left) = (at + n, left - n);
+                    }
+                }
+                Received::TooLarge { size: n, name } => {
+                    let whose = if !own || options & opt::RCV_LARGE_IDENTITY != 0 { name as i64 } else { 0 };
+                    (e.fflags, e.data, e.ext) = (MACH_RCV_TOO_LARGE as u32, if large { whose } else { 0 }, [to, if large { n } else { size }, 0, 0]);
+                }
+                // (Received by another thread since the queue looked.)
+                Received::Nothing(_) | Received::NoName | Received::BadBuffer => {
+                    out.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        room.map(|_| left)
     }
 
     /// What hears of files changing for `kq`, made at its first need, on a
@@ -1087,6 +1206,9 @@ mod tests {
     fn unwatched(_: i32) -> Result<i32, Errno> {
         Err(Errno::EBADF)
     }
+    fn no_port(_: u32) -> Result<Arc<Mutex<crate::darwin::port::Space>>, Errno> {
+        Err(Errno::ENOENT)
+    }
     fn quiet() -> Arc<crate::signal::ProcSig> {
         Arc::clone(crate::signal::Signals::new().process())
     }
@@ -1097,9 +1219,9 @@ mod tests {
     #[test]
     fn a_user_event_is_said_when_posted_and_once_if_cleared() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody, &unwatched, &quiet()).unwrap();
+        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()).unwrap();
         assert!(kq.collect(8, &Found::new()).is_empty());
-        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody, &unwatched, &quiet()).unwrap();
+        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody, &unwatched, &no_port, &quiet()).unwrap();
         let got = kq.collect(8, &Found::new());
         assert_eq!((got.len(), got[0].ident, got[0].fflags, got[0].udata), (1, 1, 5, 7));
         assert!(kq.collect(8, &Found::new()).is_empty());
@@ -1108,22 +1230,22 @@ mod tests {
     #[test]
     fn a_note_that_is_not_there_cannot_be_changed() {
         let kq = Kqueue::new(clock);
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EBADF));
-        assert_eq!(kq.change(&Event { filter: -9, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EOPNOTSUPP));
-        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &quiet()), Err(Errno::EINVAL));
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EBADF));
+        assert_eq!(kq.change(&Event { filter: -9, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EOPNOTSUPP));
+        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::EINVAL));
     }
 
     #[test]
     fn once_is_once_and_dispatch_waits_to_be_switched_on() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody, &unwatched, &quiet()).unwrap();
-        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody, &unwatched, &quiet()).unwrap();
+        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody, &unwatched, &no_port, &quiet()).unwrap();
+        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody, &unwatched, &no_port, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 2);
         assert!(kq.collect(8, &Found::new()).is_empty());
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &quiet()), Err(Errno::ENOENT));
-        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &quiet()).unwrap();
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()), Err(Errno::ENOENT));
+        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody, &unwatched, &no_port, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 1);
     }
 }
@@ -1140,7 +1262,7 @@ mod signal_tests {
         // Darwin's SIGUSR1 is 30, the kernel's 10.
         p.raise(10, None);
         let watch = Event { ident: 30, filter: filt::SIGNAL, flags: ev::ADD, udata: 9, ..Event::default() };
-        kq.change(&watch, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), p).unwrap();
+        kq.change(&watch, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), &|_| Err(Errno::ENOENT), p).unwrap();
         assert!(kq.collect(8, &Found::new()).is_empty());
         p.raise(10, None);
         p.raise(10, None);
@@ -1148,7 +1270,7 @@ mod signal_tests {
         let got = kq.collect(8, &Found::new());
         assert_eq!((got.len(), got[0].ident, got[0].data, got[0].flags & ev::CLEAR), (1, 30, 2, ev::CLEAR));
         assert!(kq.collect(8, &Found::new()).is_empty());
-        assert_eq!(kq.change(&Event { ident: 99, filter: filt::SIGNAL, flags: ev::ADD, ..Event::default() }, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), p), Ok(()));
+        assert_eq!(kq.change(&Event { ident: 99, filter: filt::SIGNAL, flags: ev::ADD, ..Event::default() }, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), &|_| Err(Errno::EBADF), &|_| Err(Errno::ENOENT), p), Ok(()));
         assert!(kq.collect(8, &Found::new()).is_empty());
     }
 }

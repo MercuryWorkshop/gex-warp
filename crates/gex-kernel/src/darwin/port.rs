@@ -78,6 +78,8 @@ pub mod opt {
     pub const SEND_MSG: u64 = 0x1;
     pub const RCV_MSG: u64 = 0x2;
     pub const RCV_LARGE: u64 = 0x4;
+    /// With `RCV_LARGE`: whose message was too large is said too.
+    pub const RCV_LARGE_IDENTITY: u64 = 0x8;
     pub const RCV_TIMEOUT: u64 = 0x100;
     /// `mach_msg2`: the message is a pair of vectors, not a buffer.
     pub const MSG_VECTOR: u64 = 0x1_0000_0000;
@@ -111,6 +113,9 @@ pub enum Kind {
     Clock,
     /// A semaphore, which is waited on and signalled by traps of its own.
     Semaphore,
+    /// A voucher: what a message carries of who it is sent for. It is a
+    /// name and nothing more here.
+    Voucher,
 }
 
 /// A message on a port's queue: what its receiver will be given, with the
@@ -195,6 +200,24 @@ pub struct Space {
     /// A page of the task's memory the kernel keeps, a word for each name
     /// (by the name's index): what a thread waiting on that name sleeps on.
     pub words: u64,
+    /// The wait queues told when a name has something, by name: those of
+    /// the kqueues with a note on it ([`super::kqueue`]).
+    watchers: HashMap<u32, Vec<u32>>,
+}
+
+/// What became of an attempt to receive ([`Kernel::darwin_port_receive`]).
+pub(super) enum Received {
+    /// A message, written: its size with its trailer.
+    Got(u64),
+    /// One with no room for it: its size without, and whose it is.
+    TooLarge { size: u64, name: u32 },
+    /// None; and when the nearest timer among the ports fires, if one is
+    /// armed.
+    Nothing(Option<u64>),
+    /// The name is of nothing to receive from.
+    NoName,
+    /// The message could not be written where it was to go.
+    BadBuffer,
 }
 
 impl Default for Space {
@@ -203,7 +226,7 @@ impl Default for Space {
         for (name, kind) in [(names::TASK, Kind::Task), (names::HOST, Kind::Host)] {
             names.insert(name, Entry { send: 1, ..Entry::of(Port::new(kind)) });
         }
-        Space { names, next: names::FIRST_ALLOCATED, words: 0 }
+        Space { names, next: names::FIRST_ALLOCATED, words: 0, watchers: HashMap::new() }
     }
 }
 
@@ -227,6 +250,59 @@ impl Space {
             self.names.insert(name, Entry { send: 1, ..Entry::of(Port::new(Kind::Thread(tid))) });
         }
         self.names.get_mut(&name)
+    }
+
+    /// The ports `name` receives from: its own, or a set's members.
+    /// `None`: it is a name for neither.
+    fn receives(&self, name: u32) -> Option<Vec<(u32, Arc<Port>)>> {
+        match self.names.get(&name) {
+            Some(e) if e.is_set() => Some(e.members.iter().filter_map(|n| self.names.get(n).map(|e| (*n, Arc::clone(&e.port)))).collect()),
+            Some(e) if e.recv => Some(vec![(name, Arc::clone(&e.port))]),
+            _ => None,
+        }
+    }
+
+    /// Whether `name` is one a kqueue may watch (a receive right, or a
+    /// set), and if not whether it is a name at all.
+    pub(super) fn watchable(&mut self, pid: i32, name: u32) -> Result<(), Errno> {
+        match self.entry(pid, name) {
+            Some(e) if e.recv || e.is_set() => Ok(()),
+            Some(_) => Err(Errno::EOPNOTSUPP),
+            None => Err(Errno::ENOENT),
+        }
+    }
+
+    /// `queue` is told when `name` has something, from now on; or no more.
+    pub(super) fn watch(&mut self, name: u32, queue: u32) {
+        self.watchers.entry(name).or_default().push(queue);
+    }
+
+    pub(super) fn unwatch(&mut self, name: u32, queue: u32) {
+        if let Some(v) = self.watchers.get_mut(&name) {
+            if let Some(at) = v.iter().position(|q| *q == queue) {
+                v.remove(at);
+            }
+            if v.is_empty() {
+                self.watchers.remove(&name);
+            }
+        }
+    }
+
+    /// Whose message a receive from `name` would be given at `now`, if
+    /// there is one (a timer whose moment has come has one); and when the
+    /// nearest timer still to come fires.
+    pub(super) fn pending(&self, name: u32, now: u64) -> (Option<u32>, Option<u64>) {
+        let mut nearest: Option<u64> = None;
+        for (member, port) in self.receives(name).unwrap_or_default() {
+            let st = port.state();
+            if !st.queue.is_empty() || st.timer.is_some_and(|when| when <= now) {
+                return (Some(member), None);
+            }
+            if let Some(when) = st.timer {
+                nearest = Some(nearest.map_or(when, |n| n.min(when)));
+            }
+        }
+        (None, nearest)
     }
 
     fn drop_if_empty(&mut self, name: u32) {
@@ -424,6 +500,9 @@ impl Kernel {
     /// Say that `names` have something for whoever waits on them.
     fn darwin_wake(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, names: &[u32], all: bool) {
         for &name in names {
+            for queue in sp.watchers.get(&name).into_iter().flatten() {
+                crate::wait::notify(*queue);
+            }
             if let Ok(at) = self.darwin_word(m, sp, name) {
                 let v = m.read_u32(at).unwrap_or(0);
                 let _ = m.write_u32(at, v.wrapping_add(1));
@@ -468,6 +547,17 @@ impl Kernel {
             Some(e) => Ok(Arc::clone(&e.port)),
         };
         Some(match n {
+            // (host, recipes, their size, out voucher): a voucher made to
+            // the recipes, which libdispatch asks for before it first sends
+            // for anyone. What it is made of is not kept.
+            t::HOST_CREATE_MACH_VOUCHER => {
+                if x[0] as u32 != names::HOST {
+                    MACH_SEND_INVALID_DEST
+                } else {
+                    let name = sp.give(Port::new(Kind::Voucher), disp::MOVE_SEND);
+                    kern(m.write_u32(x[3], name).map(|_| 0))
+                }
+            }
             t::MK_TIMER_CREATE => {
                 let name = sp.allocate(Kind::User);
                 sp.names[&name].port.state().is_timer = true;
@@ -840,12 +930,41 @@ impl Kernel {
         if c.option & opt::RCV_MSG == 0 {
             return Err(MACH_MSG_SUCCESS);
         }
-        // What is asked of: a receive right, or a set of them.
-        let from = match sp.names.get(&c.rcv_name) {
-            Some(e) if e.is_set() => e.members.iter().filter_map(|n| sp.names.get(n).map(|e| (*n, Arc::clone(&e.port)))).collect::<Vec<_>>(),
-            Some(e) if e.recv => vec![(c.rcv_name, Arc::clone(&e.port))],
-            _ => return Err(MACH_RCV_INVALID_NAME),
+        let nearest = match self.darwin_port_receive(m, &mut sp, c.rcv_name, c.rcv_at, c.rcv_size, c.option & opt::RCV_LARGE != 0) {
+            Received::Got(_) => return Err(MACH_MSG_SUCCESS),
+            Received::TooLarge { .. } => return Err(MACH_RCV_TOO_LARGE),
+            Received::NoName => return Err(MACH_RCV_INVALID_NAME),
+            Received::BadBuffer => return Err(MACH_RCV_INVALID_DATA),
+            Received::Nothing(nearest) => nearest,
         };
+        // Nothing there: say so, or wait to be told to look again. A wait
+        // that ends at a timer's moment was not timed out: it looks again,
+        // and finds the timer's message.
+        let now = clock_ns(self.clock, 1);
+        let timeout = (c.option & opt::RCV_TIMEOUT != 0).then_some(c.timeout * 1_000_000);
+        if timeout == Some(0) {
+            return Err(MACH_RCV_TIMED_OUT);
+        }
+        let until_timer = nearest.map(|when| when.saturating_sub(now).max(1));
+        let timer_first = until_timer.is_some_and(|t| timeout.is_none_or(|u| t < u));
+        let timeout = if timer_first { until_timer } else { timeout };
+        match self.darwin_wait(m, &mut sp, c.rcv_name, timeout, a) {
+            Ok(call) => {
+                let timed_out = if timer_first { MACH_RCV_INTERRUPTED } else { MACH_RCV_TIMED_OUT };
+                self.darwin_post = Post::Wake { woken: MACH_RCV_INTERRUPTED as u32, timed_out: timed_out as u32 };
+                Ok(call)
+            }
+            Err(_) => Err(MACH_RCV_INVALID_DATA),
+        }
+    }
+
+    /// The receiving half, without the wait: the first message of what
+    /// `rcv_name` receives from, into the `rcv_size` bytes at `rcv_at`,
+    /// its rights into the caller's space. One too large for the room
+    /// stays queued if `large`, and is gone otherwise.
+    pub(super) fn darwin_port_receive(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, rcv_name: u32, rcv_at: u64, rcv_size: u64, large: bool) -> Received {
+        // What is asked of: a receive right, or a set of them.
+        let Some(from) = sp.receives(rcv_name) else { return Received::NoName };
         // A timer whose moment has come has its message now (24 bytes of
         // nothing, as `mk_timer_expire` sends); the nearest still to come
         // is how long a wait may be.
@@ -866,20 +985,20 @@ impl Kernel {
             let mut st = port.state();
             let Some(msg) = st.queue.front() else { continue };
             let size = HEADER + msg.body.len() as u64;
-            if size + TRAILER > c.rcv_size {
+            if size + TRAILER > rcv_size {
                 // Too large: with RCV_LARGE it stays queued and its size
                 // is said; without, it is gone.
                 let mut head = [0u8; HEADER as usize];
                 put32(&mut head, 4, size as u32);
                 put32(&mut head, 12, name);
                 put32(&mut head, 20, msg.id);
-                if c.option & opt::RCV_LARGE == 0 {
+                if !large {
                     st.queue.pop_front();
                 }
-                if c.rcv_size >= HEADER {
-                    let _ = m.write(c.rcv_at, &head);
+                if rcv_size >= HEADER {
+                    let _ = m.write(rcv_at, &head);
                 }
-                return Err(MACH_RCV_TOO_LARGE);
+                return Received::TooLarge { size, name };
             }
             let msg = st.queue.pop_front().unwrap();
             drop(st);
@@ -905,29 +1024,12 @@ impl Kernel {
             put32(&mut out, 20, msg.id);
             // The trailer: format 0, eight bytes.
             put32(&mut out, size as usize + 4, TRAILER as u32);
-            return Err(match m.write(c.rcv_at, &out) {
-                Ok(()) => MACH_MSG_SUCCESS,
-                Err(_) => MACH_RCV_INVALID_DATA,
-            });
+            return match m.write(rcv_at, &out) {
+                Ok(()) => Received::Got(size + TRAILER),
+                Err(_) => Received::BadBuffer,
+            };
         }
-        // Nothing there: say so, or wait to be told to look again. A wait
-        // that ends at a timer's moment was not timed out: it looks again,
-        // and finds the timer's message.
-        let timeout = (c.option & opt::RCV_TIMEOUT != 0).then_some(c.timeout * 1_000_000);
-        if timeout == Some(0) {
-            return Err(MACH_RCV_TIMED_OUT);
-        }
-        let until_timer = nearest.map(|when| (when - now).max(1));
-        let timer_first = until_timer.is_some_and(|t| timeout.is_none_or(|u| t < u));
-        let timeout = if timer_first { until_timer } else { timeout };
-        match self.darwin_wait(m, &mut sp, c.rcv_name, timeout, a) {
-            Ok(call) => {
-                let timed_out = if timer_first { MACH_RCV_INTERRUPTED } else { MACH_RCV_TIMED_OUT };
-                self.darwin_post = Post::Wake { woken: MACH_RCV_INTERRUPTED as u32, timed_out: timed_out as u32 };
-                Ok(call)
-            }
-            Err(_) => Err(MACH_RCV_INVALID_DATA),
-        }
+        Received::Nothing(nearest)
     }
 
     /// The sending half: the message leaves the caller's memory and its
@@ -1156,6 +1258,13 @@ impl Kernel {
             }
             // _host_page_size(host, out size)
             (Kind::Host, 202) => plain(0, &abi::PAGE_SIZE.to_le_bytes()),
+            // host_request_notification(host, what, port): to be told when
+            // the calendar is set, which it never is here. (The request
+            // has the port before the NDR record.)
+            (Kind::Host, 217) => plain(if get32(&req.body, 24) <= 1 { 0 } else { KERN_INVALID_ARGUMENT as i32 }, &[]),
+            // host_get_special_port(host, node, which, out port): none
+            // that a program without privilege may have.
+            (Kind::Host, 412) => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             // host_get_clock_service(host, clock id, out clock)
             (Kind::Host, 206) => with_port(Port::new(Kind::Clock)),
             // clock_get_time(clock, out mach_timespec): the system clock,

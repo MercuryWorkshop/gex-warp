@@ -209,6 +209,15 @@ static void *waiter(void *arg) {
     return 0;
 }
 
+static void napms(int ms);
+static void post(u32 to, int id, int words);
+// (For `queues`: a message to the shared port, a while from now.)
+static void *late(void *arg) {
+    napms(40);
+    post(shared_port, 9, 1);
+    return arg;
+}
+
 static void napms(int ms) {
     struct t_timeval tv = {0, ms * 1000};
     SYS(SYS_select, 0, 0, 0, 0, &tv);
@@ -406,6 +415,154 @@ static void kernel_ports(void) {
     show_type("the send-once right, used", once);
 }
 
+// A kqueue told of messages (EVFILT_MACHPORT), which is how libdispatch
+// waits for them: whose message waits; or the message itself, received
+// into a buffer of the note's, or of the call's (kevent_qos).
+enum { SYS_kqueue = 362, SYS_kevent64 = 369, SYS_kevent_qos = 374 };
+enum { MACHPORT = -8, EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISPATCH = 0x80, RCV_LARGE_IDENTITY = 8 };
+struct kevent64 {
+    u64 ident;
+    short filter;
+    u16 flags;
+    u32 fflags;
+    i64 data;
+    u64 udata, ext[2];
+};
+struct kevent_qos {
+    u64 ident;
+    short filter;
+    u16 flags;
+    int qos;
+    u64 udata;
+    u32 fflags, xflags;
+    i64 data;
+    u64 ext[4];
+};
+
+static long kq;
+static u32 P, Q, S;
+static struct message into;
+
+static const char *whose(u64 n) { return n == P ? "P" : n == Q ? "Q" : n == S ? "S" : n == 0 ? "none" : "another"; }
+static const char *where(u64 at) { return at == (u64)&into ? "the buffer" : at ? "elsewhere" : "nowhere"; }
+
+static void told(const char *what) {
+    static const struct t_timespec none = {0, 0};
+    struct kevent64 e[4];
+    t_memset(e, 0, sizeof e);
+    long n = SYS(SYS_kevent64, kq, 0, 0, e, 4, 0, &none);
+    t_printf("%s: %ld\n", what, n);
+    // (In the order of the names, which is not the kernel's to keep.)
+    for (int k = 0; k < 3; k++)
+        for (long i = 0; i < n && i < 4; i++)
+            if (e[i].ident == (k == 0 ? P : k == 1 ? Q : S))
+                t_printf("  %s: flags 0x%x fflags 0x%x, whose %s, at %s, %lu bytes\n", whose(e[i].ident), e[i].flags, e[i].fflags, whose((u64)e[i].data), where(e[i].ext[0]), (unsigned long)e[i].ext[1]);
+}
+static long note(u32 name, int flags, u32 fflags, void *at, u64 room) {
+    struct kevent64 e = {name, MACHPORT, (u16)flags, fflags, 0, 0, {(u64)at, room}};
+    return SYS(SYS_kevent64, kq, &e, 1, 0, 0, 0, 0);
+}
+static void post(u32 to, int id, int words) {
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h = (struct header){MAKE_SEND, 0, to, 0, 0, id};
+    m.body[0] = (u32)id * 10;
+    long r = send(&m, sizeof m.h + 4 * (u32)words);
+    if (r) t_printf("send: %lx\n", r);
+}
+static void take(u32 from) {
+    static struct message m;
+    long r = receive(&m, from, sizeof m);
+    t_printf("  received from %s: %lx, id %d of %s\n", whose(from), r, r ? 0 : m.h.id, r ? "none" : whose(m.h.local));
+}
+
+static void queues(void) {
+    P = allocate(RIGHT_RECEIVE), Q = allocate(RIGHT_RECEIVE), S = allocate(RIGHT_PORT_SET);
+    TRAP(TRAP_port_insert_member, task, Q, S);
+    kq = SYS(SYS_kqueue);
+    t_show("watch a port", note(P, EV_ADD, 0, 0, 0));
+    t_show("watch a set", note(S, EV_ADD, 0, 0, 0));
+    t_show("watch what is not received from", note(task, EV_ADD, 0, 0, 0));
+    t_show("watch no name", note(0x123457, EV_ADD, 0, 0, 0));
+    told("nothing sent");
+    post(P, 1, 1);
+    told("one to the port");
+    told("still");
+    post(Q, 2, 1);
+    told("and one to the set's");
+    take(P);
+    told("the port's received");
+    take(S);
+    told("and the set's");
+
+    // Received by the queue: into the note's buffer, once until the note
+    // is put on again.
+    t_show("unwatch the port", note(P, EV_DELETE, 0, 0, 0));
+    t_show("and the set", note(S, EV_DELETE, 0, 0, 0));
+    t_show("watch the port, to receive", note(P, EV_ADD | EV_DISPATCH, RCV_MSG, &into, sizeof into));
+    post(P, 3, 2);
+    t_memset(&into, 0x55, sizeof into);
+    told("one to it");
+    u32 *trailer = (u32 *)((char *)&into + into.h.size);
+    t_printf("  in the buffer: bits %x, %u bytes, from %s, id %d, %u; a trailer of type %u, %u bytes\n", into.h.bits, into.h.size, whose(into.h.local), into.h.id, into.body[0], trailer[0], trailer[1]);
+    told("and then");
+    post(P, 4, 1);
+    told("another, the note not on");
+    t_show("on again", note(P, EV_ENABLE, RCV_MSG, &into, sizeof into));
+    told("now");
+    // With too little room, the message stays if that was asked, and whose
+    // it is is said if that was.
+    t_show("room for little", note(P, EV_ENABLE, RCV_MSG | RCV_LARGE | RCV_LARGE_IDENTITY, &into, 32));
+    post(P, 5, 8);
+    told("a long one");
+    t_show("on again, not asked whose", note(P, EV_ENABLE, RCV_MSG | RCV_LARGE, &into, 32));
+    told("now");
+    t_show("on again, not asked to keep it", note(P, EV_ENABLE, RCV_MSG, &into, 32));
+    told("now");
+    take(P);
+    SYS(SYS_close, kq);
+
+    // kevent_qos is given room for the call's messages, and says how much
+    // it left; with none, the message is the caller's to receive.
+    kq = SYS(SYS_kqueue);
+    struct kevent_qos c = {P, MACHPORT, EV_ADD | EV_DISPATCH, 0, 7, RCV_MSG, 0, 0, {0, 0, 0, 0}}, g[2];
+    u64 room = sizeof into;
+    long n = SYS(SYS_kevent_qos, kq, &c, 1, g, 2, &into, &room, 1);
+    t_printf("kevent_qos, watching: %ld, room %lu\n", n, (unsigned long)room);
+    post(P, 6, 3);
+    t_memset(g, 0, sizeof g);
+    n = SYS(SYS_kevent_qos, kq, 0, 0, g, 2, &into, &room, 1);
+    t_printf("kevent_qos: %ld, room left %lu; %s flags 0x%x fflags 0x%x, whose %s, at %s, %lu bytes, id %d\n", n, (unsigned long)room, whose(g[0].ident), g[0].flags, g[0].fflags, whose((u64)g[0].data), where(g[0].ext[0]), (unsigned long)g[0].ext[1], into.h.id);
+    c.flags = EV_ENABLE;
+    SYS(SYS_kevent_qos, kq, &c, 1, 0, 0, 0, 0, 1);
+    post(P, 7, 1);
+    t_memset(g, 0, sizeof g);
+    n = SYS(SYS_kevent_qos, kq, 0, 0, g, 2, 0, 0, 1);
+    t_printf("kevent_qos, no room: %ld; %s flags 0x%x fflags 0x%x, whose %s, at %s, %lu bytes\n", n, whose(g[0].ident), g[0].flags, g[0].fflags, whose((u64)g[0].data), where(g[0].ext[0]), (unsigned long)g[0].ext[1]);
+    take(P);
+    SYS(SYS_close, kq);
+
+    // A message there before the queue looked; and one waited for, sent
+    // by another thread a while on.
+    kq = SYS(SYS_kqueue);
+    post(P, 8, 1);
+    note(P, EV_ADD, 0, 0, 0);
+    note(Q, EV_ADD, 0, 0, 0);
+    told("sent before it was watched");
+    take(P);
+    shared_port = Q;
+    int th = t_thread_start(late, 0);
+    struct kevent64 e;
+    struct t_timespec long_ = {20, 0};
+    u64 t0 = t_nanos();
+    n = SYS(SYS_kevent64, kq, 0, 0, &e, 1, 0, &long_);
+    t_printf("waited for: %ld, %s, whose %s\n", n, n == 1 ? whose(e.ident) : "none", n == 1 ? whose((u64)e.data) : "none");
+    t_check("for a while", t_nanos() - t0 >= 30000000ull && t_nanos() - t0 < 10000000000ull);
+    t_thread_join(th);
+    take(Q);
+    SYS(SYS_close, kq);
+}
+
 #if defined(__arm64__)
 // A timer: a port of the task's that the kernel sends a message to at a
 // moment on mach_absolute_time's clock, which is what a run loop waits
@@ -466,6 +623,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     messages();
     threads();
     kernel_ports();
+    queues();
 #if defined(__arm64__)
     timers();
 #endif
