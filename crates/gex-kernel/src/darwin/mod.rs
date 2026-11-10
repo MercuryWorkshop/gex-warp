@@ -20,6 +20,7 @@
 
 pub mod abi;
 mod attr;
+mod reclaim;
 mod bsd;
 pub mod info;
 pub mod kqueue;

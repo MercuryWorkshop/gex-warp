@@ -227,7 +227,11 @@ the image low. What works is what a program can do with the kernel alone:
   that waits), timers the kernel sends a message for (`mk_timer_create`,
   what a run loop waits on), semaphores (and so `__semwait_signal`, which is how the
   libc sleeps), and the few MIG routines of the task's, the host's and the
-  clock's ports that those and libpthread need (`host_info` among them).
+  clock's ports that those and libpthread need (`host_info` among them);
+- the ring a task lists memory in for the kernel to take back
+  (`mach_vm_reclaim`), where libmalloc keeps what it has freed and may
+  want again: taken back when the task asks, and each time it says how
+  much it holds.
 
 What does not, yet:
 

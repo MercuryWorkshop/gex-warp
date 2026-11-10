@@ -160,6 +160,22 @@ impl Kernel {
                 std::thread::yield_now();
                 KERN_SUCCESS
             }
+            // (task, bytes taken back*, when to come next*): the task
+            // says how much its ring holds, and what is in it is taken
+            // back ([`super::reclaim`]).
+            t::MACH_VM_RECLAIM_UPDATE_KERNEL_ACCOUNTING => {
+                if x[0] as u32 != port::TASK {
+                    MACH_SEND_INVALID_DEST
+                } else {
+                    match self.darwin_reclaim_take(m, u64::MAX) {
+                        Some(bytes) => {
+                            let next = self.darwin_reclaim_deadline();
+                            kern(m.write_u64(x[1], bytes).and_then(|_| m.write_u64(x[2], next)).map(|_| 0))
+                        }
+                        None => KERN_INVALID_ARGUMENT,
+                    }
+                }
+            }
             _ => self.darwin_unimplemented_trap(n, KERN_NOT_SUPPORTED),
         })
     }

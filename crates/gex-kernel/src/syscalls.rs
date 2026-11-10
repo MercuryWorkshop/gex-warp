@@ -742,6 +742,9 @@ pub struct Kernel {
     /// `workq_kernreturn` being answered ends in.
     pub darwin_workq: Arc<std::sync::Mutex<darwin::workq::Workq>>,
     pub darwin_workq_does: Option<darwin::workq::Does>,
+    /// Where a Darwin task's ring of memory to be taken back is
+    /// ([`darwin::reclaim`]), once it has one and this kernel knows of it.
+    pub darwin_reclaim: Option<u64>,
     /// Whether the process's memory has its commpage
     /// ([`darwin::commpage`]): mapped at its first call, and a fork's copy
     /// has its parent's.
@@ -9848,6 +9851,7 @@ impl Kernel {
             darwin_kevent_pages: Default::default(),
             darwin_workq: Default::default(),
             darwin_workq_does: None,
+            darwin_reclaim: None,
             darwin_commpage: false,
             darwin_os: Default::default(),
             darwin_threads: Default::default(),
@@ -9998,6 +10002,7 @@ impl Kernel {
         self.darwin_kevent_pages.clear();
         self.darwin_workq = Default::default();
         self.darwin_workq_does = None;
+        self.darwin_reclaim = None;
         self.darwin_spawn_at = None;
     }
 
@@ -10315,6 +10320,8 @@ impl Kernel {
             darwin_kevent_pages: Default::default(),
             darwin_workq: Default::default(),
             darwin_workq_does: None,
+            // (The child's memory is the parent's, its ring with it.)
+            darwin_reclaim: self.darwin_reclaim,
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
             // The child's libpthread is the parent's, registered already.

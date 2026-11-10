@@ -1191,6 +1191,39 @@ impl Kernel {
             // which is how an allocator reserves a range it will not yet
             // touch). One descriptor, the memory object's port, comes
             // before the NDR record; only no object is anonymous memory.
+            // The task's ring of memory to be taken back
+            // ([`super::reclaim`]): made (len, max_len after the NDR
+            // record), some of it taken back at once (how many entries),
+            // made a different length (which empties it), and where it is.
+            // Each answers how much was taken and when the task should
+            // next say what it holds.
+            (Kind::Task, 4822) => match self.darwin_reclaim_allocate(m, get32(&req.body, 8) as u64, get32(&req.body, 12) as u64) {
+                Ok(at) => {
+                    let mut out = at.to_le_bytes().to_vec();
+                    out.extend_from_slice(&self.darwin_reclaim_deadline().to_le_bytes());
+                    plain(0, &out)
+                }
+                Err(why) => plain(why as i32, &[]),
+            },
+            (Kind::Task, 4823 | 4826) => {
+                let most = if req.id == 4823 { get32(&req.body, 8) as u64 } else { u64::MAX };
+                match self.darwin_reclaim_take(m, most) {
+                    Some(bytes) => {
+                        let mut out = bytes.to_le_bytes().to_vec();
+                        out.extend_from_slice(&self.darwin_reclaim_deadline().to_le_bytes());
+                        plain(0, &out)
+                    }
+                    None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
+            (Kind::Task, 4828) => match self.darwin_reclaim_query(m) {
+                Some((at, size)) => {
+                    let mut out = at.to_le_bytes().to_vec();
+                    out.extend_from_slice(&size.to_le_bytes());
+                    plain(0, &out)
+                }
+                None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+            },
             (Kind::Task, 4811) => {
                 let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
                 let (want, size, mask, flags, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, get32(&req.body, 64) & 7);
