@@ -194,6 +194,10 @@ the image low. What works is what a program can do with the kernel alone:
   none), so the version a program sees is a setting of the root it runs
   in, as a Windows version is of a Wine prefix;
 - sockets: unix and TCP, descriptors passed in a control message;
+- the commpage, on arm64: the page of facts about the machine libSystem
+  reads instead of asking. XNU's is past the end of a guest's memory, so
+  it is at `0xFFC000` (and its read-only half at `0xFF4000`), and a
+  userland built for gex is built to look there;
 - Mach ports within a task: names and the rights under them, `mach_msg2`
   between threads (a reply port, rights in the body, port sets, a receive
   that waits), semaphores (and so `__semwait_signal`, which is how the

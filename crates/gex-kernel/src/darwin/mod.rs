@@ -54,6 +54,31 @@ pub const MDEP: u64 = 0x3_0000;
 /// One past the last of them.
 pub const END: u64 = 0x4_0000;
 
+/// The commpage: a page of facts about the machine that XNU maps into
+/// every process, and that libSystem reads instead of asking (the page
+/// size, the processors, what the processor can do).
+///
+/// XNU's is at `0xFFFFFC000` on arm64, with a second, read-only page two
+/// below it at `0xFFFFF4000`: past the end of any memory a guest has. So it
+/// is here, just under where a program is loaded, the two pages the same
+/// distance apart; and a userland built for gex is built with these
+/// addresses where Apple's headers have XNU's
+/// (`_COMM_PAGE64_BASE_ADDRESS`, `_COMM_PAGE64_RO_ADDRESS`). A library
+/// Apple built looks where XNU's is and finds nothing.
+pub mod commpage {
+    pub const DATA: u64 = 0x00ff_c000;
+    pub const RO: u64 = 0x00ff_4000;
+    pub const PAGE: u64 = 0x4000;
+    /// `_COMM_PAGE_THIS_VERSION`.
+    pub const VERSION: u16 = 3;
+    /// `_cpu_capabilities`: a 128-byte cache line, the thread pointer in a
+    /// register user code can read, Advanced SIMD, VFP, fused multiply-add,
+    /// the atomics of ARMv8.1, CRC32, LDAPR, synchronous floating-point
+    /// exceptions; and the processor count in bits 16 to 23.
+    pub const CAPABILITIES: u64 = 0x40 | 0x80 | 0x100 | 0x400 | 0x2000 | 0x0200_0000 | 0x0400_0000 | 1 << 48 | 1 << 58;
+    pub const UP: u64 = 0x8000;
+}
+
 /// The first Mach port name a task allocates.
 pub const FIRST_PORT_NAME: u32 = mach::port::FIRST_ALLOCATED;
 
@@ -175,6 +200,10 @@ impl Kernel {
     /// register.
     pub(super) fn darwin_translate(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &mut [u64; 6]) -> u64 {
         self.darwin_post = Post::None;
+        if !self.darwin_commpage {
+            self.darwin_commpage = true;
+            self.darwin_map_commpage(m);
+        }
         let mut x = self.darwin_args(m);
         let class = if gex_abi::X86 {
             match (raw >> 24) & 0xff {
@@ -221,6 +250,42 @@ impl Kernel {
             a.copy_from_slice(&x[..6]);
         }
         n
+    }
+
+    /// Map the [`commpage`] and fill it in: at a process's first call, which
+    /// comes before anything of libSystem's reads it. arm64's; x86-64's has
+    /// another layout, and a clock a program computes from, and is not here
+    /// yet.
+    fn darwin_map_commpage(&mut self, m: &mut GuestMem<'_>) {
+        if gex_abi::X86 {
+            return;
+        }
+        let cpus = crate::cpus::count().min(255) as u8;
+        let caps = commpage::CAPABILITIES | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
+        let mut page = [0u8; 0x100];
+        page[..16].copy_from_slice(b"commpage 64-bit\0");
+        page[0x10..0x18].copy_from_slice(&caps.to_le_bytes());
+        page[0x1e..0x20].copy_from_slice(&commpage::VERSION.to_le_bytes());
+        page[0x20..0x24].copy_from_slice(&(caps as u32).to_le_bytes());
+        // The processor count; the page shifts of 32- and 64-bit processes;
+        // the cache line; one cluster; the counts again; the kernel's page.
+        page[0x22] = cpus;
+        page[0x24] = 14;
+        page[0x25] = 14;
+        page[0x26..0x28].copy_from_slice(&128u16.to_le_bytes());
+        page[0x2f] = 1;
+        page[0x34..0x37].fill(cpus);
+        page[0x37] = 14;
+        // The memory's size and the processor's family, as `sysctl` has them.
+        page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
+        page[0x80..0x84].copy_from_slice(&0x1b58_8bb3u32.to_le_bytes());
+        // 0x40, the time of day, and 0x90, whether the clock can be read
+        // without the kernel, are zero: libSystem asks.
+        for at in [commpage::RO, commpage::DATA] {
+            if self.mem.mmap_anon(m, at, commpage::PAGE, 3, mflags::FIXED_NOREPLACE, false, "[commpage]").is_ok() {
+                let _ = m.write(at, &page);
+            }
+        }
     }
 
     /// One of this module's own calls ([`NATIVE`], [`MACH`], [`MDEP`]).
