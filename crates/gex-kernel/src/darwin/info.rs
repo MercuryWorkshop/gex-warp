@@ -65,6 +65,9 @@ impl Os {
 }
 
 const CTL_KERN: i32 = 1;
+const CTL_NET: i32 = 4;
+const PF_ROUTE: i32 = 17;
+const NET_RT_IFLIST: i32 = 3;
 const CTL_VM: i32 = 2;
 const CTL_HW: i32 = 6;
 const CTL_USER: i32 = 8;
@@ -427,6 +430,10 @@ impl Kernel {
                 };
                 self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(procs))
             }
+            // The routing table's list of interfaces and their addresses
+            // (`NET_RT_IFLIST`), which is what `getifaddrs` reads: for an
+            // address family or all (0), one interface or all (0).
+            [CTL_NET, PF_ROUTE, 0, family, NET_RT_IFLIST, index] => self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(interface_list(family, index))),
             [CTL_HW, HW_PAGESIZE] => {
                 self.darwin_sysctl_out(m, old, oldlenp, Val::Int(abi::PAGE_SIZE as i64))?;
                 if new != 0 { Err(Errno::EPERM) } else { Ok(0) }
@@ -793,4 +800,70 @@ mod tests {
         assert_eq!(os("27.0.1", "26A434").release, "27.0.0");
         assert_eq!(Os::from_plist(b"not a plist"), None);
     }
+}
+
+/// What `sysctl` answers for the list of interfaces: for each, a routing
+/// message that says what it is (`RTM_IFINFO`: an `if_msghdr` and its
+/// link-level address), then one for each address it has (`RTM_NEWADDR`:
+/// an `ifa_msghdr`, then the netmask, the address and where a broadcast
+/// goes, in the order of their bits). The kernel's two
+/// are named as a Mac names its own: `lo0` and `en0`.
+fn interface_list(family: i32, only: i32) -> Vec<u8> {
+    const AF_INET: i32 = 2;
+    // RTA_NETMASK, RTA_IFA, RTA_BRD.
+    const ADDRS: i32 = 0x04 | 0x20 | 0x80;
+    let mut out = Vec::new();
+    for (index, loopback, mtu, mac, addr, prefix) in crate::netlink::interfaces() {
+        if only != 0 && only as u32 != index {
+            continue;
+        }
+        // IFF_UP | IFF_RUNNING | IFF_MULTICAST, and what kind it is:
+        // IFF_LOOPBACK, or IFF_BROADCAST | IFF_NOTRAILERS | IFF_SIMPLEX.
+        let flags: i32 = 0x8041 | if loopback { 0x8 } else { 0x822 };
+        // A `sockaddr_dl`: the interface's name, then its hardware address.
+        let name: &[u8] = if loopback { b"lo0" } else { b"en0" };
+        let mut link = vec![20u8, 18, index as u8, (index >> 8) as u8, if loopback { 0x18 } else { 0x06 }, 3, if loopback { 0 } else { 6 }, 0];
+        link.extend_from_slice(name);
+        if !loopback {
+            link.extend_from_slice(&mac);
+        }
+        link.resize(20, 0);
+        // The `if_msghdr`: its length, version 5, RTM_IFINFO, which
+        // addresses follow (RTA_IFP), the flags, the index, and an
+        // `if_data` that says the kind, the address's length and the MTU.
+        let mut m = vec![0u8; 112];
+        m[0..2].copy_from_slice(&132u16.to_le_bytes());
+        (m[2], m[3]) = (5, 0x0e);
+        m[4..8].copy_from_slice(&0x10i32.to_le_bytes());
+        m[8..12].copy_from_slice(&flags.to_le_bytes());
+        m[12..14].copy_from_slice(&(index as u16).to_le_bytes());
+        (m[16], m[19]) = (if loopback { 0x18 } else { 0x06 }, if loopback { 0 } else { 6 });
+        m[24..28].copy_from_slice(&(if loopback { 16384 } else { mtu }).to_le_bytes());
+        out.extend_from_slice(&m);
+        out.extend_from_slice(&link);
+        if family != 0 && family != AF_INET {
+            continue;
+        }
+        let inet = |a: [u8; 4]| {
+            let mut s = [0u8; 16];
+            (s[0], s[1]) = (16, AF_INET as u8);
+            s[4..8].copy_from_slice(&a);
+            s
+        };
+        let mask = (!0u32).checked_shl(32 - prefix as u32).unwrap_or(0).to_be_bytes();
+        let broadcast = if loopback { addr } else { std::array::from_fn(|i| addr[i] | !mask[i]) };
+        // The `ifa_msghdr`: length, version, RTM_NEWADDR, the addresses
+        // that follow, flags (RTF_UP), the index, a metric.
+        let mut a = vec![0u8; 20];
+        a[0..2].copy_from_slice(&(20u16 + 16 + 16 + 16).to_le_bytes());
+        (a[2], a[3]) = (5, 0x0c);
+        a[4..8].copy_from_slice(&ADDRS.to_le_bytes());
+        a[8..12].copy_from_slice(&1i32.to_le_bytes());
+        a[12..14].copy_from_slice(&(index as u16).to_le_bytes());
+        out.extend_from_slice(&a);
+        out.extend_from_slice(&inet(mask));
+        out.extend_from_slice(&inet(addr));
+        out.extend_from_slice(&inet(broadcast));
+    }
+    out
 }

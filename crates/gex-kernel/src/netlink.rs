@@ -113,6 +113,14 @@ const IFACES: [Iface; 2] = [
     },
 ];
 
+/// The machine's interfaces, for a personality that lists them its own
+/// way: each one's index, whether it is the loopback, its MTU, its
+/// hardware address, its IPv4 address and how many bits of that are the
+/// network's.
+pub fn interfaces() -> impl Iterator<Item = (u32, bool, u32, [u8; 6], [u8; 4], u8)> {
+    IFACES.iter().map(|i| (i.index, i.kind == ARPHRD_LOOPBACK, i.mtu, i.mac, i.addr, i.prefix))
+}
+
 /// A route socket: the replies written requests are owed, a datagram each.
 #[derive(Debug)]
 pub struct NetlinkRoute {
