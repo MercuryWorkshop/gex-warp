@@ -3484,6 +3484,8 @@ pub extern "C" fn k_inotify_queue(id: i32) -> u32 {
 #[no_mangle]
 pub extern "C" fn k_fs_unlink(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     let p = path_of(path, path_len);
+    // (A FIFO of that name has its pipe no longer: `k_fifo`.)
+    gex_kernel::pipe::Fifos::system().forget(&p);
     if let Some((m, rel)) = pagefs::find(&p) {
         return as_unit(m.unlink(&rel));
     }
@@ -3536,6 +3538,7 @@ pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem
     // Bit 0 is RENAME_NOREPLACE; above it, the holds the caller has taken
     // (`remote::Remote::rename2`).
     let (from, to) = (path_of(from, from_len), path_of(to, to_len));
+    gex_kernel::pipe::Fifos::system().rename(&from, &to);
     match (pagefs::find(&from), pagefs::find(&to)) {
         (None, None) => as_unit(rootfs().rename2_as(&from, &to, noreplace & 1 != 0, noreplace >> 1)),
         (Some((a, f)), Some((b, t))) if std::sync::Arc::ptr_eq(&a, &b) => as_unit(a.rename2(&f, &t, noreplace & 1 != 0)),
@@ -3705,6 +3708,46 @@ pub extern "C" fn k_fs_link(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::
         return -18; // EXDEV
     }
     as_unit(rootfs().link(&from, &to))
+}
+
+/// Put a FIFO at a path (`remote::Remote::mkfifo`).
+#[no_mangle]
+pub extern "C" fn k_fs_mkfifo(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
+    use gex_kernel::vfs::FileSystem;
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.mkfifo(&rel, mode));
+    }
+    as_unit(rootfs().mkfifo(&p, mode))
+}
+
+/// Open the pipe of the FIFO at a path (`pipe::Remote::fifo`,
+/// `gex_kernel::pipe::Fifos`): bit 0 of `how` to write, bit 1 not to wait,
+/// bit 2 to read and write both. The pipe's id, that end (or both) counted
+/// for `pid`, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_fifo(path: gex_kmem::PAddr, path_len: u32, how: u32, pid: i32) -> i32 {
+    let p = path_of(path, path_len);
+    let (write, both) = (how & 1 != 0, how & 4 != 0);
+    let tag = |pipe: &std::sync::Arc<gex_kernel::pipe::Pipe>| {
+        let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
+        t.push(std::sync::Arc::clone(pipe));
+        (t.len() - 1) as i32
+    };
+    let all = gex_kernel::pipe::Fifos::system();
+    let opened = if both { Ok(all.open_both(&p, tag)) } else { all.open(&p, write, how & 2 != 0, tag) };
+    match opened {
+        Ok((_, id)) => {
+            let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
+            let held = h.entry(pid).or_default();
+            if both {
+                held.push((id, false));
+            }
+            held.push((id, write));
+            id
+        }
+        Err(e) => -e.0,
+    }
 }
 
 /// Put a socket node at a path, so the name can be *seen*, not only connected

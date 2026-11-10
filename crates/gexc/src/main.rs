@@ -18,6 +18,7 @@ mod prof;
 mod eject;
 mod pe_info;
 mod units;
+mod host_mkfifo;
 mod host_xattr;
 mod host_walk;
 
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
 
 fn real_main() -> Result<ExitCode> {
     host_xattr::install();
+    host_mkfifo::install();
     host_walk::install();
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {

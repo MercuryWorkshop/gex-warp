@@ -55,7 +55,9 @@ export default async function (t) {
   run.catch((e) => { out += `\n[runProgram threw: ${e?.stack ?? e}]`; });
   const shown = () => out.replace(/\r/g, '').replace(/\x1b\[[0-9;?]*[@-~]/g, '');
   // Type a line once the prompt is back, and wait for what it prints.
-  const prompts = () => (shown().match(/mac:\S+ > /g) ?? []).length;
+  // (A prompt at the start of a line: the shell draws its prompt again in
+  // the middle of one when a line is edited, which is not a command done.)
+  const prompts = () => (shown().match(/^mac:\S+ > /gm) ?? []).length;
   const enter = async (line, what, ms = 60000) => {
     const n = prompts();
     keys?.(line);

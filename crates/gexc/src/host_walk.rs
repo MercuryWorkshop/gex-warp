@@ -67,7 +67,9 @@ fn no_links(root: i32, rel: &str) -> bool {
         };
         // SAFETY: a live CString for the call's length.
         let fd = unsafe {
-            libc::openat(dir, c.as_ptr(), libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            // (`O_NONBLOCK`: a FIFO opened so is not waited at for a
+            // writer.)
+            libc::openat(dir, c.as_ptr(), libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         };
         // SAFETY: this walk's own descriptor, closed once.
         unsafe { libc::close(dir) };

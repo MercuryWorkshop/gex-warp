@@ -924,6 +924,13 @@ pub trait FileSystem: Send + Sync {
         Err(Errno::EROFS)
     }
 
+    /// Make a FIFO: a file that names a pipe ([`crate::pipe::Fifos`]).
+    /// Opening one is the kernel's, so `open` of it here is `ENXIO`.
+    fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let _ = (path, mode);
+        Err(Errno::EPERM)
+    }
+
     /// What an `inotify` watch on `path` watches: the inode's key and
     /// whether it is a directory. `None` for the key where this filesystem
     /// says no changes (the default: `/proc`, `/dev`); `ENOENT` for nothing
@@ -1817,6 +1824,19 @@ impl Namespace {
     pub fn mksocket(&self, path: &str) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.mksocket(&rel)
+    }
+
+    /// Make a FIFO ([`FileSystem::mkfifo`]).
+    pub fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.mkfifo(&rel, mode)
+    }
+
+    /// A name for the file at `path` that is the same for every process
+    /// of this memory: which filesystem, and which file of it.
+    pub fn file_key(&self, path: &str) -> Result<String, Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        Ok(format!("{:p}:{}", Arc::as_ptr(&fs) as *const (), fs.metadata(&rel)?.ino))
     }
 
     pub fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {

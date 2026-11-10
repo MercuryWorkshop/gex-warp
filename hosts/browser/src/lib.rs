@@ -543,6 +543,8 @@ extern "C" {
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_part(path: gex_kernel::PAddr, path_len: u32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_lazy(path: gex_kernel::PAddr, path_len: u32, url: gex_kernel::PAddr, url_len: u32, size: u64) -> i32;
@@ -1270,6 +1272,14 @@ extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PA
     gex_kernel::phase::mark(8);
     r
 }
+extern "C" fn rf_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
+    unsafe { k_fs_mkfifo(path, path_len, mode) }
+}
+extern "C" fn rp_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32 {
+    let id = unsafe { k_fifo(path, path_len, how, pid) };
+    pipe_note("fifo", id, (how & 1) as i32);
+    id
+}
 extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
     let r = unsafe { k_fs_mksocket(path, path_len) };
@@ -1529,6 +1539,7 @@ pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         readable: rp_readable,
         writable: rp_writable,
         buffered: rp_buffered,
+        fifo: rp_fifo,
     })
 }
 
@@ -1940,6 +1951,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             symlink: rf_symlink,
             link: rf_link,
             mksocket: rf_mksocket,
+            mkfifo: rf_mkfifo,
             set_mtime: rf_set_mtime,
             touch: rf_touch,
             set_times: rf_set_times,
@@ -10354,6 +10366,10 @@ pub(crate) fn stage_fork_fds(h: &Host, child: i32, maps: bool) {
 /// Linux shares the one set. `None`: nothing with a name -- a local socket.
 fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
     if let Some(id) = pipe_id(&file.path) {
+        // (Both, of a FIFO open to read and write.)
+        if file.readable && file.writable {
+            unsafe { k_pipe_open_end(id, 0, holder) };
+        }
         unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
         return Some(file.path.clone());
     }
@@ -10564,13 +10580,11 @@ fn rebuild_carried(
     let file = if let Some(id) = pipe_id(path) {
         let r = global_pipes().ok_or("no global kernel")?;
         let write = acc != oflags::O_RDONLY;
-        OpenFile::new(
-            Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write, remote: r }),
-            path.to_string(),
-            flags,
-            !write,
-            write,
-        )
+        let both = acc == oflags::O_RDWR;
+        let end = |write| gex_kernel::pipe::RemotePipeEnd { id, write, remote: r };
+        let handle: Arc<dyn gex_kernel::vfs::FileHandle> =
+            if both { Arc::new(gex_kernel::pipe::BothEnds { read: end(false), write: end(true) }) } else { Arc::new(end(write)) };
+        OpenFile::new(handle, path.to_string(), flags, !write || both, write)
     } else if let Some((id, master)) = pty_ref(path) {
         let r = global_ptys().ok_or("no global kernel")?;
         OpenFile::new(

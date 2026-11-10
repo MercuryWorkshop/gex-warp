@@ -628,6 +628,9 @@ enum Node {
     /// through the socket, not the path -- but it has to be visible to
     /// `stat` and removable by `unlink`.
     Socket,
+    /// A FIFO, likewise: the pipe it names is the kernel's
+    /// (`crate::pipe::Fifos`). Its mode.
+    Fifo(u32),
 }
 
 #[derive(Debug, Default)]
@@ -1382,6 +1385,16 @@ impl TmpFs {
                 rdev: 0,
                 times: Default::default(),
             }),
+            Node::Fifo(mode) => Ok(Metadata {
+                file_type: FileType::Fifo,
+                size: 0,
+                mode: *mode,
+                ino,
+                mtime: mtime(),
+                nlink: 1,
+                rdev: 0,
+                times: Default::default(),
+            }),
             Node::Socket => Ok(Metadata {
                 file_type: FileType::Socket,
                 size: 0,
@@ -1708,6 +1721,7 @@ impl FileHandle for TmpHandle {
                     Node::Dir => FileType::Directory,
                     Node::Symlink(_) => FileType::Symlink,
                     Node::Socket => FileType::Socket,
+                    Node::Fifo(_) => FileType::Fifo,
                 },
                 ino,
             });
@@ -1847,6 +1861,11 @@ impl TmpFs {
                 Some(node) => {
                     if flags & oflags::O_EXCL != 0 && flags & oflags::O_CREAT != 0 {
                         return Err(Errno::EEXIST);
+                    }
+                    // A FIFO is opened by the kernel, as the pipe it
+                    // names; and a socket is not opened at all.
+                    if matches!(node, Node::Fifo(_) | Node::Socket) {
+                        return Err(Errno::ENXIO);
                     }
                     // A directory opens for reading only.
                     let acc = flags & oflags::ACCMODE;
@@ -2143,6 +2162,7 @@ impl FileSystem for TmpFs {
             Some(Node::Dir) => return Err(Errno::EPERM),
             // A socket has one name, the one it was bound to.
             Some(Node::Socket) => return Err(Errno::EPERM),
+            Some(Node::Fifo(mode)) => Node::Fifo(*mode),
             None => return Err(Errno::ENOENT),
         };
         if inner.nodes.contains_key(to) {
@@ -2163,6 +2183,20 @@ impl FileSystem for TmpFs {
             crate::inotify::event(crate::inotify::Key { fs, ino }, crate::inotify::mask::ATTRIB, 0, None, false);
             note(&inner, fs, to, None, crate::inotify::mask::CREATE, 0);
         }
+        Ok(())
+    }
+
+    fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(path) {
+            return Err(Errno::EEXIST);
+        }
+        inner.parent_ok(path)?;
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.set_ino(path.to_string(), ino);
+        inner.nodes.insert(path.to_string(), Node::Fifo(mode & 0o7777));
+        note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
 

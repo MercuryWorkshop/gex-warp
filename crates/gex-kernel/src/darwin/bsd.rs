@@ -166,6 +166,11 @@ impl Kernel {
             }
             d::RMDIR => set(nr::UNLINKAT, &[CWD, x[0], K_REMOVEDIR]),
             d::MKDIR => set(nr::MKDIRAT, &[CWD, x[0], x[1]]),
+            // A FIFO, by its own call or as the kind of node it is.
+            d::MKFIFO => set(nr::MKNODAT, &[CWD, x[0], x[1] & 0o7777 | 0o010000]),
+            d::MKFIFOAT => set(nr::MKNODAT, &[dirfd(x[0]), x[1], x[2] & 0o7777 | 0o010000]),
+            d::MKNOD => set(nr::MKNODAT, &[CWD, x[0], x[1], x[2]]),
+            d::MKNODAT => set(nr::MKNODAT, &[dirfd(x[0]), x[1], x[2], x[3]]),
             d::MKDIRAT => set(nr::MKDIRAT, &[dirfd(x[0]), x[1], x[2]]),
             d::RENAME => set(nr::RENAMEAT, &[CWD, x[0], CWD, x[1]]),
             d::RENAMEAT => set(nr::RENAMEAT, &[dirfd(x[0]), x[1], dirfd(x[2]), x[3]]),

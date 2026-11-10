@@ -405,7 +405,7 @@ fn seed_of(fs: &TmpFs) -> HashMap<String, u64> {
             Node::Dir => sig_dir(mode_of(&inner, p, n), &xattrs_of(&inner, ino)),
             Node::Symlink(t) => sig_link(t),
             Node::File(_) => sig_file_seed(mode_of(&inner, p, n)),
-            Node::Socket => continue,
+            Node::Socket | Node::Fifo(_) => continue,
         };
         out.insert(p.clone(), s);
     }
@@ -443,7 +443,7 @@ impl State {
                     }
                     out.push((p.clone(), Pre::Link { target: t.clone() }));
                 }
-                Node::Socket => {}
+                Node::Socket | Node::Fifo(_) => {}
                 Node::File(f) => {
                     let xattrs = xattrs_of(&inner, f.ino);
                     if f.written.load(Ordering::Relaxed) || !xattrs.is_empty() {

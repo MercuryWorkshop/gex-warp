@@ -326,6 +326,81 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// A FIFO's pipe: whoever opens it first, the other finds the same one;
+    /// an open that would have waited has the other end's place held, and
+    /// one that would not is answered as a real one is.
+    #[test]
+    fn a_fifo_is_one_pipe_whoever_comes_first() {
+        let all = Fifos::default();
+        let open = |name: &str, write, nonblock| all.open(name, write, nonblock, |_| 0).map(|(p, _)| p);
+        let mut b = [0u8; 8];
+
+        // The reader first: nothing yet, not the end.
+        let r = open("a", false, false).unwrap();
+        assert_eq!(r.ends(), (1, 1), "the writer's place is held");
+        assert_eq!(r.read(&mut b), Err(Errno::EAGAIN));
+        let w = open("a", true, false).unwrap();
+        assert!(Arc::ptr_eq(&r, &w));
+        assert_eq!(r.ends(), (1, 1));
+        assert_eq!(w.write(b"hi"), Ok(2));
+        w.close_end(true);
+        assert_eq!(r.read(&mut b), Ok(2));
+        assert_eq!(r.read(&mut b), Ok(0), "the end, once the writer has gone");
+        // A reader beside it would have waited for a writer to come.
+        let r2 = open("a", false, false).unwrap();
+        assert!(Arc::ptr_eq(&r, &r2));
+        assert_eq!(r.read(&mut b), Err(Errno::EAGAIN));
+        r.close_end(false);
+        r2.close_end(false);
+
+        // The writer first: what it writes waits for the reader.
+        let w = open("b", true, false).unwrap();
+        assert_eq!(w.write(b"early"), Ok(5), "not a broken pipe");
+        w.close_end(true);
+        let r = open("b", false, false).unwrap();
+        assert!(Arc::ptr_eq(&r, &w));
+        assert_eq!(r.read(&mut b), Ok(5));
+        assert_eq!(r.read(&mut b), Ok(0));
+        r.close_end(false);
+        assert_eq!(r.ends(), (0, 0));
+        // Everybody gone: the next has a pipe of its own.
+        let w2 = open("b", true, false).unwrap();
+        assert!(!Arc::ptr_eq(&w2, &w));
+        // (And one that wrote nothing was met all the same.)
+        w2.close_end(true);
+        let r = open("b", false, false).unwrap();
+        assert_eq!(r.read(&mut b), Ok(0));
+
+        // Not to wait: a writer with nobody reading is refused, a reader
+        // with nobody writing reads the end.
+        assert_eq!(open("c", true, true).err(), Some(Errno::ENXIO));
+        let r = open("c", false, true).unwrap();
+        assert_eq!(r.ends(), (1, 0));
+        assert_eq!(r.read(&mut b), Ok(0));
+        let w = open("c", true, true).unwrap();
+        assert_eq!(w.write(b"x"), Ok(1));
+        assert_eq!(r.read(&mut b), Ok(1));
+        w.close_end(true);
+        assert_eq!(open("c", true, true).map(|_| ()), Ok(()), "a reader is there");
+
+        // A name moved goes with its pipe; one forgotten leaves the pipe to
+        // whoever has it.
+        let r = open("d", false, false).unwrap();
+        // To read and write both waits for nobody and is refused by nobody.
+        let (both, _) = all.open_both("rw", |_| 0);
+        assert_eq!(both.ends(), (1, 1));
+        assert_eq!(both.write(b"me"), Ok(2));
+        assert_eq!(both.read(&mut b), Ok(2));
+        assert_eq!(both.read(&mut b), Err(Errno::EAGAIN), "its own writer is there");
+        assert_eq!(open("rw", true, true).map(|_| ()), Ok(()));
+        assert_eq!(both.ends(), (1, 2));
+
+        all.rename("d", "e");
+        assert!(Arc::ptr_eq(&open("e", true, false).unwrap(), &r));
+        all.forget("e");
+        assert!(!Arc::ptr_eq(&open("e", true, false).unwrap(), &r));
+    }
+
     /// `read_with` takes up to what is there, sized under the lock: never a
     /// stale size that splits a record; and hands over a wrapped buffer
     /// whole, in order.
@@ -461,6 +536,178 @@ mod tests {
     }
 }
 
+/// The pipes of the system's FIFOs: files that name a pipe, which whoever
+/// opens one reads from or writes to.
+///
+/// A FIFO's pipe is made when the file is first opened and lasts while
+/// anything has it open or it holds what nobody has read. POSIX has an
+/// `open` to read wait for one to write and the other way round; here
+/// neither waits, and the pipe behaves as if the other were on its way: a
+/// reader that comes first finds nothing to read yet, not the end (a
+/// writer's place is held until the first one comes), and a writer that
+/// comes first fills the pipe, not a broken one (a reader's place
+/// likewise). So `cat fifo & echo hi > fifo` and its reverse both work,
+/// and what a writer wrote and left is the next reader's.
+#[derive(Default)]
+pub struct Fifos {
+    by_name: Mutex<std::collections::HashMap<String, Fifo>>,
+}
+
+struct Fifo {
+    pipe: std::sync::Arc<Pipe>,
+    /// The host's number for the pipe, if it has one.
+    tag: i32,
+    /// Whether the pipe's first reader, and writer, has yet to come: its
+    /// place is held (a reference to that end) until it does.
+    awaits_reader: bool,
+    awaits_writer: bool,
+    /// A writer has opened it with nobody reading, and no reader has come
+    /// since: the reader that does has met its writer, though that may
+    /// have written and gone already.
+    writer_came: bool,
+}
+
+impl Fifos {
+    /// The system's: one for a host whose processes share this memory, the
+    /// global kernel's in the page.
+    pub fn system() -> &'static Fifos {
+        static ALL: std::sync::OnceLock<Fifos> = std::sync::OnceLock::new();
+        ALL.get_or_init(Fifos::default)
+    }
+
+    /// Open the pipe of the FIFO `name` (a name every process has for the
+    /// file) to read or to write: the pipe, with that end counted, and its
+    /// tag. `tag` numbers a pipe newly made.
+    ///
+    /// An open does not wait for the other end as a real one does. Instead
+    /// one that would have waited (`nonblock` unset, nobody at the other
+    /// end) has that end's place held for it until somebody comes: so its
+    /// reader waits for bytes and is not told the pipe has ended, and its
+    /// writer fills the pipe and is not told it is broken. One that would
+    /// not have waited is answered as it would have been: a writer with
+    /// nobody reading `ENXIO`, a reader with nobody writing a pipe that
+    /// reads as ended.
+    pub fn open(&self, name: &str, write: bool, nonblock: bool, tag: impl FnOnce(&std::sync::Arc<Pipe>) -> i32) -> Result<(std::sync::Arc<Pipe>, i32), Errno> {
+        let mut all = self.by_name.lock().unwrap_or_else(|e| e.into_inner());
+        // (One that everybody has left, with no place held, is over: the
+        // next to open the file starts anew.)
+        if all.get(name).is_none_or(|f| f.pipe.ends() == (0, 0)) {
+            let pipe = std::sync::Arc::new(Pipe::new());
+            let tag = tag(&pipe);
+            // (A pipe is made with one of each end: the reader's is a place
+            // held, the writer's is given up for one held when it is wanted.)
+            pipe.close_end(true);
+            all.insert(name.to_string(), Fifo { pipe, tag, awaits_reader: true, awaits_writer: false, writer_came: false });
+        }
+        let f = all.get_mut(name).expect("just put there");
+        let (readers, writers) = f.pipe.ends();
+        let (readers, writers) = (readers - f.awaits_reader as usize, writers - f.awaits_writer as usize);
+        if write {
+            if readers == 0 {
+                if nonblock {
+                    return Err(Errno::ENXIO);
+                }
+                if !f.awaits_reader {
+                    f.pipe.open_end(false);
+                    f.awaits_reader = true;
+                }
+                f.writer_came = true;
+            }
+        } else {
+            // (A writer that came first and has gone is the one this reader
+            // would have met: what it wrote, and then the end.)
+            let met = std::mem::take(&mut f.writer_came);
+            if writers == 0 && !met && !nonblock && !f.awaits_writer {
+                f.pipe.open_end(true);
+                f.awaits_writer = true;
+            }
+            // (The first reader, which will not wait, of a pipe a place was
+            // held in for one that left: nobody writes it.)
+            if writers == 0 && nonblock && f.awaits_writer && readers == 0 {
+                f.pipe.close_end(true);
+                f.awaits_writer = false;
+            }
+        }
+        let awaits_mine = if write { &mut f.awaits_writer } else { &mut f.awaits_reader };
+        f.pipe.open_end(write);
+        if std::mem::take(awaits_mine) {
+            f.pipe.close_end(write);
+        }
+        Ok((std::sync::Arc::clone(&f.pipe), f.tag))
+    }
+
+    /// Open the pipe of the FIFO `name` to read and to write at once, which
+    /// waits for nobody and has both ends counted: as [`Self::open`].
+    pub fn open_both(&self, name: &str, tag: impl FnOnce(&std::sync::Arc<Pipe>) -> i32) -> (std::sync::Arc<Pipe>, i32) {
+        // (The reader first, not to wait; and then the writer has one.)
+        let (pipe, tag) = self.open(name, false, true, tag).expect("a reader is not refused");
+        self.open(name, true, true, |_| tag).expect("a writer with a reader is not refused");
+        (pipe, tag)
+    }
+
+    /// The FIFO `name` is no more (unlinked): its pipe goes on for whoever
+    /// has it open, and a file of that name made later has its own.
+    pub fn forget(&self, name: &str) {
+        self.by_name.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+    }
+
+    /// The FIFO `from` is now named `to`.
+    pub fn rename(&self, from: &str, to: &str) {
+        let mut all = self.by_name.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = all.remove(from) {
+            all.insert(to.to_string(), f);
+        }
+    }
+}
+
+/// Both ends of a pipe in one open file: a FIFO opened to read and write,
+/// which a program does to wait for nobody, or to keep the pipe from ending
+/// between one writer and the next.
+#[derive(Debug)]
+pub struct BothEnds<E> {
+    pub read: E,
+    pub write: E,
+}
+
+impl<E: crate::vfs::FileHandle> crate::vfs::FileHandle for BothEnds<E> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.read.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
+        self.write.write_at(offset, buf)
+    }
+    fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        self.read.metadata()
+    }
+    fn is_stream(&self) -> bool {
+        true
+    }
+    fn poll_readable(&self) -> bool {
+        self.read.poll_readable()
+    }
+    fn poll_writable(&self) -> bool {
+        self.write.poll_writable()
+    }
+    fn available(&self) -> Option<u64> {
+        self.read.available()
+    }
+    fn write_room(&self) -> Option<u64> {
+        self.write.write_room()
+    }
+    fn wait_queue(&self) -> u32 {
+        self.read.wait_queue()
+    }
+    fn wakes(&self) -> Option<u64> {
+        self.read.wakes()
+    }
+    fn read_frees_nothing(&self) -> bool {
+        self.read.read_frees_nothing()
+    }
+    fn debug_state(&self) -> String {
+        self.read.debug_state()
+    }
+}
+
 /// A pipe that lives in another wasm module.
 ///
 /// An `Arc<Pipe>` is a pointer, so both ends of such a pipe must share one
@@ -495,6 +742,11 @@ pub struct Remote {
     pub buffered: extern "C" fn(id: i32) -> i32,
     /// The pipe's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
+    /// Open the pipe of the FIFO at a path ([`Fifos::open`]): bit 0 of
+    /// `how` to write, bit 1 not to wait, bit 2 to read and write both
+    /// ([`Fifos::open_both`]). The pipe's id, with that end (or both)
+    /// counted for `pid`, or a negated errno.
+    pub fifo: extern "C" fn(path: crate::PAddr, path_len: u32, how: u32, pid: i32) -> i32,
 }
 
 /// One end of a pipe in the global kernel. Dropping closes that end there, so

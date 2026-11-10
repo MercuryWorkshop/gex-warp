@@ -433,6 +433,12 @@ impl FileSystem for HostFs {
         let host = self.host_path(path)?;
         let md = std::fs::metadata(&host);
         if let Ok(md) = &md {
+            // A FIFO is the kernel's to open, as the pipe it names
+            // (`crate::pipe::Fifos`): the host's own would stop this thread
+            // until the host found it a reader.
+            if std::os::unix::fs::FileTypeExt::is_fifo(&md.file_type()) {
+                return Err(Errno::ENXIO);
+            }
             // a directory opens for reading only
             let acc = flags & oflags::ACCMODE;
             if md.is_dir() && (acc == oflags::O_WRONLY || acc == oflags::O_RDWR) {
@@ -725,6 +731,21 @@ impl FileSystem for HostFs {
         Ok(())
     }
 
+    /// A real FIFO, made by the host ([`host_mkfifo`]).
+    fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let host = self.host_path(path)?;
+        if std::fs::symlink_metadata(&host).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+        let make = host_mkfifo::CALL.get().ok_or(Errno::EPERM)?;
+        make(&host, mode)?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
+        Ok(())
+    }
+
     /// A real socket node, made by binding a `UnixListener` and dropping it,
     /// which leaves the node. `mknod` would mean a libc dependency for one call.
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
@@ -744,6 +765,21 @@ impl FileSystem for HostFs {
 }
 
 use std::os::unix::fs::OpenOptionsExt;
+
+/// The host's `mkfifo`, which is a call of its libc's (this crate has no
+/// unsafe code): a hook the native shim sets.
+pub mod host_mkfifo {
+    use crate::errno::Errno;
+
+    pub type Call = fn(host: &std::path::Path, mode: u32) -> Result<(), Errno>;
+
+    pub(super) static CALL: std::sync::OnceLock<Call> = std::sync::OnceLock::new();
+
+    /// Install the host's call. The first wins.
+    pub fn set(call: Call) {
+        let _ = CALL.set(call);
+    }
+}
 
 /// Extended attributes on the host's files, `user.` only either way: a
 /// guest neither sets nor sees the host's other namespaces. The calls

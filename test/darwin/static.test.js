@@ -31,7 +31,7 @@ export default async function (t) {
   await d.compare('attr', await d.build('attr'));
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
-  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue', 'vnode', 'calls', 'shm']) await d.compare(name, await d.build(name), [], { page: true });
+  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue', 'vnode', 'calls', 'shm', 'fifo']) await d.compare(name, await d.build(name), [], { page: true });
   // posix_spawn. A file without permission to be run is refused under
   // gexc; the page's files have no modes, and it is run (and fails as the
   // child).

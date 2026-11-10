@@ -85,6 +85,8 @@ pub struct Remote {
     /// Not read -- only stat'd: Xvfb binds `/tmp/.X11-unix/X0` and its startup
     /// script waits for that path to exist before launching a client.
     pub mksocket: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    /// Put a FIFO at a path.
+    pub mkfifo: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     /// Set a path's modification time (`utimensat`, a bundle's file times).
     pub set_mtime: extern "C" fn(path: crate::PAddr, path_len: u32, secs: i64) -> i32,
     /// Set an open file's modification time. The global kernel has no clock
@@ -437,6 +439,11 @@ impl FileSystem for RemoteFs {
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         let (a, n) = at(path.as_bytes());
         ok((self.remote.mksocket)(a, n)).map(|_| ())
+    }
+
+    fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        ok((self.remote.mkfifo)(a, n, mode)).map(|_| ())
     }
 }
 

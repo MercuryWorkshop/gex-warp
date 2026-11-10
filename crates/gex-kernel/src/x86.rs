@@ -242,6 +242,8 @@ pub mod raw {
     pub const FCHDIR: u64 = 81;
     pub const RENAME: u64 = 82;
     pub const MKDIR: u64 = 83;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
     pub const RMDIR: u64 = 84;
     pub const CREAT: u64 = 85;
     pub const LINK: u64 = 86;
@@ -537,6 +539,10 @@ pub fn translate(
             *a = [AT_FDCWD, a[0], a[1], 0, 0, 0];
             nr::MKDIRAT
         }
+        x::MKNOD => {
+            *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
+            nr::MKNODAT
+        }
         x::RMDIR => {
             *a = [AT_FDCWD, a[0], AT_REMOVEDIR, 0, 0, 0];
             nr::UNLINKAT
@@ -656,6 +662,7 @@ pub fn translate(
         x::TGKILL => nr::TGKILL,
         x::OPENAT => nr::OPENAT,
         x::MKDIRAT => nr::MKDIRAT,
+        x::MKNODAT => nr::MKNODAT,
         x::FCHOWNAT => nr::FCHOWNAT,
         x::NEWFSTATAT => nr::NEWFSTATAT,
         x::UNLINKAT => nr::UNLINKAT,

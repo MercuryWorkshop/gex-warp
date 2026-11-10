@@ -70,6 +70,8 @@ pub mod raw {
     pub const KILL: u64 = 37;
     pub const RENAME: u64 = 38;
     pub const MKDIR: u64 = 39;
+    pub const MKNOD: u64 = 14;
+    pub const MKNODAT: u64 = 297;
     pub const RMDIR: u64 = 40;
     pub const DUP: u64 = 41;
     pub const PIPE: u64 = 42;
@@ -682,6 +684,14 @@ pub fn translate(
         x::MKDIRAT => {
             a[0] = sext(a[0]);
             nr::MKDIRAT
+        }
+        x::MKNOD => {
+            *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
+            nr::MKNODAT
+        }
+        x::MKNODAT => {
+            a[0] = sext(a[0]);
+            nr::MKNODAT
         }
         x::UNLINKAT => {
             a[0] = sext(a[0]);

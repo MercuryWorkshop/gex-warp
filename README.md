@@ -221,6 +221,13 @@ the image low. What works is what a program can do with the kernel alone:
   once and in whole pages, mapped shared and within its size). It is the
   kernel's own, a file of `/dev/shm`, so a Linux program and a Mac one
   that name the same memory share it;
+- FIFOs (`mkfifo`, and `mknod` of one): a file that names a pipe, in a
+  directory of the host, of memory or of the page, which is again the
+  kernel's own and so one pipe between a Linux program and a Mac one. An
+  open of one does not wait for the other end to be opened: the place of
+  a reader or a writer still to come is held instead, so the first to
+  open it reads nothing yet, or fills the pipe, until the other arrives.
+  Opened to read and write both it waits for nobody, as on a Mac;
 - the commpage: the page of facts about the machine libSystem reads
   instead of asking, and on x86-64 computes the time from. XNU's is past
   the end of a guest's memory, so it is at `0xFFC000` (arm64's read-only
@@ -273,7 +280,7 @@ What does not, yet:
   told apart from one written to, and one renamed over from one removed
   (`EVFILT_VNODE` says `NOTE_WRITE` of the first and `NOTE_LINK` too of
   the second);
-  `mknod`; a mutex or condition shared between
+  `mknod` of a device; a mutex or condition shared between
   processes (each is its own process's).
 - A floating-point environment beyond what WebAssembly has: the rounding
   mode and the exception flags a program sets are kept and read back, but

@@ -93,6 +93,9 @@ impl FileSystem for Subtree {
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         self.inner.mksocket(&self.at(path))
     }
+    fn mkfifo(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        self.inner.mkfifo(&self.at(path), mode)
+    }
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
         self.inner.watch_key(&self.at(path))
     }

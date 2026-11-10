@@ -37,6 +37,7 @@ pub mod nr {
     pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
+    pub const MKNODAT: u64 = 33;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
     pub const SYMLINKAT: u64 = 36;
@@ -3204,6 +3205,8 @@ pub struct PathIo<'a> {
     /// with it: this kernel's, and the global kernel's when there is one.
     pub socket_names: &'a Arc<unix::SocketNames>,
     pub unix_remote: Option<unix::Remote>,
+    /// The global kernel's pipes, when there is one: where a FIFO's is.
+    pub pipes: Option<crate::pipe::Remote>,
 }
 
 thread_local! {
@@ -3304,6 +3307,7 @@ impl PathIo<'_> {
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::MKNODAT => self.sys_mknodat(m, a[0] as i32, a[1], a[2] as u32),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             // There is one process's view of the world and nothing consults
@@ -3502,7 +3506,12 @@ impl PathIo<'_> {
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
             // O_CREAT's mode, less the umask, as Linux makes the file.
-            let h = self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask())?;
+            let h = match self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask()) {
+                // What a filesystem will not open may be a FIFO, which is
+                // opened here as its pipe.
+                Err(Errno::ENXIO) if self.ns.metadata(&p).is_ok_and(|md| md.file_type == FileType::Fifo) => return self.open_fifo(p, flags),
+                h => h?,
+            };
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
@@ -3895,6 +3904,65 @@ impl PathIo<'_> {
         let to = self.at_path(m, a[2] as i32, a[3])?;
         self.new_name_check(m, a[3], &to)?;
         self.ns.link(&from, &to).map(|_| 0)
+    }
+
+    /// `mknodat(dirfd, path, mode, dev)`: a FIFO, an empty file or a socket
+    /// by its name. A device is not a file anyone here may make (`EPERM`,
+    /// as for a user who is not root).
+    pub fn sys_mknodat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        let p = self.at_path(m, dirfd, path)?;
+        if self.ns.metadata_nofollow(&p).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+        let perm = mode & 0o7777 & !self.fs.umask();
+        match mode & 0o170000 {
+            0o010000 => self.ns.mkfifo(&p, perm).map(|_| 0),
+            0 | 0o100000 => self.ns.open_mode(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm).map(|_| 0),
+            0o140000 => self.ns.mksocket(&p).map(|_| 0),
+            0o020000 | 0o060000 => Err(Errno::EPERM),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// `open` of the FIFO at `p`: the pipe it names, to read or to write
+    /// ([`crate::pipe::Fifos`]); in the page the global kernel's.
+    fn open_fifo(&self, p: String, flags: u64) -> SysResult {
+        use crate::pipe::{BothEnds, Fifos, RemotePipeEnd};
+        use crate::vfs::FileHandle;
+        let acc = flags & oflags::ACCMODE;
+        let (read, write) = match acc {
+            oflags::O_RDONLY => (true, false),
+            oflags::O_WRONLY => (false, true),
+            oflags::O_RDWR => (true, true),
+            _ => return Err(Errno::EINVAL),
+        };
+        let nonblock = flags & oflags::O_NONBLOCK != 0;
+        let status = flags & (oflags::O_NONBLOCK | oflags::O_APPEND) | acc;
+        let file = match self.pipes {
+            Some(r) => {
+                let name = self.ns.outer_path(&p);
+                let how = write as u32 | (nonblock as u32) << 1 | ((read && write) as u32) << 2;
+                let id = (r.fifo)(name.as_ptr() as crate::PAddr, name.len() as u32, how, self.pid);
+                if id < 0 {
+                    return Err(Errno(-id));
+                }
+                let end = |write| RemotePipeEnd { id, write, remote: r };
+                let handle: Arc<dyn FileHandle> = if read && write { Arc::new(BothEnds { read: end(false), write: end(true) }) } else { Arc::new(end(write)) };
+                OpenFile::new(handle, format!("pipe:[{id}]"), status, read, write)
+            }
+            None => {
+                let key = self.ns.file_key(&p)?;
+                let handle: Arc<dyn FileHandle> = if read && write {
+                    let (pipe, _) = Fifos::system().open_both(&key, |_| 0);
+                    Arc::new(BothEnds { read: PipeEnd { pipe: Arc::clone(&pipe), write: false }, write: PipeEnd { pipe, write: true } })
+                } else {
+                    let (pipe, _) = Fifos::system().open(&key, write, nonblock, |_| 0)?;
+                    Arc::new(PipeEnd { pipe, write })
+                };
+                OpenFile::new(handle, p, status, read, write)
+            }
+        };
+        self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
     pub fn sys_mkdirat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
@@ -5802,6 +5870,7 @@ fn is_path(n: u64) -> bool {
             | nr::READLINKAT
             | nr::GETCWD
             | nr::MKDIRAT
+            | nr::MKNODAT
             | nr::UNLINKAT
             | nr::RENAMEAT
             | nr::RENAMEAT2
@@ -8833,6 +8902,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FACCESSAT2
         | nr::UNLINKAT
         | nr::MKDIRAT
+        | nr::MKNODAT
         | nr::READLINKAT
         | nr::UTIMENSAT
         | nr::FCHOWNAT
@@ -10970,6 +11040,7 @@ impl Kernel {
             clock: self.clock,
             socket_names: &self.socket_names,
             unix_remote: self.unix_remote,
+            pipes: self.pipes,
         }
     }
 
@@ -13203,6 +13274,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FCNTL => "fcntl",
         nr::IOCTL => "ioctl",
         nr::MKDIRAT => "mkdirat",
+        nr::MKNODAT => "mknodat",
         nr::UNLINKAT => "unlinkat",
         nr::LINKAT => "linkat",
         nr::SYMLINKAT => "symlinkat",
