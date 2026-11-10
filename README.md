@@ -232,8 +232,11 @@ the image low. What works is what a program can do with the kernel alone:
   what a run loop waits on), semaphores (and so `__semwait_signal`, which is how the
   libc sleeps), and the few MIG routines of the task's, the host's and the
   clock's ports that those and libpthread need (`host_info` among them),
-  and what a task and a thread say of themselves (`task_info`,
-  `thread_info`: their memory and times, who they run as, which thread);
+  what a task and a thread say of themselves (`task_info`,
+  `thread_info`: their memory and times, who they run as, which thread),
+  and the kernel's notifications (`mach_port_request_notification`): that
+  a port has no senders left, that the port a name was a right to has
+  died or the name has gone, that a send-once right was never used;
 - restartable ranges (`task_restartable_ranges_register`, and
   `_synchronize`): code a task says a thread may be taken out of, which is
   how the Objective-C runtime knows no thread still reads a method cache it
@@ -258,9 +261,8 @@ What does not, yet:
 - **Mach between tasks.** A port's queue lives in its own process, so no
   right crosses a `fork` or reaches another program: no bootstrap port, no
   launchd, no XPC. Within a task, messages carry ports but not memory out
-  of line; nothing is sent when a port dies or loses its senders; and much
-  of what the kernel's own ports are asked (`vm_region`, `task_threads`)
-  answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
+  of line; and much of what the kernel's own ports are asked (`vm_region`,
+  `task_threads`) answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - A kqueue's events delivered to a work queue's threads, and workloops;
   a file made longer by `ftruncate`

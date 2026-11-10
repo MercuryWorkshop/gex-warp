@@ -304,6 +304,114 @@ static void infos(void) {
     }
 }
 
+// mach_port_request_notification(task, name, which, sync, notify): a
+// message asked for, to a port of the caller's, when something becomes of
+// a right. The reply hands back what was asked for before.
+static void ask_notice(const char *what, u32 name, u32 which, u32 sync, u32 to) {
+    static struct message m;
+    static const u32 ndr[2] = {0, 1};
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3213, m.h.bits = COMPLEX;
+    m.body[0] = 1;
+    struct port_desc *d = (struct port_desc *)(m.body + 1);
+    *d = (struct port_desc){to, 0, 0, MAKE_SEND_ONCE, 0};
+    m.body[4] = ndr[0], m.body[5] = ndr[1], m.body[6] = name, m.body[7] = which, m.body[8] = sync;
+    long r = rpc(&m, task, sizeof m.h + 36);
+    t_printf("%s: %ld, reply %d", what, r, m.h.id);
+    if (m.h.bits & COMPLEX) t_printf(", and what was asked before: %s, disposition %d\n", d->name ? "a right" : "nothing", d->disposition);
+    else t_printf(", code %d\n", (int)m.body[2]);
+}
+
+// What has come to `port`: each message's id, its size, and the word after
+// its NDR record, which is a count or a name (`named`: the name it should
+// be).
+static void notices(const char *what, u32 port, u32 named) {
+    static struct message m;
+    t_printf("%s:", what);
+    for (int n = 0;; n++) {
+        t_memset(&m, 0, sizeof m);
+        if (receive(&m, port, sizeof m)) {
+            if (!n) t_printf(" nothing");
+            break;
+        }
+        t_printf(" id %d of %u bytes", m.h.id, m.h.size);
+        if (m.h.size >= sizeof m.h + 12) {
+            if (named) t_printf(", %s", m.body[2] == named ? "the name" : "another name");
+            else t_printf(", %u", m.body[2]);
+        }
+        t_printf(";");
+    }
+    t_printf("\n");
+}
+
+static void notifications(void) {
+    enum { PORT_DELETED = 65, SEND_POSSIBLE = 66, NO_SENDERS = 70, SEND_ONCE = 71, DEAD_NAME = 72 };
+    u32 to = allocate(RIGHT_RECEIVE);
+
+    // No senders: told at once when there are none, else when the last
+    // send right goes, with how many were ever made.
+    u32 p = allocate(RIGHT_RECEIVE);
+    ask_notice("ask to be told a port has no senders, which it has not", p, NO_SENDERS, 0, to);
+    notices("  told", to, 0);
+    TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND);
+    TRAP(TRAP_port_mod_refs, task, p, RIGHT_SEND, 1);
+    ask_notice("ask with a send right made", p, NO_SENDERS, 0, to);
+    notices("  told", to, 0);
+    TRAP(TRAP_port_deallocate, task, p);
+    notices("one of its two references gone", to, 0);
+    TRAP(TRAP_port_deallocate, task, p);
+    notices("and the other", to, 0);
+    TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND);
+    ask_notice("ask again", p, NO_SENDERS, 0, to);
+    ask_notice("and again, which takes the first's place", p, NO_SENDERS, 0, to);
+    notices("  told", to, 0);
+    ask_notice("ask of more senders than were ever made", p, NO_SENDERS, 5, to);
+    TRAP(TRAP_port_deallocate, task, p);
+    notices("the send right gone", to, 0);
+    ask_notice("ask it of a name with no receive right", task, NO_SENDERS, 0, to);
+    ask_notice("of no name", 0x12345, NO_SENDERS, 0, to);
+    ask_notice("ask for a notice there is none of", p, 99, 0, to);
+
+    // A dead name: told when the port a right is to has gone, and the
+    // name is then a dead name with one reference more.
+    u32 q = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, q, q, MAKE_SEND);
+    ask_notice("ask to be told a port has died", q, DEAD_NAME, 0, to);
+    notices("  told", to, q);
+    TRAP(TRAP_port_mod_refs, task, q, RIGHT_RECEIVE, -1);
+    notices("its receive right gone", to, q);
+    show_type("  its name", q);
+    u32 refs = 0x55;
+    enum { TRAP_port_get_refs = 0 };
+    t_show("  one reference gone", TRAP(TRAP_port_deallocate, task, q));
+    show_type("  its name", q);
+    t_show("  and the other", TRAP(TRAP_port_deallocate, task, q));
+    show_type("  its name", q);
+    (void)refs;
+    u32 dead = allocate(RIGHT_DEAD_NAME);
+    ask_notice("ask it of a name dead already", dead, DEAD_NAME, 0, to);
+    ask_notice("and to be told at once", dead, DEAD_NAME, 1, to);
+    notices("  told", to, dead);
+    show_type("  the dead name", dead);
+
+    // A send-once right asked about and then given up: told that the
+    // name is gone; and its port, that the right was never used.
+    u32 r = allocate(RIGHT_RECEIVE);
+    static struct message m;
+    static const u32 ndr[2] = {0, 1};
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3215;
+    m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = r, m.body[3] = MAKE_SEND_ONCE;
+    rpc(&m, task, sizeof m.h + 16);
+    u32 once = ((struct port_desc *)(m.body + 1))->name;
+    ask_notice("ask to be told a send-once right's port has died", once, DEAD_NAME, 0, to);
+    TRAP(TRAP_port_deallocate, task, once);
+    notices("the right given up", to, once);
+    notices("  and at its port", r, 0);
+    ask_notice("ask to be told a port can be sent to", r, SEND_POSSIBLE, 0, to);
+    notices("  told", to, r);
+}
+
 static void kernel_ports(void) {
     static struct message m;
     // NDR record, then the arguments.
@@ -680,6 +788,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     threads();
     kernel_ports();
     infos();
+    notifications();
     queues();
 #if defined(__arm64__)
     timers();
