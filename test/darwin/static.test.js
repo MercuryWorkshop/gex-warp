@@ -31,12 +31,7 @@ export default async function (t) {
   await d.compare('attr', await d.build('attr'));
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
-  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch']) await d.compare(name, await d.build(name), [], { page: true });
-  // kqueue. Under gexc: on the page a queue's own events, its timers and
-  // what another process writes all arrive, but a note on another process
-  // does not always hear of its end (the page's processes are apart, and
-  // what one knows of another's ending is the host's to pass on).
-  await d.compare('kqueue', await d.build('kqueue'));
+  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue']) await d.compare(name, await d.build(name), [], { page: true });
   // posix_spawn. A file without permission to be run is refused under
   // gexc; the page's files have no modes, and it is run (and fails as the
   // child).

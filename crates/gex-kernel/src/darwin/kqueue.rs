@@ -459,6 +459,10 @@ impl Kqueue {
                 // How much there is to read; or room to write, which no
                 // file here measures: a pipe's worth.
                 let data = if n.filter == filt::READ { h.available().unwrap_or(ready as u64) as i64 } else { 16384 };
+                // (Something to read that is nothing is the end: what a
+                // host whose processes are apart says of a pipe whose
+                // other end another process has closed.)
+                let eof = eof || (n.filter == filt::READ && ready && h.available() == Some(0));
                 Some((if eof { ev::EOF } else { 0 }, 0, data))
             }
             What::Timer { next, period, absolute } => {

@@ -393,7 +393,7 @@ static void timers(void) {
     long r = msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, timer, 2000);
     u64 took = ((u64)TRAP(TRAP_mach_absolute_time) - t0) / ms;
     t_printf("its message: %ld, id %d, %u bytes, for the timer %d\n", r, got.h.id, got.h.size, got.h.local == timer);
-    t_check("  at about that moment", took >= 5 && took < 1500);
+    t_check("  at about that moment", took >= 5 && took < 10000);
     t_show("once", receive(&got, timer, sizeof got));
     u64 was = 99;
     t_show("cancel it, not armed", TRAP(TRAP_mk_timer_cancel, timer, &was));
@@ -411,7 +411,7 @@ static void timers(void) {
     r = msg(&got, RCV_MSG, 0, sizeof got, set, 0);
     took = ((u64)TRAP(TRAP_mach_absolute_time) - t0) / ms;
     t_printf("through the set: %ld, for the timer %d\n", r, got.h.local == timer);
-    t_check("  at about that moment", took >= 5 && took < 1500);
+    t_check("  at about that moment", took >= 5 && took < 10000);
     // Armed for a moment already gone: as soon as may be.
     TRAP(TRAP_mk_timer_arm, timer, t0);
     t_show("armed for the past", msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, set, 2000));

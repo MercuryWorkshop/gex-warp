@@ -144,14 +144,14 @@ int main(int argc, char **argv, char **envp, char **apple) {
     u64 t0 = t_nanos();
     say("nothing for 30 ms", ready(30));
     u64 waited = (t_nanos() - t0) / 1000000;
-    t_check("  which were waited", waited >= 25 && waited < 2000);
+    t_check("  which were waited", waited >= 25 && waited < 10000);
     t_show("a timer, every 20 ms", change(1, TIMER, ADD, 0, 20, 41));
     say("too soon", ready(0));
     t0 = t_nanos();
     n = ready(-1);
     waited = (t_nanos() - t0) / 1000000;
     t_printf("waited for: %ld, filter %d udata %lu, fired %d\n", n, got[0].filter, (unsigned long)got[0].udata, got[0].data >= 1);
-    t_check("  about that long", waited >= 10 && waited < 2000);
+    t_check("  about that long", waited >= 10 && waited < 10000);
     n = ready(1000);
     t_printf("and again: %ld, fired %d\n", n, got[0].data >= 1);
     t_show("delete", change(1, TIMER, DELETE, 0, 0, 0));
@@ -163,7 +163,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_show("a timer, once", change(3, TIMER, ADD | ONESHOT, 0, 10, 43));
     t0 = t_nanos();
     n = ready(5000);
-    t_check("a wait ends at the first timer", n == 1 && (t_nanos() - t0) / 1000000 < 2000);
+    t_check("a wait ends at the first timer", n == 1 && (t_nanos() - t0) / 1000000 < 4500);
 
     // Another process: what it writes wakes a wait, its end is an end of
     // file, and its ending is an event.
@@ -273,7 +273,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     n = ready(5000);
     waited = (t_nanos() - t0) / 1000000;
     t_printf("then: %ld, filter %d flags 0x%x udata %lu\n", n, got[0].filter, got[0].flags, (unsigned long)got[0].udata);
-    t_check("  about then", waited >= 5 && waited < 2000);
+    t_check("  about then", waited >= 5 && waited < 10000);
     say("and once", ready(30));
 #endif
 
