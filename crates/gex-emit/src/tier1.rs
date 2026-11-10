@@ -5329,8 +5329,14 @@ impl<'a> Emitter<'a> {
         self.f.if_void();
         // Inside a fused loop the registers live only in locals, so the slow
         // path -- which may deliver a signal and unwind -- must write them back.
+        // A region holds them in locals too, and writes all of them, since
+        // which are dirty depends on the path the guest took to this edge.
+        // Without it a handler's frame saved the registers as they were when
+        // the region was entered, and sigreturn put a loop's counter back.
         if self.loop_depth.is_some() {
             self.flush_conditional();
+        } else if self.region.is_some() {
+            self.flush_region_exit();
         }
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
