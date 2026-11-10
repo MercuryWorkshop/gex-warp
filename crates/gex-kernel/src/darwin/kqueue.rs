@@ -53,19 +53,25 @@ mod ev {
     pub const CLEAR: u16 = 0x0020;
     pub const RECEIPT: u16 = 0x0040;
     pub const DISPATCH: u16 = 0x0080;
+    /// The note is one of several on the same thing, told apart by what
+    /// each hands back (`udata`).
+    pub const UDATA_SPECIFIC: u16 = 0x0100;
     pub const ERROR: u16 = 0x4000;
     pub const EOF: u16 = 0x8000;
     /// What a note keeps of the flags it was added with.
-    pub const KEPT: u16 = ONESHOT | CLEAR | DISPATCH;
+    pub const KEPT: u16 = ONESHOT | CLEAR | DISPATCH | UDATA_SPECIFIC;
 }
 
 /// `fflags`, by filter.
 mod note {
-    // A timer's unit (milliseconds without one), and a time of day.
+    // A timer's unit (milliseconds without one; `MACHTIME` is
+    // `mach_absolute_time`'s, which here are nanoseconds), and a time
+    // that is a moment and no span: of day, or on that clock.
     pub const SECONDS: u32 = 0x1;
     pub const USECONDS: u32 = 0x2;
     pub const NSECONDS: u32 = 0x4;
     pub const ABSOLUTE: u32 = 0x8;
+    pub const MACHTIME: u32 = 0x100;
     // A user event: post it, and how the flags given combine with the
     // note's.
     pub const TRIGGER: u32 = 0x0100_0000;
@@ -79,9 +85,11 @@ mod note {
     pub const EXITSTATUS: u32 = 0x0400_0000;
 }
 
-/// `kevent64`'s and `kevent_qos`'s flags: do not wait; and the two that
-/// hand events to the kernel's own threads.
+/// `kevent64`'s and `kevent_qos`'s flags: do not wait; say only what went
+/// wrong with the changes; and the two that hand events to the kernel's
+/// own threads.
 const KEVENT_FLAG_IMMEDIATE: u64 = 0x1;
+const KEVENT_FLAG_ERROR_EVENTS: u64 = 0x2;
 const KEVENT_FLAG_WORKQ: u64 = 0x20;
 const KEVENT_FLAG_WORKLOOP: u64 = 0x100;
 
@@ -296,7 +304,10 @@ impl Kqueue {
         process: &mut dyn FnMut(i32) -> Result<(i32, Arc<dyn FileHandle>), Errno>,
     ) -> Result<(), Errno> {
         let mut notes = self.notes();
-        let at = notes.iter().position(|n| n.ident == e.ident && n.filter == e.filter);
+        // (A note told apart by what it hands back is one only for a
+        // change that says so, with the same.)
+        let specific = e.flags & ev::UDATA_SPECIFIC;
+        let at = notes.iter().position(|n| n.ident == e.ident && n.filter == e.filter && n.flags & ev::UDATA_SPECIFIC == specific && (specific == 0 || n.udata == e.udata));
         if e.flags & ev::DELETE != 0 {
             let n = notes.remove(at.ok_or(Errno::ENOENT)?);
             self.retire(&notes, n);
@@ -346,8 +357,11 @@ impl Kqueue {
                     -15..=-3 => return Err(Errno::EOPNOTSUPP),
                     _ => return Err(Errno::EINVAL),
                 };
-                // (A timer tells of each firing once, asked to or not.)
-                let flags = e.flags & ev::KEPT | if e.filter == filt::TIMER { ev::CLEAR } else { 0 };
+                // (A timer tells of each firing once, asked to or not; and
+                // one for a moment fires once.)
+                let flags = e.flags & ev::KEPT
+                    | if e.filter == filt::TIMER { ev::CLEAR } else { 0 }
+                    | if matches!(what, What::Timer { period: 0, .. }) { ev::ONESHOT } else { 0 };
                 notes.push(Note { ident: e.ident, filter: e.filter, flags, disabled: false, fflags, udata: e.udata, qos: e.qos, ext: e.ext, what });
                 notes.len() - 1
             }
@@ -520,16 +534,17 @@ fn timer(e: &Event, mono: u64, wall: u64) -> Result<What, Errno> {
     if e.data < 0 {
         return Err(Errno::EINVAL);
     }
-    let unit: u64 = match e.fflags & (note::SECONDS | note::USECONDS | note::NSECONDS) {
+    let unit: u64 = match e.fflags & (note::SECONDS | note::USECONDS | note::NSECONDS | note::MACHTIME) {
         0 => 1_000_000,
         note::SECONDS => 1_000_000_000,
         note::USECONDS => 1_000,
-        note::NSECONDS => 1,
+        note::NSECONDS | note::MACHTIME => 1,
         _ => return Err(Errno::EINVAL),
     };
     let span = (e.data as u64).saturating_mul(unit);
+    // A moment: on the clock its unit is of, once.
     if e.fflags & note::ABSOLUTE != 0 {
-        return Ok(What::Timer { next: span, period: 0, absolute: true });
+        return Ok(What::Timer { next: span, period: 0, absolute: e.fflags & note::MACHTIME == 0 });
     }
     let _ = wall;
     // (A period of nothing would fire without end: the least there is.)
@@ -707,7 +722,14 @@ impl Kernel {
             }
         };
         // What the changes had to say is the answer by itself; otherwise
-        // what is ready.
+        // what is ready, unless only the first was asked for.
+        if flags & KEVENT_FLAG_ERROR_EVENTS != 0 && waiting.is_none() {
+            for (i, e) in out.iter().enumerate() {
+                e.write(m, events + i as u64 * form.size(), form)?;
+            }
+            self.darwin_answer = Some(Ok(out.len() as u64));
+            return Ok(None);
+        }
         if out.is_empty() && nevents > 0 {
             out = kq.collect(nevents as usize, &found);
         }

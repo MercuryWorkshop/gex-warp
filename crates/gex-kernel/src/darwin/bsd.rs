@@ -507,7 +507,11 @@ impl Kernel {
             d::ULOCK_WAIT => Err(Errno::EINVAL),
             // A `posix_spawn` that failed before anything was made.
             d::POSIX_SPAWN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
-            d::KQUEUE => self.darwin_kqueue(),
+            // (A guarded descriptor is one the program promises to close
+            // only by saying its guard again; the promise is not held it
+            // to here.)
+            d::KQUEUE | d::GUARDED_KQUEUE_NP => self.darwin_kqueue(),
+            d::GUARDED_CLOSE_NP => self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF)),
             // A work queue is there for the asking.
             d::WORKQ_OPEN => Ok(0),
             d::WORKQ_KERNRETURN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),

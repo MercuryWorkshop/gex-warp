@@ -6,7 +6,8 @@
 enum { SYS_kqueue = 362, SYS_kevent = 363, SYS_kevent64 = 369, SYS_kevent_qos = 374 };
 enum { READ = -1, WRITE = -2, PROC = -5, SIGNAL = -6, TIMER = -7, USER = -10 };
 enum { ADD = 1, DELETE = 2, ENABLE = 4, DISABLE = 8, ONESHOT = 0x10, CLEAR = 0x20, RECEIPT = 0x40, DISPATCH = 0x80, ERROR = 0x4000, EOF_ = 0x8000 };
-enum { TRIGGER = 0x01000000, FFOR = 0x80000000, FFCOPY = 0xc0000000, NOTE_EXIT = 0x80000000, USECONDS = 2 };
+enum { TRIGGER = 0x01000000, FFOR = 0x80000000, FFCOPY = 0xc0000000, NOTE_EXIT = 0x80000000, USECONDS = 2, ABSOLUTE = 8, MACHTIME = 0x100 };
+enum { SPECIFIC = 0x100, SYS_guarded_close_np = 442, SYS_guarded_kqueue_np = 443 };
 
 struct kevent {
     u64 ident;
@@ -200,6 +201,43 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_wait4, pid, &status, 0, 0);
     t_show("watch a process there is none of", change(99999, PROC, ADD, NOTE_EXIT, 0, 0));
 
+    // Two notes on one thing, told apart by what each hands back.
+    t_show("two notes on one event", change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 101) + change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 102));
+    t_show("post the second", change(5, USER, SPECIFIC, TRIGGER, 0, 102));
+    say("the second alone", ready(0));
+    t_show("post one there is none of", change(5, USER, SPECIFIC, TRIGGER, 0, 103));
+    t_show("post it by no name", change(5, USER, 0, TRIGGER, 0, 0));
+    t_show("delete the first", change(5, USER, DELETE | SPECIFIC, 0, 0, 101));
+    t_show("delete it again", change(5, USER, DELETE | SPECIFIC, 0, 0, 101));
+    t_show("delete the second", change(5, USER, DELETE | SPECIFIC, 0, 0, 102));
+
+#if defined(__arm64__)
+    // A timer set for a moment on the clock mach_absolute_time reads, in
+    // its units: 10 ms from now. (Not for x86-64, where the Mac these are
+    // checked against is Rosetta: its clock is not the kernel's.)
+    struct {
+        u32 numer, denom;
+    } base = {1, 1};
+    TRAP(TRAP_mach_timebase_info, &base);
+    u64 moment = (u64)TRAP(TRAP_mach_absolute_time) + 10000000ull * base.denom / base.numer;
+    t_show("a timer for a moment", change(6, TIMER, ADD, MACHTIME | ABSOLUTE, (i64)moment, 44));
+    say("not yet", ready(0));
+    t0 = t_nanos();
+    n = ready(5000);
+    waited = (t_nanos() - t0) / 1000000;
+    t_printf("then: %ld, filter %d flags 0x%x udata %lu\n", n, got[0].filter, got[0].flags, (unsigned long)got[0].udata);
+    t_check("  about then", waited >= 5 && waited < 2000);
+    say("and once", ready(30));
+#endif
+
+    // A queue with a guard on its descriptor, which libdispatch's is.
+    u64 guard = 0x1234;
+    long guarded = SYS(SYS_guarded_kqueue_np, &guard, 3);
+    t_check("guarded_kqueue_np", guarded >= 3);
+    t_show("kevent on it", SYS(SYS_kevent, guarded, 0, 0, got, 8, &now_));
+    t_show("guarded_close_np", SYS(SYS_guarded_close_np, guarded, &guard));
+    t_show("kevent on it closed", SYS(SYS_kevent, guarded, 0, 0, got, 8, &now_));
+
     // The wider calls, each with a queue of its own: a queue is for the
     // call it was first used with.
     struct kevent64 e64 = {8, USER, ADD | CLEAR, 0, 0, 61, {0xa, 0xb}}, g64[2];
@@ -214,6 +252,14 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_printf("kevent64: %ld [%lu filter %d fflags 0x%x udata %lu ext 0x%lx 0x%lx]\n", n, (unsigned long)g64[0].ident, g64[0].filter, g64[0].fflags & 0xffffff, (unsigned long)g64[0].udata,
         (unsigned long)g64[0].ext[0], (unsigned long)g64[0].ext[1]);
     t_show("kevent64: nothing, and not waiting (KEVENT_FLAG_IMMEDIATE)", SYS(SYS_kevent64, kq, 0, 0, g64, 2, 1, 0));
+    // (The pipe is at its end, which is something to read.)
+    e64 = (struct kevent64){rd, READ, ADD, 0, 0, 62, {0, 0}};
+    t_show("kevent64: a change, asking only what went wrong with it (KEVENT_FLAG_ERROR_EVENTS)", SYS(SYS_kevent64, kq, &e64, 1, g64, 2, 2, &now_));
+    n = SYS(SYS_kevent64, kq, 0, 0, g64, 2, 0, &now_);
+    t_printf("kevent64: and what is ready: %ld [filter %d udata %lu]\n", n, g64[0].filter, (unsigned long)g64[0].udata);
+    e64 = (struct kevent64){99, READ, ADD, 0, 0, 63, {0, 0}};
+    n = SYS(SYS_kevent64, kq, &e64, 1, g64, 2, 2, &now_);
+    t_printf("kevent64: a change that fails, asking only that: %ld [flags 0x%x data %ld udata %lu]\n", n, g64[0].flags, (long)g64[0].data, (unsigned long)g64[0].udata);
     SYS(SYS_close, kq);
     kq = SYS(SYS_kqueue);
     struct kevent_qos eq = {9, USER, ADD | CLEAR, 0, 71, TRIGGER, 0, 0, {0, 0, 0, 0}}, gq[2];
