@@ -482,6 +482,11 @@ impl ThreadSigs {
     pub fn tids(&self) -> Vec<i32> {
         self.0.lock().keys().copied().collect()
     }
+
+    /// Every thread's state, as it holds them now.
+    pub fn all(&self) -> Vec<Arc<ThreadSig>> {
+        self.0.lock().values().cloned().collect()
+    }
 }
 
 /// One thread's signal state, shared (`Arc`) between the thread and whoever
@@ -504,6 +509,15 @@ pub struct ThreadSig {
     /// `pthread_join` waits on): `CLONE_CHILD_CLEARTID`'s word, or
     /// `set_tid_address`'s. Zero for none.
     clear_child_tid: AtomicU64,
+    /// The last of its task's requests that threads be restarted
+    /// ([`crate::darwin::restart`]) this thread has answered.
+    restart_seen: AtomicU64,
+    /// Whether the thread is in a system call: in no restartable range.
+    restart_call: std::sync::atomic::AtomicBool,
+    /// The request this thread has made itself and waits to see answered
+    /// (zero: none), and how many times it has looked.
+    restart_wait: AtomicU64,
+    restart_looks: AtomicU64,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -525,7 +539,48 @@ impl ThreadSig {
             sources: Mutex::new([None; NSIG]),
             own: Mutex::new(Own::default()),
             clear_child_tid: AtomicU64::new(0),
+            restart_seen: AtomicU64::new(0),
+            restart_call: std::sync::atomic::AtomicBool::new(false),
+            restart_wait: AtomicU64::new(0),
+            restart_looks: AtomicU64::new(0),
         }
+    }
+
+    /// The thread answers its task's request `asked` that threads be
+    /// restarted: whether it had not yet.
+    pub(crate) fn restart_answer(&self, asked: u64) -> bool {
+        self.restart_seen.swap(asked, Ordering::AcqRel) != asked
+    }
+
+    /// Whether the thread has answered request `asked`, or need not: it is
+    /// in a system call.
+    pub(crate) fn restart_answered(&self, asked: u64) -> bool {
+        self.restart_call.load(Ordering::Acquire) || self.restart_seen.load(Ordering::Acquire) >= asked
+    }
+
+    pub(crate) fn restart_in_call(&self) {
+        self.restart_call.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn restart_left_call(&self) {
+        self.restart_call.store(false, Ordering::Release);
+    }
+
+    /// The request the thread waits on, made by `ask` if it waits on none;
+    /// and how many times it has now looked at it.
+    pub(crate) fn restart_waits(&self, ask: impl FnOnce() -> u64) -> (u64, u64) {
+        let mut asked = self.restart_wait.load(Ordering::Acquire);
+        if asked == 0 {
+            asked = ask();
+            self.restart_wait.store(asked, Ordering::Release);
+            self.restart_looks.store(0, Ordering::Release);
+        }
+        (asked, self.restart_looks.fetch_add(1, Ordering::AcqRel))
+    }
+
+    /// The thread waits on no request any more.
+    pub(crate) fn restart_waited(&self) {
+        self.restart_wait.store(0, Ordering::Release);
     }
 
     /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).

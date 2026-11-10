@@ -479,6 +479,9 @@ fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+/// `task_restartable_ranges_synchronize`'s number.
+const RESTART_SYNCHRONIZE: u32 = 8001;
+
 fn get32(b: &[u8], at: usize) -> u32 {
     b.get(at..at + 4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()))
 }
@@ -833,6 +836,26 @@ impl Kernel {
     /// Its answer is ready (`Err`), or it is a canonical call that waits,
     /// its arguments in `a` and [`Post::Wake`] left to turn the wait's end
     /// into the trap's answer.
+    /// Whether the calling thread's request that its task's threads be
+    /// restarted ([`super::restart`]) is still to be answered by one of
+    /// them: made, the first time this is asked; and given up on after a
+    /// second of looking, when a thread that has not answered is taken to
+    /// be one this kernel has lost sight of and not one in a range.
+    fn darwin_restart_waits(&mut self) -> bool {
+        const LOOKS: u64 = 5000;
+        let ranges = Arc::clone(&self.darwin_restart);
+        if !ranges.on() {
+            return false;
+        }
+        let me = Arc::clone(self.signals.thread());
+        let (asked, looks) = me.restart_waits(|| ranges.ask());
+        if looks < LOOKS && ranges.unanswered(&self.thread_signals, &me, asked) {
+            return true;
+        }
+        me.restart_waited();
+        false
+    }
+
     pub(super) fn darwin_wait_trap(&mut self, m: &mut GuestMem<'_>, n: u64, x: [u64; 8], a: &mut [u64; 6]) -> Option<Result<u64, u64>> {
         use super::nr::trap as t;
         Some(match n {
@@ -858,6 +881,18 @@ impl Kernel {
             // size and priority, timeout). With MSG_VECTOR the data is two
             // vectors, the message's and its auxiliary data's, and the two
             // sizes count them.
+            // The task asks that its threads be restarted
+            // (`task_restartable_ranges_synchronize`, [`super::restart`]):
+            // while one of them has yet to answer, a little later and
+            // again. Only once they all have is it answered.
+            t::MACH_MSG2 if (x[4] >> 32) as u32 == RESTART_SYNCHRONIZE && x[1] & opt::SEND_MSG != 0 && self.darwin_restart_waits() => {
+                let ts = self.ctx_addr + SCRATCH_SLOT as u64;
+                let _ = m.write_u64(ts, 0);
+                let _ = m.write_u64(ts + 8, 200_000);
+                self.darwin_post = Post::Again;
+                *a = [ts, 0, 0, 0, 0, 0];
+                Ok(nr::NANOSLEEP)
+            }
             t::MACH_MSG2 => {
                 let (mut send_at, mut rcv_at, mut send_size, mut rcv_size) = (x[0], x[0], x[2] >> 32, x[6] & 0xffff_ffff);
                 if x[1] & opt::MSG_VECTOR != 0 {
@@ -1197,6 +1232,26 @@ impl Kernel {
             // made a different length (which empties it), and where it is.
             // Each answers how much was taken and when the task should
             // next say what it holds.
+            // task_restartable_ranges_register(task, ranges, count)
+            // ([`super::restart`]): how many, then each's location, length,
+            // recovery offset and flags.
+            (Kind::Task, 8000) => {
+                let count = get32(&req.body, 8) as usize;
+                let given: Option<Vec<(u64, u16, u16, u32)>> = (0..count.min(65))
+                    .map(|i| {
+                        let b = req.body.get(12 + 16 * i..28 + 16 * i)?;
+                        Some((u64::from_le_bytes(b[..8].try_into().ok()?), u16::from_le_bytes([b[8], b[9]]), u16::from_le_bytes([b[10], b[11]]), get32(b, 12)))
+                    })
+                    .collect();
+                match given {
+                    Some(given) if count <= 64 => plain(self.darwin_restart.register(&given).err().unwrap_or(0), &[]),
+                    _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
+            // task_restartable_ranges_synchronize(task): every thread has
+            // answered by now, since the call waited to be made until
+            // they had ([`Self::darwin_restart_waits`]).
+            (Kind::Task, RESTART_SYNCHRONIZE) => plain(0, &[]),
             (Kind::Task, 4822) => match self.darwin_reclaim_allocate(m, get32(&req.body, 8) as u64, get32(&req.body, 12) as u64) {
                 Ok(at) => {
                     let mut out = at.to_le_bytes().to_vec();

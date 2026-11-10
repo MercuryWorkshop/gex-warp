@@ -21,6 +21,7 @@
 pub mod abi;
 mod attr;
 mod reclaim;
+pub mod restart;
 pub mod root;
 mod bsd;
 pub mod info;
@@ -156,6 +157,8 @@ pub enum Post {
     UlockWake,
     /// `unlink`: a directory is refused as Darwin refuses one.
     Unlink,
+    /// The call only waited to be made again ([`restart`]).
+    Again,
     /// `fstat` of shared memory: the `stat` at `stat` says no kind of
     /// file.
     NoKind { stat: u64 },
@@ -471,7 +474,7 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
         },
         // (The kernel's answer already, or a host that makes the call
         // again and does not come here.)
-        Post::Psynch | Post::Workq => r,
+        Post::Psynch | Post::Workq | Post::Again => r,
         Post::SoError { at } => {
             if r.is_ok() {
                 if let Ok(e @ 1..) = m.read_u32(at) {

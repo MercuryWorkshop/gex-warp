@@ -33,6 +33,9 @@ pub(crate) struct Home {
     /// Its threads' signal states (`Kernel::thread_signals`), for a
     /// `tgkill` to one.
     threads: Arc<gex_kernel::signal::ThreadSigs>,
+    /// A Darwin task's restartable ranges (`Kernel::darwin_restart`), which
+    /// its threads answer at their polls.
+    restart: Arc<gex_kernel::darwin::restart::Ranges>,
     clock: ClockFn,
     /// Its futexes and its memory map's published view, for `futex`
     /// without the kernel.
@@ -118,6 +121,7 @@ fn home_of(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proc
         pid: k.pid,
         creds: Arc::clone(&k.creds),
         threads: Arc::clone(&k.thread_signals),
+        restart: Arc::clone(&k.darwin_restart),
         clock: k.clock,
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
@@ -446,6 +450,31 @@ fn gather(home: &Home) {
         let (secs, nanos) = (home.clock)();
         home.sig.fire_timers(secs as u128 * 1_000_000_000 + nanos as u128);
     }
+}
+
+/// This Worker's thread is at exactly `pc` in its own code, its context
+/// whole: where it is to go on instead, when its task has asked that its
+/// threads be restarted and it is in one of the ranges that means
+/// (`gex_kernel::darwin::restart`). No kernel lock.
+pub(crate) fn restart_point(pc: u64) -> Option<u64> {
+    let home = home()?;
+    if !home.restart.on() {
+        return None;
+    }
+    MINE.with(|m| m.borrow().as_ref().and_then(|(_, t)| home.restart.point(t, pc)))
+}
+
+/// This Worker's thread's wait in a system call has ended: it goes back to
+/// its code, where it may be in a restartable range again
+/// (`Kernel::finish_blocking`'s part, for a wait finished without the
+/// kernel).
+pub(crate) fn left_call() {
+    let Some(home) = home() else { return };
+    MINE.with(|m| {
+        if let Some((_, t)) = m.borrow().as_ref() {
+            home.restart.leave_call(t);
+        }
+    });
 }
 
 /// Whether a signal would do something to this Worker's thread: a handler,

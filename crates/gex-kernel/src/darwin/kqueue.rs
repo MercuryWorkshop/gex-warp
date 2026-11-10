@@ -1209,7 +1209,7 @@ impl Kernel {
     pub(crate) fn darwin_again(&mut self, r: SysResult) -> bool {
         let again = match self.darwin_post {
             Post::Kevent { .. } => r != Err(Errno::EINTR),
-            Post::Workq => true,
+            Post::Workq | Post::Again => true,
             _ => false,
         };
         if again {

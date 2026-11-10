@@ -9296,7 +9296,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         | k.retry_recvmsg.take().is_some()
                         | k.retry_transfer.take().is_some()
                         | (k.darwin_post == gex_kernel::darwin::Post::Psynch)
-                        | matches!(k.darwin_post, gex_kernel::darwin::Post::Kevent { .. } | gex_kernel::darwin::Post::Workq),
+                        | matches!(k.darwin_post, gex_kernel::darwin::Post::Kevent { .. } | gex_kernel::darwin::Post::Workq | gex_kernel::darwin::Post::Again),
                     darwin_post: std::mem::take(&mut k.darwin_post),
                 };
                 {
@@ -10231,8 +10231,15 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     // a Mac program's root, entered and to be left
     // (`gex_kernel::darwin::root`).
     v.extend_from_slice(k.vfs.root().as_bytes());
-    if k.vfs.entered() {
-        v.extend_from_slice(b"\0darwin");
+    // (And after another, a Darwin task's restartable ranges, which a
+    // forked child has: `gex_kernel::darwin::restart`.)
+    let ranges = k.darwin_restart.carry();
+    if k.vfs.entered() || !ranges.is_empty() {
+        v.extend_from_slice(if k.vfs.entered() { b"\0darwin" } else { b"\0" });
+    }
+    if !ranges.is_empty() {
+        v.push(0);
+        v.extend_from_slice(ranges.as_bytes());
     }
     v
 }
@@ -10262,10 +10269,9 @@ fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
     let saved = ids + gex_kernel::syscalls::Creds::SAVED;
     k.creds.restore(&rest[ids..saved]);
     let root = String::from_utf8_lossy(&rest[saved..]);
-    let (root, entered) = match root.split_once('\0') {
-        Some((root, how)) => (root, how == "darwin"),
-        None => (&*root, false),
-    };
+    let mut fields = root.split('\0');
+    let (root, entered) = (fields.next().unwrap_or(""), fields.next() == Some("darwin"));
+    k.darwin_restart.adopt(fields.next().unwrap_or(""));
     if !root.is_empty() && root != "/" {
         // The directory came over in the chrooted namespace's terms, and
         // was set before there was one (where it may have named nothing,
@@ -15130,6 +15136,10 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // What other processes wrote back while the call waited
     // (`Kernel::finish_blocking`, as the native host's).
     sigs::catch_up_shared(&mut gm);
+    // And the thread is in its call no longer.
+    if gex_kernel::darwin::on() {
+        sigs::left_call();
+    }
     let Some(op) = op else {
         // A futex thread arriving with nothing to finish must still receive
         // a legal result. Linux permits spurious futex wakes, and zero is
@@ -15173,7 +15183,7 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // Darwin psynch wait is made again however it ended: the kernel
     // finishes it, and what ended it is the kernel's to say
     // (`Kernel::darwin_psynch`).
-    let psynch = matches!(owed.darwin_post, gex_kernel::darwin::Post::Psynch | gex_kernel::darwin::Post::Workq);
+    let psynch = matches!(owed.darwin_post, gex_kernel::darwin::Post::Psynch | gex_kernel::darwin::Post::Workq | gex_kernel::darwin::Post::Again);
     if res == Err(PI_RETRY) || (owed.reissue && (psynch || res != Err(Errno::EINTR))) {
         return Done::At(ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES);
     }
@@ -17039,6 +17049,23 @@ fn safepoint(ctx: i32, pc: i64) {
                  threads:{census}\n",
                 pc as u64
             ));
+        }
+    }
+    // A Darwin thread its task has asked be restarted, in one of the ranges
+    // that means (`gex_kernel::darwin::restart`): it goes on at the range's
+    // recovery address, as it would at a handler's. No kernel lock.
+    if gex_kernel::darwin::on() {
+        if let Some(to) = sigs::restart_point(pc as u64) {
+            let ctx_addr = ctx as u32 as u64;
+            let _ = guest().write_u64(ctx_addr + ctx::PC as u64, to);
+            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
+                r.pc = to;
+                r.waiting = Waiting::Runnable;
+            }
+            set_resume(to);
+            set_resume_ctx(my_ctx());
+            trap();
         }
     }
     // A signal, if one is pending: without this a signal was only noticed

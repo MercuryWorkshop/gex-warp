@@ -745,6 +745,9 @@ pub struct Kernel {
     /// Where a Darwin task's ring of memory to be taken back is
     /// ([`darwin::reclaim`]), once it has one and this kernel knows of it.
     pub darwin_reclaim: Option<u64>,
+    /// A Darwin task's restartable ranges ([`darwin::restart`]): its own
+    /// and its threads', read without this kernel's lock.
+    pub darwin_restart: Arc<darwin::restart::Ranges>,
     /// Whether the process's memory has its commpage
     /// ([`darwin::commpage`]): mapped at its first call, and a fork's copy
     /// has its parent's.
@@ -9852,6 +9855,7 @@ impl Kernel {
             darwin_workq: Default::default(),
             darwin_workq_does: None,
             darwin_reclaim: None,
+            darwin_restart: Arc::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
             darwin_threads: Default::default(),
@@ -10003,6 +10007,7 @@ impl Kernel {
         self.darwin_workq = Default::default();
         self.darwin_workq_does = None;
         self.darwin_reclaim = None;
+        self.darwin_restart.clear();
         self.darwin_spawn_at = None;
     }
 
@@ -10332,6 +10337,7 @@ impl Kernel {
             darwin_workq_does: None,
             // (The child's memory is the parent's, its ring with it.)
             darwin_reclaim: self.darwin_reclaim,
+            darwin_restart: Arc::new(self.darwin_restart.copy()),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
             // The child's libpthread is the parent's, registered already.
@@ -10407,11 +10413,19 @@ impl Kernel {
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         // Other processes' write-backs into this one's shared mappings.
         self.mem.shared_maps().catch_up(m);
+        // A Darwin thread in a call is in no restartable range
+        // ([`darwin::restart`]), until the call ends: here, or when its
+        // wait does ([`Self::finish_blocking`]).
+        if self.darwin {
+            self.darwin_restart.enter_call(self.signals.thread());
+        }
         let out = self.syscall_cwd(m, pc);
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
             self.block_pc = pc;
+        } else if self.darwin {
+            self.darwin_restart.leave_call(self.signals.thread());
         }
         out
     }
@@ -11086,6 +11100,9 @@ impl Kernel {
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        if self.darwin {
+            self.darwin_restart.leave_call(self.signals.thread());
+        }
         // What other processes wrote back while the call waited: the wait's
         // end can be what orders this process after their writes (a pipe
         // read of a byte written after a commit), with no system call of
@@ -11399,6 +11416,21 @@ impl Kernel {
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
         sigaltstack(&self.signals, m, self.compat, new, old)
+    }
+
+    /// What a thread's poll at a loop's back edge finds for it to do, with
+    /// the thread at exactly `pc` and its context whole: a Darwin thread
+    /// that its task has asked be restarted, in one of the ranges that
+    /// means ([`darwin::restart`]), goes on at the range's recovery address;
+    /// else a pending signal is delivered ([`Self::deliver_pending`]).
+    pub fn poll_at(&mut self, m: &mut GuestMem<'_>, pc: u64) -> Delivery {
+        if self.darwin {
+            if let Some(to) = self.darwin_restart.point(self.signals.thread(), pc) {
+                let _ = m.write_u64(self.ctx_addr + ctx::PC as u64, to);
+                return Delivery::Resume(to);
+            }
+        }
+        self.deliver_pending(m)
     }
 
     /// Deliver a pending signal, if any is deliverable right now.

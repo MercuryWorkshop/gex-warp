@@ -5636,7 +5636,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
-            match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
+            match state.with_kernel(|k| k.poll_at(&mut gm, pc as u64)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
                     if run_signal_frames(&mut caller, pc as u64)? {
