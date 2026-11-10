@@ -9268,7 +9268,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         | k.retry_recvmsg.take().is_some()
                         | k.retry_transfer.take().is_some()
                         | (k.darwin_post == gex_kernel::darwin::Post::Psynch)
-                        | matches!(k.darwin_post, gex_kernel::darwin::Post::Kevent { .. }),
+                        | matches!(k.darwin_post, gex_kernel::darwin::Post::Kevent { .. } | gex_kernel::darwin::Post::Workq),
                     darwin_post: std::mem::take(&mut k.darwin_post),
                 };
                 {
@@ -15122,7 +15122,7 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // Darwin psynch wait is made again however it ended: the kernel
     // finishes it, and what ended it is the kernel's to say
     // (`Kernel::darwin_psynch`).
-    let psynch = owed.darwin_post == gex_kernel::darwin::Post::Psynch;
+    let psynch = matches!(owed.darwin_post, gex_kernel::darwin::Post::Psynch | gex_kernel::darwin::Post::Workq);
     if res == Err(PI_RETRY) || (owed.reissue && (psynch || res != Err(Errno::EINTR))) {
         return Done::At(ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES);
     }

@@ -424,6 +424,7 @@ impl Kernel {
             d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
             d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
             d::POSIX_SPAWN => return self.darwin_posix_spawn(m, x, a),
+            d::WORKQ_KERNRETURN => return self.darwin_workq(m, x, a),
             d::KEVENT => return self.darwin_kevent(m, kqueue::Form::Plain, x, a),
             d::KEVENT64 => return self.darwin_kevent(m, kqueue::Form::Wide, x, a),
             d::KEVENT_QOS => return self.darwin_kevent(m, kqueue::Form::Qos, x, a),
@@ -507,6 +508,9 @@ impl Kernel {
             // A `posix_spawn` that failed before anything was made.
             d::POSIX_SPAWN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             d::KQUEUE => self.darwin_kqueue(),
+            // A work queue is there for the asking.
+            d::WORKQ_OPEN => Ok(0),
+            d::WORKQ_KERNRETURN => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // A `kevent` that did not wait: its answer.
             d::KEVENT => self.darwin_answer.take().unwrap_or(Err(Errno::EINVAL)),
             // A psynch call that did not wait: its answer.

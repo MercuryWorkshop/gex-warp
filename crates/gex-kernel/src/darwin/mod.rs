@@ -31,6 +31,7 @@ mod sock;
 mod spawn;
 pub mod thread;
 pub mod tty;
+pub mod workq;
 
 use super::*;
 
@@ -179,6 +180,9 @@ pub enum Post {
     /// finishes its waits without one. `slot` is the thread's, whose mark
     /// says the call is one being made again.
     Kevent { slot: u64 },
+    /// A work queue's thread that waited for work ([`workq`]): it asks
+    /// again, however its wait ended.
+    Workq,
     /// `waitid`: the kernel's `siginfo_t` at `at` as Darwin's, which is
     /// shorter; `was` is what the caller had there, and past it.
     Waitid { at: u64, was: [u64; 16] },
@@ -456,7 +460,7 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
         },
         // (The kernel's answer already, or a host that makes the call
         // again and does not come here.)
-        Post::Psynch => r,
+        Post::Psynch | Post::Workq => r,
         Post::SoError { at } => {
             if r.is_ok() {
                 if let Ok(e @ 1..) = m.read_u32(at) {

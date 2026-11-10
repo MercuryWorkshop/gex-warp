@@ -745,15 +745,21 @@ impl Kernel {
         Ok(Some(nr::PPOLL))
     }
 
-    /// Whether the call whose wait just ended as `r` is a `kevent` to be
-    /// made again ([`Kernel::finish_blocking`]): one is, unless a signal
-    /// ended its wait. What was left to do after it is then done with.
-    pub(crate) fn darwin_kevent_again(&mut self, r: SysResult) -> bool {
-        if !matches!(self.darwin_post, Post::Kevent { .. }) || r == Err(Errno::EINTR) {
-            return false;
+    /// Whether the call whose wait just ended as `r` is one to be made
+    /// again ([`Kernel::finish_blocking`]): a `kevent` is, unless a signal
+    /// ended its wait, and a work queue's thread that waited for work
+    /// ([`super::workq`]) always. What was left to do after it is then
+    /// done with.
+    pub(crate) fn darwin_again(&mut self, r: SysResult) -> bool {
+        let again = match self.darwin_post {
+            Post::Kevent { .. } => r != Err(Errno::EINTR),
+            Post::Workq => true,
+            _ => false,
+        };
+        if again {
+            self.darwin_post = Post::None;
         }
-        self.darwin_post = Post::None;
-        true
+        again
     }
 }
 

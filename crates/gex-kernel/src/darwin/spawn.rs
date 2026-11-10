@@ -53,6 +53,12 @@ const TEXT_X86: [u8; 21] = [
     0x0f, 0x0b, // ud2
 ];
 
+/// The code a `posix_spawn`'s copy re-enters the kernel through, at the
+/// start of the kernel's page of it ([`Kernel::darwin_text_page`]).
+pub(super) fn text() -> Vec<u8> {
+    if gex_abi::X86 { TEXT_X86.to_vec() } else { TEXT_ARM64.iter().flat_map(|w| w.to_le_bytes()).collect() }
+}
+
 impl Kernel {
     /// `posix_spawn(pid, path, adesc, argv, envp)`: the canonical call it
     /// becomes (a fork in the caller, an exec in the copy), or its answer
@@ -84,14 +90,7 @@ impl Kernel {
         if let Err(e) = self.darwin_spawn_actions(m, adesc) {
             return self.darwin_spawn_fails(false, e, a);
         }
-        if self.mem.mmap_anon(m, commpage::TEXT, commpage::PAGE, 7, mflags::FIXED_NOREPLACE, false, "[commpage text]").is_ok() {
-            if gex_abi::X86 {
-                let _ = m.write(commpage::TEXT, &TEXT_X86);
-            } else {
-                let code: Vec<u8> = TEXT_ARM64.iter().flat_map(|w| w.to_le_bytes()).collect();
-                let _ = m.write(commpage::TEXT, &code);
-            }
-        }
+        self.darwin_text_page(m);
         self.darwin_spawn_at = Some(pid_at);
         *a = [SIGCHLD, 0, 0, 0, 0, 0];
         nr::CLONE

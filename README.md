@@ -199,6 +199,10 @@ the image low. What works is what a program can do with the kernel alone:
   them, which is how Apple's libc finds a file's real path and sets its
   times; and the calls that carry an access list beside a mode
   (`stat64_extended`, `chmod_extended`), of which no file has one;
+- work queues: the threads XNU makes for a process that asks for work to
+  be done (`workq_kernreturn`), on stacks of the kernel's laying out,
+  given more when they come back and let go when there is none, which is
+  where libdispatch's threads come from;
 - `kqueue` and `kevent` (and `kevent64`, `kevent_qos`): a descriptor to
   read or write, timers, events a program posts to itself, a process
   ending; told each time or once, and waited for;
@@ -236,8 +240,8 @@ What does not, yet:
   of what the kernel's own ports are asked (`task_info`, `vm_region`)
   answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
-- Work queues (the threads XNU makes for libdispatch, and `kevent`
-  delivering to them); the kqueue filters for a signal, a Mach port and a
+- A kqueue's events delivered to a work queue's threads, and workloops;
+  the kqueue filters for a signal, a Mach port and a
   file changing; a queue's descriptor closed in a child of `fork`; on the
   page, a note on another process hearing of its end every time;
   `mknod`; a mutex or condition shared between
