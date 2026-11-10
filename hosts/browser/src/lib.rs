@@ -2120,7 +2120,7 @@ impl FileHandle for StdinQueue {
             ino: 2,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: TTY_RDEV,
             times: Default::default(),
         })
     }
@@ -2330,6 +2330,14 @@ fn install_console(kernel: &mut Kernel) {
 ///
 /// A shell with job control opens this before running anything, as do `less`,
 /// `ssh` and `sudo`; none accepts a substitute.
+/// The device a terminal of the page says it is, its standard streams and
+/// `/dev/tty` alike: `/dev/tty`'s own number (5:0). A libc that looks in
+/// `/dev` for the name of what a descriptor is (a Mac's `ttyname`) finds
+/// that name, and a shell that opens its terminal by the name it was told
+/// (zsh) has its terminal; with no number, it was taken for the first
+/// device in `/dev` that has none, which is no terminal.
+const TTY_RDEV: u64 = 0x500;
+
 #[derive(Debug)]
 struct Tty;
 
@@ -2350,7 +2358,7 @@ impl FileHandle for Tty {
             ino: 3,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: TTY_RDEV,
             times: Default::default(),
         })
     }
@@ -2416,7 +2424,7 @@ impl FileHandle for Console {
             ino: 1,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: TTY_RDEV,
             times: Default::default(),
         })
     }

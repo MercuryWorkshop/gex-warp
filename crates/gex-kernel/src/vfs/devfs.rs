@@ -215,6 +215,14 @@ impl FileSystem for DevFs {
         if path.is_empty() {
             return Ok(Metadata::dir());
         }
+        // (The host-call device says what it is without being opened: an
+        // open of it is a handle in the host, made for a `stat` and never
+        // let go, and what that handle said of itself was the page's
+        // first terminal's device, which a Mac's `ttyname` then took for
+        // the terminal's name.)
+        if path == super::hostcall::NAME && self.per_open.iter().any(|(n, _)| n == path) {
+            return Ok(super::hostcall::metadata());
+        }
         if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
             return open().metadata();
         }

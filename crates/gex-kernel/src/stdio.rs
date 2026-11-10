@@ -166,7 +166,13 @@ impl FileHandle for StdStream {
             ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            // A terminal is the device `/dev/tty` is (5:0): a libc that
+            // looks in `/dev` for the name of what a descriptor is (a
+            // Mac's `ttyname`) finds that, and a shell that opens its
+            // terminal by the name it was told has its terminal. (With
+            // no number of its own it was taken for the first device
+            // there with none, which is no terminal.)
+            rdev: if self.tty { 0x500 } else { 0 },
             times: Default::default(),
         })
     }
