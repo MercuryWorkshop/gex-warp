@@ -1026,26 +1026,37 @@ impl Kernel {
     /// into the trap's answer.
     /// Whether the calling thread's request that its task's threads be
     /// restarted ([`super::restart`]) is still to be answered by one of
-    /// them: made, the first time this is asked; and given up on after a
-    /// second of looking, when a thread that has not answered is taken to
-    /// be one this kernel has lost sight of and not one in a range.
-    fn darwin_restart_waits(&mut self) -> bool {
+    /// them, and how long to wait before asking again: made, the first
+    /// time this is asked; looked at again very soon at first (a thread at
+    /// work answers within a thousand turns of whatever loop it is in),
+    /// then less often; and given up on after about a second, when a
+    /// thread that has not answered is taken to be one this kernel has
+    /// lost sight of and not one in a range.
+    fn darwin_restart_waits(&mut self) -> Option<u64> {
         const LOOKS: u64 = 5000;
         let ranges = Arc::clone(&self.darwin_restart);
         if !ranges.on() {
-            return false;
+            return None;
         }
         let me = Arc::clone(self.signals.thread());
         let (asked, looks) = me.restart_waits(|| ranges.ask());
-        if looks < LOOKS && ranges.unanswered(&self.thread_signals, &me, asked) {
-            return true;
+        // (Of the threads there are: a thread that has ended may have
+        // left its signal state behind.)
+        let (procs, pid) = (Arc::clone(&self.procs), self.pid);
+        if looks < LOOKS && ranges.unanswered(&self.thread_signals, &me, asked, |tid| procs.task_owner(tid) == Some(pid)) {
+            return Some(match looks {
+                0..16 => 1_000,
+                16..64 => 20_000,
+                _ => 200_000,
+            });
         }
         me.restart_waited();
-        false
+        None
     }
 
     pub(super) fn darwin_wait_trap(&mut self, m: &mut GuestMem<'_>, n: u64, x: [u64; 8], a: &mut [u64; 6]) -> Option<Result<u64, u64>> {
         use super::nr::trap as t;
+        let restart = if n == t::MACH_MSG2 && (x[4] >> 32) as u32 == RESTART_SYNCHRONIZE && x[1] & opt::SEND_MSG != 0 { self.darwin_restart_waits() } else { None };
         Some(match n {
             t::MACH_MSG | t::MACH_MSG_OVERWRITE => {
                 let Ok(h) = m.read(x[0], HEADER as usize).map(|b| b.to_vec()) else { return Some(Err(MACH_SEND_INVALID_DATA)) };
@@ -1073,10 +1084,10 @@ impl Kernel {
             // (`task_restartable_ranges_synchronize`, [`super::restart`]):
             // while one of them has yet to answer, a little later and
             // again. Only once they all have is it answered.
-            t::MACH_MSG2 if (x[4] >> 32) as u32 == RESTART_SYNCHRONIZE && x[1] & opt::SEND_MSG != 0 && self.darwin_restart_waits() => {
+            t::MACH_MSG2 if restart.is_some() => {
                 let ts = self.ctx_addr + SCRATCH_SLOT as u64;
                 let _ = m.write_u64(ts, 0);
-                let _ = m.write_u64(ts + 8, 200_000);
+                let _ = m.write_u64(ts + 8, restart.unwrap_or(0));
                 self.darwin_post = Post::Again;
                 *a = [ts, 0, 0, 0, 0, 0];
                 Ok(nr::NANOSLEEP)
@@ -1582,6 +1593,44 @@ impl Kernel {
                         plain(0, &b)
                     }
                     _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
+            // mach_vm_remap(target, in-out address, size, mask, flags,
+            // source task, source address, copy, out protections,
+            // inheritance): the source's memory at a second address in the
+            // target, both of them this task. What is there arrives as a
+            // copy, with the source's protection: which is the source
+            // itself for memory that is not written (a page of code mapped
+            // again, as the Objective-C runtime maps its trampolines). To
+            // have one writable memory at two addresses is refused.
+            (Kind::Task, 4813) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (want, size, mask, flags, from, copy) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, at(52), get32(&req.body, 60) != 0);
+                let source_is_this = req.ports.first().is_some_and(|(_, p, _)| p.kind == Kind::Task);
+                let len = size.next_multiple_of(abi::PAGE_SIZE);
+                let prot = self.mem.lock().vma_at(from).map(|v| v.prot & 7);
+                match prot {
+                    _ if !source_is_this || size == 0 => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                    Some(prot) if self.mem.lock().check_access(from, len, prot) && (copy || prot & crate::mem::prot::WRITE == 0) => {
+                        let bytes = m.read(from, len as usize).map(|b| b.to_vec());
+                        let made = bytes.map_err(|_| Errno::EFAULT).and_then(|bytes| {
+                            let to = self.darwin_vm_map_at(m, want, len, mask, flags, crate::mem::prot::READ | crate::mem::prot::WRITE)?;
+                            m.write(to, &bytes)?;
+                            self.map_io().call(m, nr::MPROTECT, [to, len, prot as u64, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))?;
+                            Ok(to)
+                        });
+                        match made {
+                            Ok(to) => {
+                                let mut out = to.to_le_bytes().to_vec();
+                                out.extend_from_slice(&prot.to_le_bytes());
+                                out.extend_from_slice(&prot.to_le_bytes());
+                                plain(0, &out)
+                            }
+                            Err(e) => plain(super::mach::kern(Err(e)) as i32, &[]),
+                        }
+                    }
+                    Some(_) if !copy => plain(46, &[]),
+                    _ => plain(KERN_INVALID_ADDRESS as i32, &[]),
                 }
             }
             // mach_vm_region(task, in-out address, out size, flavor, out

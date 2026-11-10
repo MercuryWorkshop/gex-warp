@@ -234,7 +234,9 @@ the image low. What works is what a program can do with the kernel alone:
   clock's ports that those and libpthread need (`host_info` among them),
   what a task and a thread say of themselves (`task_info`,
   `thread_info`: their memory and times, who they run as, which thread),
-  the regions of a task's memory (`mach_vm_region`, and `_recurse`),
+  the regions of a task's memory (`mach_vm_region`, and `_recurse`) and
+  memory given a second address (`mach_vm_remap`: of what is not written,
+  or as a copy),
   and the kernel's notifications (`mach_port_request_notification`): that
   a port has no senders left, that the port a name was a right to has
   died or the name has gone, that a send-once right was never used;

@@ -10424,7 +10424,8 @@ impl Kernel {
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
             self.block_pc = pc;
-        } else if self.darwin {
+        } else if self.darwin && !matches!(out, SyscallOutcome::Exit(_) | SyscallOutcome::Killed { .. } | SyscallOutcome::ThreadExit) {
+            // (A thread that ends in its call never leaves it.)
             self.darwin_restart.leave_call(self.signals.thread());
         }
         out

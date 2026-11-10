@@ -170,10 +170,11 @@ impl Ranges {
     }
 
     /// Whether a thread of `threads` other than `me` may still be in a
-    /// range as it was before request `asked` was made: one that has not
-    /// answered it and is not in a system call.
-    pub fn unanswered(&self, threads: &ThreadSigs, me: &Arc<ThreadSig>, asked: u64) -> bool {
-        threads.all().iter().any(|t| !Arc::ptr_eq(t, me) && !t.restart_answered(asked))
+    /// range as it was before request `asked` was made: one there still
+    /// is (`live`, by its id) that has not answered it and is not in a
+    /// system call.
+    pub fn unanswered(&self, threads: &ThreadSigs, me: &Arc<ThreadSig>, asked: u64, live: impl Fn(i32) -> bool) -> bool {
+        threads.pairs().iter().any(|(tid, t)| !Arc::ptr_eq(t, me) && !t.restart_answered(asked) && live(*tid))
     }
 }
 
@@ -207,13 +208,13 @@ mod tests {
         threads.insert(2, Arc::clone(&other));
         assert_eq!(r.point(&other, 0x1004), None, "nothing asked");
         let asked = r.ask();
-        assert!(r.unanswered(&threads, &me, asked), "the other has not answered");
+        assert!(r.unanswered(&threads, &me, asked, |_| true), "the other has not answered");
         assert_eq!(r.point(&other, 0x1004), Some(0x1018));
-        assert!(!r.unanswered(&threads, &me, asked));
+        assert!(!r.unanswered(&threads, &me, asked, |_| true));
         assert_eq!(r.point(&other, 0x1004), None, "answered already");
         let asked = r.ask();
         assert_eq!(r.point(&other, 0x1010), None, "past the range's end");
-        assert!(!r.unanswered(&threads, &me, asked), "which answers all the same");
+        assert!(!r.unanswered(&threads, &me, asked, |_| true), "which answers all the same");
     }
 
     #[test]
@@ -226,12 +227,16 @@ mod tests {
         threads.insert(2, Arc::clone(&other));
         r.enter_call(&other);
         let asked = r.ask();
-        assert!(!r.unanswered(&threads, &me, asked), "in its call");
+        assert!(!r.unanswered(&threads, &me, asked, |_| true), "in its call");
         r.leave_call(&other);
-        assert!(r.unanswered(&threads, &me, asked), "back in its code, and not seen there since");
+        assert!(r.unanswered(&threads, &me, asked, |_| true), "back in its code, and not seen there since");
         r.enter_call(&other);
         r.leave_call(&other);
-        assert!(!r.unanswered(&threads, &me, asked), "a call made since is an answer");
+        assert!(!r.unanswered(&threads, &me, asked, |_| true), "a call made since is an answer");
+        r.leave_call(&other);
+        let asked = r.ask();
+        assert!(r.unanswered(&threads, &me, asked, |_| true));
+        assert!(!r.unanswered(&threads, &me, asked, |tid| tid != 2), "a thread there is no more of answers nothing");
     }
 
     #[test]

@@ -483,9 +483,9 @@ impl ThreadSigs {
         self.0.lock().keys().copied().collect()
     }
 
-    /// Every thread's state, as it holds them now.
-    pub fn all(&self) -> Vec<Arc<ThreadSig>> {
-        self.0.lock().values().cloned().collect()
+    /// Every thread's state by its id, as it holds them now.
+    pub fn pairs(&self) -> Vec<(i32, Arc<ThreadSig>)> {
+        self.0.lock().iter().map(|(tid, t)| (*tid, Arc::clone(t))).collect()
     }
 }
 

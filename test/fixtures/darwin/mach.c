@@ -372,6 +372,67 @@ static void regions(void) {
     SYS(SYS_munmap, at - PAGE, 7 * PAGE);
 }
 
+// mach_vm_remap: memory of the task's given a second address. (Memory that
+// is not written, or a copy asked for: one writable memory at two
+// addresses is XNU's to give and not this kernel's.)
+static long remap(u64 *at, u64 size, u32 flags, u64 from, u32 copy, u32 *now, u32 *most) {
+    static struct {
+        struct header h;
+        u32 body[32];
+    } m;
+    static const u32 ndr[2] = {0, 1};
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 4813;
+    m.body[0] = 1;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){task, 0, 0, COPY_SEND, 0};
+    m.body[4] = ndr[0], m.body[5] = ndr[1];
+    // { address, size, mask, flags, source address, copy, inheritance }
+    m.body[6] = (u32)*at, m.body[7] = (u32)(*at >> 32), m.body[8] = (u32)size, m.body[9] = (u32)(size >> 32), m.body[12] = flags;
+    m.body[13] = (u32)from, m.body[14] = (u32)(from >> 32), m.body[15] = copy, m.body[16] = 1;
+    u32 reply = (u32)TRAP(TRAP_mach_reply_port);
+    m.h.bits = COMPLEX | COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = task, m.h.local = reply;
+    long r = msg((struct message *)&m, SEND_MSG | RCV_MSG | KOBJECT_CALL, sizeof m.h + 68, sizeof m, reply, 0);
+    TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
+    if (r) return r;
+    if (m.body[2]) return (long)(i32)m.body[2];
+    *at = m.body[3] | (u64)m.body[4] << 32, *now = m.body[5], *most = m.body[6];
+    return 0;
+}
+
+static void remapped(void) {
+#if defined(__arm64__)
+    enum { PAGE = 16384 };
+#else
+    enum { PAGE = 4096 };
+#endif
+    enum { ANYWHERE = 1, OVERWRITE = 0x4000 };
+    u8 *src = (u8 *)SYS(SYS_mmap, 0, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    for (long i = 0; i < 2 * PAGE; i++) src[i] = (u8)(i * 13 + i / 97);
+    u64 at = 0;
+    u32 now = 0x55, most = 0x55;
+    // A copy of memory that is written.
+    long r = remap(&at, 2 * PAGE, ANYWHERE, (u64)src, 1, &now, &most);
+    t_printf("remap two pages, as a copy: %ld, protection %u\n", r, now);
+    u8 *got = (u8 *)at;
+    int same = 1;
+    if (!r)
+        for (long i = 0; i < 2 * PAGE; i++) same &= got[i] == src[i];
+    t_check("  at an address of its own, the same bytes", !r && got != src && (u64)got % PAGE == 0 && same);
+    if (!r) got[5] ^= 0xff;
+    t_check("  and its own", !r && src[5] == (u8)(5 * 13));
+    // Memory that is read only, where a page already is.
+    SYS(SYS_mprotect, src, 2 * PAGE, PROT_READ);
+    u64 over = (u64)SYS(SYS_mmap, 0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0), there = over;
+    now = most = 0x55;
+    r = remap(&there, PAGE, OVERWRITE, (u64)src + PAGE, 0, &now, &most);
+    t_printf("remap a page not written, over another: %ld, protection %u\n", r, now);
+    t_check("  where it was asked, the same bytes", !r && there == over && ((u8 *)over)[7] == src[PAGE + 7]);
+    u64 none = 0;
+    t_show("remap from where there is nothing", remap(&none, PAGE, ANYWHERE, 0x10, 0, &now, &most));
+    t_show("remap nothing", remap(&none, 0, ANYWHERE, (u64)src, 0, &now, &most));
+    SYS(SYS_munmap, src, 2 * PAGE);
+}
+
 // Memory out of line: a message that carries an address and a size, and
 // whose receiver has those bytes at an address of its own.
 static void out_of_line(void) {
@@ -924,6 +985,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     kernel_ports();
     infos();
     regions();
+    remapped();
     out_of_line();
     notifications();
     queues();
