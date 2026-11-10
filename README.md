@@ -292,6 +292,32 @@ x86-64 programs' reference is Rosetta, which answers a few things for the
 Mac under it (the page size, the processor, Mach's clock in the host's
 ticks), and those the x86-64 tests do not ask.
 
+#### Beside Linux programs
+
+A Mac program in a system that is Linux's runs in a root of its own, as a
+Windows program runs in a Wine prefix: a directory with a Mac's tree in it,
+its dynamic linker at `usr/lib/dyld` (pyrus builds one). When a process is
+about to become a Mach-O program, the kernel enters the root its
+environment names (`GEX_DARWIN_ROOT`), or else the nearest directory above
+the program that has a linker, and the program runs with that as its `/`.
+What the two systems share is there too: the devices, `/tmp` (a Mac's
+`/private/tmp`), and the whole of the system the root is in, as the volume
+`/Volumes/Linux`; the working directory is the same directory by its name
+there. A program in the root that is no Mac's leaves it for the tree it
+was entered from.
+
+```console
+$ /opt/mac/bin/bash -c 'uname -s; pwd; /Volumes/Linux/bin/uname -s'
+Darwin
+/Volumes/Linux/home/user
+Linux
+```
+
+This is the page's (`crates/gex-kernel/src/darwin/root.rs`), where each
+process has a kernel of its own; `gexc` runs programs of one kind at a
+time, and a Mac program there is given its root with `--sysroot`. A
+system whose own tree is a Mac's enters nothing.
+
 ### Build the page
 
 ```console

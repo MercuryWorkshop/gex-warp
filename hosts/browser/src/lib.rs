@@ -9077,6 +9077,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
             stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
+
         // An exec that asked for a 64-bit memory of a program that has a
         // memory64 twin beside it (`<path>.m64`, 64-bit Wine's loader in a twin dist):
         // the twin runs (vfork.rs `exec_route`).
@@ -10199,14 +10200,20 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&hard.to_le_bytes());
     }
     v.extend_from_slice(&k.creds.save());
-    // And the root a `chroot` made, the rest.
+    // And the root a `chroot` made, the rest; and after a NUL, that it is
+    // a Mac program's root, entered and to be left
+    // (`gex_kernel::darwin::root`).
     v.extend_from_slice(k.vfs.root().as_bytes());
+    if k.vfs.entered() {
+        v.extend_from_slice(b"\0darwin");
+    }
     v
 }
 
 /// [`state_bytes`] into a kernel being built. Bytes that are not one
-/// change nothing.
-fn apply_state(k: &mut Kernel, b: &[u8]) {
+/// change nothing. `cwd` is the directory the process was in, as its root
+/// names it (none: the kernel's own, as it stands).
+fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
     let Some(n) = b.get(..4).map(|w| u32::from_le_bytes(w.try_into().unwrap()) as usize) else { return };
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
@@ -10228,11 +10235,17 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let saved = ids + gex_kernel::syscalls::Creds::SAVED;
     k.creds.restore(&rest[ids..saved]);
     let root = String::from_utf8_lossy(&rest[saved..]);
+    let (root, entered) = match root.split_once('\0') {
+        Some((root, how)) => (root, how == "darwin"),
+        None => (&*root, false),
+    };
     if !root.is_empty() && root != "/" {
         // The directory came over in the chrooted namespace's terms, and
-        // was set before there was one.
-        let cwd = k.cwd();
-        if k.vfs.chroot(&root).is_ok() {
+        // was set before there was one (where it may have named nothing,
+        // or something else).
+        let cwd = if cwd.is_empty() { k.cwd() } else { cwd.to_string() };
+        let there = if entered { k.enter_root(root).is_ok() } else { k.vfs.chroot(root).is_ok() };
+        if there {
             let _ = k.set_cwd(&cwd);
         }
     }
@@ -11828,11 +11841,9 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // The parent's working directory, now that the root is mounted so `set_cwd`
     // can confirm the target exists; else the child resolves relative paths
     // against `/`.
-    {
-        let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
-        if !cwd.is_empty() {
-            let _ = kernel.set_cwd(&cwd);
-        }
+    let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
+    if !cwd.is_empty() {
+        let _ = kernel.set_cwd(&cwd);
     }
     // The parent's program and arguments (`gex_set_child_exe`).
     {
@@ -11852,7 +11863,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     {
         let state = std::mem::take(&mut *CHILD_STATE.0.borrow_mut());
         if !state.is_empty() {
-            apply_state(&mut kernel, &state);
+            apply_state(&mut kernel, &state, &cwd);
         }
     }
     Host {
@@ -12072,6 +12083,11 @@ fn announce_placed(h: &mut Host, p: &gex_ld::Program, path: &str) {
 }
 
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    // A Mac program in a system that is not a Mac's runs in a root of its
+    // own, and a program that is not one leaves it: the program's name in
+    // the root it is to run in (`gex_kernel::darwin::root`).
+    let path = h.kernel.exec_root(path, envp);
+    let path = path.as_str();
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
     {
         let size = warch::memory_size(0) as u64 * 65536;
@@ -12093,7 +12109,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Has this program been linked already, in this run, in this
     // environment? Then there is nothing to load: the answer is an address
     // space, and it goes back byte for byte.
-    let key = snap_key(path, envp);
+    // (By the name every root has for it: two roots have a `/bin/sh`.)
+    let key = snap_key(&h.kernel.vfs.outer_path(path), envp);
     let linked = snap_lookup(key);
     // Headers only: each segment is read from its file straight into place
     // below, once the old image is gone. Reading the whole executable and its

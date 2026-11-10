@@ -1058,6 +1058,22 @@ impl VfsView {
         err
     }
 
+    /// [`Namespace::enter`] of the namespace as published.
+    pub fn enter(&self, dir: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+        let mut err = Ok(());
+        self.change(|ns| {
+            err = ns.enter(dir, shared);
+            err.is_ok()
+        });
+        err
+    }
+
+    /// [`Namespace::leave`] of the namespace as published: whether there
+    /// was one to go back to.
+    pub fn leave(&self) -> bool {
+        self.change(|ns| ns.leave())
+    }
+
     /// Mount `fs` at `at` unless something is mounted there already:
     /// whether it did.
     pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
@@ -1153,7 +1169,28 @@ impl Vfs {
                 self.ns.cwd.clone_from(&ns.cwd);
             }
         }
+        self.ns.outer.clone_from(&ns.outer);
         self.mounts = now;
+    }
+
+    /// Enter the tree at `path` as a root of its own
+    /// ([`Namespace::enter`]): a directory, its links followed.
+    pub fn enter(&mut self, path: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+        let dir = self.ns.canonical(&normalize(path, &self.ns.cwd));
+        if self.ns.metadata(&dir)?.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        self.view.0.enter(&dir, shared)?;
+        self.refresh();
+        Ok(())
+    }
+
+    /// Back to the namespace a tree was entered from
+    /// ([`Namespace::leave`]): whether there was one.
+    pub fn leave(&mut self) -> bool {
+        let left = self.view.0.leave();
+        self.refresh();
+        left
     }
 
     /// `chroot` to `path` ([`VfsView::chroot`]): a directory, its links
@@ -1230,6 +1267,32 @@ pub struct Namespace {
     /// Where this namespace's `/` is in the one the process started with:
     /// `/` until a `chroot` ([`Namespace::chroot`]).
     root: String,
+    /// What this namespace was entered from ([`Namespace::enter`]), if it
+    /// is a tree entered and not the system's own.
+    outer: Option<Arc<Outer>>,
+}
+
+/// The namespace a tree was entered from ([`Namespace::enter`]): what
+/// leaving goes back to, and how a name inside is a name there.
+#[derive(Clone)]
+struct Outer {
+    ns: Namespace,
+    /// The directory entered, as `ns` names it.
+    dir: String,
+    /// What of `ns` is inside too: where inside, and what it is in `ns`.
+    shared: Vec<(String, String)>,
+}
+
+/// `abs` with `from` at its head replaced by `to` (each a directory's
+/// name, `/` among them).
+fn rehead(abs: &str, from: &str, to: &str) -> String {
+    let rest = if from == "/" { abs } else { &abs[from.len()..] };
+    match (to, rest) {
+        ("/", "") => "/".to_string(),
+        ("/", rest) => rest.to_string(),
+        (to, "/") => to.to_string(),
+        (to, rest) => format!("{to}{rest}"),
+    }
 }
 
 impl Namespace {
@@ -1239,7 +1302,82 @@ impl Namespace {
             others: String::new(),
             cwd: "/".to_string(),
             root: "/".to_string(),
+            outer: None,
         }
+    }
+
+    /// Whether this is a tree entered from another namespace
+    /// ([`Namespace::enter`]).
+    pub fn entered(&self) -> bool {
+        self.outer.is_some()
+    }
+
+    /// Enter the tree at `dir` (absolute, normal, a directory) as a root of
+    /// its own: what a program of another system runs in, in a system that
+    /// is not its own (a Mac's, among Linux's). It is a `chroot` that can
+    /// be left ([`Namespace::leave`]), and that takes some of where it came
+    /// from with it: each of `shared`, (where inside, what outside), is
+    /// that part of this namespace mounted in the tree. The working
+    /// directory stays the directory it
+    /// was, by whichever name the tree has for it; one the tree has no
+    /// name for is the tree's root.
+    fn enter(&mut self, dir: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+        if dir == "/" {
+            return Ok(());
+        }
+        let before = self.clone();
+        let mut kept = Vec::new();
+        for (inside, outside) in shared {
+            let Ok((fs, rel)) = self.mount_of(outside.to_string()) else { continue };
+            let fs: Arc<dyn FileSystem> = if rel.is_empty() { fs.clone() } else { Arc::new(subtree::Subtree::new(fs.clone(), &rel)) };
+            self.mount(&format!("{dir}{inside}"), fs);
+            kept.push((inside.to_string(), outside.to_string()));
+        }
+        let cwd = if within(&self.cwd, dir) {
+            rehead(&self.cwd, dir, "/")
+        } else {
+            match kept.iter().filter(|(_, outside)| within(&self.cwd, outside) || outside == "/").max_by_key(|(_, outside)| outside.len()) {
+                Some((inside, outside)) => rehead(&self.cwd, outside, inside),
+                None => "/".to_string(),
+            }
+        };
+        self.chroot(dir)?;
+        self.cwd = cwd;
+        self.outer = Some(Arc::new(Outer { ns: before, dir: dir.to_string(), shared: kept }));
+        Ok(())
+    }
+
+    /// Absolute `abs`, a name in the namespace a tree was entered from, as
+    /// the tree names it: under its own root, or through what the two
+    /// share. `None`: no tree was entered, or it has no name for that.
+    pub fn inner_name(&self, abs: &str) -> Option<String> {
+        let outer = self.outer.as_ref()?;
+        if within(abs, &outer.dir) {
+            return Some(rehead(abs, &outer.dir, "/"));
+        }
+        outer.shared.iter().filter(|(_, outside)| within(abs, outside) || outside == "/").max_by_key(|(_, outside)| outside.len()).map(|(inside, outside)| rehead(abs, outside, inside))
+    }
+
+    /// Absolute `abs`, a name in a tree entered ([`Namespace::enter`]), as
+    /// the namespace it was entered from names it: through what the two
+    /// share, or under the tree's directory. `None`: no tree was entered.
+    pub fn outer_name(&self, abs: &str) -> Option<String> {
+        let outer = self.outer.as_ref()?;
+        Some(match outer.shared.iter().filter(|(inside, _)| within(abs, inside)).max_by_key(|(inside, _)| inside.len()) {
+            Some((inside, outside)) => rehead(abs, inside, outside),
+            None => rehead(abs, "/", &outer.dir),
+        })
+    }
+
+    /// Leave a tree entered, for the namespace it was entered from, as it
+    /// was then; the working directory is the same directory, by its name
+    /// there. Whether there was one to leave.
+    fn leave(&mut self) -> bool {
+        let Some(outer) = self.outer.clone() else { return false };
+        let cwd = self.outer_name(&self.cwd).unwrap_or_else(|| "/".to_string());
+        *self = outer.ns.clone();
+        self.cwd = if self.metadata(&cwd).is_ok_and(|md| md.file_type == FileType::Directory) { cwd } else { "/".to_string() };
+        true
     }
 
     /// Where `/` is in the namespace the process started with.

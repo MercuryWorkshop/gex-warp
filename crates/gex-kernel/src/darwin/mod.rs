@@ -21,6 +21,7 @@
 pub mod abi;
 mod attr;
 mod reclaim;
+pub mod root;
 mod bsd;
 pub mod info;
 pub mod kqueue;
