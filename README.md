@@ -325,6 +325,11 @@ system whose own tree is a Mac's enters nothing.
 A page whose whole tree is a Mac's starts its shell as it starts any
 program (`runProgram`): `test/darwin/terminal.test.js` runs Apple's bash
 from such a root on a terminal in a browser tab, typing at its prompt.
+And a Mac program draws where a Linux one does: the page's compositor is
+a Wayland compositor at a socket in `/tmp`, which a Mac program reaches as
+any program does. `test/darwin/window.test.js` runs one that speaks the
+protocol itself (a Mac has no library for it), its pixels in shared memory
+whose descriptor it passes, and the compositor shows its window.
 
 ### Build the page
 

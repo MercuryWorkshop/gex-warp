@@ -13,7 +13,9 @@
 //   darwin-root  darwin-root.aarch64.tar and darwin-root.x86.tar: a Mac's root
 //            for each architecture there is one of (GEX_TEST_DARWIN_ROOT,
 //            GEX_TEST_DARWIN_ROOT_X86; by default pyrus's out/root and
-//            out/root-x86_64 beside this repository).
+//            out/root-x86_64 beside this repository); and beside each,
+//            darwin-window.ARCH, fixtures/darwin/page's programs built
+//            for a Mac where there is a compiler for one.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
@@ -206,6 +208,13 @@ export const images = {
       // (No `._` files for what a Mac keeps beside a file's bytes.)
       execFileSync('tar', ['-cf', out, '-C', root, '.'], { env: { ...process.env, COPYFILE_DISABLE: '1' } });
       made++;
+      // And the Mac programs a page's tests run in it, where there is a
+      // compiler for them (a Mac's).
+      for (const name of ['window']) {
+        const prog = join(work, `darwin-${name}.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin/page', `${name}.c`)], { stdio: 'ignore' });
+      }
     }
     return made ? null : 'no Mac root (GEX_TEST_DARWIN_ROOT, GEX_TEST_DARWIN_ROOT_X86: pyrus builds one)';
   },
