@@ -551,7 +551,7 @@ extern "C" {
     fn k_fs_link_now(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, now: i64) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mksocket_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
-    fn k_fs_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_mkfifo_now(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32;
     fn k_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_part(path: gex_kernel::PAddr, path_len: u32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
@@ -1294,7 +1294,7 @@ extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PA
     r
 }
 extern "C" fn rf_mkfifo(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_mkfifo(path, path_len, mode) }
+    unsafe { k_fs_mkfifo_now(path, path_len, mode, browser_clock().0 as i64) }
 }
 extern "C" fn rp_fifo(path: gex_kernel::PAddr, path_len: u32, how: u32, pid: i32) -> i32 {
     let id = unsafe { k_fifo(path, path_len, how, pid) };

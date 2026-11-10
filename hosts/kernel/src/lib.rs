@@ -3777,6 +3777,12 @@ pub extern "C" fn k_fs_mkfifo(path: gex_kmem::PAddr, path_len: u32, mode: u32) -
     as_unit(rootfs().mkfifo(&p, mode))
 }
 
+/// [`k_fs_mkfifo`] at `now`, the caller's clock: the directory's time.
+#[no_mangle]
+pub extern "C" fn k_fs_mkfifo_now(path: gex_kmem::PAddr, path_len: u32, mode: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_mkfifo(path, path_len, mode))
+}
+
 /// Open the pipe of the FIFO at a path (`pipe::Remote::fifo`,
 /// `gex_kernel::pipe::Fifos`): bit 0 of `how` to write, bit 1 not to wait,
 /// bit 2 to read and write both. The pipe's id, that end (or both) counted

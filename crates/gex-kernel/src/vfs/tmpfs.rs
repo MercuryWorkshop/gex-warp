@@ -2243,6 +2243,7 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Fifo(mode & 0o7777));
+        inner.entries_changed(path, now());
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -2327,13 +2328,14 @@ mod tests {
         FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
         fs.add_file("apps/also-seeded.desktop", b"x".to_vec());
         assert_eq!(dir(&fs), 1_000, "seeding keeps the directory's time");
-        let steps: [(&str, &dyn Fn(&TmpFs)); 6] = [
+        let steps: [(&str, &dyn Fn(&TmpFs)); 7] = [
             ("create", &|fs| { fs.open("apps/new.desktop", O_RDWR | O_CREAT, 0o644).unwrap(); }),
             ("rename in", &|fs| { fs.open("t", O_RDWR | O_CREAT, 0o644).unwrap(); fs.rename("t", "apps/moved.desktop").unwrap(); }),
             ("unlink", &|fs| fs.unlink("apps/new.desktop").unwrap()),
             ("mkdir", &|fs| fs.mkdir("apps/sub", 0o755).unwrap()),
             ("rmdir", &|fs| fs.rmdir("apps/sub").unwrap()),
             ("symlink", &|fs| fs.symlink("seeded.desktop", "apps/link.desktop").unwrap()),
+            ("mkfifo", &|fs| fs.mkfifo("apps/fifo", 0o644).unwrap()),
         ];
         for (what, step) in steps {
             FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
