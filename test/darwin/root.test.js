@@ -5,7 +5,8 @@
 // one, which is in its root (its linker there, the system at
 // /Volumes/Linux, the same working directory by its name there, the same
 // /tmp); that runs the Linux one, which is back out; and that the Mac one
-// again. Then a Mac program outside any root, given one by its environment.
+// again. Then the two sharing memory by its name, and a Mac program outside
+// any root, given one by its environment.
 //
 // The page's runtime under Node only: a process there has a kernel of its
 // own, where gexc runs one kind of program at a time. The Mac's tree is
@@ -44,8 +45,16 @@ export default async function (t) {
     t.skip(`xcrun clang: ${String(e.stderr || e).trim().split('\n').pop()}`);
   }
 
-  const run = async (args, env = []) => {
-    const r = await n.g.run(seed, join(tree, 'bin/where'), args, {
+  const shm = join(ROOT, 'test/fixtures/darwin/root/shm.c');
+  await n.cc(['-static', '-O1', '-o', join(tree, 'bin/shm'), shm]);
+  try {
+    execFileSync('xcrun', ['clang', '-arch', x86 ? 'x86_64' : 'arm64', '-O1', shm, '-o', join(tree, 'opt/mac/bin/shm')], { stdio: 'pipe' });
+  } catch (e) {
+    t.skip(`xcrun clang: ${String(e.stderr || e).trim().split('\n').pop()}`);
+  }
+
+  const run = async (args, env = [], prog = 'bin/where') => {
+    const r = await n.g.run(seed, join(tree, prog), args, {
       env: { GEX_SHARED: '1' },
       flags: ['--dir', `/=${tree}`, '--cwd', '/work', ...env.flatMap((e) => ['--env', e])],
       timeout: 240000,
@@ -69,6 +78,13 @@ export default async function (t) {
   ];
   t.check('a Linux program runs a Mac one in its root, which runs a Linux one out of it', chain.lines.join('\n') === want.join('\n') && chain.code === 0,
     `exit ${chain.code}: ${chain.lines.join(' / ') || chain.stderr.trim().split('\n').slice(-3).join(' / ')}`);
+
+  // Shared memory by its name is the one memory to both: what the Linux
+  // program writes the Mac one reads, and the other way.
+  const shared = await run(['/opt/mac/bin/shm', '/Volumes/Linux/bin/shm'], [], 'bin/shm');
+  t.check('a Linux program and a Mac one share memory by its name',
+    shared.lines.join('\n') === ['Linux: the memory says ""', 'Darwin: the memory says "written by Linux"', 'Linux: the memory says "written by Darwin"'].join('\n') && shared.code === 0,
+    `exit ${shared.code}: ${shared.lines.join(' / ') || shared.stderr.trim().split('\n').slice(-3).join(' / ')}`);
 
   // A Mac program that is in no root: the one its environment names.
   const named = await run(['/bin/macwhere'], ['GEX_DARWIN_ROOT=/opt/mac']);

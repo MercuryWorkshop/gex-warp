@@ -1331,6 +1331,14 @@ impl Namespace {
             let Ok((fs, rel)) = self.mount_of(outside.to_string()) else { continue };
             let fs: Arc<dyn FileSystem> = if rel.is_empty() { fs.clone() } else { Arc::new(subtree::Subtree::new(fs.clone(), &rel)) };
             self.mount(&format!("{dir}{inside}"), fs);
+            // And what is mounted within it, where it is there: the
+            // devices' shared memory and terminals (`/dev/shm`, `/dev/pts`),
+            // the system's own `/proc` under its volume.
+            for (at, sub) in &before.mounts {
+                if at != outside && (*outside == "/" || within(at, outside)) {
+                    self.mount(&format!("{dir}{}", rehead(at, outside, inside)), sub.clone());
+                }
+            }
             kept.push((inside.to_string(), outside.to_string()));
         }
         let cwd = if within(&self.cwd, dir) {
