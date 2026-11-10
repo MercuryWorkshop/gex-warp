@@ -2823,9 +2823,17 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // leaves the child with the data and no link-map entry, and the child
     // loads it again if it asks. Every other process shares the parent's
     // (the modules are the same code at the same addresses).
+    //
+    // A Mac's process has its own too. Its loader is the guest's (dyld),
+    // which maps a library where the address space has room: a child that
+    // loads one and its parent that later loads another have different
+    // code at one address, and with what was translated shared, the parent
+    // ran the child's translation of that address over its own library's
+    // data (a zsh that loaded a module in a subshell, then another itself,
+    // branched into the first one's stubs).
     let jit_shared = cx.jit_shared.as_ref().map(|s| {
         let s0 = s.lock().unwrap_or_else(|e| e.into_inner());
-        if s0.ftab.dyproc.is_some() {
+        if s0.ftab.dyproc.is_some() || gex_kernel::darwin::on() {
             Arc::new(Mutex::new(s0.fork_copy()))
         } else {
             Arc::clone(s)

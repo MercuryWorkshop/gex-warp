@@ -17,6 +17,21 @@ static void waited(const char *what, long pid) {
     t_printf("%s: wait4 %s, status %x\n", what, got == pid ? "its pid" : "something else", status);
 }
 
+// A function that returns `n`, made at one fixed address and called: the
+// machine's `mov` of a constant to the register a result is in, and `ret`.
+static int code_at(u8 *where, int n) {
+    u8 *at = (u8 *)SYS(SYS_mmap, where, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (at != where) return -1;
+#if defined(__arm64__)
+    u32 code[2] = {0x52800000u | (u32)n << 5, 0xd65f03c0u};
+#else
+    u8 code[6] = {0xb8, (u8)n, 0, 0, 0, 0xc3};
+#endif
+    for (unsigned i = 0; i < sizeof code; i++) at[i] = ((const u8 *)code)[i];
+    if (SYS(SYS_mprotect, at, 0x4000, PROT_READ | PROT_EXEC)) return -2;
+    return ((int (*)(void))at)();
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)apple;
     if (argc > 1 && !t_strcmp(argv[1], "child")) {
@@ -107,5 +122,20 @@ int main(int argc, char **argv, char **envp, char **apple) {
         t_exit(4);
     }
     waited("failed exec", pid);
+
+    // Code a child maps is the child's: its parent, mapping other code at
+    // the same address afterwards, runs its own. (As a shell that loads a
+    // module in a subshell and then another itself does: a loader puts a
+    // library where the address space has room, the same place in both.)
+    // (A place there is room at, found and let go before the two part.)
+    u8 *room = (u8 *)SYS(SYS_mmap, 0, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    SYS(SYS_munmap, room, 0x4000);
+    pid = fork_();
+    if (pid == 0) {
+        t_printf("the child's code says %d\n", code_at(room, 11));
+        t_exit(0);
+    }
+    waited("the child with code of its own", pid);
+    t_printf("the parent's, at the same address, says %d\n", code_at(room, 22));
     return 0;
 }
