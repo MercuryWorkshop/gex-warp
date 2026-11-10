@@ -367,6 +367,43 @@ static void kernel_ports(void) {
     t_show("destroy it", rpc(&m, task, sizeof m.h + 4 + sizeof *d));
     t_printf("  reply %d, %u bytes: code %d\n", m.h.id, m.h.size, m.body[2]);
     t_show("signal it now", TRAP(TRAP_semaphore_signal, sem));
+
+    // mach_port_extract_right(task, name, how): a right made from one of
+    // the task's own and handed back in the reply, which is how a library
+    // gets a send-once right to a port it holds only the receive right of.
+    u32 port = allocate(RIGHT_RECEIVE);
+    static const struct {
+        const char *what;
+        u32 how;
+        int named;
+    } takes[] = {
+        {"a send-once right made of it", MAKE_SEND_ONCE, 1}, {"a send right made of it", MAKE_SEND, 1},
+        {"a right of no name", MAKE_SEND, 0},                 {"a right in no such way", 121, 1},
+    };
+    u32 once = 0;
+    for (unsigned i = 0; i < sizeof takes / sizeof *takes; i++) {
+        t_memset(&m, 0, sizeof m);
+        m.h.id = 3215;
+        m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = takes[i].named ? port : 0x123457, m.body[3] = takes[i].how;
+        t_printf("ask the task for %s", takes[i].what);
+        long r = rpc(&m, task, sizeof m.h + 16);
+        if (m.h.bits & COMPLEX) {
+            t_printf(": %ld, reply %d, %u bytes, disposition %d, %s\n", r, m.h.id, m.h.size, d->disposition,
+                     d->name == port ? "the port's own name" : d->name ? "a name of its own" : "no name");
+            if (takes[i].how == MAKE_SEND_ONCE) once = d->name;
+        } else {
+            t_printf(": %ld, reply %d, %u bytes, code %d\n", r, m.h.id, m.h.size, m.body[2]);
+        }
+    }
+    show_type("the port", port);
+    show_type("the send-once right", once);
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = MOVE_SEND_ONCE, m.h.remote = once, m.h.id = 77, m.body[0] = 4242;
+    t_show("send by it", send(&m, sizeof m.h + 4));
+    t_memset(&m, 0, sizeof m);
+    t_show("receive", receive(&m, port, sizeof m));
+    t_printf("  id %d, %u\n", m.h.id, m.body[0]);
+    show_type("the send-once right, used", once);
 }
 
 #if defined(__arm64__)

@@ -1039,6 +1039,29 @@ impl Kernel {
             reply(b, vec![(4, port, disp::MOVE_SEND)])
         };
         match (kind, req.id) {
+            // mach_port_extract_right(task, name, how): a right taken out
+            // of the task's space as a message's would be, and handed
+            // back in the reply, to arrive under a name of its own.
+            // (No such way of taking one; no such name; a name that has
+            // no right to be taken that way.)
+            (Kind::Task, 3215) => {
+                let (name, how) = (get32(&req.body, 8), get32(&req.body, 12));
+                if !(disp::MOVE_RECEIVE..=disp::MAKE_SEND_ONCE).contains(&how) {
+                    plain(18, &[])
+                } else if !sp.names.contains_key(&name) {
+                    plain(KERN_INVALID_NAME as i32, &[])
+                } else {
+                    match sp.take(self.pid, name, how) {
+                        Some((port, got)) => {
+                            let mut b = vec![0u8; 16];
+                            put32(&mut b, 0, 1);
+                            b[4 + 10] = got as u8;
+                            reply(b, vec![(4, port, got)])
+                        }
+                        None => plain(KERN_INVALID_RIGHT as i32, &[]),
+                    }
+                }
+            }
             // semaphore_create(task, out semaphore, policy, value): the
             // value follows the NDR record and the policy.
             (Kind::Task, 3418) => {
