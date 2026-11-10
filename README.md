@@ -216,6 +216,12 @@ the image low. What works is what a program can do with the kernel alone:
   `/System/Library/CoreServices/SystemVersion.plist` says (macOS 26.0 with
   none), so the version a program sees is a setting of the root it runs
   in, as a Windows version is of a Wine prefix;
+- job control, which is the kernel's own and so every guest's: a signal
+  that stops a process (`SIGSTOP`, and a terminal's `^Z`, its
+  `SIGTTIN` and `SIGTTOU` in a job a shell controls) holds each of its
+  threads at its next call or poll until `SIGCONT`, and its parent's
+  `wait` is told of the stop and of the continuing where it asks
+  (`WUNTRACED`, `WCONTINUED`): a shell's `^Z`, `jobs`, `fg` and `bg`;
 - sockets: unix and TCP, descriptors passed in a control message;
 - POSIX shared memory by name (`shm_open`), with XNU's rules for it (sized
   once and in whole pages, mapped shared and within its size). It is the

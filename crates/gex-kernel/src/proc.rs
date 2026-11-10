@@ -21,6 +21,24 @@ use crate::syscalls::{Child, ChildHandle};
 /// The pid the kernel gives the first process, and the one orphans go to.
 pub const INIT_PID: i32 = 1;
 
+/// How a `wait` asks ([`ProcTable::collect`], [`ProcTable::stop_news`]):
+/// the child is told of and left as it was; a stopped child is asked
+/// after too (`WUNTRACED`), and one continued (`WCONTINUED`).
+pub const WAIT_NOWAIT: u32 = 1;
+pub const WAIT_STOPPED: u32 = 2;
+pub const WAIT_CONTINUED: u32 = 4;
+
+/// The signals that stop a process, as bits of a pending set; the three a
+/// terminal sends are only obeyed in a job somebody controls
+/// ([`ProcTable::stop`]).
+const STOPS: u64 = 1 << (SIGSTOP - 1) | 1 << (SIGTSTP - 1) | 1 << (SIGTTIN - 1) | 1 << (SIGTTOU - 1);
+const SIGKILL: u32 = 9;
+const SIGCONT: u32 = 18;
+const SIGSTOP: u32 = crate::signal::sig::SIGSTOP;
+const SIGTSTP: u32 = crate::signal::sig::SIGTSTP;
+const SIGTTIN: u32 = 21;
+const SIGTTOU: u32 = 22;
+
 /// The process table when it is not in this process's memory.
 ///
 /// Between the *threads* of one process the table above is shared directly.
@@ -38,9 +56,10 @@ pub struct Remote {
     /// Collect a finished child: pid in the high 32 bits, wait status in the low
     /// 32, or zero if none. Packed into one return because two Workers may
     /// collect at once and a status left between calls belongs to whoever asked
-    /// last. `nowait` non-zero (`waitid`'s `WNOWAIT`) reports the child and
-    /// leaves it to be collected.
-    pub wait: extern "C" fn(ppid: i32, want: i32, nowait: i32) -> i64,
+    /// last. `how` is [`WAIT_NOWAIT`] (`waitid`'s `WNOWAIT`: report the
+    /// child and leave it to be collected) and what else of a child is
+    /// asked after ([`WAIT_STOPPED`], [`WAIT_CONTINUED`]).
+    pub wait: extern "C" fn(ppid: i32, want: i32, how: i32) -> i64,
     pub has_children: extern "C" fn(ppid: i32) -> i32,
     pub kill: extern "C" fn(caller: i32, target: i32, signo: u32) -> i32,
     /// Signal every process in a group, naming it *positively*.
@@ -65,7 +84,11 @@ pub struct Remote {
     pub setsid: extern "C" fn(pid: i32) -> i32,
     pub setpgid: extern "C" fn(caller: i32, target: i32, pgid: i32) -> i32,
     /// Would a `wait4` answer now? See [`ProcTable::wait_ready`].
-    pub wait_ready: extern "C" fn(ppid: i32, want: i32) -> i32,
+    pub wait_ready: extern "C" fn(ppid: i32, want: i32, job: u32) -> i32,
+    /// See [`ProcTable::stop`]: whether it stopped.
+    pub stop: extern "C" fn(pid: i32, signo: u32) -> i32,
+    /// See [`ProcTable::stopped`].
+    pub stopped: extern "C" fn(pid: i32) -> u32,
     pub request_halt: extern "C" fn(code: i32),
     pub halt_code: extern "C" fn() -> i32,
     /// The process's wait queue. See [`ProcTable::queue`].
@@ -384,6 +407,13 @@ struct Proc {
     /// How it crashed, as it said before it ended ([`ProcTable::set_crash`]):
     /// empty when it has not.
     crash: Vec<u8>,
+    /// The signal that stopped it ([`ProcTable::stop`]), or zero while it
+    /// runs.
+    stop: u32,
+    /// What its parent's `wait` has yet to be told of that: a stop
+    /// (`signal << 8 | 0x7f`) or its being continued (`0xffff`), as the
+    /// wait status that says so, or zero.
+    stop_news: u32,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -556,6 +586,61 @@ impl Table {
     fn cpu_total(&self) -> u64 {
         self.gone_cpu_ns + self.procs.iter().map(|p| p.usage.cpu_ns).sum::<u64>()
     }
+
+    /// What sending `signo` to the process at `i` does to a job, which is
+    /// done as it is sent and not when the target gets to it: `SIGCONT`
+    /// starts a stopped process again, whatever it has done about the
+    /// signal, and takes back the stop signals still on their way to it; a
+    /// stop signal takes back a `SIGCONT`; and `SIGKILL` lets a stopped
+    /// process go, to die. The queue of a parent owed word of it.
+    fn job_signal(&mut self, i: usize, signo: u32) -> u32 {
+        let p = &mut self.procs[i];
+        match signo {
+            SIGCONT => {
+                p.pending.fetch_and(!STOPS, Ordering::AcqRel);
+                p.killed &= !STOPS;
+                if std::mem::take(&mut p.stop) == 0 {
+                    return 0;
+                }
+                p.stop_news = 0xffff;
+                let ppid = p.ppid;
+                self.tell_parent(ppid)
+            }
+            SIGKILL => {
+                p.stop = 0;
+                0
+            }
+            s if s != 0 && STOPS & 1 << (s - 1) != 0 => {
+                p.pending.fetch_and(!(1 << (SIGCONT - 1)), Ordering::AcqRel);
+                p.killed &= !(1 << (SIGCONT - 1));
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// `SIGCHLD` for the process `ppid`, a child of which has stopped or
+    /// been continued: its queue, to notify once the table is let go.
+    fn tell_parent(&mut self, ppid: i32) -> u32 {
+        match self.procs.iter().find(|p| p.pid == ppid) {
+            Some(parent) => {
+                parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+                parent.queue.id()
+            }
+            None => 0,
+        }
+    }
+
+    /// Whether nobody controls the job `pid` is in: no process of its group
+    /// has a parent in another group of the same session (a shell that put
+    /// the job in a group of its own, and waits to hear that it stopped).
+    /// A terminal's stop signals do nothing to such a group, where they
+    /// would stop it for good.
+    fn orphaned(&self, pid: i32) -> bool {
+        let Some((pgid, sid)) = self.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) else { return true };
+        !self.procs.iter().filter(|p| p.pgid == pgid).any(|p| self.procs.iter().any(|q| q.pid == p.ppid && q.sid == sid && q.pgid != pgid))
+    }
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -637,6 +722,8 @@ impl ProcTable {
                     host_child: false,
                     usage: Usage::default(),
                     crash: Vec::new(),
+                    stop: 0,
+                    stop_news: 0,
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
@@ -683,6 +770,8 @@ impl ProcTable {
             host_child,
             usage: Usage::default(),
             crash: Vec::new(),
+            stop: 0,
+            stop_news: 0,
         });
         pid
     }
@@ -1268,6 +1357,7 @@ impl ProcTable {
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
             let virtual_init = self.virtual_init.load(Ordering::Acquire);
+            let mut parents = Vec::new();
             for &i in &hits {
                 let p = &mut t.procs[i];
                 if virtual_init && p.pid == INIT_PID {
@@ -1276,11 +1366,16 @@ impl ProcTable {
                 p.killed |= bit;
                 p.senders[signo as usize - 1] = caller;
                 p.pending.fetch_or(bit, Ordering::AcqRel);
+                parents.push(t.job_signal(i, signo));
             }
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
             // A signal ends a wait: wake each target's waiting threads.
             for &i in &hits {
                 t.procs[i].queue.notify();
+            }
+            drop(t);
+            for q in parents {
+                crate::wait::notify(q);
             }
         }
         Ok(hits.len())
@@ -1296,19 +1391,25 @@ impl ProcTable {
         if signo > 64 {
             return Err(Errno::EINVAL);
         }
-        let t = self.lock();
-        let hits: Vec<&Proc> = t.procs.iter().filter(|p| p.pgid == pgid).collect();
+        let mut t = self.lock();
+        let hits: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == pgid).collect();
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
-            for p in &hits {
-                p.pending.fetch_or(bit, Ordering::AcqRel);
+            let mut parents = Vec::new();
+            for &i in &hits {
+                t.procs[i].pending.fetch_or(bit, Ordering::AcqRel);
+                parents.push(t.job_signal(i, signo));
             }
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
-            for p in &hits {
-                p.queue.notify();
+            for &i in &hits {
+                t.procs[i].queue.notify();
+            }
+            drop(t);
+            for q in parents {
+                crate::wait::notify(q);
             }
         }
         Ok(hits.len())
@@ -1508,11 +1609,16 @@ impl ProcTable {
     }
 
     /// Whether a `wait4` by `ppid` for `want` would answer now: a child with a
-    /// status ready, or no matching child at all (`ECHILD`). Separate from
-    /// `collect`, which *takes* the child -- asking must not reap.
-    pub fn wait_ready(&self, ppid: i32, want: i32) -> bool {
+    /// status ready (or, where `job` asks after them, one that has stopped
+    /// or been continued: [`WAIT_STOPPED`], [`WAIT_CONTINUED`]), or no
+    /// matching child at all (`ECHILD`). Separate from `collect`, which
+    /// *takes* the child -- asking must not reap.
+    pub fn wait_ready(&self, ppid: i32, want: i32, job: u32) -> bool {
         if let Some(r) = self.remote {
-            return (r.wait_ready)(ppid, want) != 0;
+            return (r.wait_ready)(ppid, want, job) != 0;
+        }
+        if self.stop_news(ppid, want, job | WAIT_NOWAIT).is_some() {
+            return true;
         }
         let mut any = false;
         for c in self
@@ -1526,6 +1632,66 @@ impl ProcTable {
             }
         }
         !any
+    }
+
+    /// Process `pid` has taken a signal whose doing is to stop it, and
+    /// stops: its threads go no further until it is sent `SIGCONT` (or
+    /// `SIGKILL`), which the hosts see to ([`ProcTable::stopped`]), and its
+    /// parent is told (`SIGCHLD`, and a `wait` that asks). Whether it did:
+    /// one of the three signals a terminal sends stops only a job somebody
+    /// controls, and nothing stops the first process.
+    pub fn stop(&self, pid: i32, signo: u32) -> bool {
+        if let Some(r) = self.remote {
+            return (r.stop)(pid, signo) != 0;
+        }
+        let parent_q = {
+            let mut t = self.lock();
+            if pid == INIT_PID || (signo != SIGSTOP && t.orphaned(pid)) {
+                return false;
+            }
+            let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
+            // (One that has ended is not stopped by what it left behind.)
+            if p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
+                return false;
+            }
+            p.stop = signo;
+            p.stop_news = signo << 8 | 0x7f;
+            let ppid = p.ppid;
+            t.tell_parent(ppid)
+        };
+        crate::wait::notify(parent_q);
+        true
+    }
+
+    /// The signal process `pid` is stopped by, or zero: it runs.
+    pub fn stopped(&self, pid: i32) -> u32 {
+        if let Some(r) = self.remote {
+            return (r.stopped)(pid);
+        }
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.stop)
+    }
+
+    /// A child of `ppid` (`want`, or any) that has stopped or been
+    /// continued since a `wait` was last told so, if `how` asks after that
+    /// ([`WAIT_STOPPED`], [`WAIT_CONTINUED`]): its pid and the wait status
+    /// that says which. Told once, unless `how` has [`WAIT_NOWAIT`].
+    pub fn stop_news(&self, ppid: i32, want: i32, how: u32) -> Option<(i32, u32)> {
+        if how & (WAIT_STOPPED | WAIT_CONTINUED) == 0 {
+            return None;
+        }
+        let mut t = self.lock();
+        let p = t.procs.iter_mut().find(|p| {
+            p.ppid == ppid && (want <= 0 || p.pid == want) && match p.stop_news {
+                0 => false,
+                0xffff => how & WAIT_CONTINUED != 0,
+                _ => how & WAIT_STOPPED != 0,
+            }
+        })?;
+        let news = p.stop_news;
+        if how & WAIT_NOWAIT == 0 {
+            p.stop_news = 0;
+        }
+        Some((p.pid, news))
     }
 
     /// A table that is really somewhere else. See [`Remote`]. The local `Table`
@@ -1548,10 +1714,11 @@ impl ProcTable {
     /// Collect a finished child of `ppid` from a remote table. `Some((pid,
     /// status))` when ready, `None` when none -- distinguish `ECHILD` with
     /// `wait_ready`. Also `None` if the table is local: check `is_shared` first.
-    /// `nowait` leaves the child there (`WNOWAIT`).
-    pub fn collect(&self, ppid: i32, want: i32, nowait: bool) -> Option<(i32, i32)> {
+    /// `how` says what is asked after and whether it is left there
+    /// ([`WAIT_NOWAIT`], [`WAIT_STOPPED`], [`WAIT_CONTINUED`]).
+    pub fn collect(&self, ppid: i32, want: i32, how: u32) -> Option<(i32, i32)> {
         let r = self.remote?;
-        let packed = (r.wait)(ppid, want, nowait as i32);
+        let packed = (r.wait)(ppid, want, how as i32);
         let pid = (packed >> 32) as i32;
         (pid > 0).then(|| (pid, packed as u32 as i32))
     }
@@ -1574,6 +1741,57 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Job control in the table: what stops a process and what does not,
+    /// what starts it again, and what its parent's wait is told, once.
+    #[test]
+    fn a_job_stops_is_continued_and_its_parent_hears_of_each() {
+        let t = ProcTable::new();
+        let shell = t.spawn(INIT_PID);
+        t.setsid(shell).unwrap();
+        let job = t.spawn(shell);
+        // In its shell's own group nobody controls it: the terminal's stop
+        // does nothing, and the one nothing refuses stops it.
+        assert!(!t.stop(job, SIGTSTP));
+        assert_eq!(t.stopped(job), 0);
+        assert!(!t.stop(INIT_PID, SIGSTOP), "nothing stops the first process");
+        t.setpgid(shell, job, job).unwrap();
+        assert!(t.stop(job, SIGTSTP));
+        assert_eq!(t.stopped(job), SIGTSTP);
+        assert_ne!(t.take_signals(shell) & 1 << (SIGCHLD - 1), 0, "its parent is told");
+
+        // A wait that does not ask is told nothing; one that does, once.
+        assert_eq!(t.stop_news(shell, -1, 0), None);
+        assert_eq!(t.stop_news(shell, -1, WAIT_CONTINUED), None);
+        assert!(t.wait_ready(shell, job, WAIT_STOPPED) && !t.wait_ready(shell, job, 0));
+        assert_eq!(t.stop_news(shell, job, WAIT_STOPPED | WAIT_NOWAIT), Some((job, SIGTSTP << 8 | 0x7f)));
+        assert_eq!(t.stop_news(shell, -1, WAIT_STOPPED), Some((job, SIGTSTP << 8 | 0x7f)));
+        assert_eq!(t.stop_news(shell, -1, WAIT_STOPPED), None);
+        assert_eq!(t.stop_news(INIT_PID, -1, WAIT_STOPPED), None, "not its parent");
+
+        // SIGCONT starts it as it is sent, and takes back a stop on its way.
+        t.kill(shell, job, SIGSTOP).unwrap();
+        t.kill(shell, job, SIGCONT).unwrap();
+        assert_eq!(t.stopped(job), 0);
+        assert_eq!(t.take_signals(job), 1 << (SIGCONT - 1), "the stop sent while it was stopped is gone");
+        assert_eq!(t.stop_news(shell, -1, WAIT_STOPPED), None);
+        assert_eq!(t.stop_news(shell, -1, WAIT_STOPPED | WAIT_CONTINUED), Some((job, 0xffff)));
+        // And a stop takes back a SIGCONT.
+        t.kill(shell, job, SIGCONT).unwrap();
+        t.kill(shell, job, SIGTSTP).unwrap();
+        assert_eq!(t.take_signals(job), 1 << (SIGTSTP - 1));
+
+        // A group's signal does the same; SIGKILL lets a stopped one go.
+        assert!(t.stop(job, SIGSTOP));
+        t.kill_group(shell, job, SIGCONT).unwrap();
+        assert_eq!(t.stopped(job), 0);
+        assert!(t.stop(job, SIGSTOP));
+        t.kill(shell, job, SIGKILL).unwrap();
+        assert_eq!(t.stopped(job), 0);
+        // One that has ended is not stopped.
+        t.exit(job, 9);
+        assert!(!t.stop(job, SIGSTOP));
+    }
 
     #[test]
     fn a_crash_is_reported_once_with_what_the_process_said() {

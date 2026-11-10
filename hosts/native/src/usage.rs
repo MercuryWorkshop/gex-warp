@@ -83,6 +83,9 @@ fn host_tid() -> u32 {
 /// The kernel's processor-time clocks read these from now on.
 pub(crate) fn install() {
     gex_kernel::proc::set_cpu_clock(cpu_ns);
+    // (And with the rest a host says of itself once: its threads can be
+    // held, so a stop signal stops a process, `job_stop_point`.)
+    gex_kernel::signal::set_job_control(true);
 }
 
 /// This host thread runs a thread of `k`'s process until the guard drops.

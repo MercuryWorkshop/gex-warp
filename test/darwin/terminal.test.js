@@ -2,8 +2,8 @@
 // (pyrus's), started as a page starts a program (runProgram, page/src/run.js)
 // on a terminal bridged to an xterm-shaped object, with keys typed into it:
 // a prompt, a line edited before it is entered, a pipeline of the root's
-// tools, the terminal's size, a program interrupted from the keyboard, a job
-// in the background, and the shell's exit status.
+// tools, the terminal's size, a program interrupted from the keyboard and one
+// stopped from it, a job in the background, and the shell's exit status.
 //
 // The root is the `darwin-root` image (test/fixtures/images.mjs).
 import { runProgram } from '../../page/src/run.js';
@@ -82,6 +82,17 @@ export default async function (t) {
     await timeout(until(() => prompts() > n, 'an interrupt', 60000), 65000, 'an interrupt').catch((e) => { throw new Error(`${e.message}: ${shown().slice(-600)}`); });
   }
   await enter('echo "after $?"\r', 'the status after');
+  // A program the keyboard stops: the shell has its prompt back and the
+  // program as a job, which it sets going again behind it and then ends.
+  {
+    const n = prompts();
+    keys?.('sleep 100\r');
+    await new Promise((r) => setTimeout(r, 1500));
+    keys?.('\x1a');
+    await timeout(until(() => prompts() > n, 'a stop', 60000), 65000, 'a stop').catch((e) => { throw new Error(`${e.message}: ${shown().slice(-600)}`); });
+  }
+  await enter('jobs | sed "s/  */ /g"\r', 'the stopped job');
+  await enter('bg %1 > /dev/null; jobs | sed "s/  */ /g"; kill %1; wait %1 2>/dev/null; echo "stopped job ended $?"\r', 'the job set going');
   await enter('sleep 100 &\r', 'a job');
   await enter('jobs | sed "s/  */ /g"; kill %1; wait %1 2>/dev/null; echo "ended $?"\r', 'the job ended');
   keys?.('exit 7\r');
@@ -96,6 +107,7 @@ export default async function (t) {
   check('a pipeline of the root\'s tools', /^1:a\n2:b\nsum 3$/m.test(lines));
   check('the root\'s own files', /^\/usr\/lib\ndyld\nlibSystem\.B\.dylib$/m.test(lines));
   check('a program interrupted from the keyboard', /\^C/.test(lines) && /^status 130$/m.test(lines) && /^after 0$/m.test(lines));
+  check('a program stopped from the keyboard, set going again, and ended', /\^Z/.test(lines) && /^\[1\]\+ Stopped sleep 100$/m.test(lines) && /^\[1\]\+ Running sleep 100 &$/m.test(lines) && /^stopped job ended 143$/m.test(lines));
   check('a job in the background, and ended', /^\[1\]\+? Running sleep 100 &$/m.test(lines) && /^ended 143$/m.test(lines));
   eq('the system stopped', r.system?.state.phase, 'stopped');
 }

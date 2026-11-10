@@ -447,6 +447,10 @@ pub enum BlockOp {
         ppid: i32,
         /// Which child, or -1 for any.
         want: i32,
+        /// What of a child besides its end is waited for: one stopped
+        /// (`WUNTRACED`), one continued ([`crate::proc::WAIT_STOPPED`],
+        /// [`crate::proc::WAIT_CONTINUED`]).
+        job: u32,
         /// Where to write the wait status, or zero.
         wstatus: u64,
         /// `WNOHANG`: report nothing rather than blocking.
@@ -490,8 +494,13 @@ impl WaitidOut {
         if pid <= 0 {
             return Ok(0);
         }
-        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the signal.
-        let (code, status) = if word & 0x7f == 0 {
+        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the
+        // signal, CLD_STOPPED with the one that stopped it, CLD_CONTINUED.
+        let (code, status) = if word == 0xffff {
+            (6, 18)
+        } else if word & 0xff == 0x7f {
+            (5, (word >> 8) & 0xff)
+        } else if word & 0x7f == 0 {
             (1, (word >> 8) & 0xff)
         } else if word & 0x80 != 0 {
             (3, word & 0x7f)
@@ -6713,6 +6722,9 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         procs: Arc::clone(procs),
         ppid: pid,
         want: a[0] as i32,
+        // (`WUNTRACED` 2 and `WCONTINUED` 8, which are `waitid`'s
+        // `WSTOPPED` and `WCONTINUED` too.)
+        job: if a[2] & 2 != 0 { crate::proc::WAIT_STOPPED } else { 0 } | if a[2] & 8 != 0 { crate::proc::WAIT_CONTINUED } else { 0 },
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
         waitid: None,
@@ -6732,7 +6744,7 @@ fn waitid_child(procs: &Arc<ProcTable>, fds: &FdTable, pid: i32, mut a: [u64; 6]
         let f = fds.get(a[1] as i32)?;
         let child = f.handle.pidfd().ok_or(Errno::EINVAL)?;
         const WNOHANG: u64 = 1;
-        if f.flags() & oflags::O_NONBLOCK != 0 && a[3] & WNOHANG == 0 && !procs.wait_ready(pid, child) {
+        if f.flags() & oflags::O_NONBLOCK != 0 && a[3] & WNOHANG == 0 && !procs.wait_ready(pid, child, 0) {
             return Err(Errno::EAGAIN);
         }
         a[0] = 1;
@@ -6753,12 +6765,13 @@ fn waitid_child(procs: &Arc<ProcTable>, fds: &FdTable, pid: i32, mut a: [u64; 6]
         1 if id > 0 => id,
         _ => return Err(Errno::EINVAL),
     };
-    let mut op = wait_child(procs, pid, [want as u64, 0, options & WNOHANG, 0, 0, 0]);
-    if let BlockOp::WaitChild { waitid, nohang, .. } = &mut op {
+    let mut op = wait_child(procs, pid, [want as u64, 0, options & (WNOHANG | WSTOPPED | WCONTINUED), 0, 0, 0]);
+    if let BlockOp::WaitChild { waitid, nohang, job, .. } = &mut op {
         *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat });
-        // Only exits are ever waited for here: without WEXITED a wait would
-        // never end, so it reports none (zero, or ECHILD with no children).
-        if options & WEXITED == 0 {
+        // An exit is always waited for with whatever else is: without
+        // WEXITED, and nothing else asked, a wait would never end, so it
+        // reports none (zero, or ECHILD with no children).
+        if options & WEXITED == 0 && *job == 0 {
             *nohang = true;
         }
     }
@@ -11511,6 +11524,15 @@ impl Kernel {
             }
         }
         self.deliver_pending(m)
+    }
+
+    /// Whether the process is stopped (job control): asked by the host for
+    /// each thread before a call, after it, and at a poll, and while it is
+    /// so the thread waits a while and asks again
+    /// ([`signal::ProcSig::job_stopped`]). Not when the system is halting.
+    pub fn job_stopped(&self) -> bool {
+        let p = self.signals.process();
+        p.stop_due() && self.procs.halt_code().is_none() && p.job_stopped(&self.procs, self.pid)
     }
 
     /// Deliver a pending signal, if any is deliverable right now.

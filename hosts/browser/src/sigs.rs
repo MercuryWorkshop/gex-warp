@@ -477,6 +477,23 @@ pub(crate) fn left_call() {
     });
 }
 
+/// Job control: this Worker's thread waits here while its process is
+/// stopped (`ProcSig::job_stopped`), which is where it is put before each
+/// call and at each poll, until the process is continued or killed or the
+/// system halts. Two loads when nothing has stopped. No kernel lock.
+pub(crate) fn job_stop_point() {
+    let Some(home) = home() else { return };
+    if !home.sig.stop_due() {
+        return;
+    }
+    while home.procs.halt_code().is_none() && home.sig.job_stopped(&home.procs, home.pid) {
+        // (The slot as it is now: what continues the process notifies it,
+        // and what notified it before is no reason not to sleep.)
+        crate::waitq::begin_turn();
+        crate::waitq::park_bounded(10_000_000);
+    }
+}
+
 /// Whether a signal would do something to this Worker's thread: a handler,
 /// or a default that is not "ignore". No kernel lock.
 pub(crate) fn ready() -> bool {

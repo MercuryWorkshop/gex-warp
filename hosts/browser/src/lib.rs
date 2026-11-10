@@ -469,8 +469,10 @@ extern "C" {
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
     /// pid in the high 32 bits, wait status in the low 32; zero for none.
-    fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64;
-    fn k_wait_ready(ppid: i32, want: i32) -> i32;
+    fn k_wait(ppid: i32, want: i32, how: i32) -> i64;
+    fn k_wait_ready(ppid: i32, want: i32, job: u32) -> i32;
+    fn k_proc_stop(pid: i32, signo: u32) -> i32;
+    fn k_proc_stopped(pid: i32) -> u32;
     fn k_has_children(ppid: i32) -> i32;
     fn k_kill(caller: i32, target: i32, signo: u32) -> i32;
     fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32;
@@ -898,11 +900,17 @@ extern "C" fn r_exit(pid: i32, status: i32) {
 extern "C" fn r_reap(pid: i32) {
     unsafe { k_reap(pid) }
 }
-extern "C" fn r_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
-    unsafe { k_wait(ppid, want, nowait) }
+extern "C" fn r_wait(ppid: i32, want: i32, how: i32) -> i64 {
+    unsafe { k_wait(ppid, want, how) }
 }
-extern "C" fn r_wait_ready(ppid: i32, want: i32) -> i32 {
-    unsafe { k_wait_ready(ppid, want) }
+extern "C" fn r_wait_ready(ppid: i32, want: i32, job: u32) -> i32 {
+    unsafe { k_wait_ready(ppid, want, job) }
+}
+extern "C" fn r_stop(pid: i32, signo: u32) -> i32 {
+    unsafe { k_proc_stop(pid, signo) }
+}
+extern "C" fn r_stopped(pid: i32) -> u32 {
+    unsafe { k_proc_stopped(pid) }
 }
 extern "C" fn r_has_children(ppid: i32) -> i32 {
     unsafe { k_has_children(ppid) }
@@ -1027,6 +1035,9 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
     // Every waitable object's queue lives in the global kernel, where a
     // waiter in another process can be on it. Before anything that makes one.
     gex_kernel::proc::set_cpu_clock(usage::cpu_ns);
+    // (Each process a Worker of its own, which can be held: a stop signal
+    // stops, `sigs::job_stop_point`.)
+    gex_kernel::signal::set_job_control(true);
     gex_kernel::wait::set_hooks(gex_kernel::wait::Hooks {
         new: || unsafe { k_wq_new() },
         free: |id| unsafe { k_wq_free(id) },
@@ -1042,6 +1053,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             reap: r_reap,
             wait: r_wait,
             wait_ready: r_wait_ready,
+            stop: r_stop,
+            stopped: r_stopped,
             has_children: r_has_children,
             kill: r_kill,
             kill_group: r_kill_group,
@@ -8481,6 +8494,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     usage::tick();
     let mut pc = pc;
     loop {
+        // A stopped process makes no call until it is continued.
+        sigs::job_stop_point();
         gex_kernel::phase::begin();
         syscall_entry(ctx, pc);
         gex_kernel::phase::mark(16);
@@ -13958,6 +13973,7 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                 procs,
                 ppid,
                 want,
+                job,
                 ..
             }) => {
                 // The child is another Worker, so its status is not in this
@@ -13965,7 +13981,7 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                 // that holds it is asked instead. Asking must not reap --
                 // this runs on every turn of the run queue.
                 if procs.is_shared() {
-                    return procs.wait_ready(*ppid, *want);
+                    return procs.wait_ready(*ppid, *want, *job);
                 }
                 let mut any = false;
                 for c in children.iter().filter(|c| *want <= 0 || c.pid == *want) {
@@ -15396,6 +15412,7 @@ fn finish_parked(
             procs,
             ppid,
             want,
+            job,
             wstatus,
             nohang,
             waitid,
@@ -15403,9 +15420,10 @@ fn finish_parked(
             let nowait = waitid.is_some_and(|w| w.nowait);
             // A shared table already holds the status in the form `wait4`
             // reports it, because the child's own Worker published it there
-            // as it exited. Nothing here has to reconstruct it.
+            // as it exited. Nothing here has to reconstruct it. (One that
+            // has stopped or been continued, where `job` asks, likewise.)
             if procs.is_shared() {
-                if let Some((pid, word)) = procs.collect(*ppid, *want, nowait) {
+                if let Some((pid, word)) = procs.collect(*ppid, *want, nowait as u32 | *job) {
                     if let Some(w) = waitid {
                         return w.report(gm, pid, word as u32);
                     }
@@ -15429,7 +15447,7 @@ fn finish_parked(
                     trace_line(&format!(
                         "[gex] wait4 blocking by {ppid} for {want}: nothing to collect, \
                          has_children={kids}, ready={}\n",
-                        procs.wait_ready(*ppid, *want)
+                        procs.wait_ready(*ppid, *want, *job)
                     ));
                 }
                 return if *nohang && kids {
@@ -16945,6 +16963,8 @@ fn safepoint(ctx: i32, pc: i64) {
         stop_gone();
         trap();
     }
+    // And one of a stopped process goes no further until it is continued.
+    sigs::job_stop_point();
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.
     {

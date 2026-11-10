@@ -2177,9 +2177,10 @@ fn perform_block(
             wstatus,
             nohang,
             waitid,
-            // The children list passed in is already this process's, so ppid
-            // is redundant here.
-            ppid: _,
+            // The children list passed in is already this process's; the
+            // table is asked by it of one that has stopped or gone on.
+            ppid,
+            job,
         } => {
             let nowait = waitid.is_some_and(|w| w.nowait);
             let candidates: Vec<_> = children
@@ -2214,6 +2215,18 @@ fn perform_block(
                         }
                         return Ok(c.pid as u64);
                     }
+                }
+                // One that has stopped, or been continued, where that is
+                // asked after (job control).
+                if let Some((pid, word)) = procs.stop_news(ppid, want, job | if nowait { gex_kernel::proc::WAIT_NOWAIT } else { 0 }) {
+                    let mut mem = GuestMem::new(data);
+                    if let Some(w) = waitid {
+                        return w.report(&mut mem, pid, word);
+                    }
+                    if wstatus != 0 {
+                        mem.write_u32(wstatus, word)?;
+                    }
+                    return Ok(pid as u64);
                 }
                 if nohang {
                     return match waitid {
@@ -2957,6 +2970,27 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         })
         .context("spawning a child process")?;
     Ok(())
+}
+
+/// Job control: a thread of a stopped process waits here until the process
+/// is continued (or killed, or the system halts), which is where the host
+/// puts it before a call, after one, and at a poll. Two loads when nothing
+/// has stopped. (Out of the way of a fork in another thread meanwhile,
+/// which waits for every thread in guest code to reach a place like this.)
+fn job_stop_point(state: &mut HostState) {
+    if !state.with_kernel(|k| k.job_stopped()) {
+        return;
+    }
+    let gate = state.spawn.as_ref().map(|s| Arc::clone(&s.gate));
+    if let Some(g) = &gate {
+        g.leave();
+    }
+    while state.with_kernel(|k| k.job_stopped()) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if let Some(g) = &gate {
+        g.enter();
+    }
 }
 
 /// A child a signal ended says so, once, as a shell would. A crash (a signal
@@ -4651,6 +4685,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     dump_guest(&mut gm, ctx_addr, tid, &vmas);
                 }
             }
+            // A stopped process makes no call until it is continued.
+            job_stop_point(state);
             let outcome = state.with_kernel(|k| {
                 // Cheap when nothing changed; an exec changes the image.
                 k.publish_proc(&proc_state);
@@ -5638,7 +5674,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
-            match state.with_kernel(|k| k.poll_at(&mut gm, pc as u64)) {
+            let delivery = state.with_kernel(|k| k.poll_at(&mut gm, pc as u64));
+            // (A stop signal taken just now, or by another thread.)
+            job_stop_point(state);
+            match delivery {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
                     if run_signal_frames(&mut caller, pc as u64)? {

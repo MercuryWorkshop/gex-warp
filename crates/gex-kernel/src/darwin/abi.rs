@@ -157,6 +157,10 @@ pub fn sigset_to_darwin(l: u64) -> u32 {
 /// terminating signal in the low seven bits, the stopping one in the second
 /// byte of a stopped status (low byte `0x7f`).
 pub fn wait_status_to_darwin(w: u32) -> u32 {
+    // (One continued: Darwin says it as stopped by `SIGCONT`, 19 there.)
+    if w == 0xffff {
+        return 0x137f;
+    }
     match w & 0x7f {
         0 => w,
         0x7f => (w & !0xff00) | (sig_to_darwin((w >> 8) & 0xff) << 8),
@@ -547,6 +551,8 @@ mod tests {
         // Killed by SIGUSR1; stopped by SIGTSTP; exited 3.
         assert_eq!(wait_status_to_darwin(10), 30);
         assert_eq!(wait_status_to_darwin(0x147f), 0x127f);
+        assert_eq!(wait_status_to_darwin(0x137f), 0x117f);
+        assert_eq!(wait_status_to_darwin(0xffff), 0x137f);
         assert_eq!(wait_status_to_darwin(0x300), 0x300);
     }
 

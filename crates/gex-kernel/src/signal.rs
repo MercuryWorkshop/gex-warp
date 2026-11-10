@@ -188,6 +188,25 @@ pub struct ProcSig {
     /// thread of this process), target thread (0 for `kill`), signal. What
     /// says which thread of a process sent its own death.
     fault_send: Mutex<Option<(i32, i32, i32, u32)>>,
+    /// A signal whose doing is to stop the process, which a thread has
+    /// taken and the process has yet to act on ([`ProcSig::job_stopped`]);
+    /// zero for none.
+    stop_asked: std::sync::atomic::AtomicU32,
+    /// The process is stopped, as far as its threads last saw: each waits
+    /// at its next call or poll until the process table says it runs.
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// Whether this host stops a process a stop signal is delivered to
+/// ([`set_job_control`]).
+static JOB_CONTROL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host can hold a stopped process's threads until it is continued
+/// ([`ProcSig::job_stopped`], asked at each call and poll), so a stop
+/// signal stops. Where it cannot, one does as it did before there was job
+/// control here: `SIGSTOP` ends the process, the terminal's three do nothing.
+pub fn set_job_control(on: bool) {
+    JOB_CONTROL.store(on, Ordering::Release);
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -200,6 +219,38 @@ impl std::fmt::Debug for ProcSig {
 }
 
 impl ProcSig {
+    /// Whether [`ProcSig::job_stopped`] has anything to look at: two loads,
+    /// for every call and every poll to ask.
+    pub fn stop_due(&self) -> bool {
+        self.stop_asked.load(Ordering::Relaxed) != 0 || self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Whether process `pid`, whose signals these are, is stopped, for a
+    /// thread of it to ask where it may wait (a call's start or end, a
+    /// poll): while it is, the thread waits a while and asks again. A stop
+    /// signal a thread took stops the process here ([`ProcTable::stop`],
+    /// which may decline), and what starts it again is the table's
+    /// (`SIGCONT`, as it is sent).
+    pub fn job_stopped(&self, procs: &crate::proc::ProcTable, pid: i32) -> bool {
+        let asked = self.stop_asked.swap(0, Ordering::AcqRel);
+        if asked != 0 && procs.stop(pid, asked) {
+            self.stopped.store(true, Ordering::Release);
+        }
+        if !self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        if procs.stopped(pid) != 0 {
+            return true;
+        }
+        self.stopped.store(false, Ordering::Release);
+        // (Stopped again by another thread between the two.)
+        if procs.stopped(pid) != 0 {
+            self.stopped.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
     fn with_actions(actions: [SigAction; NSIG]) -> ProcSig {
         ProcSig {
             actions: RwLock::new(actions),
@@ -210,6 +261,8 @@ impl ProcSig {
             timers: Mutex::new([None; 3]),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
+            stop_asked: std::sync::atomic::AtomicU32::new(0),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             fatal: Mutex::new(None),
             handled: Mutex::new(None),
             fault_send: Mutex::new(None),
@@ -2141,11 +2194,20 @@ pub fn dispatch(
     if action.handler == SIG_DFL {
         let d = match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
-            // The three a terminal raises, with no handler and no scheduler to
-            // resume from: doing nothing matches a shell with no job control (a
-            // `^Z` there does nothing on real hardware too), and is far better
-            // than killing a backgrounded reader. `SIGSTOP` is excluded -- it
-            // can't be handled, so ending the process at least does something.
+            // The process stops: not here, but where its threads next ask
+            // (`ProcSig::job_stopped`), which is before any of them goes
+            // further. The process table says whether it does: a terminal's
+            // stop signal does nothing to a job nobody controls.
+            DefaultAction::Stop if JOB_CONTROL.load(Ordering::Acquire) => {
+                signals.proc.stop_asked.store(signal, Ordering::Release);
+                Delivery::None
+            }
+            // Where the host cannot hold a process: the three a terminal
+            // raises do nothing, which matches a shell with no job control
+            // (a `^Z` there does nothing on real hardware too), and is far
+            // better than killing a backgrounded reader. `SIGSTOP` is
+            // excluded -- it can't be handled, so ending the process at
+            // least does something.
             DefaultAction::Stop
                 if matches!(signal, sig::SIGTSTP | 21 | 22) =>
             {

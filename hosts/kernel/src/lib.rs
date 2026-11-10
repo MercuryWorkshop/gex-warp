@@ -1757,7 +1757,11 @@ pub extern "C" fn k_proc_no_memory(pid: i32) {
 /// atomically, since two Workers can collect at once and a status left in a
 /// static between calls would go to whichever asked last.
 #[no_mangle]
-pub extern "C" fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
+pub extern "C" fn k_wait(ppid: i32, want: i32, how: i32) -> i64 {
+    // (`how`: `gex_kernel::proc::WAIT_NOWAIT`, and whether a child that
+    // has stopped or been continued is asked after, which is told as the
+    // wait status that says so.)
+    let nowait = how & gex_kernel::proc::WAIT_NOWAIT as i32;
     for c in procs().children(ppid) {
         if want > 0 && c.pid != want {
             continue;
@@ -1779,6 +1783,9 @@ pub extern "C" fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
             return ((c.pid as i64) << 32) | word as i64;
         }
     }
+    if let Some((pid, word)) = procs().stop_news(ppid, want, how as u32) {
+        return ((pid as i64) << 32) | word as i64;
+    }
     0
 }
 
@@ -1788,8 +1795,21 @@ pub extern "C" fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
 /// Separate from [`k_wait`] because collecting *takes* the child, and a
 /// scheduler asking whether a parked thread can run must not reap one.
 #[no_mangle]
-pub extern "C" fn k_wait_ready(ppid: i32, want: i32) -> i32 {
-    procs().wait_ready(ppid, want) as i32
+pub extern "C" fn k_wait_ready(ppid: i32, want: i32, job: u32) -> i32 {
+    procs().wait_ready(ppid, want, job) as i32
+}
+
+/// Process `pid` has taken a signal that stops it (`ProcTable::stop`):
+/// whether it stopped.
+#[no_mangle]
+pub extern "C" fn k_proc_stop(pid: i32, signo: u32) -> i32 {
+    procs().stop(pid, signo) as i32
+}
+
+/// The signal process `pid` is stopped by, or zero (`ProcTable::stopped`).
+#[no_mangle]
+pub extern "C" fn k_proc_stopped(pid: i32) -> u32 {
+    procs().stopped(pid)
 }
 
 /// Whether `ppid` has any live children, which is what tells `wait4` the
