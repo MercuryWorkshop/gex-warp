@@ -1,10 +1,18 @@
-# gex
+# gex-warp
+
+gex-warp is a fork of [gex](https://github.com/HeyPuter/gex) that teaches
+its kernel to be other operating systems' kernels too. The first of those
+personalities is Darwin: a macOS program enters the kernel as it would
+enter XNU. Everything gex does, this does, and the rest of this file is
+gex's own with the fork's additions marked where they are.
 
 gex runs unmodified Linux and Windows programs in a web browser. It
 translates their machine code to WebAssembly and runs it against its own
 implementation of the Linux kernel ABI. That kernel is written in Rust and
 compiled to WebAssembly as well. A program needs no source changes and no
-rebuild, and nothing in it knows it is not on a Linux machine.
+rebuild, and nothing in it knows it is not on a Linux machine. In this fork
+the same goes for macOS programs, the statically linked ones so far
+([below](#run-a-macos-program)).
 
 ```console
 $ file hello
