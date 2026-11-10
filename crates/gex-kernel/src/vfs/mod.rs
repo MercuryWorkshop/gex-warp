@@ -1509,11 +1509,13 @@ impl Namespace {
 
     /// Absolute `abs` with every root-filesystem symlink on it followed,
     /// the last component's too: the name Linux's `/proc/self/fd/N` shows
-    /// for a file opened by `abs`. `abs` itself when the walk fails or
-    /// reaches another mount (which names its own links).
+    /// for a file opened by `abs`. `abs` itself when the walk fails; as far
+    /// as another mount (which names its own links) when it reaches one: a
+    /// Mac's `/tmp/x`, its `/tmp` a link to a `/private/tmp` that is a
+    /// filesystem of its own, is `/private/tmp/x`.
     pub fn canonical(&self, abs: &str) -> String {
         match self.walk(abs, true) {
-            Ok(Some(w)) if !w.at_mount => w.path,
+            Ok(Some(w)) => w.path,
             _ => abs.to_string(),
         }
     }
@@ -1880,7 +1882,10 @@ impl Namespace {
         if md.file_type != FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
-        self.cwd = abs;
+        // By the name the directory has, its links followed, as `chdir`
+        // leaves it: a process started in a Mac's `/var/root` is in
+        // `/private/var/root`, and is told so.
+        self.cwd = self.canonical(&abs);
         Ok(())
     }
 }

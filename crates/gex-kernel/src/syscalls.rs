@@ -4051,7 +4051,9 @@ impl PathIo<'_> {
             return Err(Errno::ENOTDIR);
         }
         let dir = dir.or_else(|| self.ns.open(&abs, oflags::O_RDONLY | oflags::O_DIRECTORY, 0).ok());
-        self.fs.set(abs, dir);
+        // And kept by that name: `..` from it is the directory it is in,
+        // not the one its link is in, and `getcwd` says where it is.
+        self.fs.set(self.ns.canonical(&abs), dir);
         Ok(0)
     }
 
