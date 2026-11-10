@@ -248,6 +248,62 @@ static long rpc(struct message *m, u32 to, u32 size) {
     return r;
 }
 
+// task_info and thread_info: what each flavor answers and how many words
+// of it, with room to spare and with too little, and what of the answer
+// does not change from one run to the next.
+static void infos(void) {
+    static struct {
+        struct header h;
+        u32 body[128];
+    } m;
+    static const u32 ndr[2] = {0, 1};
+    u32 thread = (u32)TRAP(TRAP_thread_self);
+    static const struct {
+        int task;
+        u32 flavor, room;
+    } asks[] = {
+        {1, 2, 120},  {1, 3, 120},  {1, 4, 120}, {1, 5, 120}, {1, 6, 120}, {1, 13, 120}, {1, 15, 120}, {1, 17, 120}, {1, 18, 120}, {1, 20, 120},
+        {1, 22, 120}, {1, 23, 120}, {1, 99, 120}, {1, 20, 11}, {1, 15, 7},  {1, 22, 35},  {1, 22, 37},  {1, 22, 43},  {1, 22, 85},  {1, 22, 92},
+        {0, 3, 120},  {0, 4, 120},  {0, 5, 120}, {0, 99, 120}, {0, 3, 9},  {0, 4, 5},    {0, 4, 6},    {0, 4, 9},    {0, 5, 27},
+    };
+    for (unsigned i = 0; i < sizeof asks / sizeof *asks; i++) {
+        t_memset(&m, 0, sizeof m);
+        m.h.id = asks[i].task ? 3405 : 3612;
+        m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = asks[i].flavor, m.body[3] = asks[i].room;
+        u32 reply = (u32)TRAP(TRAP_mach_reply_port);
+        m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = asks[i].task ? task : thread, m.h.local = reply;
+        long r = msg((struct message *)&m, SEND_MSG | RCV_MSG | KOBJECT_CALL, sizeof m.h + 16, sizeof m, reply, 0);
+        TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
+        t_printf("%s flavor %u with room for %u: %ld, code %d", asks[i].task ? "the task's" : "the thread's", asks[i].flavor, asks[i].room, r, (int)m.body[2]);
+        if (r || m.body[2]) {
+            t_printf("\n");
+            continue;
+        }
+        const u32 *w = m.body + 4;
+        t_printf(", %u words", m.body[3]);
+        if (asks[i].room < 120) {
+            t_printf("\n");
+            continue;
+        }
+        u64 first = w[0] | (u64)w[1] << 32;
+        if (asks[i].task) switch (asks[i].flavor) {
+            case 13: t_printf(": the user's %s, the group's %s", w[0] == (u32)SYS(SYS_geteuid) ? "yes" : "no", w[1] == (u32)SYS(SYS_getegid) ? "yes" : "no"); break;
+            case 15: t_printf(": the user's %s, the group's %s, the process's %s", w[1] == (u32)SYS(SYS_geteuid) ? "yes" : "no", w[2] == (u32)SYS(SYS_getegid) ? "yes" : "no", w[5] == (u32)SYS(SYS_getpid) ? "yes" : "no"); break;
+            case 17: t_printf(": format %u", w[4]); break;
+            case 18: t_printf(": suspended %u times, some memory %s, policy %u", w[0], (w[1] | w[2]) && (w[3] | w[4]) ? "yes" : "no", w[9]); break;
+            case 20: t_printf(": some memory %s, policy %u, suspended %u times", first && (w[2] | w[3]) ? "yes" : "no", w[10], w[11]); break;
+            case 22: t_printf(": some memory %s, a page of %u, some of it resident %s", first ? "yes" : "no", w[3], (w[4] | w[5]) ? "yes" : "no"); break;
+            default: break;
+        } else switch (asks[i].flavor) {
+            case 3: t_printf(": policy %u, state %u, flags %u, suspended %u times", w[5], w[6], w[7], w[8]); break;
+            case 4: t_printf(": its id %s", first == (u64)SYS(SYS_thread_selfid) ? "yes" : "no"); break;
+            case 5: t_printf(": policy %u, state %u", w[5], w[6]); break;
+            default: break;
+        }
+        t_printf("\n");
+    }
+}
+
 static void kernel_ports(void) {
     static struct message m;
     // NDR record, then the arguments.
@@ -623,6 +679,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     messages();
     threads();
     kernel_ports();
+    infos();
     queues();
 #if defined(__arm64__)
     timers();

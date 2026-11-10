@@ -1232,6 +1232,135 @@ impl Kernel {
             // made a different length (which empties it), and where it is.
             // Each answers how much was taken and when the task should
             // next say what it holds.
+            // task_info(task, flavor, out info, in-out count): what the
+            // task is and has used, in 32-bit words; too little room for a
+            // flavor is a bad argument. The sizes are the memory map's
+            // (everything mapped, and what of it can be touched: nothing
+            // is paged out here), the times the process's, and what is
+            // not counted (faults, messages, switches) is none.
+            (Kind::Task, 3405) => {
+                let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
+                let (size, resident, anon) = self.mem.lock().vm_counters();
+                let regions = self.mem.lock().vmas().len() as u32;
+                let cpu = self.cpu_nanos();
+                // (A time is seconds and microseconds.)
+                let time = [(cpu / 1_000_000_000) as u32, (cpu % 1_000_000_000 / 1000) as u32];
+                let wide = |v: u64| [v as u32, (v >> 32) as u32];
+                let narrow = |v: u64| v.min(u32::MAX as u64) as u32;
+                const TIMESHARE: u32 = 1;
+                let basic32 = || [&[0, narrow(size), narrow(resident)][..], &time, &[0, 0, TIMESHARE]].concat();
+                let basic64 = || [&[0][..], &wide(size), &wide(resident), &time, &[0, 0, TIMESHARE]].concat();
+                let words: Option<Vec<u32>> = match flavor {
+                    // TASK_EVENTS_INFO
+                    2 => Some(vec![0; 8]),
+                    // TASK_THREAD_TIMES_INFO: its live threads' times.
+                    3 => Some([&time[..], &[0, 0]].concat()),
+                    // TASK_BASIC_INFO_32 and TASK_BASIC2_INFO_32: how many
+                    // times suspended, the sizes, the times, the policy.
+                    4 | 6 => Some(basic32()),
+                    // TASK_BASIC_INFO_64: number 18 on arm64, where 5 has
+                    // the 32-bit one's shape, and 5 on x86-64.
+                    5 if gex_abi::X86 => Some(basic64()),
+                    5 => Some(basic32()),
+                    18 => Some(basic64()),
+                    // TASK_SECURITY_TOKEN: who it runs as.
+                    13 => Some(vec![self.creds.uid(), self.creds.gid()]),
+                    // TASK_AUDIT_TOKEN: the audit user, the effective and
+                    // real ids, the process, its audit session and which
+                    // use of the process's number this is.
+                    15 => Some(vec![self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1]),
+                    // TASK_DYLD_INFO: where the dynamic linker's list of
+                    // images is, its size and its format. The kernel is
+                    // not told here: nowhere, in the 64-bit format.
+                    17 => Some(vec![0, 0, 0, 0, 1]),
+                    // MACH_TASK_BASIC_INFO: the sizes and the most that
+                    // was resident, the times, the policy, how many times
+                    // suspended.
+                    20 => Some([&wide(size)[..], &wide(resident), &wide(resident), &time, &[0, 0, TIMESHARE, 0]].concat()),
+                    // TASK_VM_INFO (and with what is purgeable): the map's
+                    // size and regions, the page, what is resident and
+                    // what of it is the task's own, its footprint, the
+                    // addresses a task may have, and how much more it may
+                    // use. It has grown by revisions, and a caller is
+                    // given the last one it has room for.
+                    22 | 23 => {
+                        const REVISIONS: [usize; 8] = [36, 38, 42, 84, 86, 87, 89, 93];
+                        REVISIONS.iter().rev().find(|n| **n <= room).map(|n| {
+                            let mut v = vec![0u32; 93];
+                            let mut put = |at: usize, x: u64| v[at..at + 2].copy_from_slice(&wide(x));
+                            put(0, size);
+                            put(4, resident);
+                            put(6, resident);
+                            put(12, anon);
+                            put(14, anon);
+                            put(36, resident);
+                            put(38, abi::PAGE_SIZE);
+                            put(40, if gex_abi::mem64() { gex_abi::LIMIT64 } else { 1 << 32 });
+                            put(84, super::info::Machine::this().mem as u64);
+                            v[2] = regions;
+                            v[3] = abi::PAGE_SIZE as u32;
+                            v.truncate(*n);
+                            v
+                        })
+                    }
+                    _ => None,
+                };
+                match words {
+                    Some(w) if room >= w.len() => {
+                        let mut b = (w.len() as u32).to_le_bytes().to_vec();
+                        w.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                    _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
+            // thread_info(thread, flavor, out info, in-out count), likewise:
+            // a thread's times and state, and which thread it is.
+            (Kind::Thread(tid), 3612) => {
+                let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
+                // (Its own time is known; another's is not kept.)
+                let cpu = if tid == self.tid { crate::proc::cpu_clock(true).unwrap_or(0) } else { 0 };
+                let time = [(cpu / 1_000_000_000) as u32, (cpu % 1_000_000_000 / 1000) as u32];
+                const TIMESHARE: u32 = 1;
+                const RUNNING: u32 = 1;
+                let words: Option<Vec<u32>> = match flavor {
+                    // THREAD_BASIC_INFO: the times, how much of a processor
+                    // it has lately used, its policy, state and flags, how
+                    // many times suspended, how long asleep.
+                    3 => Some([&time[..], &[0, 0, 0, TIMESHARE, RUNNING, 0, 0, 0]].concat()),
+                    // THREAD_IDENTIFIER_INFO: its id (`thread_selfid`), then
+                    // its handle and its queue's address, which libpthread
+                    // keeps and the kernel is not told here. As much as
+                    // there is room for, past the id's part.
+                    4 if room >= 6 => {
+                        let mut v = vec![0u32; room.min(32)];
+                        v[0] = tid as u32;
+                        Some(v)
+                    }
+                    // THREAD_EXTENDED_INFO: the times in nanoseconds, the
+                    // same state, its priorities and its name (none).
+                    5 => {
+                        let mut v = vec![0u32; 28];
+                        v[0] = (cpu % (1 << 32)) as u32;
+                        v[1] = (cpu >> 32) as u32;
+                        v[5] = TIMESHARE;
+                        v[6] = RUNNING;
+                        v[9] = 31;
+                        v[10] = 31;
+                        v[11] = 63;
+                        Some(v)
+                    }
+                    _ => None,
+                };
+                match words {
+                    Some(w) if room >= w.len() => {
+                        let mut b = (w.len() as u32).to_le_bytes().to_vec();
+                        w.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                    _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
             // task_restartable_ranges_register(task, ranges, count)
             // ([`super::restart`]): how many, then each's location, length,
             // recovery offset and flags.
