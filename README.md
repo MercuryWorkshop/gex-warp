@@ -243,8 +243,8 @@ What does not, yet:
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - A kqueue's events delivered to a work queue's threads, and workloops;
   the kqueue filters for a Mach port and a
-  file changing; a queue's descriptor closed in a child of `fork`; on the
-  page, a note on another process hearing of its end every time;
+  file changing; on the page, a queue closed in a child of `fork`, and a
+  note on another process hearing of its end every time;
   `mknod`; a mutex or condition shared between
   processes (each is its own process's).
 - A floating-point environment beyond what WebAssembly has: the rounding

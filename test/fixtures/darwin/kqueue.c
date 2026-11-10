@@ -173,6 +173,8 @@ int main(int argc, char **argv, char **envp, char **apple) {
     if (pid >= 0 && second) {
         // (select's time is seconds and microseconds: 20 ms.)
         struct t_timespec nap = {0, 20000};
+        // A child has none of its parent's queues.
+        if (SYS(SYS_kevent, kq, 0, 0, got, 8, &now_) != -9) SYS(SYS_write, 1, "the child has the queue\n", 24);
         SYS(SYS_close, rd);
         SYS(SYS_select, 0, 0, 0, 0, &nap);
         SYS(SYS_write, wr, "child", 5);
@@ -228,6 +230,23 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_wait4, pid, &status, 0, 0);
     t_show("delete", change(30, SIGNAL, DELETE, 0, 0, 0));
     t_show("watch a signal there is none of", change(99, SIGNAL, ADD, 0, 0, 0));
+
+    // A file on a disk: something to read while its descriptor has not
+    // read to its end, and how much.
+    long file = SYS(SYS_open, "k.txt", 0x602, 0644); // O_RDWR | O_CREAT | O_TRUNC
+    SYS(SYS_write, file, "0123456789", 10);
+    t_show("watch a file", change(file, READ, ADD, 0, 0, 91));
+    say("at its end", ready(0));
+    SYS(SYS_lseek, file, 4, 0);
+    say("six left", ready(0));
+    SYS(SYS_read, file, buf, 6);
+    say("read to its end", ready(0));
+    SYS(SYS_write, file, "ab", 2);
+    SYS(SYS_lseek, file, 10, 0);
+    say("two written past it", ready(0));
+    t_show("delete", change(file, READ, DELETE, 0, 0, 0));
+    SYS(SYS_close, file);
+    SYS(SYS_unlink, "k.txt");
 
     // Two notes on one thing, told apart by what each hands back.
     t_show("two notes on one event", change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 101) + change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 102));

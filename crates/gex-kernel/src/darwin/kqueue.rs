@@ -185,7 +185,7 @@ enum What {
     /// open), the wait queue of its this queue is chained onto, and for a
     /// note that reports each change once (`EV_CLEAR`) how often the file
     /// had woken its waiters when it last reported.
-    File { file: Weak<dyn FileHandle>, source: u32, seen: Option<u64> },
+    File { file: Weak<crate::file::OpenFile>, source: u32, seen: Option<u64> },
     /// A timer: when it next fires, on the monotonic clock in nanoseconds
     /// (or, `absolute`, the wall clock), and every how often after.
     Timer { next: u64, period: u64, absolute: bool },
@@ -308,7 +308,7 @@ impl Kqueue {
     pub fn change(
         &self,
         e: &Event,
-        file: &dyn Fn(i32) -> Result<Arc<dyn FileHandle>, Errno>,
+        file: &dyn Fn(i32) -> Result<Arc<crate::file::OpenFile>, Errno>,
         process: &mut dyn FnMut(i32) -> Result<(i32, Arc<dyn FileHandle>), Errno>,
         signals: &Arc<crate::signal::ProcSig>,
     ) -> Result<(), Errno> {
@@ -350,7 +350,7 @@ impl Kqueue {
                 let (what, fflags) = match e.filter {
                     filt::READ | filt::WRITE => {
                         let f = file(e.ident as i32)?;
-                        let source = f.wait_queue();
+                        let source = f.handle.wait_queue();
                         crate::wait::chain(source, self.queue.id());
                         (What::File { file: Arc::downgrade(&f), source, seen: None }, e.fflags)
                     }
@@ -436,23 +436,29 @@ impl Kqueue {
                     *dead = true;
                     return None;
                 };
+                let h = &f.handle;
+                // A file on a disk has something to read while there is
+                // more of it past where its descriptor has read to, and how
+                // much is said; nothing else is asked of it.
+                if n.filter == filt::READ && h.metadata().is_ok_and(|md| md.file_type == FileType::Regular) {
+                    let size = h.metadata().map_or(0, |md| md.size as i64);
+                    let left = size - f.seek(0, 1).map_or(0, |at| at as i64);
+                    return (left > 0).then_some((0, 0, left));
+                }
                 let (eof, ready) = match found.get(&(n.ident as i32)) {
                     Some(&got) => (got & (poll::HUP | poll::ERR) != 0, got & if n.filter == filt::READ { poll::IN } else { poll::OUT } != 0),
-                    None => (
-                        f.poll_hup() || (n.filter == filt::READ && f.poll_rdhup()),
-                        if n.filter == filt::READ { f.poll_readable() } else { f.poll_writable() },
-                    ),
+                    None => (h.poll_hup() || (n.filter == filt::READ && h.poll_rdhup()), if n.filter == filt::READ { h.poll_readable() } else { h.poll_writable() }),
                 };
                 if !ready && !eof {
                     return None;
                 }
                 // Told of each change once: nothing new since the last.
-                if n.flags & ev::CLEAR != 0 && seen.is_some() && f.wakes().is_some() && f.wakes() == *seen {
+                if n.flags & ev::CLEAR != 0 && seen.is_some() && h.wakes().is_some() && h.wakes() == *seen {
                     return None;
                 }
                 // How much there is to read; or room to write, which no
                 // file here measures: a pipe's worth.
-                let data = if n.filter == filt::READ { f.available().unwrap_or(ready as u64) as i64 } else { 16384 };
+                let data = if n.filter == filt::READ { h.available().unwrap_or(ready as u64) as i64 } else { 16384 };
                 Some((if eof { ev::EOF } else { 0 }, 0, data))
             }
             What::Timer { next, period, absolute } => {
@@ -508,7 +514,7 @@ impl Kqueue {
             let n = &mut notes[i];
             out.push(Event { ident: n.ident, filter: n.filter, flags: ev::ADD | n.flags | flags, fflags, data, udata: n.udata, qos: n.qos, ext: n.ext });
             match &mut n.what {
-                What::File { file, seen, .. } => *seen = file.upgrade().and_then(|f| f.wakes()),
+                What::File { file, seen, .. } => *seen = file.upgrade().and_then(|f| f.handle.wakes()),
                 What::Timer { next, period, .. } => {
                     if *period == 0 {
                         n.flags |= ev::ONESHOT;
@@ -715,7 +721,7 @@ impl Kernel {
                     let mut taken = false;
                     let r = kq.change(
                         &e,
-                        &|fd| fds.get(fd).map(|f| Arc::clone(&f.handle)),
+                        &|fd| fds.get(fd),
                         &mut |_| {
                             let fd = opened.ok_or(Errno::ESRCH)??;
                             taken = true;
@@ -822,7 +828,7 @@ mod tests {
     fn clock() -> (u64, u32) {
         (1000, 0)
     }
-    fn none(_: i32) -> Result<Arc<dyn FileHandle>, Errno> {
+    fn none(_: i32) -> Result<Arc<crate::file::OpenFile>, Errno> {
         Err(Errno::EBADF)
     }
     fn nobody(_: i32) -> Result<(i32, Arc<dyn FileHandle>), Errno> {

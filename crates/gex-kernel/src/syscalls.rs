@@ -10232,6 +10232,15 @@ impl Kernel {
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
         }
+        // A Darwin child has none of its parent's kqueues: XNU does not
+        // pass one on, and a queue's notes are of the parent's doing.
+        if self.darwin {
+            for (fd, file, _) in child.fds.entries() {
+                if Arc::clone(&file.handle).as_kqueue().is_some() {
+                    let _ = child.fds.close(fd);
+                }
+            }
+        }
         child
     }
 
