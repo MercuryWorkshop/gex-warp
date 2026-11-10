@@ -144,6 +144,8 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_lstat64, "l", &st);
     t_printf("a link's mode: %o\n", st.st_mode & 07777);
     t_show("change the link's own", SYS(SYS_fchmodat, AT_FDCWD, "l", 0600, AT_SYMLINK_NOFOLLOW));
+    SYS(SYS_lstat64, "l", &st);
+    t_printf("  the link's is %o\n", st.st_mode & 07777);
     SYS(SYS_stat64, "f", &st);
     t_printf("  its file's stays %o\n", st.st_mode & 07777);
     // (What a mode is changed to is `files`' to say: the page's files keep

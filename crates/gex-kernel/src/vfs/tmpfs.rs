@@ -1419,7 +1419,7 @@ impl TmpFs {
             Node::Symlink(t) => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: t.len() as u64,
-                mode: 0o777,
+                mode: inner.modes.get(path).copied().unwrap_or(0o777),
                 ino,
                 mtime: mtime(),
                 nlink: 1,
@@ -2049,6 +2049,18 @@ impl FileSystem for TmpFs {
     /// A name here is its node, link or not: `metadata` never follows.
     fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         self.metadata(path)
+    }
+
+    fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.nodes.get(path) {
+            Some(Node::Symlink(_)) => {}
+            Some(_) => return Err(Errno::EINVAL),
+            None => return Err(Errno::ENOENT),
+        }
+        inner.modes.insert(path.to_string(), mode & 0o7777);
+        note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
+        Ok(())
     }
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {

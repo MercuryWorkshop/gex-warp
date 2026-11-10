@@ -161,6 +161,23 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     }
 }
 
+/// The symlink at `host` itself, open: what its own mode and times are
+/// changed through. A Mac's host opens one (`O_SYMLINK`); Linux's has no
+/// such thing, and a link there has no mode to change.
+fn open_link(host: &std::path::Path) -> Result<File, Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_SYMLINK: i32 = 0x20_0000;
+        std::fs::OpenOptions::new().read(true).custom_flags(O_SYMLINK).open(host).map_err(|e| Errno::from_io(&e))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = host;
+        Err(Errno::EOPNOTSUPP)
+    }
+}
+
 /// An open host file.
 #[derive(Debug)]
 struct HostHandle {
@@ -552,6 +569,28 @@ impl FileSystem for HostFs {
         host_access(&host, mode)
     }
 
+    /// A link's own: the host's account of it (its mode and times are a
+    /// Mac's host's to keep; its number is its own).
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        let host = self.host_path(path)?;
+        match std::fs::symlink_metadata(&host) {
+            Ok(md) if md.is_symlink() => Ok(convert(&md)),
+            _ => self.metadata(path),
+        }
+    }
+
+    fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let host = self.host_path(path)?;
+        let link = open_link(&host)?;
+        link.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777)).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
+    }
+
     fn read_link(&self, path: &str) -> Result<String, Errno> {
         let host = self.host_path(path)?;
         // `read_link` on a non-symlink reports EINVAL, which the VFS uses to
@@ -690,7 +729,12 @@ impl FileSystem for HostFs {
         // A symlink's own times (`utimensat` with AT_SYMLINK_NOFOLLOW: dpkg
         // stamps every link it unpacks, before its target exists): std opens
         // only what a link names, so this leaves the link's times as they are.
+        // (Where the host can open a link itself, a Mac, they are set.)
         if std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink()) {
+            if let Ok(link) = open_link(&host) {
+                link.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))?;
+                hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+            }
             return Ok(());
         }
         let f = std::fs::File::open(&host).map_err(|e| Errno::from_io(&e))?;

@@ -617,12 +617,16 @@ impl Kernel {
             d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
             d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),
             d::SETPRIORITY => Err(Errno::ESRCH),
-            // A link's own mode is not kept: changing it changes nothing,
-            // and its file is left alone.
+            // A link's own mode, where it is kept (a tree in memory, a
+            // Mac's host's files): where it is not, changing it changes
+            // nothing, and either way its file is left alone.
             d::FCHMODAT => {
                 let p = self.path_io().at_path(m, dirfd(x[0]) as i32, x[1])?;
                 if self.vfs.metadata_nofollow(&p)?.file_type == crate::vfs::FileType::Symlink {
-                    Ok(0)
+                    match self.vfs.chmod_link(&p, x[2] as u32) {
+                        Err(Errno::EOPNOTSUPP) => Ok(0),
+                        r => r.map(|_| 0),
+                    }
                 } else {
                     self.dispatch(m, nr::FCHMODAT, [dirfd(x[0]), x[1], x[2], 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))
                 }

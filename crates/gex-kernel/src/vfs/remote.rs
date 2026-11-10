@@ -17,6 +17,9 @@ use std::sync::Arc;
 use crate::errno::Errno;
 use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, SysResult};
 
+/// In [`Remote::chmod`]'s mode: the link named, not what it names.
+pub const CHMOD_LINK: u32 = 1 << 31;
+
 /// The calls a remote filesystem is reached by.
 ///
 /// Every address is an offset into the *calling* process's memory, and every
@@ -75,6 +78,8 @@ pub struct Remote {
     pub rename_epoch: extern "C" fn() -> i32,
     /// [`FileHandle::hold_renames`]: 1 when the filesystem has the lock.
     pub hold_renames: extern "C" fn(handle: i32, owner: i32, on: u32) -> i32,
+    /// `chmod`; with [`CHMOD_LINK`] in `mode`, of the symlink `path` itself
+    /// ([`FileSystem::chmod_link`]).
     pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     /// `fchmod` on an open handle.
     pub fchmod: extern "C" fn(handle: i32, mode: u32) -> i32,
@@ -407,6 +412,11 @@ impl FileSystem for RemoteFs {
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (a, n) = at(path.as_bytes());
         ok((self.remote.chmod)(a, n, mode)).map(|_| ())
+    }
+
+    fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        ok((self.remote.chmod)(a, n, mode & 0o7777 | CHMOD_LINK)).map(|_| ())
     }
 
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {

@@ -3665,10 +3665,12 @@ pub extern "C" fn k_fs_fchmod(handle: i32, mode: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_fs_chmod(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
     let p = path_of(path, path_len);
+    // (A symlink's own mode, `remote::CHMOD_LINK`: a Mac's `chmod -h`.)
+    let (link, mode) = (mode & gex_kernel::vfs::remote::CHMOD_LINK != 0, mode & !gex_kernel::vfs::remote::CHMOD_LINK);
     if let Some((m, rel)) = pagefs::find(&p) {
-        return as_unit(m.chmod(&rel, mode));
+        return as_unit(if link { m.chmod_link(&rel, mode) } else { m.chmod(&rel, mode) });
     }
-    as_unit(rootfs().chmod(&p, mode))
+    as_unit(if link { rootfs().chmod_link(&p, mode) } else { rootfs().chmod(&p, mode) })
 }
 
 /// An extended-attribute call (`remote::Remote::xattr`): on open `handle`,

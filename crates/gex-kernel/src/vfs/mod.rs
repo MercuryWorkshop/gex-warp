@@ -902,6 +902,13 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, mode);
         Ok(())
     }
+    /// Change the mode of the symlink `path` itself, which a Mac's link
+    /// has and Linux's has not (`lchmod`, `chmod -h`). `EOPNOTSUPP` where
+    /// a link's mode is not kept.
+    fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let _ = (path, mode);
+        Err(Errno::EOPNOTSUPP)
+    }
     /// Set a file's modification time (seconds since the epoch), for
     /// `utimensat`. Filesystems that keep no times accept it and do nothing.
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
@@ -1742,6 +1749,12 @@ impl Namespace {
     pub fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.metadata_nofollow(&rel)
+    }
+
+    /// [`FileSystem::chmod_link`], of the link `path` names.
+    pub fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.chmod_link(&rel, mode)
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, Errno> {
