@@ -2738,6 +2738,7 @@ impl FdIo<'_> {
                 writable: file.as_ref().is_some_and(|f| f.writable),
                 epoll: None,
                 edge: false,
+                gone: None,
             });
         }
         Some(out)
@@ -2804,6 +2805,7 @@ impl FdIo<'_> {
                 writable: file.as_ref().is_some_and(|f| f.writable),
                         epoll: None,
                         edge: false,
+                        gone: None,
                     }
                 })
                 .collect(),
@@ -2838,6 +2840,7 @@ impl FdIo<'_> {
                     writable,
                     epoll: Some(Arc::clone(set)),
                     edge: w.events & unix::epoll_flag::ET != 0,
+                    gone: None,
                 })
             })
             .collect()
@@ -2930,7 +2933,19 @@ impl FdIo<'_> {
     fn poll_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
         let (fds, report, wait) = self.poll_question(m, n, a).ok()?;
         let deadline = wait?;
-        (!poll_ready(&fds)).then_some(BlockOp::Poll { fds, deadline, report })
+        (!poll_ready(&fds)).then(|| BlockOp::Poll { fds: self.watch_closes(fds, &report), deadline, report })
+    }
+
+    /// The entries of a call about to wait, a Mac's `select`'s told when
+    /// one of its descriptors is closed ([`closed_under`]).
+    fn watch_closes(&self, mut fds: Vec<PollFd>, report: &PollReport) -> Vec<PollFd> {
+        if crate::darwin::on() && matches!(report, PollReport::Select { .. }) {
+            let flag = closed_under::watch(self.fds, fds.iter().map(|p| p.fd));
+            for p in &mut fds {
+                p.gone = Some(Arc::clone(&flag));
+            }
+        }
+        fds
     }
 
     /// A poll-family call answered now, with whatever is ready.
@@ -2947,7 +2962,7 @@ impl FdIo<'_> {
             Err(e) => return Ok(Err(e)),
         };
         match wait {
-            Some(deadline) if !poll_ready(&fds) => Err(BlockOp::Poll { fds, deadline, report }),
+            Some(deadline) if !poll_ready(&fds) => Err(BlockOp::Poll { fds: self.watch_closes(fds, &report), deadline, report }),
             _ => Ok(poll_finish(&fds, &report, m)),
         }
     }
@@ -9215,6 +9230,57 @@ pub struct PollFd {
     /// An edge-triggered watch (`EPOLLET`): only for one is the handle's
     /// wakeup count asked ([`crate::vfs::FileHandle::wakes`]).
     pub edge: bool,
+    /// Set when a descriptor of the waiting `select` was closed under it
+    /// ([`closed_under`]): the wait is over, with `EBADF`. One for the whole
+    /// call, held by each of its entries.
+    pub gone: Option<Arc<core::sync::atomic::AtomicBool>>,
+}
+
+/// A Mac's `select` whose descriptor another thread closes ends at once
+/// with `EBADF` (XNU drains a file's waiters as it closes it); Linux's goes
+/// on waiting, holding the file open. Core Foundation's sockets rely on the
+/// Mac's: one thread selects on every socket, and closing one is how it is
+/// told to look again -- and, here, what lets the closed socket's peer see
+/// it go, which the waiting `select`'s hold on the file would put off.
+pub(crate) mod closed_under {
+    use super::FdTable;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
+
+    /// The waits there are: whose table, which descriptors, and the flag.
+    type Wait = (usize, Vec<i32>, Weak<AtomicBool>);
+    static WAITS: Mutex<Vec<Wait>> = Mutex::new(Vec::new());
+
+    fn of(table: &FdTable) -> usize {
+        table as *const FdTable as usize
+    }
+
+    /// A wait on `fds` of `table` begins: the flag its entries hold.
+    pub fn watch(table: &FdTable, fds: impl Iterator<Item = i32>) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        // (A wait that ended let its flag go.)
+        w.retain(|(_, _, f)| f.strong_count() > 0);
+        w.push((of(table), fds.collect(), Arc::downgrade(&flag)));
+        flag
+    }
+
+    /// `fd` of `table` is being closed: every wait on it is over.
+    pub fn closing(table: &FdTable, fd: i32) {
+        let w = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        for (t, fds, flag) in w.iter() {
+            if *t == of(table) && fds.contains(&fd) {
+                if let Some(flag) = flag.upgrade() {
+                    flag.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Whether a wait holding `flag` is over.
+    pub fn is(flag: &Option<Arc<AtomicBool>>) -> bool {
+        flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
+    }
 }
 
 /// How a waiter wants its answer written back.
@@ -9294,6 +9360,9 @@ fn poll_revents_level(p: &PollFd) -> u16 {
     // `wineboot` resolving the host name was 5 s of each session boot).
     if p.fd < 0 {
         return 0;
+    }
+    if closed_under::is(&p.gone) {
+        return POLLNVAL;
     }
     let Some(h) = &p.handle else {
         return POLLNVAL;
@@ -9405,6 +9474,10 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             writefds,
             exceptfds,
         } => {
+            // (A Mac's, one of whose descriptors was closed as it waited.)
+            if fds.iter().any(|p| closed_under::is(&p.gone)) {
+                return Err(Errno::EBADF);
+            }
             // `select` reports by rewriting the caller's sets in place, so
             // every set it was given is cleared first: a descriptor that is
             // not ready must come back clear even though it went in set.
@@ -13831,7 +13904,7 @@ mod tests {
 
     #[test]
     fn poll_skips_negative_descriptors() {
-        let slot = |fd| PollFd { addr: 0, fd, events: 1, handle: None, writable: false, epoll: None, edge: false };
+        let slot = |fd| PollFd { addr: 0, fd, events: 1, handle: None, writable: false, epoll: None, edge: false, gone: None };
         // An unused slot reports nothing; a closed descriptor is POLLNVAL.
         assert_eq!(poll_revents(&slot(-1)), 0);
         assert_eq!(poll_revents(&slot(7)), 0x020);

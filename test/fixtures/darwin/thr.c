@@ -41,6 +41,19 @@ static void *target(void *arg) {
     return 0;
 }
 
+static long sel[2], selected;
+static int selecting;
+
+static void *selector(void *arg) {
+    u32 set[32] = {0};
+    set[sel[0] / 32] |= 1u << (sel[0] % 32);
+    set[sel[1] / 32] |= 1u << (sel[1] % 32);
+    struct t_timeval tv = {10, 0};
+    __atomic_store_n(&selecting, 1, __ATOMIC_RELEASE);
+    selected = SYS(SYS_select, (sel[0] > sel[1] ? sel[0] : sel[1]) + 1, set, 0, 0, &tv);
+    return arg;
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)argc, (void)argv, (void)envp, (void)apple;
     u64 me = (u64)SYS(SYS_thread_selfid);
@@ -87,5 +100,21 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_ulock_wake, UL_COMPARE_AND_WAIT, &target_go, 0);
     t_thread_join(th);
     t_show("__pthread_kill of no thread", SYS(SYS___pthread_kill, 0x12345, SIGUSR1));
+
+    // A descriptor closed while another thread waits on it in `select`:
+    // the wait is over at once, and what it says is that the descriptor
+    // is bad. (Core Foundation's sockets are told to look again so.)
+    long w1 = -1, w2 = -1;
+    sel[0] = t_syscall2(&w1, SYS_pipe, 0, 0, 0);
+    sel[1] = t_syscall2(&w2, SYS_pipe, 0, 0, 0);
+    th = t_thread_start(selector, 0);
+    while (!__atomic_load_n(&selecting, __ATOMIC_ACQUIRE)) TRAP(TRAP_swtch_pri, 0);
+    struct t_timeval a_while = {0, 100000};
+    SYS(SYS_select, 0, 0, 0, 0, &a_while);
+    u64 t0 = t_nanos();
+    SYS(SYS_close, sel[1]);
+    t_thread_join(th);
+    t_show("select, one of its descriptors closed by another thread", selected);
+    t_check("at once", t_nanos() - t0 < 3000000000ull);
     return 0;
 }

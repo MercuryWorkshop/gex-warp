@@ -109,6 +109,7 @@ impl Kernel {
         }
         if matches!(code, d::CLOSE | d::CLOSE_NOCANCEL | d::GUARDED_CLOSE_NP) {
             self.darwin_kqueue_closing(x[0] as i32);
+            crate::syscalls::closed_under::closing(&self.fds, x[0] as i32);
         }
         let mut set = |n: u64, args: &[u64]| {
             *a = [0; 6];

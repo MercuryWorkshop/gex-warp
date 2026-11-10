@@ -1128,6 +1128,7 @@ mod tests {
             writable: true,
             epoll: None,
             edge: false,
+            gone: None,
         };
         let (a, b) = UnixSocket::pair();
         b.send(b"last").unwrap();
@@ -1831,6 +1832,7 @@ impl FileHandle for EpollSet {
                 writable: *writable,
                 epoll: None,
                 edge: false,
+                gone: None,
             };
             crate::syscalls::poll_revents(&p) != 0 && self.may_report(x.fd, wakes)
         })
