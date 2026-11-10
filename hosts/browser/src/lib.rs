@@ -2125,6 +2125,10 @@ impl FileHandle for StdinQueue {
 /// A function because every kernel this shim builds needs it -- both the
 /// process `gex_load` places and every child `gex_adopt_child` adopts, since a
 /// child with only the root filesystem has no `/dev/null` and no GPU.
+/// Where the global kernel's filesystem keeps POSIX shared memory
+/// ([`mount_devices`]).
+const SHM_DIR: &str = "dev/shm";
+
 fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
@@ -2190,10 +2194,24 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
     // for every process so a name one creates another opens (Chromium's
-    // processes, in a CEF game). The shim's memory is the processes' shared
-    // memory, so one static is one filesystem.
-    static SHM: std::sync::OnceLock<Arc<gex_kernel::vfs::TmpFs>> = std::sync::OnceLock::new();
-    kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::new())).clone());
+    // processes, in a CEF game). With a global kernel that is a directory
+    // of its filesystem (`dev/shm`, which the devices mounted at /dev hide
+    // from everything else): each process is a Worker with a memory of its
+    // own, and a filesystem kept in one is no other's (a forked child found
+    // its parent's shared memory by its name, and found it empty). Without
+    // one, this process is the whole system.
+    match global_root() {
+        Some(root) => {
+            use gex_kernel::vfs::FileSystem;
+            let _ = root.mkdir("dev", 0o755);
+            let _ = root.mkdir(SHM_DIR, 0o1777);
+            kernel.vfs.mount("/dev/shm", Arc::new(gex_kernel::vfs::subtree::Subtree::new(root, SHM_DIR)));
+        }
+        None => {
+            static SHM: std::sync::OnceLock<Arc<gex_kernel::vfs::TmpFs>> = std::sync::OnceLock::new();
+            kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::new())).clone());
+        }
+    }
     // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
@@ -6313,6 +6331,15 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // Absent otherwise, so a guest sees a machine with no GL rather than one
     // whose drawing vanishes.
     let wayland = mount_devices(&mut kernel);
+    // Shared memory does not outlast the system: what a filesystem that is
+    // kept has of an earlier one's goes, as this one starts.
+    if let Some(r) = &shared_root {
+        use gex_kernel::vfs::FileSystem;
+        let names = r.open(SHM_DIR, 0, 0).and_then(|d| d.read_dir()).unwrap_or_default();
+        for e in names.iter().filter(|e| e.name != "." && e.name != "..") {
+            let _ = r.unlink(&format!("{SHM_DIR}/{}", e.name));
+        }
+    }
     // `/tmp` in the root, not a mount of its own, so a page may bundle a file
     // at any path: a mount would shadow a bundled `/tmp/x`.
     root.add_dir("/tmp");
