@@ -7067,6 +7067,15 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
             return Err(StopExecution.into());
         }
     }
+    // (GEX_DUMP_ABORT: where the branch nobody handles was made from.)
+    if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(memory) = caller.data().memory.clone() {
+            let mut gm = GuestMem::new(memory.bytes());
+            let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
+            let vmas = caller.data_mut().with_kernel(|k| k.mem.lock().vmas().to_vec());
+            dump_guest(&mut gm, ctx_addr, tid, &vmas);
+        }
+    }
     // A wild branch is nearly always a bad return address or
     // function pointer: say where the last indirect branch
     // was aimed and what the stack holds, so the caller can
