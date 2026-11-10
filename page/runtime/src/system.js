@@ -47,12 +47,17 @@ const ARCHES = { x86: 'x86', aarch64: 'aarch64' };
 /** ELF's machine numbers, as the guest's programs are built for them. */
 const EM = { 62: 'x86', 183: 'aarch64' };
 
-/** The machine of the 64-bit ELF whose bytes start at `at` in `b`, or null
- *  (a gexcc program, wasm32, runs on either and says nothing). */
+/** Mach-O's CPU types (64-bit), as a Mac's programs are built for them. */
+const CPU = { 0x01000007: 'x86', 0x0100000c: 'aarch64' };
+
+/** The machine of the 64-bit ELF, or the 64-bit Mach-O (a Mac's tree), whose
+ *  bytes start at `at` in `b`, or null (a gexcc program, wasm32, runs on
+ *  either and says nothing). */
 function machine(b, at = 0) {
-  return b && b.length >= at + 20 && b[at] === 0x7f && b[at + 1] === 0x45 && b[at + 2] === 0x4c && b[at + 3] === 0x46 && b[at + 4] === 2
-    ? EM[b[at + 18] | (b[at + 19] << 8)] ?? null
-    : null;
+  if (!b || b.length < at + 20) return null;
+  if (b[at] === 0x7f && b[at + 1] === 0x45 && b[at + 2] === 0x4c && b[at + 3] === 0x46 && b[at + 4] === 2) return EM[b[at + 18] | (b[at + 19] << 8)] ?? null;
+  if (b[at] === 0xcf && b[at + 1] === 0xfa && b[at + 2] === 0xed && b[at + 3] === 0xfe) return CPU[(b[at + 4] | (b[at + 5] << 8) | (b[at + 6] << 16) | (b[at + 7] << 24)) >>> 0] ?? null;
+  return null;
 }
 
 /**

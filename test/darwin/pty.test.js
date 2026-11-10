@@ -37,6 +37,10 @@ export default async function (t) {
   // The terminal by its name, as a shell opens its own (zsh does, by what
   // ttyname says), and by `/dev/tty`.
   await enter('(stty size < "$(tty)") && (exec 3<>/dev/tty && stty size <&3)\r', 'the terminal by name');
+  // A Mac's `/var` and `/tmp` are links into `/private`, which the root's
+  // own first directories of those names give way to (hosts/kernel
+  // `premade_gives_way`): half the tree is reached through them.
+  await enter('echo "links $(readlink /var) $(readlink /tmp)"; (cd /tmp && pwd -P); (cd /var/db && pwd -P)\r', 'the links at the root');
   await enter('cho $((6*7))xx\x7f\x7f\x01e\r', 'an edited line');
   {
     const n = prompts();
@@ -65,6 +69,7 @@ export default async function (t) {
   check('of the size the page gave it', /^30 100$/m.test(lines));
   check('opened by its name and by /dev/tty, the same terminal', (lines.match(/^30 100$/gm) ?? []).length >= 3);
   check('set as a terminal is', /^speed \d+ baud; 30 rows; 100 columns$/m.test(lines));
+  check('the root\'s links into /private', /^links private\/var private\/tmp$/m.test(lines) && /^\/private\/tmp$/m.test(lines) && /^\/private\/var\/db$/m.test(lines));
   check('a line edited before it is entered', /^42$/m.test(lines));
   check('a program interrupted from the keyboard', /\^C/.test(lines) && /^status 130$/m.test(lines));
   check('a program stopped from the keyboard, and ended', /\^Z/.test(lines) && /^\[1\]\+ Stopped sleep 100$/m.test(lines) && /^ended 143$/m.test(lines));

@@ -2914,6 +2914,30 @@ pub extern "C" fn k_fs_limit(lo: u32, hi: u32) -> i32 {
     0
 }
 
+/// The directories the root has before any tree is laid in it.
+const PREMADE: [&str; 6] = ["/tmp", "/proc", "/dev", "/run", "/var", "/var/tmp"];
+
+/// One of [`PREMADE`], still as it was made (nothing in it but others of
+/// them, as empty), gives way to a link of that name: it is taken out. A
+/// Mac's root has `/var` and `/tmp` as links into `/private`, which a
+/// directory standing there would refuse as the tree is laid, leaving the
+/// root without the half of itself that is under `/var`. (The directory
+/// is the kernel's own placeholder and nobody's files: once anything is
+/// in it, it is a directory like any other and a link there is `EEXIST`.)
+fn premade_gives_way(p: &str) -> bool {
+    // (The root's names are kept without the slash they are said with.)
+    let p = p.trim_start_matches('/');
+    let named = |d: &'static str| d.trim_start_matches('/');
+    if !PREMADE.iter().any(|d| named(d) == p) || matches!(p, "proc" | "dev") {
+        return false;
+    }
+    let fs = rootfs();
+    for d in PREMADE.iter().rev().map(|d| named(d)).filter(|d| d.len() > p.len() && d.starts_with(p) && d.as_bytes()[p.len()] == b'/') {
+        let _ = fs.rmdir(d);
+    }
+    fs.rmdir(p).is_ok()
+}
+
 /// The root every process sees.
 fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     note_panics();
@@ -2927,7 +2951,7 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
         fs.use_store();
         // Directories a guest expects before anything is bundled: `open(O_CREAT)`
         // under a missing directory is `ENOENT`, not a directory being made.
-        for d in ["/tmp", "/proc", "/dev", "/run", "/var", "/var/tmp"] {
+        for d in PREMADE {
             fs.add_dir(d);
         }
         std::sync::Arc::new(fs)
@@ -3751,7 +3775,12 @@ pub extern "C" fn k_fs_symlink(target: gex_kmem::PAddr, target_len: u32, path: g
     if let Some((m, rel)) = pagefs::find(&p) {
         return as_unit(m.symlink(&path_of_raw(target, target_len), &rel));
     }
-    as_unit(rootfs().symlink(&path_of_raw(target, target_len), &p))
+    // (A tree is laid by this call too, where it is not seeded.)
+    let to = path_of_raw(target, target_len);
+    match rootfs().symlink(&to, &p) {
+        Err(gex_kernel::Errno::EEXIST) if premade_gives_way(&p) => as_unit(rootfs().symlink(&to, &p)),
+        r => as_unit(r),
+    }
 }
 
 #[no_mangle]
@@ -4068,7 +4097,11 @@ pub extern "C" fn k_fs_seed(at: gex_kmem::PAddr, len: u32) -> i32 {
                 if let Some((m, rel)) = pagefs::find(&p) {
                     let _ = m.symlink(&target, &rel);
                 } else {
-                    let _ = rootfs().symlink(&target, &p);
+                    // (Where one of the root's first directories stands,
+                    // untouched: it gives way, `premade_gives_way`.)
+                    if rootfs().symlink(&target, &p) == Err(gex_kernel::Errno::EEXIST) && premade_gives_way(&p) {
+                        let _ = rootfs().symlink(&target, &p);
+                    }
                 }
                 Some(())
             })(),

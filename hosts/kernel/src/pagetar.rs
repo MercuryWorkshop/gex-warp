@@ -68,7 +68,11 @@ fn entry(g: &mut Ingest, h: Header) {
         Kind::Symlink => {
             parent();
             let _ = fs.unlink(&p);
-            let _ = fs.symlink(&h.link, &p);
+            // (One of the root's first directories, untouched, gives way to
+            // the tree's link of its name: a Mac's `/var` and `/tmp`.)
+            if fs.symlink(&h.link, &p) == Err(gex_kernel::Errno::EEXIST) && crate::premade_gives_way(&p) {
+                let _ = fs.symlink(&h.link, &p);
+            }
             finish(&p, &h);
         }
         Kind::Hard => {
