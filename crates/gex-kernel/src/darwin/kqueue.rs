@@ -346,6 +346,22 @@ impl Kqueue {
         out
     }
 
+    /// Descriptor `fd` is closed: the notes that watch a file by that
+    /// number go with it, whatever else still has the file open (a watch
+    /// is of a descriptor, and a `dup` of it is another).
+    pub fn close_ident(&self, fd: i32) {
+        let mut notes = self.notes();
+        let mut at = 0;
+        while at < notes.len() {
+            if notes[at].ident == fd as u64 && matches!(notes[at].what, What::File { .. } | What::Vnode { .. }) {
+                let gone = notes.remove(at);
+                self.retire(&notes, gone);
+            } else {
+                at += 1;
+            }
+        }
+    }
+
     /// The descriptors notes held that are gone, to be closed.
     pub fn take_closed(&self) -> Vec<i32> {
         std::mem::take(&mut *self.closed.lock().unwrap_or_else(|e| e.into_inner()))
@@ -888,9 +904,14 @@ const MARK: u64 = 16;
 const COUNT: u64 = 20;
 const FDS: u64 = 24;
 
+/// Whether any queue has been made (by any process this host runs): a
+/// close looks for the queues that watch its descriptor only then.
+static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Kernel {
     /// `kqueue`: a new queue, on a descriptor.
     pub(super) fn darwin_kqueue(&mut self) -> SysResult {
+        ANY.store(true, std::sync::atomic::Ordering::Relaxed);
         let handle: Arc<dyn FileHandle> = Arc::new(Kqueue::new(self.clock));
         let file = crate::file::OpenFile::new(handle, "anon_inode:[kqueue]".into(), 0, true, true);
         // (A queue is not passed on to a program run in this one's place.)
@@ -1188,10 +1209,19 @@ impl Kernel {
         Ok(wd as i32)
     }
 
-    /// Descriptor `fd` is about to be closed: if it is the last of a
-    /// queue's, the queue's notes go with it, and what it held.
+    /// Descriptor `fd` is about to be closed: the notes of this process's
+    /// queues that watch it go with it; and if it is the last of a queue's,
+    /// the queue's notes go, and what it held.
     pub(super) fn darwin_kqueue_closing(&mut self, fd: i32) {
+        if !ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let Ok(file) = self.fds.get(fd) else { return };
+        for (_, other, _) in self.fds.entries() {
+            if let Some(kq) = Arc::clone(&other.handle).as_kqueue() {
+                kq.close_ident(fd);
+            }
+        }
         let Some(kq) = Arc::clone(&file.handle).as_kqueue() else { return };
         if self.fds.entries().iter().filter(|(_, other, _)| Arc::ptr_eq(other, &file)).count() > 1 {
             return;

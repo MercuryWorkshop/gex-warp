@@ -368,5 +368,28 @@ int main(int argc, char **argv, char **envp, char **apple) {
             if (g3[i].ident == (u64)k) t_printf(" [%d udata %lu ext %lu %lu %lu %lu]", k, (unsigned long)g3[i].udata, (unsigned long)g3[i].ext[0], (unsigned long)g3[i].ext[1], (unsigned long)g3[i].ext[2], (unsigned long)g3[i].ext[3]);
     t_printf("\n");
     SYS(SYS_close, kq);
+
+    // A watch is of a descriptor: it goes when the descriptor is closed,
+    // though another descriptor still has the file open, and a file that
+    // then gets the number is not watched.
+    static const struct t_timespec none = {0, 0};
+    struct kevent got1[4];
+    long q = SYS(SYS_kqueue), w1 = -1, w2 = -1;
+    long r1 = t_syscall2(&w1, SYS_pipe, 0, 0, 0);
+    long held = SYS(SYS_dup, r1);
+    struct kevent watch = {(u64)r1, READ, ADD, 0, 0, 0x1111};
+    t_show("watch a pipe", SYS(SYS_kevent, q, &watch, 1, 0, 0, &none));
+    SYS(SYS_close, r1);
+    SYS(SYS_write, w1, "x", 1);
+    t_show("written to, its watched descriptor closed and another still open", SYS(SYS_kevent, q, 0, 0, got1, 4, &none));
+    long r2 = t_syscall2(&w2, SYS_pipe, 0, 0, 0);
+    t_check("another pipe has the number", r2 == r1);
+    SYS(SYS_write, w2, "y", 1);
+    t_show("which is written to, unwatched", SYS(SYS_kevent, q, 0, 0, got1, 4, &none));
+    watch = (struct kevent){(u64)r2, READ, ADD, 0, 0, 0x2222};
+    SYS(SYS_kevent, q, &watch, 1, 0, 0, &none);
+    n = SYS(SYS_kevent, q, 0, 0, got1, 4, &none);
+    t_printf("and watched: %ld, udata 0x%lx\n", n, n > 0 ? (unsigned long)got1[0].udata : 0ul);
+    (void)held;
     return 0;
 }
