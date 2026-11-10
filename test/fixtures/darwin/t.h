@@ -85,6 +85,15 @@ struct t_mcontext {
     __uint128_t v[32];
     u32 fpsr, fpcr;
 };
+#elif defined(__x86_64__)
+// x86_exception_state64, x86_thread_state64, x86_float_state64.
+struct t_mcontext {
+    u16 trapno, cpu;
+    u32 err;
+    u64 faultvaddr;
+    u64 rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15, rip, rflags, cs, fs, gs;
+    u8 fpu[524];
+};
 #endif
 enum { SA_ONSTACK = 1, SA_RESTART = 2, SA_RESETHAND = 4, SA_NODEFER = 0x10, SA_SIGINFO = 0x40 };
 enum { SIG_BLOCK = 1, SIG_UNBLOCK = 2, SIG_SETMASK = 3 };
@@ -110,6 +119,8 @@ int t_strncmp(const char *a, const char *b, size_t n);
 void *t_memset(void *p, int c, size_t n);
 void *t_memcpy(void *d, const void *s, size_t n);
 int t_memcmp(const void *a, const void *b, size_t n);
+// Nanoseconds on a clock that only runs forward, for measuring a wait.
+u64 t_nanos(void);
 // The value of NAME in a vector of NAME=value strings (envp, apple), or 0.
 const char *t_getenv(char **vec, const char *name);
 

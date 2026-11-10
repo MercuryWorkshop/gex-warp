@@ -76,6 +76,24 @@ void t_unlock(u32 *word) {
     if (__atomic_exchange_n(word, 0, __ATOMIC_RELEASE) == 2) SYS(SYS_ulock_wake, UL_COMPARE_AND_WAIT, word, 0);
 }
 
+// Mach's own clock; but for x86-64, whose reference is Rosetta: there the
+// trap answers in the host's ticks and the timebase says one to one, so the
+// wall clock measures instead.
+u64 t_nanos(void) {
+#if defined(__x86_64__)
+    struct t_timeval tv = {0, 0};
+    SYS(SYS_gettimeofday, &tv, 0, 0);
+    return (u64)tv.tv_sec * 1000000000ull + (u64)tv.tv_usec * 1000;
+#else
+    struct {
+        u32 numer, denom;
+    } tb = {1, 1};
+    TRAP(TRAP_mach_timebase_info, &tb);
+    u64 t = (u64)TRAP(TRAP_mach_absolute_time);
+    return t / tb.denom * tb.numer + t % tb.denom * tb.numer / tb.denom;
+#endif
+}
+
 #define T_THREADS 16
 #ifdef T_STATIC
 // What stands for a pthread_t: the kernel is told where in it the thread's
@@ -95,8 +113,9 @@ void t_thread_main(struct t_pthread *self, u32 port) {
 #if defined(__arm64__)
     __asm__("mrs %0, tpidrro_el0" : "=r"(tp));
 #else
+    // The base of %gs is not read directly: its first word is, where the
+    // thread's maker put the address, as libpthread does.
     __asm__("movq %%gs:0, %0" : "=r"(tp));
-    self->tsd[0] = (u64)self->tsd;
 #endif
     if (tp != (u64)self->tsd) t_printf("FAIL the new thread's thread pointer\n");
     if (port != (u32)TRAP(TRAP_thread_self)) t_printf("FAIL the new thread's port\n");
@@ -140,6 +159,7 @@ int t_thread_start(void *(*fn)(void *), void *arg) {
     if (base < 0) return (int)base;
     struct t_pthread *t = (struct t_pthread *)(base + size - 4096);
     t->fn = fn, t->arg = arg;
+    t->tsd[0] = (u64)t->tsd;
     threads[nthreads] = t;
     // PTHREAD_START_CUSTOM: the stack and the record are the caller's.
     long r = SYS(SYS_bsdthread_create, fn, arg, t, t, 0x01000000);

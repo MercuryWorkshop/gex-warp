@@ -42,7 +42,9 @@ export function darwin(t) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') t.skip('Darwin programs are built and checked on an arm64 Mac');
   const n = native(t);
   const dir = n.dir('darwin');
-  const cflags = ['-arch', 'arm64', '-O1', '-Wall', '-Wextra', '-Werror', '-ffreestanding', '-fno-stack-protector', '-fno-builtin', '-nostdlib', `-I${PROGRAMS}`];
+  // x86-64 programs too (`--arch x86`): the Mac runs them under Rosetta.
+  const x86 = t.arch === 'x86';
+  const cflags = ['-arch', x86 ? 'x86_64' : 'arm64', '-O1', '-Wall', '-Wextra', '-Werror', '-ffreestanding', '-fno-stack-protector', '-fno-builtin', '-nostdlib', `-I${PROGRAMS}`];
   const cc = async (args) => {
     const r = await exec(['xcrun', 'clang', ...cflags, ...args], { cwd: dir, env: n.env });
     if (r.code === 127) t.skip('no xcrun clang (the Xcode command line tools)');
@@ -85,8 +87,10 @@ export function darwin(t) {
      * on it too). `null` when the page's shim is not built.
      */
     async page(prog, args = [], { env = {}, timeout = 120000 } = {}) {
-      const seed = join(ROOT, 'page/public/gex/seed.shared.wasm');
-      if (!existsSync(seed) || !existsSync(join(ROOT, 'page/public/gex/gex_browser.shared.wasm'))) return null;
+      // This arch's shim: `seed.shared.wasm`, or `seed.x86.shared.wasm`.
+      const infix = x86 ? '.x86' : '';
+      const seed = join(ROOT, `page/public/gex/seed${infix}.shared.wasm`);
+      if (!existsSync(seed) || !existsSync(join(ROOT, `page/public/gex/gex_browser${infix}.shared.wasm`))) return null;
       const envs = Object.entries({ T_VAR: 'yes', ...env }).flatMap(([k, v]) => ['--env', `${k}=${v}`]);
       const r = await n.g.run(seed, prog.gex, args, { files: { [prog.gex]: prog.gex }, env: { GEX_SHARED: '1' }, flags: [...envs, '--cwd', '/tmp'], timeout });
       return { ...r, stdout: r.stdout.split('\n').filter((l) => !l.startsWith('[')).join('\n') };
@@ -111,7 +115,7 @@ export function darwin(t) {
       if (page) {
         const on = await this.page(prog, args, opts);
         if (on) leg('on the page runtime, ', on);
-        else t.say(`${label}: no page leg (page/public/gex has no shared shim: hosts/browser/build.sh)`);
+        else t.say(`${label}: no page leg (page/public/gex has no shared shim for this arch: hosts/browser/build.sh, GEX_ARCH=x86 for x86)`);
       }
       return { want, got };
     },

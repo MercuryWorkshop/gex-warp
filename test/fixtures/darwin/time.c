@@ -2,15 +2,6 @@
 // calls that wait.
 #include "t.h"
 
-static u64 nanos(void) {
-    struct {
-        u32 numer, denom;
-    } tb = {0, 0};
-    TRAP(TRAP_mach_timebase_info, &tb);
-    u64 t = (u64)TRAP(TRAP_mach_absolute_time);
-    return t / tb.denom * tb.numer + t % tb.denom * tb.numer / tb.denom;
-}
-
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)argc, (void)argv, (void)envp, (void)apple;
     struct t_timeval tv = {0, 0}, tv2;
@@ -22,13 +13,13 @@ int main(int argc, char **argv, char **envp, char **apple) {
     } tb = {0, 0};
     t_show("mach_timebase_info", TRAP(TRAP_mach_timebase_info, &tb));
     t_check("a timebase", tb.numer > 0 && tb.denom > 0);
-    u64 t0 = nanos();
+    u64 t0 = t_nanos();
     t_check("mach_absolute_time runs", t0 > 0);
 
     // select as a sleep: 50 ms.
     struct t_timeval wait = {0, 50000};
     t_show("select with no descriptors", SYS(SYS_select, 0, 0, 0, 0, &wait));
-    u64 t1 = nanos();
+    u64 t1 = t_nanos();
     t_check("it took 50 ms", t1 - t0 >= 50000000ull && t1 - t0 < 2000000000ull);
     t_check("and left the timeout alone", wait.tv_sec == 0 && wait.tv_usec == 50000);
     SYS(SYS_gettimeofday, &tv2, 0, 0);
@@ -42,9 +33,9 @@ int main(int argc, char **argv, char **envp, char **apple) {
         int fd;
         short events, revents;
     } pfd = {(int)rd, 1, 0};
-    t0 = nanos();
+    t0 = t_nanos();
     t_show("poll an empty pipe, 30 ms", SYS(SYS_poll, &pfd, 1, 30));
-    t_check("it waited", nanos() - t0 >= 30000000ull);
+    t_check("it waited", t_nanos() - t0 >= 30000000ull);
     SYS(SYS_write, wr, "x", 1);
     t_show("poll a pipe with a byte", SYS(SYS_poll, &pfd, 1, -1));
     t_show("revents", pfd.revents);

@@ -24,6 +24,8 @@ const FAT_MAGIC: u32 = 0xcafe_babe;
 const FAT_MAGIC_64: u32 = 0xcafe_babf;
 
 pub const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+/// `CPU_SUBTYPE_X86_64_H`.
+pub const CPU_SUBTYPE_X86_64_H: u32 = 8;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 /// The `cputype` of an image this build's guest runs.
 pub const CPU_TYPE_GUEST: u32 = if gex_abi::X86 { CPU_TYPE_X86_64 } else { CPU_TYPE_ARM64 };
@@ -162,11 +164,14 @@ fn guest_slice_in(bytes: &[u8], file_len: u64) -> Result<(usize, usize), LoadErr
         if off.checked_add(len).is_none_or(|e| e > file_len) {
             return Err(bad("a universal file's slice lies outside the file"));
         }
-        // Lower is better: the plain subtype, then arm64e, then its variants.
+        // Lower is better: the plain subtype, then arm64e (or x86_64h, the
+        // slice for Haswell and later, which may use what the plain one
+        // does not), then its variants.
         let rank = match (sub & !CPU_SUBTYPE_MASK, sub & CPU_SUBTYPE_MASK) {
             (CPU_SUBTYPE_ARM64E, 0) => 1,
             (CPU_SUBTYPE_ARM64E, _) => 2,
-            (0..=1, _) | (3, _) | (8, _) => 0,
+            (CPU_SUBTYPE_X86_64_H, _) => 1,
+            (0..=1, _) | (3, _) => 0,
             _ => 3,
         };
         if best.is_none_or(|(r, _, _)| rank < r) {

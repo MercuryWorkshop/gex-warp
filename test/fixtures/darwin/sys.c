@@ -130,12 +130,16 @@ static void by_name(void) {
     len = sizeof i;
     t_show("hw.optional.floatingpoint", byname("hw.optional.floatingpoint", &i, &len));
     t_printf("  %d\n", i);
+#if defined(__arm64__)
+    // (Asked of an arm64 process only: an x86-64 one's reference is Rosetta,
+    // which answers for the Mac under it.)
     len = sizeof i, i = -1;
     t_show("hw.optional.arm64", byname("hw.optional.arm64", &i, &len));
     t_printf("  %d\n", i);
     len = sizeof i, i = -1;
     t_show("sysctl.proc_translated", byname("sysctl.proc_translated", &i, &len));
     t_printf("  %d\n", i);
+#endif
     len = sizeof i, i = 0;
     t_show("hw.logicalcpu", byname("hw.logicalcpu", &i, &len));
     t_check("a processor at least", i >= 1);
@@ -193,7 +197,10 @@ static void process(int argc, char **argv) {
 
     u32 flags = 0;
     t_show("csops status", SYS(SYS_csops, me, 0, &flags, sizeof flags));
+#if defined(__arm64__)
+    // (The linker signs every arm64 program; an x86-64 one it leaves bare.)
     t_check("signed and valid", flags & 1);
+#endif
     t_show("csops of nobody", SYS(SYS_csops, 0x3fffffff, 0, &flags, sizeof flags));
     t_show("csops of an operation there is not", SYS(SYS_csops, me, 999, &flags, sizeof flags));
 

@@ -1140,8 +1140,12 @@ fn build_frame(
     if compat {
         return setup_frame_i386(signals, m, ctx_addr, signal, fault_address, taken);
     }
-    if crate::darwin::on() && !gex_abi::X86 {
-        return setup_frame_darwin(signals, m, ctx_addr, signal, fault_address, taken);
+    if crate::darwin::on() {
+        return if gex_abi::X86 {
+            setup_frame_darwin_x86(signals, m, ctx_addr, signal, fault_address, taken)
+        } else {
+            setup_frame_darwin(signals, m, ctx_addr, signal, fault_address, taken)
+        };
     }
     if gex_abi::X86 {
         return setup_frame_x86(signals, m, ctx_addr, signal, fault_address, taken);
@@ -1370,6 +1374,173 @@ fn sigreturn_darwin(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> R
     own.blocked = abi::sigset_to_linux(mask) & !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
     own.in_handler = false;
     Ok(regs[32])
+}
+
+/// Darwin's x86-64 `mcontext64`: `x86_exception_state64` (trapno, cpu, err,
+/// faultvaddr), `x86_thread_state64` (rax, rbx, rcx, rdx, rdi, rsi, rbp,
+/// rsp, r8 to r15, rip, rflags, cs, fs, gs), then `x86_float_state64`: two
+/// reserved words and an FXSAVE image.
+mod dxframe {
+    pub const MC_TRAPNO: u64 = 0;
+    pub const MC_FAULTVADDR: u64 = 8;
+    pub const MC_REGS: u64 = 16;
+    /// The context's register for each of the sixteen, in the state's order.
+    pub const GPR_ORDER: [u8; 16] = [0, 3, 1, 2, 7, 6, 5, 4, 8, 9, 10, 11, 12, 13, 14, 15];
+    pub const MC_RIP: u64 = MC_REGS + 16 * 8;
+    pub const MC_RFLAGS: u64 = MC_RIP + 8;
+    pub const MC_CS: u64 = MC_RFLAGS + 8;
+    pub const MC_FLOAT: u64 = MC_REGS + 21 * 8;
+    /// Within the float state: the control word, MXCSR and its mask, and
+    /// the sixteen XMM registers.
+    pub const FS_FCW: u64 = 8;
+    pub const FS_MXCSR: u64 = 32;
+    pub const FS_XMM: u64 = 168;
+    pub const MCONTEXT_SIZE: u64 = 712;
+    /// The user code segment of a 64-bit process.
+    pub const USER64_CS: u64 = 0x2b;
+}
+
+/// Darwin's frame for an x86-64 thread, as XNU's `sendsig` lays it out:
+/// below the red zone the context, the siginfo, then the machine context,
+/// and the stack as a `call` to the trampoline would have left it. The
+/// trampoline is entered with (handler, style, signal, siginfo, context,
+/// token) in the six argument registers.
+fn setup_frame_darwin_x86(
+    signals: &Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault_address: u64,
+    taken: Taken,
+) -> Result<u64, Errno> {
+    use crate::darwin::abi;
+    let action = signals.action(signal);
+    let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
+    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    let mut own = signals.own();
+    let alt = own.alt_stack;
+    let on_alt = alt.size > 0 && sp > alt.sp && sp <= alt.sp + alt.size;
+    let (base, stack_size) = if action.flags & sa::ONSTACK != 0 && alt.size > 0 && alt.flags & 2 == 0 && !on_alt {
+        (alt.sp + alt.size, alt.size)
+    } else {
+        (sp - dframe::RED_ZONE, 0)
+    };
+    let uc = base - dframe::UCONTEXT_SIZE as u64;
+    let info = uc - dframe::SIGINFO_SIZE as u64;
+    let mc = info - dxframe::MCONTEXT_SIZE;
+    let frame = (mc & !0xf) - 8;
+    m.zero(frame, (base - frame) as usize)?;
+
+    let source = match taken {
+        Taken::Fault => signals.take_source(signal),
+        Taken::Claimed(source) => source,
+    };
+    let number = abi::sig_to_darwin(signal);
+    m.write_u32(info, number)?;
+    m.write_u64(info + dframe::SI_ADDR as u64, pc)?;
+    m.write_u64(info + dframe::SI_PAD as u64, sp)?;
+    match signal {
+        // ILL_ILLOPC
+        sig::SIGILL => m.write_u32(info + 8, 1)?,
+        // BUS_ADRALN, and SEGV_MAPERR.
+        sig::SIGBUS | sig::SIGSEGV => {
+            m.write_u32(info + 8, 1)?;
+            m.write_u64(info + dframe::SI_ADDR as u64, fault_address)?;
+        }
+        sig::SIGCHLD => {
+            if let Some(src) = source {
+                m.write_u32(info + 8, src.code as u32)?;
+                m.write_u32(info + 12, src.pid as u32)?;
+                m.write_u32(info + 16, src.uid)?;
+            }
+        }
+        _ => {}
+    }
+
+    m.write_u32(uc + dframe::UC_ONSTACK as u64, on_alt as u32)?;
+    let mask = own.suspend_restore.take().unwrap_or(own.blocked);
+    m.write_u32(uc + dframe::UC_SIGMASK as u64, abi::sigset_to_darwin(mask))?;
+    m.write_u64(uc + dframe::UC_STACK_SP as u64, frame)?;
+    m.write_u64(uc + dframe::UC_STACK_SIZE as u64, stack_size)?;
+    m.write_u32(uc + dframe::UC_STACK_FLAGS as u64, on_alt as u32)?;
+    m.write_u64(uc + dframe::UC_MCSIZE as u64, dxframe::MCONTEXT_SIZE)?;
+    m.write_u64(uc + dframe::UC_MCONTEXT as u64, mc)?;
+
+    // T_PAGE_FAULT for a bad address.
+    m.write_u32(mc + dxframe::MC_TRAPNO, if signal == sig::SIGSEGV { 14 } else { 0 })?;
+    m.write_u64(mc + dxframe::MC_FAULTVADDR, fault_address)?;
+    for (i, reg) in dxframe::GPR_ORDER.iter().enumerate() {
+        let v = m.read_u64(ctx_addr + ctx::x(*reg) as u64)?;
+        m.write_u64(mc + dxframe::MC_REGS + i as u64 * 8, v)?;
+    }
+    m.write_u64(mc + dxframe::MC_RIP, pc)?;
+    m.write_u64(mc + dxframe::MC_RFLAGS, read_rflags(m, ctx_addr)?)?;
+    m.write_u64(mc + dxframe::MC_CS, dxframe::USER64_CS)?;
+    let fs = mc + dxframe::MC_FLOAT;
+    m.write_u32(fs + dxframe::FS_FCW, m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff)?;
+    m.write_u32(fs + dxframe::FS_MXCSR, m.read_u32(ctx_addr + ctx::MXCSR as u64)?)?;
+    m.write_u32(fs + dxframe::FS_MXCSR + 4, 0xffff)?;
+    for n in 0..16u8 {
+        for half in 0..2u64 {
+            let v = m.read_u64(ctx_addr + ctx::v(n) as u64 + half * 8)?;
+            m.write_u64(fs + dxframe::FS_XMM + n as u64 * 16 + half * 8, v)?;
+        }
+    }
+
+    own.blocked |= action.mask;
+    if action.flags & sa::NODEFER == 0 {
+        own.blocked |= bit(signal);
+    }
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
+    if action.flags & sa::RESETHAND != 0 {
+        let _ = signals.set_action(signal, SigAction::default());
+    }
+
+    // rdi, rsi, rdx, rcx, r8, r9.
+    let style = if action.flags & sa::SIGINFO != 0 { dframe::UC_FLAVOR } else { dframe::UC_TRAD };
+    for (reg, v) in [7u8, 6, 2, 1, 8, 9].into_iter().zip([action.handler, style, number as u64, info, uc, uc ^ dframe::TOKEN]) {
+        m.write_u64(ctx_addr + ctx::x(reg) as u64, v)?;
+    }
+    m.write_u64(ctx_addr + ctx::SP as u64, frame)?;
+    m.write_u64(ctx_addr + ctx::PC as u64, action.restorer)?;
+    m.write_u32(ctx_addr + ctx::CS as u64, 0)?;
+    Ok(action.restorer)
+}
+
+/// Darwin's `sigreturn(uctx, infostyle, token)` for an x86-64 thread.
+fn sigreturn_darwin_x86(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+    use crate::darwin::abi;
+    let uc = m.read_u64(ctx_addr + ctx::x(7) as u64)?;
+    let token = m.read_u64(ctx_addr + ctx::x(2) as u64)?;
+    if m.read_u64(uc + dframe::UC_MCSIZE as u64)? != dxframe::MCONTEXT_SIZE || token != uc ^ dframe::TOKEN {
+        return Err(Errno::EINVAL);
+    }
+    let mc = m.read_u64(uc + dframe::UC_MCONTEXT as u64)?;
+    let mut regs = [0u64; 18];
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = m.read_u64(mc + dxframe::MC_REGS + i as u64 * 8)?;
+    }
+    let mask = m.read_u32(uc + dframe::UC_SIGMASK as u64)?;
+    let fs = mc + dxframe::MC_FLOAT;
+    m.write_u32(ctx_addr + ctx::MXCSR as u64, m.read_u32(fs + dxframe::FS_MXCSR)?)?;
+    for n in 0..16u8 {
+        for half in 0..2u64 {
+            let v = m.read_u64(fs + dxframe::FS_XMM + n as u64 * 16 + half * 8)?;
+            m.write_u64(ctx_addr + ctx::v(n) as u64 + half * 8, v)?;
+        }
+    }
+    for (i, reg) in dxframe::GPR_ORDER.iter().enumerate() {
+        m.write_u64(ctx_addr + ctx::x(*reg) as u64, regs[i])?;
+    }
+    m.write_u64(ctx_addr + ctx::PC as u64, regs[16])?;
+    write_rflags(m, ctx_addr, regs[17])?;
+    let mut own = signals.own();
+    own.blocked = abi::sigset_to_linux(mask) & !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
+    own.in_handler = false;
+    Ok(regs[16])
 }
 
 /// The x86-64 frame builder. See [`xframe`] for the layout.
@@ -1840,8 +2011,8 @@ pub fn sigreturn(
         let kind = signals.own().legacy_frame;
         return sigreturn_i386(signals, m, ctx_addr, kind);
     }
-    if crate::darwin::on() && !gex_abi::X86 {
-        return sigreturn_darwin(signals, m, ctx_addr);
+    if crate::darwin::on() {
+        return if gex_abi::X86 { sigreturn_darwin_x86(signals, m, ctx_addr) } else { sigreturn_darwin(signals, m, ctx_addr) };
     }
     if gex_abi::X86 {
         return sigreturn_x86(signals, m, ctx_addr);

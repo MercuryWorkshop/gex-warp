@@ -36,9 +36,10 @@ for debugging and for building what a page loads ahead of time.
 - **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
-- **macOS programs for arm64, the static ones so far.** A Mach-O executable
-  enters the same kernel as it would enter XNU (`svc #0x80`, BSD calls and
-  Mach traps, the carry flag for an error), and the kernel answers in
+- **macOS programs for arm64 and x86-64, the static ones so far.** A Mach-O
+  executable enters the same kernel as it would enter XNU (`svc #0x80` or
+  `syscall`, BSD calls and Mach traps, the carry flag for an error), and
+  the kernel answers in
   Darwin's numbers and layouts: files, processes, signals through XNU's
   frame, threads as libpthread asks for them, `sysctl`, terminals, sockets.
   What is not there yet is what a dynamically linked program starts with:
@@ -163,8 +164,10 @@ $ xcrun clang -arch arm64 -static -nostdlib -ffreestanding -e start \
 $ target/release/gexc run hello
 ```
 
-`gexc` and the page take a Mach-O where they take an ELF: a thin arm64
-file, or the arm64 slice of a universal one. The process is a Darwin
+`gexc` and the page take a Mach-O where they take an ELF: a thin file for
+the guest's processor, or its slice of a universal one (arm64 before
+arm64e, x86_64 before x86_64h). An x86-64 program is built with
+`-arch x86_64` and run by `target/x86/release/gexc`. The process is a Darwin
 process from then on (`crates/gex-kernel/src/darwin`): its system calls are
 XNU's, numbered from `bsd/kern/syscalls.master` (`make regen-darwin
 XNU_SRC=<an xnu checkout>` regenerates the table), and each is rewritten
@@ -207,8 +210,26 @@ What does not, yet:
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - `kqueue`, `posix_spawn`, the `psynch` calls behind a contended pthread
   mutex, work queues, `getattrlist`, `mknod`.
-- x86-64. The entry is written (`syscall`, the class in `rax`'s top byte)
-  and nothing has run through it; there is no signal frame for it.
+- **Other Macs.** Three more processors have run Mac OS X, and none is
+  here:
+  - *i386* (through macOS 10.14). gex translates i386 and its kernel has
+    32-bit layouts for Linux, so this is the nearest: a loader for 32-bit
+    Mach-O, the `int 0x80`/`0x81`/`0x82` and `sysenter` entries with their
+    arguments on the stack, and an ILP32 spelling of every structure this
+    personality converts. Nothing on a current Mac runs i386, so its
+    reference would have to be recorded on an old one.
+  - *PowerPC and PowerPC 64* (through 10.5, and under Rosetta to 10.6).
+    gex had a PowerPC guest, with the big-endian guest memory it needs,
+    until 73601b3 removed it; `archive/nt-pewasm` (29471aa2) keeps the
+    code. Bringing it back is the larger part; Darwin's entry there is
+    `sc`, which returns one instruction further on when a call succeeds.
+  - *x86_64h* is x86-64 for Haswell and later: its slice is taken only
+    when a file has no plain one, and runs as far as the translator knows
+    the instructions.
+- **Old systems' programs** otherwise ask for what old kernels had: the
+  calls from before 64-bit inodes (`stat`, `getdirentries`, `statfs` under
+  their first numbers) are not answered, and a program linked against an
+  old libSystem needs that libSystem.
 - A page fault is not delivered where XNU would deliver one: nothing in a
   WebAssembly memory is protected, so a write to a read-only page succeeds.
 
@@ -216,7 +237,10 @@ The tests (`test/darwin`) build each program in `test/fixtures/darwin`
 twice: statically for gex, and dynamically for the Mac the tests run on,
 whose kernel is the reference. They pass when the two print the same, under
 `gexc` and on the page's runtime. They need a Mac with Xcode's command-line
-tools, and skip anywhere else.
+tools, and skip anywhere else. `--arch a64,x86` runs both processors; the
+x86-64 programs' reference is Rosetta, which answers a few things for the
+Mac under it (the page size, the processor, Mach's clock in the host's
+ticks), and those the x86-64 tests do not ask.
 
 ### Build the page
 

@@ -14,7 +14,7 @@
 // own ports answering MIG requests.
 import { darwin } from '../lib/darwin.mjs';
 
-export const meta = { hosts: ['node'], arches: ['a64'], timeout: 600 };
+export const meta = { hosts: ['node'], arches: ['a64', 'x86'], timeout: 600 };
 
 export default async function (t) {
   const d = darwin(t);

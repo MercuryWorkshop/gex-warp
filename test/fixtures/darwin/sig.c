@@ -15,7 +15,7 @@ static u32 mask_now(void) {
 static void handler(int sig, struct t_siginfo *si, struct t_ucontext *uc) {
     got++;
     got_sig = sig;
-    info_ok = si && si->si_signo == sig && uc && uc->uc_mcsize == sizeof(struct t_mcontext) && uc->uc_mcontext != 0;
+    info_ok = si && si->si_signo == sig && uc && uc->uc_mcsize >= sizeof(struct t_mcontext) && uc->uc_mcontext != 0;
     // The signal itself and the action's mask are blocked while it runs.
     u32 m = mask_now();
     in_mask_ok = (m & T_SIGBIT(sig)) != 0 && (m & T_SIGBIT(SIGHUP)) != 0;
@@ -23,16 +23,16 @@ static void handler(int sig, struct t_siginfo *si, struct t_ucontext *uc) {
     on_alt = &here >= alt && &here < alt + sizeof alt;
 }
 
+#if defined(__arm64__)
 static void skip(int sig, struct t_siginfo *si, struct t_ucontext *uc) {
     (void)si;
     got++;
     got_sig = sig;
-#if defined(__arm64__)
     // Past the trapping instruction, with a value for the caller.
     uc->uc_mcontext->pc += 4;
     uc->uc_mcontext->x[0] = 1234;
-#endif
 }
+#endif
 
 static void plain(int sig) {
     got++;

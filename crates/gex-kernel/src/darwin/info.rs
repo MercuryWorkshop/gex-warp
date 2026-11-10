@@ -304,10 +304,10 @@ impl Kernel {
             // An `int`, so no more than it holds.
             "hw.physmem" | "hw.usermem" => Int(mem.min(i32::MAX as i64)),
             "hw.memsize" | "hw.memsize_usable" => Quad(mem),
-            // CPU_TYPE_ARM64 and CPU_SUBTYPE_ARM64_ALL, or CPU_TYPE_X86_64
-            // and CPU_SUBTYPE_X86_64_ALL; the family is the M1's, or
-            // Skylake's.
-            "hw.cputype" => Int(if x86 { 0x0100_0007 } else { 0x0100_000c }),
+            // CPU_TYPE_ARM64 and CPU_SUBTYPE_ARM64_ALL, or CPU_TYPE_X86 (an
+            // Intel Mac says so without the 64-bit flag) and
+            // CPU_SUBTYPE_X86_64_ALL; the family is the M1's, or Skylake's.
+            "hw.cputype" => Int(if x86 { 7 } else { 0x0100_000c }),
             "hw.cpusubtype" => Int(if x86 { 3 } else { 0 }),
             "hw.cpu64bit_capable" => Int(1),
             "hw.cpufamily" => Int(if x86 { 0x37fc_219f } else { 0x1b58_8bb3 }),

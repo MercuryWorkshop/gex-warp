@@ -6,9 +6,19 @@
 
 // A trap with eight arguments: mach_msg2's.
 long t_trap8(long n, long a, long b, long c, long d, long e, long f, long g, long h);
+#if defined(__arm64__)
 __asm__(".text\n.globl _t_trap8\n.p2align 2\n_t_trap8:\n"
         "  neg x16, x0\n  mov x0, x1\n  mov x1, x2\n  mov x2, x3\n  mov x3, x4\n"
         "  mov x4, x5\n  mov x5, x6\n  mov x6, x7\n  ldr x7, [sp]\n  svc #0x80\n  ret\n");
+#elif defined(__x86_64__)
+// Six in registers; the kernel reads the seventh and eighth from the stack,
+// past the return address.
+__asm__(".text\n.globl _t_trap8\n_t_trap8:\n"
+        "  movq %rdi, %rax\n  orq $0x1000000, %rax\n  movq %rsi, %rdi\n  movq %rdx, %rsi\n"
+        "  movq %rcx, %rdx\n  movq %r8, %r10\n  movq %r9, %r8\n  movq 8(%rsp), %r9\n"
+        "  movq 16(%rsp), %r11\n  movq %r11, 8(%rsp)\n  movq 24(%rsp), %r11\n  movq %r11, 16(%rsp)\n"
+        "  syscall\n  ret\n");
+#endif
 
 enum {
     TRAP_port_allocate = 16, TRAP_port_deallocate = 18, TRAP_port_mod_refs = 19, TRAP_port_insert_right = 21,
@@ -71,14 +81,6 @@ static void show_type(const char *what, u32 name) {
     else t_printf("%s: type %x\n", what, type);
 }
 
-static u64 nanos(void) {
-    struct {
-        u32 numer, denom;
-    } tb = {1, 1};
-    TRAP(TRAP_mach_timebase_info, &tb);
-    return (u64)TRAP(TRAP_mach_absolute_time) / tb.denom * tb.numer;
-}
-
 static void rights(void) {
     t_check("task, host and thread have names", task && TRAP(TRAP_host_self) && TRAP(TRAP_thread_self));
     show_type("the task's port", task);
@@ -121,9 +123,9 @@ static void messages(void) {
     TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND);
 
     t_show("receive with nothing there", receive(&got, p, sizeof got));
-    u64 t0 = nanos();
+    u64 t0 = t_nanos();
     t_show("and for 30 ms", msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, p, 30));
-    t_check("it waited", nanos() - t0 >= 30000000ull);
+    t_check("it waited", t_nanos() - t0 >= 30000000ull);
     t_show("receive from no name", receive(&got, 0x123457, sizeof got));
     m.h = (struct header){COPY_SEND, 0, 0x123457, 0, 0, 1};
     t_show("send to no name", send(&m, sizeof m.h));
@@ -247,7 +249,14 @@ static void kernel_ports(void) {
     t_memset(&m, 0, sizeof m);
     m.h.id = 202;
     t_show("ask the host its page size", rpc(&m, host, sizeof m.h));
-    t_printf("  reply %d, %u bytes, bits %x: code %d, %u\n", m.h.id, m.h.size, m.h.bits, m.body[2], m.body[3]);
+    // 16 KiB on arm64. An x86-64 process has 4 KiB pages, but Rosetta, its
+    // reference here, answers with the Mac's under it.
+#if defined(__arm64__)
+    int page_ok = m.body[3] == 16384;
+#else
+    int page_ok = m.body[3] == 4096 || m.body[3] == 16384;
+#endif
+    t_printf("  reply %d, %u bytes, bits %x: code %d, %s\n", m.h.id, m.h.size, m.h.bits, m.body[2], page_ok ? "a page's size" : "something else");
 
     // A routine no port has.
     t_memset(&m, 0, sizeof m);
@@ -279,9 +288,9 @@ static void kernel_ports(void) {
     u32 sem = d->name;
     show_type("the semaphore", sem);
     t_show("wait on it", TRAP(TRAP_semaphore_wait, sem));
-    u64 t0 = nanos();
+    u64 t0 = t_nanos();
     t_show("and again, for 30 ms", TRAP(TRAP_semaphore_timedwait, sem, 0, 30000000));
-    t_check("it waited", nanos() - t0 >= 30000000ull);
+    t_check("it waited", t_nanos() - t0 >= 30000000ull);
     t_show("signal it", TRAP(TRAP_semaphore_signal, sem));
     t_show("wait", TRAP(TRAP_semaphore_timedwait, sem, 0, 30000000));
     t_show("signal what is no semaphore", TRAP(TRAP_semaphore_signal, task));
@@ -298,9 +307,9 @@ static void kernel_ports(void) {
 
     // How the libc sleeps: __semwait_signal on a semaphore nobody signals,
     // for a time from now.
-    t0 = nanos();
+    t0 = t_nanos();
     t_show("__semwait_signal for 40 ms", SYS(SYS___semwait_signal, sem, 0, 1, 1, 0, 40000000));
-    t_check("it slept", nanos() - t0 >= 40000000ull && nanos() - t0 < 2000000000ull);
+    t_check("it slept", t_nanos() - t0 >= 40000000ull && t_nanos() - t0 < 2000000000ull);
     t_show("__semwait_signal on no semaphore", SYS(SYS___semwait_signal, 0, 0, 1, 1, 0, 1000));
 
     // semaphore_destroy(task, semaphore)
