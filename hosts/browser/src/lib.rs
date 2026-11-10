@@ -16132,9 +16132,16 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     trap();
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
+pub extern "C" fn gex_sysreg_read(ctx: i32, _pc: i64, reg: i32) -> i64 {
     let _pc = fault_pc(_pc);
     match reg {
+        // FPCR and FPSR: what the guest last wrote there, and the saturation
+        // bit the slow path sets. (Arithmetic neither rounds by the one nor
+        // raises the other: wasm's has one mode and no flags.)
+        -8 | -9 if !gex_abi::X86 => {
+            let at = ctx as u32 as u64 + if reg == -8 { ctx::FPCR } else { ctx::FPSR } as u64;
+            guest().read_u32(at).unwrap_or(0) as i64
+        }
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact; less the time
         // a restored session spent saved, as the monotonic clocks.
@@ -16151,6 +16158,11 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     // A SIMD or crypto instruction with no wasm form, on the registers the call flushed. FPSR.QC
     // lands in the context, the only place that holds it: the lifter's own saturating lowerings
     // do not record it, and an MRS of FPSR reads 0 either way.
+    if !gex_abi::X86 && (reg == -8 || reg == -9) {
+        let at = ctx as u32 as u64 + if reg == -8 { ctx::FPCR } else { ctx::FPSR } as u64;
+        let _ = guest().write_u32(at, val as u32);
+        return;
+    }
     if reg == gex_isa::slow::SYSREG {
         let at = ctx as u32 as u64;
         let mut g = guest();

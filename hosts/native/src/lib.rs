@@ -5201,8 +5201,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSREG_READ,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, reg: i32| -> i64 {
+        |caller: Caller<'_, HostState>, ctx: i32, _pc: i64, reg: i32| -> i64 {
             match reg {
+                // FPCR and FPSR: what the guest last wrote there (the rounding
+                // mode it asked for, the flags it raised itself), and the
+                // saturation bit the slow path sets. Arithmetic neither rounds
+                // by the one nor raises the other: wasm's has one mode and no
+                // flags.
+                -8 | -9 if !gex_abi::X86 => {
+                    let Some(memory) = caller.data().memory.clone() else { return 0 };
+                    let at = ctx as u32 as usize + if reg == -8 { ctx::FPCR } else { ctx::FPSR };
+                    memory.bytes().get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as i64)
+                }
                 // CNTVCT_EL0. Served from the host clock at the frequency the
                 // guest was told (CNTFRQ), which keeps its arithmetic exact.
                 -3 => {
@@ -5229,6 +5239,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A function an ejected project replaced (`Intrinsic::Replace`).
             if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
                 return aot::call(&mut caller, ctx, pc as u64, v as u64);
+            }
+            // FPCR or FPSR: kept, for the guest to read back.
+            if !gex_abi::X86 && (reg == -8 || reg == -9) {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let at = ctx as u32 as usize + if reg == -8 { ctx::FPCR } else { ctx::FPSR };
+                if let Some(b) = memory.bytes().get_mut(at..at + 4) {
+                    b.copy_from_slice(&(v as u32).to_le_bytes());
+                }
+                return Ok(());
             }
             // A SIMD or crypto instruction with no wasm form (`gex_isa::slow`),
             // carried out on the vector registers the call flushed to the
