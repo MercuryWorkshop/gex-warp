@@ -161,6 +161,11 @@ pub struct ProcSig {
     /// the two sets apart the same way.
     shared: AtomicU64,
     shared_sources: Mutex<[Option<Source>; NSIG]>,
+    /// How many times each signal has been raised for the process, taken
+    /// or not, and a wait queue told of each: what a Darwin kqueue's
+    /// signal filter watches ([`ProcSig::raised`]).
+    raised: [std::sync::atomic::AtomicU32; NSIG],
+    raised_queue: crate::wait::Queue,
     /// The interval timers, indexed by `which`.
     timers: Mutex<[Option<Itimer>; 3]>,
     /// The earliest armed timer's deadline, clamped to `u64`; [`NO_TIMER`]
@@ -200,6 +205,8 @@ impl ProcSig {
             actions: RwLock::new(actions),
             shared: AtomicU64::new(0),
             shared_sources: Mutex::new([None; NSIG]),
+            raised: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            raised_queue: crate::wait::Queue::new(),
             timers: Mutex::new([None; 3]),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
@@ -244,7 +251,20 @@ impl ProcSig {
         if signal > 0 && signal <= sig::MAX {
             self.shared_sources.lock()[signal as usize] = source;
             self.shared.fetch_or(bit(signal), Ordering::AcqRel);
+            self.raised[signal as usize].fetch_add(1, Ordering::AcqRel);
+            self.raised_queue.notify();
         }
+    }
+
+    /// How many times `signal` has been raised for the process since it
+    /// began, whatever became of each.
+    pub fn raised(&self, signal: u32) -> u32 {
+        self.raised.get(signal as usize).map_or(0, |n| n.load(Ordering::Acquire))
+    }
+
+    /// The wait queue notified at each raise.
+    pub fn raised_queue(&self) -> u32 {
+        self.raised_queue.id()
     }
 
     /// The process-directed pending set.

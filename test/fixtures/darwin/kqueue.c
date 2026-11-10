@@ -201,6 +201,34 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_wait4, pid, &status, 0, 0);
     t_show("watch a process there is none of", change(99999, PROC, ADD, NOTE_EXIT, 0, 0));
 
+    // A signal: each raising counted from when it is watched, whatever the
+    // process does with it (here nothing: it is ignored). 30 is SIGUSR1.
+    long me = SYS(SYS_getpid);
+    t_sigaction(30, (void *)1, 0, 0, 0);
+    SYS(SYS_kill, me, 30);
+    t_show("watch a signal", change(30, SIGNAL, ADD, 0, 0, 81));
+    say("none since", ready(0));
+    SYS(SYS_kill, me, 30);
+    SYS(SYS_kill, me, 30);
+    say("raised twice", ready(0));
+    say("and told once", ready(0));
+    // From another process, while this one waits. (A wait a signal ends
+    // may say so, and is made again.)
+    second = -1;
+    pid = t_syscall2(&second, SYS_fork, 0, 0, 0);
+    if (pid >= 0 && second) {
+        struct t_timespec nap = {0, 20000};
+        SYS(SYS_select, 0, 0, 0, 0, &nap);
+        SYS(SYS_kill, me, 30);
+        t_exit(0);
+    }
+    do n = ready(-1);
+    while (n == -4);
+    say("raised by another", n);
+    SYS(SYS_wait4, pid, &status, 0, 0);
+    t_show("delete", change(30, SIGNAL, DELETE, 0, 0, 0));
+    t_show("watch a signal there is none of", change(99, SIGNAL, ADD, 0, 0, 0));
+
     // Two notes on one thing, told apart by what each hands back.
     t_show("two notes on one event", change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 101) + change(5, USER, ADD | CLEAR | SPECIFIC, 0, 0, 102));
     t_show("post the second", change(5, USER, SPECIFIC, TRIGGER, 0, 102));

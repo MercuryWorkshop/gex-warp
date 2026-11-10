@@ -25,9 +25,11 @@
 //!
 //! The filters here are the ones a program meets first: a descriptor
 //! readable or writable, a timer, an event a program posts to itself
-//! (`EVFILT_USER`), and a process ending. The others (a signal, a Mach
-//! port, a file changing, the kernel's work queues delivering events to
-//! threads it makes) are refused by name, `ENOTSUP`.
+//! (`EVFILT_USER`), a process ending, and a signal raised for the process
+//! (counted, whatever the process does with it; one sent to a single
+//! thread is not). The others (a Mach port, a file changing, the kernel's
+//! work queues delivering events to threads it makes) are refused by name,
+//! `ENOTSUP`.
 use super::nr as d;
 use super::*;
 use crate::syscalls::{clock_ns, nr, ClockFn};
@@ -39,6 +41,7 @@ mod filt {
     pub const READ: i16 = -1;
     pub const WRITE: i16 = -2;
     pub const PROC: i16 = -5;
+    pub const SIGNAL: i16 = -6;
     pub const TIMER: i16 = -7;
     pub const USER: i16 = -10;
 }
@@ -191,6 +194,10 @@ enum What {
     /// A process, to end: the kernel's descriptor for it, which the note
     /// opened and closes, and the file behind that.
     Proc { fd: i32, file: Arc<dyn FileHandle>, source: u32 },
+    /// A signal (the kernel's number for it) raised for the process: the
+    /// process's signals, and how many of this one had been raised when
+    /// the note last said.
+    Signal { of: Arc<crate::signal::ProcSig>, signal: u32, seen: u32 },
 }
 
 /// A registration: a thing, a filter, and what the caller wants back.
@@ -296,12 +303,14 @@ impl Kqueue {
 
     /// One change: a note added, changed, switched on or off, or removed.
     /// `file` finds an open file by its descriptor, `process` opens a
-    /// descriptor for a process to watch, by its id.
+    /// descriptor for a process to watch, by its id; `signals` are the
+    /// calling process's.
     pub fn change(
         &self,
         e: &Event,
         file: &dyn Fn(i32) -> Result<Arc<dyn FileHandle>, Errno>,
         process: &mut dyn FnMut(i32) -> Result<(i32, Arc<dyn FileHandle>), Errno>,
+        signals: &Arc<crate::signal::ProcSig>,
     ) -> Result<(), Errno> {
         let mut notes = self.notes();
         // (A note told apart by what it hands back is one only for a
@@ -353,14 +362,24 @@ impl Kqueue {
                         crate::wait::chain(source, self.queue.id());
                         (What::Proc { fd, file, source }, e.fflags)
                     }
+                    // A signal, by Darwin's number for it: each raising
+                    // from now on, whatever the process does with it.
+                    filt::SIGNAL => {
+                        // (A number that is no signal's may be watched,
+                        // and is never raised.)
+                        let signal = if e.ident > abi::NSIG as u64 { 0 } else { abi::sig_to_linux(e.ident as u32) };
+                        crate::wait::chain(signals.raised_queue(), self.queue.id());
+                        (What::Signal { of: Arc::clone(signals), signal, seen: signals.raised(signal) }, e.fflags)
+                    }
                     // A filter Darwin has and this does not yet; or none.
                     -15..=-3 => return Err(Errno::EOPNOTSUPP),
                     _ => return Err(Errno::EINVAL),
                 };
-                // (A timer tells of each firing once, asked to or not; and
-                // one for a moment fires once.)
+                // (A timer tells of each firing once, asked to or not, as a
+                // signal's note does of each raising; and a timer for a
+                // moment fires once.)
                 let flags = e.flags & ev::KEPT
-                    | if e.filter == filt::TIMER { ev::CLEAR } else { 0 }
+                    | if e.filter == filt::TIMER || e.filter == filt::SIGNAL { ev::CLEAR } else { 0 }
                     | if matches!(what, What::Timer { period: 0, .. }) { ev::ONESHOT } else { 0 };
                 notes.push(Note { ident: e.ident, filter: e.filter, flags, disabled: false, fflags, udata: e.udata, qos: e.qos, ext: e.ext, what });
                 notes.len() - 1
@@ -395,8 +414,9 @@ impl Kqueue {
 
     /// Stop hearing from `gone`'s source, unless another note still does.
     fn unchain(&self, left: &[Note], gone: &Note) {
-        let source = |n: &Note| match n.what {
-            What::File { source, .. } | What::Proc { source, .. } => source,
+        let source = |n: &Note| match &n.what {
+            What::File { source, .. } | What::Proc { source, .. } => *source,
+            What::Signal { of, .. } => of.raised_queue(),
             _ => 0,
         };
         let s = source(gone);
@@ -440,6 +460,10 @@ impl Kqueue {
                 (now >= *next).then(|| (0, 0, if *period == 0 { 1 } else { 1 + ((now - *next) / *period) as i64 }))
             }
             What::User { triggered } => triggered.then_some((0, n.fflags, 0)),
+            What::Signal { of, signal, seen } => {
+                let more = of.raised(*signal).wrapping_sub(*seen);
+                (more != 0).then_some((0, 0, more as i64))
+            }
             What::Proc { fd, file, .. } => {
                 let gone = found.get(fd).map_or_else(|| file.poll_readable(), |got| got & (poll::IN | poll::HUP) != 0);
                 if n.fflags & note::EXIT == 0 || !gone {
@@ -498,6 +522,7 @@ impl Kqueue {
                         *triggered = false;
                     }
                 }
+                What::Signal { of, signal, seen } => *seen = of.raised(*signal),
                 What::Proc { .. } => {}
             }
             if (n.flags | flags) & ev::ONESHOT != 0 {
@@ -688,11 +713,16 @@ impl Kernel {
                     }
                     let fds = &self.fds;
                     let mut taken = false;
-                    let r = kq.change(&e, &|fd| fds.get(fd).map(|f| Arc::clone(&f.handle)), &mut |_| {
-                        let fd = opened.ok_or(Errno::ESRCH)??;
-                        taken = true;
-                        Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
-                    });
+                    let r = kq.change(
+                        &e,
+                        &|fd| fds.get(fd).map(|f| Arc::clone(&f.handle)),
+                        &mut |_| {
+                            let fd = opened.ok_or(Errno::ESRCH)??;
+                            taken = true;
+                            Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
+                        },
+                        self.signals.process(),
+                    );
                     if let (Some(Ok(fd)), false) = (opened, taken) {
                         let _ = self.sys_close(fd);
                     }
@@ -798,6 +828,9 @@ mod tests {
     fn nobody(_: i32) -> Result<(i32, Arc<dyn FileHandle>), Errno> {
         Err(Errno::ESRCH)
     }
+    fn quiet() -> Arc<crate::signal::ProcSig> {
+        Arc::clone(crate::signal::Signals::new().process())
+    }
     fn user(ident: u64, flags: u16, fflags: u32) -> Event {
         Event { ident, filter: filt::USER, flags, fflags, udata: 7, ..Event::default() }
     }
@@ -805,9 +838,9 @@ mod tests {
     #[test]
     fn a_user_event_is_said_when_posted_and_once_if_cleared() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody).unwrap();
+        kq.change(&user(1, ev::ADD | ev::CLEAR, 0), &none, &mut nobody, &quiet()).unwrap();
         assert!(kq.collect(8, &Found::new()).is_empty());
-        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody).unwrap();
+        kq.change(&user(1, 0, note::TRIGGER | note::FFOR | 5), &none, &mut nobody, &quiet()).unwrap();
         let got = kq.collect(8, &Found::new());
         assert_eq!((got.len(), got[0].ident, got[0].fflags, got[0].udata), (1, 1, 5, 7));
         assert!(kq.collect(8, &Found::new()).is_empty());
@@ -816,22 +849,47 @@ mod tests {
     #[test]
     fn a_note_that_is_not_there_cannot_be_changed() {
         let kq = Kqueue::new(clock);
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody), Err(Errno::ENOENT));
-        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody), Err(Errno::EBADF));
-        assert_eq!(kq.change(&Event { filter: -6, flags: ev::ADD, ..Event::default() }, &none, &mut nobody), Err(Errno::EOPNOTSUPP));
-        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody), Err(Errno::EINVAL));
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&user(1, ev::ENABLE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
+        assert_eq!(kq.change(&Event { filter: filt::READ, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EBADF));
+        assert_eq!(kq.change(&Event { filter: -4, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EOPNOTSUPP));
+        assert_eq!(kq.change(&Event { filter: 3, flags: ev::ADD, ..Event::default() }, &none, &mut nobody, &quiet()), Err(Errno::EINVAL));
     }
 
     #[test]
     fn once_is_once_and_dispatch_waits_to_be_switched_on() {
         let kq = Kqueue::new(clock);
-        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody).unwrap();
-        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody).unwrap();
+        kq.change(&user(1, ev::ADD | ev::ONESHOT, note::TRIGGER), &none, &mut nobody, &quiet()).unwrap();
+        kq.change(&user(2, ev::ADD | ev::DISPATCH, note::TRIGGER), &none, &mut nobody, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 2);
         assert!(kq.collect(8, &Found::new()).is_empty());
-        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody), Err(Errno::ENOENT));
-        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody).unwrap();
+        assert_eq!(kq.change(&user(1, ev::DELETE, 0), &none, &mut nobody, &quiet()), Err(Errno::ENOENT));
+        kq.change(&user(2, ev::ENABLE, 0), &none, &mut nobody, &quiet()).unwrap();
         assert_eq!(kq.collect(8, &Found::new()).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    #[test]
+    fn a_signal_is_counted_from_when_it_is_watched() {
+        let kq = Kqueue::new(|| (1000, 0));
+        let sigs = crate::signal::Signals::new();
+        let p = sigs.process();
+        // Darwin's SIGUSR1 is 30, the kernel's 10.
+        p.raise(10, None);
+        let watch = Event { ident: 30, filter: filt::SIGNAL, flags: ev::ADD, udata: 9, ..Event::default() };
+        kq.change(&watch, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), p).unwrap();
+        assert!(kq.collect(8, &Found::new()).is_empty());
+        p.raise(10, None);
+        p.raise(10, None);
+        p.raise(12, None);
+        let got = kq.collect(8, &Found::new());
+        assert_eq!((got.len(), got[0].ident, got[0].data, got[0].flags & ev::CLEAR), (1, 30, 2, ev::CLEAR));
+        assert!(kq.collect(8, &Found::new()).is_empty());
+        assert_eq!(kq.change(&Event { ident: 99, filter: filt::SIGNAL, flags: ev::ADD, ..Event::default() }, &|_| Err(Errno::EBADF), &mut |_| Err(Errno::ESRCH), p), Ok(()));
+        assert!(kq.collect(8, &Found::new()).is_empty());
     }
 }

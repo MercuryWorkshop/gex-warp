@@ -205,7 +205,7 @@ the image low. What works is what a program can do with the kernel alone:
   where libdispatch's threads come from;
 - `kqueue` and `kevent` (and `kevent64`, `kevent_qos`): a descriptor to
   read or write, timers, events a program posts to itself, a process
-  ending; told each time or once, and waited for;
+  ending, a signal raised; told each time or once, and waited for;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
 - which system it is: `kern.osproductversion`, `kern.osversion` and
   `kern.osrelease` are what the root's
@@ -241,7 +241,7 @@ What does not, yet:
   answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
   and untested: the tests send as libsyscall does, with `mach_msg2`.
 - A kqueue's events delivered to a work queue's threads, and workloops;
-  the kqueue filters for a signal, a Mach port and a
+  the kqueue filters for a Mach port and a
   file changing; a queue's descriptor closed in a child of `fork`; on the
   page, a note on another process hearing of its end every time;
   `mknod`; a mutex or condition shared between
