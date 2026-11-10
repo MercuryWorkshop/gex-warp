@@ -974,6 +974,25 @@ impl Kernel {
                 }
                 _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             },
+            // mach_vm_map(task, in-out address, size, mask, flags, object,
+            // offset, copy, protection, most protection, inheritance), as
+            // a message: what libsyscall sends when the call says more
+            // than its trap carries (protections other than everything,
+            // which is how an allocator reserves a range it will not yet
+            // touch). One descriptor, the memory object's port, comes
+            // before the NDR record; only no object is anonymous memory.
+            (Kind::Task, 4811) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (want, size, mask, flags, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, get32(&req.body, 64) & 7);
+                if get32(&req.body, 4) != 0 {
+                    plain(KERN_INVALID_ARGUMENT as i32, &[])
+                } else {
+                    match self.darwin_vm_map_at(m, want, size, mask, flags, prot) {
+                        Ok(addr) => plain(0, &addr.to_le_bytes()),
+                        Err(e) => plain(super::mach::kern(Err(e)) as i32, &[]),
+                    }
+                }
+            }
             // host_info(host, flavor, out info, in-out count): the flavor
             // and the room follow the NDR record. What is told is counted
             // in 32-bit words; too little room for it is a failure.

@@ -792,6 +792,10 @@ impl AppleStrings {
             format!("malloc_entropy=0x{:016x},0x{:016x}", word(1), word(2)),
             format!("ptr_munge=0x{:016x}", word(3)),
             format!("main_stack=0x{:x},0x{:x},0x{:x},0x{:x}", self.stack.0, self.stack.1, self.stack.0, self.stack.1),
+            // What the kernel knows the program's file by, for the
+            // allocator to keep its secrets by: twenty bytes of hash.
+            // (libmalloc will not start the first process without it.)
+            format!("executable_boothash={:016x}{:016x}{:08x}", word(4), word(5), word(6) as u32),
         ];
         if !gex_abi::X86 {
             v.push(format!("arm64e_abi={}", if darwin.arm64e { "os" } else { "all" }));

@@ -621,6 +621,8 @@ pub enum Op {
     Emms,
     Ldmxcsr,
     Stmxcsr,
+    /// `sidt m`: the interrupt table's limit and base, stored.
+    Sidt,
 
     // -- x87 -------------------------------------------------------------
     /// Load from memory and push.

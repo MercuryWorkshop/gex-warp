@@ -69,7 +69,7 @@ pub fn port_thread(pid: i32, name: u32) -> Option<i32> {
     (step % 0x100 == 0 && step / 0x100 < 1 << 20).then(|| pid + (step / 0x100) as i32)
 }
 
-fn kern(r: Result<u64, Errno>) -> u64 {
+pub(super) fn kern(r: Result<u64, Errno>) -> u64 {
     match r {
         Ok(_) => KERN_SUCCESS,
         Err(Errno::ENOMEM) => KERN_NO_SPACE,
@@ -170,22 +170,33 @@ impl Kernel {
         if target as u32 != port::TASK {
             return Err(Errno::ESRCH);
         }
-        let page = abi::PAGE_SIZE;
         let want = m.read_u64(addr_ptr)?;
+        let at = self.darwin_vm_map_at(m, want, size, mask, flags, prot_bits)?;
+        m.write_u64(addr_ptr, at)?;
+        Ok(0)
+    }
+
+    /// The same, the address given and answered directly (as the MIG
+    /// routine has it, [`Kernel::darwin_mig`]): where the memory is.
+    pub(super) fn darwin_vm_map_at(&mut self, m: &mut GuestMem<'_>, want: u64, size: u64, mask: u64, flags: u64, prot_bits: u32) -> Result<u64, Errno> {
+        let page = abi::PAGE_SIZE;
         if size == 0 {
-            m.write_u64(addr_ptr, 0)?;
             return Ok(0);
         }
         let len = size.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
-        let at = if flags & VM_FLAGS_ANYWHERE != 0 {
+        if flags & VM_FLAGS_ANYWHERE != 0 {
             let at = self.darwin_place(want, len, prot_bits, false, mask)?;
-            self.mem.mmap_anon(m, at, len, prot_bits, 0, false, "")?
+            self.mem.mmap_anon(m, at, len, prot_bits, 0, false, "")
         } else {
             let at = want & !(page - 1);
+            // A place past the end of the task's address space is no
+            // address at all (KERN_INVALID_ADDRESS): what libmalloc's nano
+            // zone finds of its 0x600000000000 on x86-64, and does without.
+            if at.checked_add(len).is_none_or(|end| end > m.limit() as u64) {
+                return Err(Errno::EFAULT);
+            }
             let extra = if flags & VM_FLAGS_OVERWRITE != 0 { mflags::FIXED } else { mflags::FIXED_NOREPLACE };
-            self.mem.mmap_anon(m, at, len, prot_bits, extra, false, "")?
-        };
-        m.write_u64(addr_ptr, at)?;
-        Ok(0)
+            self.mem.mmap_anon(m, at, len, prot_bits, extra, false, "")
+        }
     }
 }

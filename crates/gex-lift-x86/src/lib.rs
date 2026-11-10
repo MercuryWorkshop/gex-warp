@@ -1671,6 +1671,21 @@ impl<'a> Lifter<'a> {
                 self.wr(i.op0(), Width::D, v);
                 Flow::Next
             }
+            Op::Sidt => {
+                // The interrupt table's limit (two bytes) and base (eight).
+                // XNU gives each processor a table of its own and keeps the
+                // processor's number in the limit's low twelve bits, which
+                // is how a Darwin program asks which processor it is on
+                // (`_os_cpu_number`; libmalloc, at every allocation). There
+                // is no such table here, and the answer is the first.
+                if let Operand::Mem(mem) = i.op0() {
+                    let limit = self.k32(0x1000);
+                    self.store(&mem, Width::W, limit);
+                    let base = self.k64(0);
+                    self.store(&Mem { disp: mem.disp.wrapping_add(2), ..mem }, Width::Q, base);
+                }
+                Flow::Next
+            }
             Op::Fxsave | Op::Fxrstor | Op::Xsave | Op::Xrstor => self.fxsave(i),
 
             Op::Crc32

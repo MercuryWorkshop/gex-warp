@@ -930,6 +930,8 @@ impl<'a> Decoder<'a> {
                 return Ok(match m.raw {
                     0xd0 => self.i0(Op::Xgetbv, Width::D),
                     0xf9 => self.i0(Op::Rdtscp, Width::D),
+                    // /1 with memory: sidt, which user code may run.
+                    _ if !m.is_reg && m.reg & 7 == 1 => self.i1(Op::Sidt, Width::Q, Operand::Mem(m.mem)),
                     _ => self.unk(),
                 });
             }

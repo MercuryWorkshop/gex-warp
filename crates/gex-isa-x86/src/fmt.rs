@@ -421,6 +421,7 @@ pub fn mnemonic(i: &Inst) -> String {
         Emms => "emms".into(),
         Ldmxcsr => "ldmxcsr".into(),
         Stmxcsr => "stmxcsr".into(),
+        Sidt => "sidt".into(),
 
         Fld(_) | FldSt(_) => "fld".into(),
         Fild(_) => "fild".into(),
