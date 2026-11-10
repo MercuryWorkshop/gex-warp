@@ -3717,8 +3717,16 @@ fn mount_filesystems(
     // Wine's topology read them.
     kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
     if opts.sysroot.is_some() {
-        // A sysroot has no host /tmp behind it, so give the guest one.
-        kernel.vfs.mount("/tmp", Arc::new(TmpFs::new()));
+        // A sysroot has no host /tmp behind it, so give the guest one:
+        // where the root's own is, which for a Mac's root is
+        // /private/tmp, its /tmp a link there (and a directory in it
+        // is named so, as on a Mac).
+        let at = match kernel.vfs.read_link("/tmp") {
+            Ok(to) if to.starts_with('/') => to,
+            Ok(to) => format!("/{to}"),
+            Err(_) => "/tmp".to_string(),
+        };
+        kernel.vfs.mount(at.trim_end_matches('/'), Arc::new(TmpFs::new()));
     }
     // Start where the host process is, so relative paths on the command line
     // mean what the user typed.
@@ -5296,6 +5304,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         caller.data_mut().resume_at = Some(target);
                         return Err(StopExecution.into());
                     }
+                }
+            }
+            // (GEX_DUMP_ABORT: where a program that ends itself so was.)
+            if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let mut gm = GuestMem::new(memory.bytes());
+                    let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
+                    let vmas = caller.data_mut().with_kernel(|k| k.mem.lock().vmas().to_vec());
+                    dump_guest(&mut gm, ctx_addr, tid, &vmas);
                 }
             }
             caller.data_mut().exit = Some(Exit::Signal {
