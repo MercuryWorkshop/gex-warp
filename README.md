@@ -234,6 +234,11 @@ the image low. What works is what a program can do with the kernel alone:
   a reader or a writer still to come is held instead, so the first to
   open it reads nothing yet, or fills the pipe, until the other arrives.
   Opened to read and write both it waits for nobody, as on a Mac;
+- a Linux program and a Mac one side by side in one system on the page
+  (`test/darwin/beside`): the Linux one runs the Mac's shell from a Mac
+  root that is a directory of its tree, and they talk through the kernel
+  they share, a FIFO each way, shared memory by name, the wait status,
+  and the signals that stop a job and set it going;
 - the commpage: the page of facts about the machine libSystem reads
   instead of asking, and on x86-64 computes the time from. XNU's is past
   the end of a guest's memory, so it is at `0xFFC000` (arm64's read-only

@@ -390,6 +390,14 @@ impl Kernel {
             // Past it Darwin's is to do with reuse, and none of it lets the
             // kernel drop what the pages hold (Linux's `MADV_DONTNEED` does).
             d::MADVISE if x[2] <= 3 => set(nr::MADVISE, &x[..3]),
+            // But `MADV_ZERO` (11) asks for exactly that: the pages read as
+            // zero from here on, which is what the kernel's `MADV_DONTNEED`
+            // does to memory that is nobody's file. libmalloc's `calloc`
+            // on arm64 zeroes a block it has used before this way, and
+            // takes the call's success for its having been done.
+            // (An x86-64 Mac has none of it, and its libmalloc does not ask.)
+            d::MADVISE if x[2] == 11 && gex_abi::X86 => NATIVE + code,
+            d::MADVISE if x[2] == 11 => set(nr::MADVISE, &[x[0], x[1], 4]),
             d::MADVISE | d::MLOCK | d::MUNLOCK | d::MLOCKALL | d::MUNLOCKALL | d::MINCORE => set(nr::NOOP_OK, &[]),
             d::GETRUSAGE => set(nr::GETRUSAGE, &x[..2]),
             d::GETRLIMIT => match abi::rlimit(x[0]) {
@@ -573,6 +581,8 @@ impl Kernel {
             // No copy-on-write clones, and no exchange of two names: the
             // caller does without.
             d::CLONEFILEAT | d::RENAMEATX_NP => Err(Errno::EOPNOTSUPP),
+            // (`MADV_ZERO` on x86-64: the one advice that comes here.)
+            d::MADVISE => Err(Errno::EOPNOTSUPP),
             d::FSCTL | d::FFSCTL => Err(Errno::ENOTTY),
             // A port that is no thread's.
             d::PTHREAD_KILL => Err(Errno::ESRCH),

@@ -742,7 +742,8 @@ pub struct Remote {
     pub buffered: extern "C" fn(id: i32) -> i32,
     /// The pipe's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
-    /// Open the pipe of the FIFO at a path ([`Fifos::open`]): bit 0 of
+    /// Open the pipe of the FIFO a name stands for, which is the file's
+    /// identity and not a path to it ([`Fifos::open`]): bit 0 of
     /// `how` to write, bit 1 not to wait, bit 2 to read and write both
     /// ([`Fifos::open_both`]). The pipe's id, with that end (or both)
     /// counted for `pid`, or a negated errno.

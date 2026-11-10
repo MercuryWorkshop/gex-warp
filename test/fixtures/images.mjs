@@ -15,7 +15,9 @@
 //            GEX_TEST_DARWIN_ROOT_X86; by default pyrus's out/root and
 //            out/root-x86_64 beside this repository); and beside each,
 //            darwin-window.ARCH, fixtures/darwin/page's programs built
-//            for a Mac where there is a compiler for one.
+//            for a Mac where there is a compiler for one, and
+//            darwin-beside.ARCH, its Linux program (zig, or a musl
+//            cross gcc).
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
@@ -214,6 +216,19 @@ export const images = {
         const prog = join(work, `darwin-${name}.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin/page', `${name}.c`)], { stdio: 'ignore' });
+      }
+      // And the Linux program that runs beside a Mac one (darwin/beside),
+      // where there is a compiler for it (zig, or a musl cross gcc:
+      // GEX_TOOLCHAIN, GEX_TOOLCHAIN_X86, as lib/native.mjs): static, musl,
+      // at the address the page's programs load.
+      const beside = join(work, `darwin-beside.${arch}`);
+      rmSync(beside, { force: true });
+      const triple = `${arch === 'x86' ? 'x86_64' : 'aarch64'}-linux-musl`;
+      const src = join(HERE, 'darwin/page', 'beside.c');
+      spawnSync('zig', ['cc', '-target', triple, '-O2', '-static', '-Wl,--image-base=0x1000000', '-o', beside, src], { stdio: 'ignore' });
+      if (!existsSync(beside)) {
+        const tc = process.env[arch === 'x86' ? 'GEX_TOOLCHAIN_X86' : 'GEX_TOOLCHAIN'] || join(homedir(), 'toolchains', `${triple}-cross`);
+        spawnSync(join(tc, 'bin', `${triple}-gcc`), ['-O2', '-static', '-Wl,-Ttext-segment=0x1000000', '-o', beside, src], { stdio: 'ignore' });
       }
     }
     return made ? null : 'no Mac root (GEX_TEST_DARWIN_ROOT, GEX_TEST_DARWIN_ROOT_X86: pyrus builds one)';

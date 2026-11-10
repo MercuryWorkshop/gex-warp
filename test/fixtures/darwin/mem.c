@@ -93,5 +93,14 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_check("on a megabyte", al && (al & 0xfffff) == 0);
     ((u8 *)al)[3 * PAGE - 1] = 1;
     t_show("mach_vm_deallocate of nothing", TRAP(TRAP_mach_vm_deallocate, task, al, 0));
+
+    // MADV_ZERO: the pages read as zero once it has returned, which is what
+    // libmalloc's calloc takes its success to mean.
+    u8 *z = (u8 *)SYS(SYS_mmap, 0, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    t_memset(z, 0xa5, 4 * PAGE);
+    t_show("madvise to zero the middle of it", SYS(SYS_madvise, z + PAGE, 2 * PAGE, 11));
+    long left = 0;
+    for (long i = PAGE; i < 3 * PAGE; i++) left += z[i] != 0;
+    t_printf("  bytes of it not zero: %ld; before it %x, after it %x\n", left, z[PAGE - 1], z[3 * PAGE]);
     return 0;
 }

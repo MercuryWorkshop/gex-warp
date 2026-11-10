@@ -3504,8 +3504,6 @@ pub extern "C" fn k_inotify_queue(id: i32) -> u32 {
 #[no_mangle]
 pub extern "C" fn k_fs_unlink(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     let p = path_of(path, path_len);
-    // (A FIFO of that name has its pipe no longer: `k_fifo`.)
-    gex_kernel::pipe::Fifos::system().forget(&p);
     if let Some((m, rel)) = pagefs::find(&p) {
         return as_unit(m.unlink(&rel));
     }
@@ -3558,7 +3556,6 @@ pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem
     // Bit 0 is RENAME_NOREPLACE; above it, the holds the caller has taken
     // (`remote::Remote::rename2`).
     let (from, to) = (path_of(from, from_len), path_of(to, to_len));
-    gex_kernel::pipe::Fifos::system().rename(&from, &to);
     match (pagefs::find(&from), pagefs::find(&to)) {
         (None, None) => as_unit(rootfs().rename2_as(&from, &to, noreplace & 1 != 0, noreplace >> 1)),
         (Some((a, f)), Some((b, t))) if std::sync::Arc::ptr_eq(&a, &b) => as_unit(a.rename2(&f, &t, noreplace & 1 != 0)),
@@ -3741,8 +3738,10 @@ pub extern "C" fn k_fs_mkfifo(path: gex_kmem::PAddr, path_len: u32, mode: u32) -
     as_unit(rootfs().mkfifo(&p, mode))
 }
 
-/// Open the pipe of the FIFO at a path (`pipe::Remote::fifo`,
-/// `gex_kernel::pipe::Fifos`): bit 0 of `how` to write, bit 1 not to wait,
+/// Open the pipe of a FIFO (`pipe::Remote::fifo`,
+/// `gex_kernel::pipe::Fifos`), which the caller names by the file it is
+/// (its inode here, so a renamed FIFO keeps its pipe and one made after an
+/// unlink has its own): bit 0 of `how` to write, bit 1 not to wait,
 /// bit 2 to read and write both. The pipe's id, that end (or both) counted
 /// for `pid`, or a negated errno.
 #[no_mangle]

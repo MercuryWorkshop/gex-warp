@@ -3969,7 +3969,10 @@ impl PathIo<'_> {
         let status = flags & (oflags::O_NONBLOCK | oflags::O_APPEND) | acc;
         let file = match self.pipes {
             Some(r) => {
-                let name = self.ns.outer_path(&p);
+                // (By the file it is, not a name for it: a process in a
+                // root of its own, a Mac program in its prefix, comes to
+                // the same file by another path.)
+                let name = format!("#{}", self.ns.metadata(&p)?.ino);
                 let how = write as u32 | (nonblock as u32) << 1 | ((read && write) as u32) << 2;
                 let id = (r.fifo)(name.as_ptr() as crate::PAddr, name.len() as u32, how, self.pid);
                 if id < 0 {
@@ -7361,6 +7364,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
@@ -7466,6 +7470,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
