@@ -1,0 +1,325 @@
+// Mach ports: names and the rights under them, messages sent and received
+// (with a reply port, with a right in the body, through a port set, to a
+// thread that waits), the kernel's own ports answering MIG requests, and
+// semaphores -- which is how the libc sleeps.
+#include "t.h"
+
+// A trap with eight arguments: mach_msg2's.
+long t_trap8(long n, long a, long b, long c, long d, long e, long f, long g, long h);
+__asm__(".text\n.globl _t_trap8\n.p2align 2\n_t_trap8:\n"
+        "  neg x16, x0\n  mov x0, x1\n  mov x1, x2\n  mov x2, x3\n  mov x3, x4\n"
+        "  mov x4, x5\n  mov x5, x6\n  mov x6, x7\n  ldr x7, [sp]\n  svc #0x80\n  ret\n");
+
+enum {
+    TRAP_port_allocate = 16, TRAP_port_deallocate = 18, TRAP_port_mod_refs = 19, TRAP_port_insert_right = 21,
+    TRAP_port_insert_member = 22, TRAP_port_extract_member = 23, TRAP_semaphore_signal = 33,
+    TRAP_semaphore_wait = 36, TRAP_semaphore_timedwait = 38, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
+};
+enum { RIGHT_SEND = 0, RIGHT_RECEIVE = 1, RIGHT_SEND_ONCE = 2, RIGHT_PORT_SET = 3, RIGHT_DEAD_NAME = 4 };
+enum { MOVE_SEND = 17, MOVE_SEND_ONCE = 18, COPY_SEND = 19, MAKE_SEND = 20, MAKE_SEND_ONCE = 21 };
+enum { SEND_MSG = 1, RCV_MSG = 2, RCV_LARGE = 4, RCV_TIMEOUT = 0x100 };
+#define COMPLEX 0x80000000u
+// What mach_msg2 is told of the destination: a queue, or the kernel.
+#define MQ_CALL 0x400000000ull
+#define KOBJECT_CALL 0x200000000ull
+#define RCV_INTERRUPTED 0x10004005
+
+struct header {
+    u32 bits, size, remote, local, voucher;
+    i32 id;
+};
+struct port_desc {
+    u32 name, pad1;
+    u16 pad2;
+    u8 disposition, type;
+};
+// A message with room to receive anything the tests send.
+struct message {
+    struct header h;
+    u32 body[24];
+};
+
+static u32 task;
+
+// mach_msg, as libsyscall makes it: the header in registers.
+static long msg(struct message *m, u64 option, u32 send_size, u32 rcv_size, u32 rcv_name, u32 timeout) {
+    u32 descs = (option & SEND_MSG) && (m->h.bits & COMPLEX) ? m->body[0] : 0;
+    long r;
+    do {
+        r = t_trap8(TRAP_mach_msg2, (long)m, (long)option, (long)(m->h.bits | (u64)send_size << 32),
+                    (long)(m->h.remote | (u64)m->h.local << 32), (long)(m->h.voucher | (u64)(u32)m->h.id << 32),
+                    (long)(descs | (u64)rcv_name << 32), (long)rcv_size, timeout);
+        // The send has been done; an interrupted receive is asked again.
+        option &= ~(u64)SEND_MSG;
+    } while (r == RCV_INTERRUPTED);
+    return r;
+}
+
+static long send(struct message *m, u32 size) { return msg(m, SEND_MSG | MQ_CALL, size, 0, 0, 0); }
+static long receive(struct message *m, u32 from, u32 room) { return msg(m, RCV_MSG | RCV_TIMEOUT, 0, room, from, 0); }
+
+static u32 allocate(int right) {
+    u32 name = 0;
+    long r = TRAP(TRAP_port_allocate, task, right, &name);
+    return r ? 0 : name;
+}
+
+static void show_type(const char *what, u32 name) {
+    u32 type = 0x55555555;
+    long r = TRAP(TRAP_port_type, task, name, &type);
+    if (r) t_printf("%s: no type, %ld\n", what, r);
+    else t_printf("%s: type %x\n", what, type);
+}
+
+static u64 nanos(void) {
+    struct {
+        u32 numer, denom;
+    } tb = {1, 1};
+    TRAP(TRAP_mach_timebase_info, &tb);
+    return (u64)TRAP(TRAP_mach_absolute_time) / tb.denom * tb.numer;
+}
+
+static void rights(void) {
+    t_check("task, host and thread have names", task && TRAP(TRAP_host_self) && TRAP(TRAP_thread_self));
+    show_type("the task's port", task);
+    u32 p = 0;
+    t_show("allocate a receive right", TRAP(TRAP_port_allocate, task, RIGHT_RECEIVE, &p));
+    t_check("a name", p != 0 && p != task);
+    show_type("it", p);
+    t_show("make a send right from it", TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND));
+    show_type("now", p);
+    t_show("another reference", TRAP(TRAP_port_mod_refs, task, p, RIGHT_SEND, 1));
+    t_show("deallocate one", TRAP(TRAP_port_deallocate, task, p));
+    t_show("and the other", TRAP(TRAP_port_deallocate, task, p));
+    show_type("the receive right alone", p);
+    t_show("deallocate with none left", TRAP(TRAP_port_deallocate, task, p));
+    t_show("drop the receive right", TRAP(TRAP_port_mod_refs, task, p, RIGHT_RECEIVE, -1));
+    show_type("the name", p);
+
+    t_show("allocate a right there is not", TRAP(TRAP_port_allocate, task, 99, &p));
+    t_show("deallocate a name there is not", TRAP(TRAP_port_deallocate, task, 0x123457));
+    t_show("mod_refs of one", TRAP(TRAP_port_mod_refs, task, 0x123457, RIGHT_SEND, 1));
+    show_type("a name there is not", 0x123457);
+    t_show("allocate in no task", TRAP(TRAP_port_allocate, 0, RIGHT_RECEIVE, &p));
+
+    // A port whose receive right goes while a send right is held: the name
+    // is a dead one.
+    p = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND);
+    t_show("drop a receive right with a sender", TRAP(TRAP_port_mod_refs, task, p, RIGHT_RECEIVE, -1));
+    show_type("the name", p);
+    static struct message m;
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 7};
+    t_show("send to it", send(&m, sizeof m.h));
+    t_show("deallocate the dead name", TRAP(TRAP_port_deallocate, task, p));
+    show_type("and then", p);
+}
+
+static void messages(void) {
+    static struct message m, got;
+    u32 p = allocate(RIGHT_RECEIVE), reply = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, p, p, MAKE_SEND);
+
+    t_show("receive with nothing there", receive(&got, p, sizeof got));
+    u64 t0 = nanos();
+    t_show("and for 30 ms", msg(&got, RCV_MSG | RCV_TIMEOUT, 0, sizeof got, p, 30));
+    t_check("it waited", nanos() - t0 >= 30000000ull);
+    t_show("receive from no name", receive(&got, 0x123457, sizeof got));
+    m.h = (struct header){COPY_SEND, 0, 0x123457, 0, 0, 1};
+    t_show("send to no name", send(&m, sizeof m.h));
+    m.h = (struct header){COPY_SEND, 0, reply, 0, 0, 1};
+    t_show("send by a right not held", send(&m, sizeof m.h));
+
+    // A request, with a reply port: a send-once right made from `reply`.
+    m.h = (struct header){COPY_SEND | MAKE_SEND_ONCE << 8, 0, p, reply, 0, 1234};
+    m.body[0] = 0xfeedface;
+    t_show("send", send(&m, sizeof m.h + 4));
+    t_memset(&got, 0x55, sizeof got);
+    t_show("receive", receive(&got, p, sizeof got));
+    t_printf("  bits %x, %u bytes, id %d, body %x; trailer type %u, %u bytes\n", got.h.bits, got.h.size, got.h.id, got.body[0], got.body[1],
+             got.body[2]);
+    t_check("on the port it was sent to", got.h.local == p);
+    t_check("with a new name to reply by", got.h.remote != 0 && got.h.remote != reply && got.h.remote != p);
+    show_type("which", got.h.remote);
+    u32 once = got.h.remote;
+    m.h = (struct header){MOVE_SEND_ONCE, 0, once, 0, 0, 1334};
+    t_show("reply by it", send(&m, sizeof m.h));
+    show_type("the name, used", once);
+    t_show("receive the reply", receive(&got, reply, sizeof got));
+    t_printf("  bits %x, %u bytes, id %d, %s\n", got.h.bits, got.h.size, got.h.id, got.h.local == reply ? "on the reply port" : "elsewhere");
+
+    // Too large for the room: gone, or with RCV_LARGE kept and measured.
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 2};
+    send(&m, sizeof m.h + 64);
+    t_show("receive 88 bytes into 40", receive(&got, p, 40));
+    t_show("and again", receive(&got, p, sizeof got));
+    send(&m, sizeof m.h + 64);
+    t_memset(&got, 0, sizeof got);
+    t_show("with RCV_LARGE", msg(&got, RCV_MSG | RCV_TIMEOUT | RCV_LARGE, 0, 40, p, 0));
+    t_printf("  it would be %u bytes\n", got.h.size);
+    t_show("and again, with room", receive(&got, p, sizeof got));
+    t_printf("  %u bytes, id %d\n", got.h.size, got.h.id);
+
+    // A right in the body: a send right to `reply`, made as it is sent.
+    m.h = (struct header){COMPLEX | COPY_SEND, 0, p, 0, 0, 3};
+    m.body[0] = 1;
+    struct port_desc *d = (struct port_desc *)&m.body[1];
+    *d = (struct port_desc){reply, 0, 0, MAKE_SEND, 0};
+    t_show("send a right", send(&m, sizeof m.h + 4 + sizeof *d));
+    t_memset(&got, 0, sizeof got);
+    t_show("receive it", receive(&got, p, sizeof got));
+    d = (struct port_desc *)&got.body[1];
+    t_printf("  bits %x, %u descriptor, disposition %d, type %d, %s\n", got.h.bits, got.body[0], d->disposition, d->type,
+             d->name == reply ? "under the name the port has here" : "under another name");
+    show_type("that port", reply);
+    m.h = (struct header){COMPLEX | COPY_SEND, 0, p, 0, 0, 3};
+    *(struct port_desc *)&m.body[1] = (struct port_desc){0x123457, 0, 0, COPY_SEND, 0};
+    t_show("send a right not held", send(&m, sizeof m.h + 4 + sizeof *d));
+
+    // Through a port set.
+    u32 set = allocate(RIGHT_PORT_SET);
+    show_type("a port set", set);
+    t_show("put the port in it", TRAP(TRAP_port_insert_member, task, p, set));
+    m.h = (struct header){COPY_SEND, 0, p, 0, 0, 4};
+    send(&m, sizeof m.h);
+    t_show("receive from the port itself", receive(&got, p, sizeof got));
+    t_show("receive from the set", receive(&got, set, sizeof got));
+    t_printf("  id %d, %s\n", got.h.id, got.h.local == p ? "from the member" : "from elsewhere");
+    t_show("send to the set", ({ m.h = (struct header){COPY_SEND, 0, set, 0, 0, 4}; send(&m, sizeof m.h); }));
+    t_show("take it out", TRAP(TRAP_port_extract_member, task, p, set));
+    t_show("put a name that is no port in", TRAP(TRAP_port_insert_member, task, 0x123457, set));
+}
+
+static u32 shared_port, shared_sem;
+
+static void *receiver(void *arg) {
+    static struct message got;
+    long r = msg(&got, RCV_MSG, 0, sizeof got, shared_port, 0);
+    *(long *)arg = r ? -1 : got.h.id;
+    return 0;
+}
+
+static void *waiter(void *arg) {
+    long r;
+    do r = TRAP(TRAP_semaphore_wait, shared_sem);
+    while (r == 14);
+    *(long *)arg = r;
+    return 0;
+}
+
+static void napms(int ms) {
+    struct t_timeval tv = {0, ms * 1000};
+    SYS(SYS_select, 0, 0, 0, 0, &tv);
+}
+
+static void threads(void) {
+    static struct message m;
+    shared_port = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, shared_port, shared_port, MAKE_SEND);
+    long got = -2;
+    int th = t_thread_start(receiver, &got);
+    napms(30);
+    t_check("a thread waits for a message", got == -2);
+    m.h = (struct header){COPY_SEND, 0, shared_port, 0, 0, 77};
+    t_show("send it one", send(&m, sizeof m.h));
+    t_thread_join(th);
+    t_printf("it received id %ld\n", got);
+}
+
+// A MIG request to one of the kernel's ports and its reply, through a reply
+// port of this thread's.
+static long rpc(struct message *m, u32 to, u32 size) {
+    u32 reply = (u32)TRAP(TRAP_mach_reply_port);
+    m->h.bits = (m->h.bits & COMPLEX) | COPY_SEND | MAKE_SEND_ONCE << 8;
+    m->h.remote = to, m->h.local = reply, m->h.voucher = 0;
+    long r = msg(m, SEND_MSG | RCV_MSG | KOBJECT_CALL, size, sizeof *m, reply, 0);
+    TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
+    return r;
+}
+
+static void kernel_ports(void) {
+    static struct message m;
+    // NDR record, then the arguments.
+    static const u32 ndr[2] = {0, 1};
+    u32 host = (u32)TRAP(TRAP_host_self);
+
+    // _host_page_size(host, out size)
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 202;
+    t_show("ask the host its page size", rpc(&m, host, sizeof m.h));
+    t_printf("  reply %d, %u bytes, bits %x: code %d, %u\n", m.h.id, m.h.size, m.h.bits, m.body[2], m.body[3]);
+
+    // A routine no port has.
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 9999;
+    t_show("ask the task for nothing it does", rpc(&m, task, sizeof m.h));
+    t_printf("  reply %d, %u bytes: code %d\n", m.h.id, m.h.size, m.body[2]);
+
+    // host_get_clock_service(host, SYSTEM_CLOCK, out clock), clock_get_time.
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 206;
+    m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = 0;
+    t_show("ask the host for its clock", rpc(&m, host, sizeof m.h + 12));
+    struct port_desc *d = (struct port_desc *)&m.body[1];
+    t_printf("  reply %d, %u bytes, bits %x: %u descriptor, disposition %d\n", m.h.id, m.h.size, m.h.bits, m.body[0], d->disposition);
+    u32 clock = d->name;
+    show_type("the clock", clock);
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 1000;
+    t_show("ask it the time", rpc(&m, clock, sizeof m.h));
+    t_printf("  reply %d, %u bytes: code %d, %s\n", m.h.id, m.h.size, m.body[2], m.body[3] > 0 && m.body[4] < 1000000000 ? "a time" : "no time");
+
+    // semaphore_create(task, out semaphore, policy, value): one, already
+    // signalled once.
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3418;
+    m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = 0, m.body[3] = 1;
+    t_show("ask the task for a semaphore", rpc(&m, task, sizeof m.h + 16));
+    t_printf("  reply %d, %u bytes, bits %x: %u descriptor, disposition %d\n", m.h.id, m.h.size, m.h.bits, m.body[0], d->disposition);
+    u32 sem = d->name;
+    show_type("the semaphore", sem);
+    t_show("wait on it", TRAP(TRAP_semaphore_wait, sem));
+    u64 t0 = nanos();
+    t_show("and again, for 30 ms", TRAP(TRAP_semaphore_timedwait, sem, 0, 30000000));
+    t_check("it waited", nanos() - t0 >= 30000000ull);
+    t_show("signal it", TRAP(TRAP_semaphore_signal, sem));
+    t_show("wait", TRAP(TRAP_semaphore_timedwait, sem, 0, 30000000));
+    t_show("signal what is no semaphore", TRAP(TRAP_semaphore_signal, task));
+    t_show("wait on it", TRAP(TRAP_semaphore_wait, 0x123457));
+
+    shared_sem = sem;
+    long got = -2;
+    int th = t_thread_start(waiter, &got);
+    napms(30);
+    t_check("a thread waits on the semaphore", got == -2);
+    t_show("signal it", TRAP(TRAP_semaphore_signal, sem));
+    t_thread_join(th);
+    t_printf("its wait answered %ld\n", got);
+
+    // How the libc sleeps: __semwait_signal on a semaphore nobody signals,
+    // for a time from now.
+    t0 = nanos();
+    t_show("__semwait_signal for 40 ms", SYS(SYS___semwait_signal, sem, 0, 1, 1, 0, 40000000));
+    t_check("it slept", nanos() - t0 >= 40000000ull && nanos() - t0 < 2000000000ull);
+    t_show("__semwait_signal on no semaphore", SYS(SYS___semwait_signal, 0, 0, 1, 1, 0, 1000));
+
+    // semaphore_destroy(task, semaphore)
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3419;
+    m.h.bits = COMPLEX;
+    m.body[0] = 1;
+    *d = (struct port_desc){sem, 0, 0, COPY_SEND, 0};
+    t_show("destroy it", rpc(&m, task, sizeof m.h + 4 + sizeof *d));
+    t_printf("  reply %d, %u bytes: code %d\n", m.h.id, m.h.size, m.body[2]);
+    t_show("signal it now", TRAP(TRAP_semaphore_signal, sem));
+}
+
+int main(int argc, char **argv, char **envp, char **apple) {
+    (void)argc, (void)argv, (void)envp, (void)apple;
+    task = (u32)TRAP(TRAP_task_self);
+    rights();
+    messages();
+    threads();
+    kernel_ports();
+    return 0;
+}

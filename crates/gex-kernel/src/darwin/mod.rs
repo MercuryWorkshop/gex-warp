@@ -23,6 +23,7 @@ mod bsd;
 pub mod info;
 mod mach;
 pub mod nr;
+pub mod port;
 mod sock;
 pub mod thread;
 pub mod tty;
@@ -117,6 +118,11 @@ pub enum Post {
     Unlink,
     /// A Mach trap that waited: its answer as a `kern_return_t`.
     Kern { timed_out: u32 },
+    /// A Mach trap that waited on a word for something to come: told to
+    /// ask again (`woken`), or that its time is up.
+    Wake { woken: u32, timed_out: u32 },
+    /// `__semwait_signal` likewise, whose answers are error numbers.
+    SemWait,
     /// `getsockopt(SO_ERROR)`: the error at `at` is one of Linux's.
     SoError { at: u64 },
     /// `statfs64`, once the file is known to be there: Darwin's structure
@@ -197,7 +203,14 @@ impl Kernel {
         self.darwin_x = x;
         let n = match class {
             Class::Unix(code) => self.darwin_bsd(m, code, x, a),
-            Class::Mach(trap) => MACH + trap,
+            Class::Mach(trap) => match self.darwin_wait_trap(m, trap, x, a) {
+                Some(Ok(call)) => call,
+                Some(Err(ready)) => {
+                    self.darwin_ready = Some(ready);
+                    MACH + trap
+                }
+                None => MACH + trap,
+            },
             Class::Mdep(code) => MDEP + code,
             Class::Invalid => NATIVE,
         };
@@ -304,6 +317,14 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
         Post::Unlink => match r {
             Err(Errno::EISDIR) => Err(Errno::EPERM),
             r => r,
+        },
+        Post::Wake { woken, timed_out } => Ok(match r {
+            Err(Errno::ETIMEDOUT) => timed_out as u64,
+            _ => woken as u64,
+        }),
+        Post::SemWait => match r {
+            Ok(_) | Err(Errno::EAGAIN) => Err(Errno::EINTR),
+            e => e,
         },
         Post::SoError { at } => {
             if r.is_ok() {

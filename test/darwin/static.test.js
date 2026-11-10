@@ -9,7 +9,9 @@
 // trampoline; threads, made as libpthread asks for them (on the Mac, by its
 // libpthread), waiting on ulock; what a process asks about itself and its
 // machine (sysctl, csops, proc_info, statfs); the terminal's ioctls, with
-// BSD's termios; and sockets, with BSD's sockaddr, msghdr and cmsghdr.
+// BSD's termios; sockets, with BSD's sockaddr, msghdr and cmsghdr; and
+// Mach ports within a task: rights, messages, semaphores, and the kernel's
+// own ports answering MIG requests.
 import { darwin } from '../lib/darwin.mjs';
 
 export const meta = { hosts: ['node'], arches: ['a64'], timeout: 600 };
@@ -21,7 +23,7 @@ export default async function (t) {
   // size, a name's longest length): the Mac's own under gexc, and so not
   // the page's in-memory one.
   await d.compare('files', await d.build('files'));
-  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty']) await d.compare(name, await d.build(name), [], { page: true });
+  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach']) await d.compare(name, await d.build(name), [], { page: true });
   await d.compare('sys', await d.build('sys'), ['one', 'two'], { page: true });
   // A closed port on the loopback refuses under gexc; on the page the
   // loopback is the proxy's to answer for, so that question is asked only

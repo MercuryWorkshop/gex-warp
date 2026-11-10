@@ -16,8 +16,14 @@ pub const KERN_PROTECTION_FAILURE: u64 = 2;
 pub const KERN_NO_SPACE: u64 = 3;
 pub const KERN_INVALID_ARGUMENT: u64 = 4;
 pub const KERN_FAILURE: u64 = 5;
+pub const KERN_NAME_EXISTS: u64 = 13;
 pub const KERN_ABORTED: u64 = 14;
 pub const KERN_INVALID_NAME: u64 = 15;
+pub const KERN_INVALID_RIGHT: u64 = 17;
+pub const KERN_INVALID_VALUE: u64 = 18;
+pub const KERN_INVALID_CAPABILITY: u64 = 20;
+pub const KERN_RIGHT_EXISTS: u64 = 21;
+pub const KERN_TERMINATED: u64 = 37;
 pub const KERN_NOT_SUPPORTED: u64 = 46;
 pub const KERN_OPERATION_TIMED_OUT: u64 = 49;
 
@@ -45,7 +51,10 @@ pub mod port {
     /// The first thread's port; thread `n` after it has `THREAD + n * 0x100`.
     pub const THREAD: u32 = 0x103;
     /// Where the names a task allocates start (reply ports, receive rights).
-    pub const FIRST_ALLOCATED: u32 = 0x1003;
+    /// A name is an index and, in its low byte, a generation: these are of
+    /// a later generation than the ports a task is born with, so none is
+    /// ever a thread's.
+    pub const FIRST_ALLOCATED: u32 = 0x1007;
 }
 
 /// The name of thread `tid`'s port in process `pid`: the first thread's is
@@ -94,14 +103,19 @@ impl Kernel {
 
     /// Mach trap `n` (its positive number) with arguments `x`.
     pub(super) fn darwin_mach(&mut self, m: &mut GuestMem<'_>, n: u64, x: [u64; 8]) -> SysResult {
+        // A trap that might have waited and did not need to: its answer
+        // was ready when the call was read ([`Kernel::darwin_wait_trap`]).
+        if let Some(ready) = self.darwin_ready.take() {
+            return Ok(ready);
+        }
+        if let Some(r) = self.darwin_port_trap(m, n, x) {
+            return Ok(r);
+        }
         Ok(match n {
             ABSTIME | CONTTIME => self.darwin_abstime(),
             t::TASK_SELF => port::TASK as u64,
             t::HOST_SELF => port::HOST as u64,
             t::THREAD_SELF => self.darwin_thread_port() as u64,
-            t::MACH_REPLY_PORT | t::THREAD_GET_SPECIAL_REPLY_PORT => {
-                self.darwin_port_names.fetch_add(0x100, std::sync::atomic::Ordering::Relaxed) as u64
-            }
             // { numer, denom }: a tick is a nanosecond.
             t::MACH_TIMEBASE_INFO => kern(m.write_u32(x[0], 1).and_then(|_| m.write_u32(x[0] + 4, 1)).map(|_| 0)),
             t::MACH_VM_ALLOCATE => kern(self.darwin_vm_allocate(m, x[0], x[1], x[2], 0, x[3], 3)),
@@ -133,8 +147,6 @@ impl Kernel {
                 std::thread::yield_now();
                 KERN_SUCCESS
             }
-            // A message to a port that nothing serves.
-            t::MACH_MSG | t::MACH_MSG_OVERWRITE | t::MACH_MSG2 => self.darwin_unimplemented_trap(n, MACH_SEND_INVALID_DEST),
             _ => self.darwin_unimplemented_trap(n, KERN_NOT_SUPPORTED),
         })
     }

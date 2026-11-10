@@ -42,7 +42,8 @@ for debugging and for building what a page loads ahead of time.
   Darwin's numbers and layouts: files, processes, signals through XNU's
   frame, threads as libpthread asks for them, `sysctl`, terminals, sockets.
   What is not there yet is what a dynamically linked program starts with:
-  dyld and libSystem need the commpage and Mach messages (below).
+  dyld and libSystem need the commpage and more of Mach than there is
+  (below).
 - **Windows programs, through Wine.** `wine` builds Wine's own
   Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
   itself is translated like any other x86 code. The build is 64-bit Wine
@@ -184,7 +185,12 @@ the image low. What works is what a program can do with the kernel alone:
 - `sysctl` and `sysctlbyname`, `csops`, `proc_info`, `statfs`, extended
   attributes;
 - `ioctl` with BSD's `struct termios`, and pseudo-terminals;
-- sockets: unix and TCP, descriptors passed in a control message.
+- sockets: unix and TCP, descriptors passed in a control message;
+- Mach ports within a task: names and the rights under them, `mach_msg2`
+  between threads (a reply port, rights in the body, port sets, a receive
+  that waits), semaphores (and so `__semwait_signal`, which is how the
+  libc sleeps), and the few MIG routines of the task's, the host's and the
+  clock's ports that those need.
 
 What does not, yet:
 
@@ -192,10 +198,13 @@ What does not, yet:
   read the commpage, which XNU maps at `0xFFFFFC000`, past the end of any
   WebAssembly memory, and the system's libraries exist only in the dyld
   shared cache, which is mapped at 6 GiB.
-- **Mach messages.** `mach_msg` answers that there is no such destination.
-  A task has the names of its own ports and nothing to send to them, so
-  nothing that is a MIG call works: `semaphore_create` (and with it
-  `nanosleep`), `host_info`, the bootstrap port.
+- **Mach between tasks.** A port's queue lives in its own process, so no
+  right crosses a `fork` or reaches another program: no bootstrap port, no
+  launchd, no XPC. Within a task, messages carry ports but not memory out
+  of line; nothing is sent when a port dies or loses its senders; and most
+  of what the kernel's own ports are asked (`task_info`, `host_info`,
+  `vm_region`) answers `MIG_BAD_ID`. The older `mach_msg_trap` is written
+  and untested: the tests send as libsyscall does, with `mach_msg2`.
 - `kqueue`, `posix_spawn`, the `psynch` calls behind a contended pthread
   mutex, work queues, `getattrlist`, `mknod`.
 - x86-64. The entry is written (`syscall`, the class in `rax`'s top byte)

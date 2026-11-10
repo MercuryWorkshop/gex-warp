@@ -714,6 +714,11 @@ pub struct Kernel {
     pub darwin_x: [u64; 8],
     /// The next Mach port name this task allocates.
     pub darwin_port_names: Arc<std::sync::atomic::AtomicU32>,
+    /// The task's Mach port name space ([`darwin::port`]), which its
+    /// threads share and a fork does not inherit.
+    pub darwin_ports: Arc<std::sync::Mutex<darwin::port::Space>>,
+    /// The answer of a Mach trap that was ready as the call was read.
+    pub darwin_ready: Option<u64>,
     /// What the process registered of its threads ([`darwin::thread`]).
     pub darwin_threads: Arc<std::sync::Mutex<darwin::thread::Registration>>,
     /// Set by a syscall that may have made a descriptor readable or
@@ -9803,6 +9808,8 @@ impl Kernel {
             darwin_post: darwin::Post::None,
             darwin_x: [0; 8],
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
+            darwin_ports: Default::default(),
+            darwin_ready: None,
             darwin_threads: Default::default(),
             fd_activity: false,
             wasm32: false,
@@ -10233,6 +10240,8 @@ impl Kernel {
             darwin_post: darwin::Post::None,
             darwin_x: [0; 8],
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
+            darwin_ports: Default::default(),
+            darwin_ready: None,
             // The child's libpthread is the parent's, registered already.
             darwin_threads: Arc::new(std::sync::Mutex::new(*self.darwin_threads.lock().unwrap_or_else(|e| e.into_inner()))),
             fd_activity: false,

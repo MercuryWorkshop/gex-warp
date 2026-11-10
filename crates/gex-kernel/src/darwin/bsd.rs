@@ -374,6 +374,32 @@ impl Kernel {
                 self.darwin_post = Post::Zero;
                 set(nr::GETRANDOM, &[x[0], x[1], 0])
             }
+            // (semaphore, mutex's semaphore, whether there is a time,
+            // whether it is from now, seconds, nanoseconds): a wait on a
+            // Mach semaphore, which is how the libc sleeps (on one nobody
+            // signals, for the time).
+            d::SEMWAIT_SIGNAL | d::SEMWAIT_SIGNAL_NOCANCEL => {
+                let timeout = (x[2] as u32 != 0).then(|| {
+                    let ns = x[4].wrapping_mul(1_000_000_000).wrapping_add(x[5] & 0xffff_ffff);
+                    if x[3] as u32 != 0 {
+                        ns
+                    } else {
+                        let (secs, nanos) = (self.clock)();
+                        ns.saturating_sub(secs * 1_000_000_000 + nanos as u64)
+                    }
+                });
+                return match self.darwin_sem_wait(m, x[0] as u32, timeout, a) {
+                    Ok(Some(call)) => {
+                        self.darwin_post = Post::SemWait;
+                        call
+                    }
+                    Ok(None) => {
+                        *a = [0; 6];
+                        nr::NOOP_OK
+                    }
+                    Err(_) => NATIVE + code,
+                };
+            }
             d::ULOCK_WAIT => return self.darwin_ulock_wait(m, x, false, a),
             d::ULOCK_WAIT2 => return self.darwin_ulock_wait(m, x, true, a),
             d::ULOCK_WAKE => return self.darwin_ulock_wake(x, a),
