@@ -12389,9 +12389,21 @@ impl FdIo<'_> {
         // l_type, l_whence, l_start, l_len, l_pid: 64-bit offsets at 8 and 16
         // (x86-64, AArch64, wasm32), i386's flock64 packed at 4 and 12, its
         // flock's 32-bit at 4 and 8.
-        let h = m.read(arg, 4)?;
+        // A Mac's has its offsets first: l_start, l_len, l_pid, l_type,
+        // l_whence, and counts its types from 1 (read, unlock, write).
+        let mac = crate::darwin::on();
+        let h = m.read(if mac { arg + 20 } else { arg }, 4)?;
         let (typ, whence) = (u16::from_le_bytes([h[0], h[1]]) as u32, u16::from_le_bytes([h[2], h[3]]));
-        let (start, len, pid_at) = if small {
+        let typ = match (mac, typ) {
+            (false, t) => t,
+            (true, 1) => lk::RDLCK,
+            (true, 2) => lk::UNLCK,
+            (true, 3) => lk::WRLCK,
+            (true, _) => return Err(Errno::EINVAL),
+        };
+        let (start, len, pid_at) = if mac {
+            (m.read_u64(arg)? as i64, m.read_u64(arg + 8)? as i64, arg + 16)
+        } else if small {
             (m.read_u32(arg + 4)? as i32 as i64, m.read_u32(arg + 8)? as i32 as i64, arg + 12)
         } else if packed {
             (m.read_u64(arg + 4)? as i64, m.read_u64(arg + 12)? as i64, arg + 20)
@@ -12445,9 +12457,26 @@ impl FdIo<'_> {
         let (small, plain) = (cmd & LK32 != 0 && self.compat && !self.wasm32, cmd & !LK32);
         if plain == 5 || plain == 36 {
             if *typ == lk::UNLCK {
+                // (Asked of no kind of lock, a Mac says nothing is in the
+                // way; Linux refuses the question.)
+                if crate::darwin::on() {
+                    return m.write(arg + 20, &2u16.to_le_bytes()).map(|_| 0);
+                }
                 return Err(Errno::EINVAL);
             }
             let got = self.file_locks.get(path, *owner, *typ, *start, *end);
+            // (A Mac's `struct flock`, as `lock_request` reads one.)
+            if crate::darwin::on() {
+                let Some(c) = got else {
+                    return m.write(arg + 20, &2u16.to_le_bytes()).map(|_| 0);
+                };
+                m.write_u64(arg, c.start)?;
+                m.write_u64(arg + 8, if c.end == u64::MAX { 0 } else { c.end - c.start })?;
+                m.write_u32(arg + 16, c.pid as u32)?;
+                m.write(arg + 20, &(if c.typ == lk::WRLCK { 3u16 } else { 1 }).to_le_bytes())?;
+                m.write(arg + 22, &0u16.to_le_bytes())?;
+                return Ok(0);
+            }
             let Some(c) = got else {
                 return m.write(arg, &(lk::UNLCK as u16).to_le_bytes()).map(|_| 0);
             };

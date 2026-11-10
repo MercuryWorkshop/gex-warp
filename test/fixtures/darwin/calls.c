@@ -7,6 +7,7 @@
 
 enum { SYS_chown = 16, SYS_fchown = 123, SYS_setpriority = 96, SYS_getpriority = 100, SYS_fchmodat = 467, SYS_fchownat = 468 };
 enum { O_SHLOCK = 0x10, O_EXLOCK = 0x20 };
+enum { F_GETLK = 7, F_SETLK = 8, F_RDLCK = 1, F_UNLCK = 2, F_WRLCK = 3 };
 // _IOR('f', 122, int), _IOR('t', 19, struct termios), _IOR('f', 127, int)
 #define FIODTYPE 0x4004667aul
 #define TIOCGETA 0x40487413ul
@@ -89,6 +90,43 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_check("shared once it is let go", s1 >= 0);
     t_check("and shared again", SYS(SYS_open, "lk", O_SHLOCK | O_NONBLOCK | O_RDONLY) >= 0);
     t_show("but not had alone", SYS(SYS_open, "lk", O_EXLOCK | O_NONBLOCK | O_RDONLY));
+
+    // Record locks: a part of a file one process has locked is in
+    // another's way, and the other is told whose it is.
+    struct {
+        i64 start, len;
+        int pid;
+        short type, whence;
+    } fl = {128, 1, 0, F_WRLCK, 0};
+    long rec = SYS(SYS_open, "rec", O_CREAT | O_RDWR, 0644);
+    long self = SYS(SYS_getpid);
+    t_show("lock a byte, to write", SYS(SYS_fcntl, rec, F_SETLK, &fl));
+    fl.type = F_UNLCK;
+    t_show("ask what is in the way of no lock", SYS(SYS_fcntl, rec, F_GETLK, &fl));
+    t_printf("  type %d\n", fl.type);
+    fl.type = F_WRLCK;
+    t_show("and of one's own", SYS(SYS_fcntl, rec, F_GETLK, &fl));
+    t_printf("  type %d\n", fl.type);
+    long in_child = 0;
+    long locker = t_syscall2(&in_child, SYS_fork, 0, 0, 0);
+    if (in_child) {
+        long mine2 = SYS(SYS_open, "rec", O_RDWR);
+        fl.start = 100, fl.len = 100, fl.type = F_RDLCK, fl.pid = 0;
+        t_show("another process asks", SYS(SYS_fcntl, mine2, F_GETLK, &fl));
+        t_printf("  type %d from %ld for %ld, whence %d\n", fl.type, (long)fl.start, (long)fl.len, fl.whence);
+        t_check("  its holder is named", fl.pid == self);
+        fl.start = 128, fl.len = 1, fl.type = F_RDLCK;
+        t_show("and locks that byte", SYS(SYS_fcntl, mine2, F_SETLK, &fl));
+        fl.start = 0, fl.len = 100, fl.type = F_WRLCK;
+        t_show("and bytes beside it", SYS(SYS_fcntl, mine2, F_SETLK, &fl));
+        fl.type = 9;
+        t_show("and with no such kind of lock", SYS(SYS_fcntl, mine2, F_SETLK, &fl));
+        t_exit(0);
+    }
+    int lock_status = -1;
+    SYS(SYS_wait4, locker, &lock_status, 0, 0);
+    fl.start = 128, fl.len = 1, fl.type = F_UNLCK;
+    t_show("unlock it", SYS(SYS_fcntl, rec, F_SETLK, &fl));
 
     // Who may give a file away.
     long me = SYS(SYS_getuid), mine = SYS(SYS_getgid);

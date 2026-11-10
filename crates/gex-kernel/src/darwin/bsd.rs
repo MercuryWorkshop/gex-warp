@@ -450,6 +450,21 @@ impl Kernel {
             }
             // `select`'s `timeval` is `pselect6`'s `timespec`, in the
             // scratch.
+            // A record lock, which may wait: the kernel's own call, which
+            // reads a Mac's `struct flock` for a Mac's program
+            // (`FdIo::lock_request`). Darwin's commands are 7 to 9, and 90
+            // to 92 for the locks that are an open file's.
+            d::FCNTL | d::FCNTL_NOCANCEL if matches!(x[1], 7..=9 | 90..=92) => {
+                let cmd = match x[1] {
+                    7 => 5,
+                    8 => 6,
+                    9 => 7,
+                    90 => 37,
+                    91 => 38,
+                    _ => 36,
+                };
+                set(nr::FCNTL, &[x[0], cmd, x[2]])
+            }
             d::SELECT | d::SELECT_NOCANCEL => {
                 let mut ts = 0;
                 if x[4] != 0 {
