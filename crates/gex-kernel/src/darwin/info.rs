@@ -76,6 +76,10 @@ const CTL_MAXNAME: u64 = 12;
 const KERN_PROC: i32 = 14;
 const KERN_PROC_ALL: i32 = 0;
 const KERN_PROC_PID: i32 = 1;
+const KERN_PROC_PGRP: i32 = 2;
+const KERN_PROC_SESSION: i32 = 3;
+const KERN_PROC_UID: i32 = 5;
+const KERN_PROC_RUID: i32 = 6;
 const KERN_PROCARGS: i32 = 38;
 const KERN_PROCARGS2: i32 = 49;
 /// The first number of a name that has no fixed one (XNU's `OID_AUTO`
@@ -89,6 +93,7 @@ const P_LP64: u32 = 0x4;
 const P_EXEC: u32 = 0x4000;
 /// `p_stat`: running.
 const SRUN: u8 = 2;
+const SZOMB: u8 = 5;
 
 /// A value `sysctl` reports.
 enum Val {
@@ -300,6 +305,44 @@ fn oid_of(name: &str) -> Option<Vec<i32>> {
     ABSENT.iter().position(|n| *n == name).map(|row| vec![CTL_HW, AUTO + (NAMES.len() + row) as i32])
 }
 
+/// The names at the top: `CTL_KERN` and its kind.
+const TOPS: [(i32, &str); 8] = [(1, "kern"), (2, "vm"), (3, "vfs"), (4, "net"), (5, "debug"), (6, "hw"), (7, "machdep"), (8, "user")];
+
+/// A `struct kinfo_proc`: a process's id, its parent's and its group's,
+/// whether it has ended and waits to be collected, its name (16 bytes at
+/// most), its (real, effective, saved) user and group, and its
+/// controlling terminal's device and foreground group, if it has one.
+#[allow(clippy::too_many_arguments)]
+fn kinfo_proc(pid: i32, ppid: i32, pgid: i32, zombie: bool, comm: &str, [ruid, uid, svuid]: [u32; 3], [rgid, gid, svgid]: [u32; 3], tty: Option<(u32, i32)>) -> Vec<u8> {
+    const EPROC: usize = 296;
+    const P_CONTROLT: u32 = 0x2;
+    let mut b = vec![0u8; KINFO_PROC];
+    let w32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    w32(&mut b, 32, P_LP64 | P_EXEC | if tty.is_some() { P_CONTROLT } else { 0 });
+    b[36] = if zombie { SZOMB } else { SRUN };
+    w32(&mut b, 40, pid as u32);
+    // p_priority, then p_comm (16 bytes and a NUL).
+    b[240] = 31;
+    let comm = &comm.as_bytes()[..comm.len().min(16)];
+    b[243..243 + comm.len()].copy_from_slice(comm);
+    // e_pcred: p_ruid, p_svuid, p_rgid, p_svgid.
+    w32(&mut b, EPROC + 16 + 80, ruid);
+    w32(&mut b, EPROC + 16 + 84, svuid);
+    w32(&mut b, EPROC + 16 + 88, rgid);
+    w32(&mut b, EPROC + 16 + 92, svgid);
+    // e_ucred: cr_ref, cr_uid, cr_ngroups, cr_groups[0].
+    w32(&mut b, EPROC + 120, 1);
+    w32(&mut b, EPROC + 120 + 4, uid);
+    b[EPROC + 120 + 8] = 1;
+    w32(&mut b, EPROC + 120 + 12, gid);
+    w32(&mut b, EPROC + 264, ppid as u32);
+    w32(&mut b, EPROC + 268, pgid as u32);
+    // e_tdev and e_tpgid: the terminal, or none.
+    w32(&mut b, EPROC + 276, tty.map_or(u32::MAX, |t| t.0));
+    w32(&mut b, EPROC + 280, tty.map_or(0, |t| t.1 as u32));
+    b
+}
+
 /// The name `oid` numbers, if it numbers one.
 fn name_of(oid: &[i32]) -> Option<&'static str> {
     if let Some((n, _)) = NAMES.iter().find(|(_, fixed)| !fixed.is_empty() && *fixed == oid) {
@@ -413,6 +456,34 @@ impl Kernel {
             oid.push(m.read_u32(name + 4 * i)? as i32);
         }
         match oid[..] {
+            // sysctl.name and sysctl.oidfmt: the name the numbers after
+            // them number, and what kind of value it is (`CTLTYPE_*` with
+            // that it may be read, then the letter `sysctl` prints it by),
+            // which is what the `sysctl` command asks of every name first.
+            // (A number nothing has, under a name that is one, is named
+            // by the number.)
+            [0, 1, ref rest @ ..] => {
+                let name = match (name_of(rest), rest) {
+                    (Some(name), _) => name.to_string(),
+                    (None, [top, n]) => format!("{}.{n}", TOPS.iter().find(|(t, _)| t == top).ok_or(Errno::ENOENT)?.1),
+                    _ => return Err(Errno::ENOENT),
+                };
+                self.darwin_sysctl_out(m, old, oldlenp, Val::Str(name))
+            }
+            [0, 4, ref rest @ ..] => {
+                let name = name_of(rest).ok_or(Errno::ENOENT)?;
+                const CTLFLAG_RD: u32 = 0x8000_0000;
+                let (kind, letter): (u32, &[u8]) = match self.darwin_sysctl_value(name).ok_or(Errno::ENOENT)? {
+                    Val::Int(_) => (2, b"I"),
+                    Val::Str(_) => (3, b"A"),
+                    Val::Quad(_) => (4, b"Q"),
+                    Val::Bytes(_) => (5, b"S"),
+                };
+                let mut out = (kind | CTLFLAG_RD).to_le_bytes().to_vec();
+                out.extend_from_slice(letter);
+                out.push(0);
+                self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(out))
+            }
             // sysctl.name2oid: the numbers of the name in `new`.
             [0, 3] => {
                 let text = m.read(new, (newlen as usize).min(256))?.to_vec();
@@ -422,12 +493,7 @@ impl Kernel {
                 self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(numbers.iter().flat_map(|v| v.to_le_bytes()).collect()))
             }
             [CTL_KERN, KERN_PROC, what, ..] => {
-                let procs = match (what, oid.get(3)) {
-                    (KERN_PROC_PID, Some(&pid)) if pid == self.pid => self.darwin_kinfo_proc(),
-                    (KERN_PROC_ALL, _) => self.darwin_kinfo_proc(),
-                    // Nobody else: no process, and no error.
-                    _ => Vec::new(),
-                };
+                let procs = self.darwin_kinfo_procs(what, oid.get(3).copied().unwrap_or(0));
                 self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(procs))
             }
             // The routing table's list of interfaces and their addresses
@@ -439,10 +505,27 @@ impl Kernel {
                 if new != 0 { Err(Errno::EPERM) } else { Ok(0) }
             }
             [CTL_KERN, KERN_PROCARGS | KERN_PROCARGS2, pid] => {
-                if pid != self.pid {
-                    return Err(Errno::EINVAL);
-                }
-                let args = self.darwin_procargs(oid[1] == KERN_PROCARGS2);
+                let counted = oid[1] == KERN_PROCARGS2;
+                let args = if pid == self.pid {
+                    self.darwin_procargs(counted)
+                } else {
+                    // Another process's, as it last published them: its
+                    // arguments (the first for its file's name, which is
+                    // not kept apart), and none of its environment.
+                    let e = self.procs.entries().into_iter().find(|e| e.pid == pid).ok_or(Errno::EINVAL)?;
+                    let argv: Vec<&[u8]> = e.cmdline().split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+                    let mut b = Vec::new();
+                    if counted {
+                        b.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+                    }
+                    b.extend_from_slice(argv.first().copied().unwrap_or(e.comm().as_bytes()));
+                    b.push(0);
+                    for a in argv {
+                        b.extend_from_slice(a);
+                        b.push(0);
+                    }
+                    b
+                };
                 self.darwin_sysctl_out(m, old, oldlenp, Val::Bytes(args))
             }
             _ => {
@@ -525,34 +608,48 @@ impl Kernel {
     }
 
     /// This process's `struct kinfo_proc`.
-    fn darwin_kinfo_proc(&self) -> Vec<u8> {
-        const EPROC: usize = 296;
-        let mut b = vec![0u8; KINFO_PROC];
-        let w32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        w32(&mut b, 32, P_LP64 | P_EXEC);
-        b[36] = SRUN;
-        w32(&mut b, 40, self.pid as u32);
-        // p_priority, then p_comm (16 bytes and a NUL).
-        b[240] = 31;
-        let comm = self.darwin_comm();
-        b[243..243 + comm.len()].copy_from_slice(comm.as_bytes());
-        let [ruid, uid, svuid] = self.creds.uids();
-        let [rgid, gid, svgid] = self.creds.gids();
-        // e_pcred: p_ruid, p_svuid, p_rgid, p_svgid.
-        w32(&mut b, EPROC + 16 + 80, ruid);
-        w32(&mut b, EPROC + 16 + 84, svuid);
-        w32(&mut b, EPROC + 16 + 88, rgid);
-        w32(&mut b, EPROC + 16 + 92, svgid);
-        // e_ucred: cr_ref, cr_uid, cr_ngroups, cr_groups[0].
-        w32(&mut b, EPROC + 120, 1);
-        w32(&mut b, EPROC + 120 + 4, uid);
-        b[EPROC + 120 + 8] = 1;
-        w32(&mut b, EPROC + 120 + 12, gid);
-        w32(&mut b, EPROC + 264, self.procs.ppid(self.pid) as u32);
-        w32(&mut b, EPROC + 268, self.procs.pgid(self.pid, 0).unwrap_or(self.pid) as u32);
-        // e_tdev: no terminal; e_tpgid likewise.
-        w32(&mut b, EPROC + 276, u32::MAX);
-        b
+    /// `KERN_PROC`: a `struct kinfo_proc` for each process the selector
+    /// `what` picks with `arg` -- all of them, one by its id, a process
+    /// group's or a session's, a user's by the effective id or the real
+    /// one. (Nothing has a terminal to be picked by.) This process's is
+    /// its own kernel's to say; another's is what the table every process
+    /// publishes itself in has of it: its name, its ids and its kin.
+    fn darwin_kinfo_procs(&self, what: i32, arg: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut entries = self.procs.entries();
+        entries.sort_by_key(|e| e.pid);
+        // (A process alone, the table not asked: at least itself.)
+        if !entries.iter().any(|e| e.pid == self.pid) {
+            entries.push(crate::proc::ProcEntry { pid: self.pid, ppid: self.procs.ppid(self.pid), pgid: self.procs.pgid(self.pid, 0).unwrap_or(self.pid), sid: self.procs.sid(self.pid, 0).unwrap_or(self.pid), ..Default::default() });
+        }
+        for e in entries {
+            let ids = |at: usize| e.creds.get(4 * at..4 * at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+            let own = e.pid == self.pid;
+            // (real, effective, saved) of the user and of the group.
+            let uids = if own { self.creds.uids() } else { [ids(0), ids(1), ids(2)].map(|v| v.unwrap_or(self.creds.ruid())) };
+            let gids = if own { self.creds.gids() } else { [ids(3), ids(4), ids(5)].map(|v| v.unwrap_or(self.creds.rgid())) };
+            let picked = match what {
+                KERN_PROC_ALL => true,
+                KERN_PROC_PID => e.pid == arg,
+                KERN_PROC_PGRP => e.pgid == arg,
+                KERN_PROC_SESSION => e.sid == arg,
+                KERN_PROC_UID => uids[1] == arg as u32,
+                KERN_PROC_RUID => uids[0] == arg as u32,
+                _ => false,
+            };
+            if picked {
+                let comm = if own { self.darwin_comm() } else { e.comm() };
+                // The terminal its session has claimed, and that
+                // terminal's foreground group, where terminals are kept
+                // (which `ps` shows a process by, unless asked for all).
+                let tty = self.ptys.and_then(|r| {
+                    let id = (r.for_sid)(e.sid);
+                    (id >= 0).then(|| (abi::dev(crate::pty::pts_rdev(id as u32)), (r.fg)(id)))
+                });
+                out.extend_from_slice(&kinfo_proc(e.pid, e.ppid, e.pgid, e.zombie, &comm, uids, gids, tty));
+            }
+        }
+        out
     }
 
     /// The program's name as `ps` shows it: its file's, 16 bytes at most.

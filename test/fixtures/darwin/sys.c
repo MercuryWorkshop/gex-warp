@@ -110,6 +110,28 @@ static void by_number(void) {
     len = sizeof i, i = 0;
     t_show("and by that number", sysctl(oid, (u32)n, &i, &len, 0, 0));
     t_printf("  %x\n", i);
+
+    // sysctl.name and sysctl.oidfmt: a number's name, and what kind of
+    // value it is and the letter it is printed by, which the `sysctl`
+    // command asks of every name before it reads it.
+    static const struct {
+        const char *name;
+        int oid[2];
+    } kinds[] = {{"kern.ostype", {CTL_KERN, KERN_OSTYPE}}, {"kern.argmax", {CTL_KERN, KERN_ARGMAX}}, {"hw.memsize", {CTL_HW, 24}}, {"a number nothing has", {CTL_KERN, 9999}}};
+    for (unsigned k = 0; k < sizeof kinds / sizeof *kinds; k++) {
+        int q1[4] = {0, 1, kinds[k].oid[0], kinds[k].oid[1]};
+        t_memset(buf, 0, sizeof buf);
+        len = sizeof buf;
+        long r = sysctl(q1, 4, buf, &len, 0, 0);
+        t_printf("the name of %s: %ld %s\n", kinds[k].name, r, r ? "" : buf);
+        q1[1] = 4;
+        t_memset(buf, 0, sizeof buf);
+        len = sizeof buf;
+        r = sysctl(q1, 4, buf, &len, 0, 0);
+        t_printf("  its kind: %ld", r);
+        if (!r) t_printf(", %u, printed by %s", *(u32 *)buf & 0xf, buf + 4);
+        t_printf("\n");
+    }
 }
 
 static void by_name(void) {
@@ -179,6 +201,50 @@ static void process(int argc, char **argv) {
     len = 0;
     t_show("its size alone", sysctl(mib, 4, 0, &len, 0, 0));
     t_check("a kinfo_proc or more", len >= 648);
+
+    // Every process (this one among them), the user's (likewise), and a
+    // child as its parent finds it: by its id, and in its group.
+    static u8 all[648 * 2048];
+    static const struct {
+        const char *what;
+        int by;
+    } lists[] = {{"every process", 0}, {"the user's", 5}, {"the user's, by the real one", 6}};
+    for (unsigned k = 0; k < sizeof lists / sizeof *lists; k++) {
+        int ask[4] = {CTL_KERN, KERN_PROC, lists[k].by, (int)SYS(SYS_getuid)};
+        len = sizeof all;
+        long r = sysctl(ask, lists[k].by ? 4 : 3, all, &len, 0, 0);
+        int here = 0;
+        for (size_t at = 0; at + 648 <= len; at += 648) here += *(i32 *)(all + at + 40) == me;
+        t_printf("%s: %ld, whole records %d, this process among them %d\n", lists[k].what, r, len % 648 == 0, here);
+    }
+    long second = 0;
+    long kid = t_syscall2(&second, SYS_fork, 0, 0, 0);
+    if (second) {
+        // (The child: until it is told to go.)
+        char c;
+        SYS(SYS_read, 0, &c, 0);
+        struct t_timeval tv = {5, 0};
+        SYS(SYS_select, 0, 0, 0, 0, &tv);
+        t_exit(0);
+    }
+    mib[1] = KERN_PROC, mib[2] = KERN_PROC_PID, mib[3] = (int)kid;
+    len = sizeof kp;
+    t_show("a child, by its id", sysctl(mib, 4, kp, &len, 0, 0));
+    t_check("one record", len == 648);
+    t_check("it is the child", *(i32 *)(kp + 40) == kid);
+    t_check("of this process", *(i32 *)(kp + 296 + 264) == me);
+    mib[2] = 2, mib[3] = (int)SYS(SYS_getpgrp);
+    len = sizeof all;
+    t_show("this process's group", sysctl(mib, 4, all, &len, 0, 0));
+    int both = 0;
+    for (size_t at = 0; at + 648 <= len; at += 648) both += *(i32 *)(all + at + 40) == me || *(i32 *)(all + at + 40) == kid;
+    t_check("has both", both == 2);
+    mib[2] = KERN_PROC_PID, mib[3] = 99999;
+    len = sizeof kp;
+    t_show("a process there is none of", sysctl(mib, 4, kp, &len, 0, 0));
+    t_printf("  %zu bytes\n", len);
+    SYS(SYS_kill, kid, 9);
+    SYS(SYS_wait4, kid, 0, 0, 0);
 
     static char args[16384];
     len = sizeof args;

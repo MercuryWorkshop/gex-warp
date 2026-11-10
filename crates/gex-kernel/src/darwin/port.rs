@@ -1289,6 +1289,55 @@ impl Kernel {
                     }
                 }
             }
+            // host_statistics and host_statistics64(host, flavor, out
+            // info, in-out count): how loaded the machine is and what its
+            // memory is doing, which `vm_stat`, `uptime` and `top` print.
+            // There is no load kept here and no paging: the averages are
+            // nothing, the processors idle, and memory is half free, the
+            // rest of it in use the ordinary ways. A caller with room for
+            // less (an older structure) is given that much.
+            (Kind::Host, 216 | 219) => {
+                let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
+                let mc = super::info::Machine::this();
+                let pages = (mc.mem as u64 / abi::PAGE_SIZE) as u32;
+                let words = match flavor {
+                    // HOST_LOAD_INFO: three averages, and three Mach
+                    // factors (the processors free), in thousandths.
+                    1 => Some(vec![0, 0, 0, mc.cpus as u32 * 1000, mc.cpus as u32 * 1000, mc.cpus as u32 * 1000]),
+                    // HOST_VM_INFO: free, active, inactive and wired
+                    // pages, then counts of what has happened (nothing).
+                    2 => {
+                        let mut w = vec![0u32; 15];
+                        w[..4].copy_from_slice(&[pages / 2, pages / 4, pages / 8, pages / 8]);
+                        Some(w)
+                    }
+                    // HOST_CPU_LOAD_INFO: ticks spent in user code, the
+                    // system's, idle and at low priority.
+                    3 => {
+                        let ticks = (clock_ns(self.clock, 1) / 10_000_000) as u32;
+                        Some(vec![ticks / 16, ticks / 32, ticks, 0])
+                    }
+                    // HOST_VM_INFO64: the same four, the counts 64 bits
+                    // wide, and what is file-backed or not.
+                    4 if req.id == 219 => {
+                        let mut w = vec![0u32; 38];
+                        w[..4].copy_from_slice(&[pages / 2, pages / 4, pages / 8, pages / 8]);
+                        (w[34], w[35]) = (pages / 8, pages / 4);
+                        Some(w)
+                    }
+                    _ => None,
+                };
+                match words {
+                    None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                    Some(_) if room == 0 => plain(KERN_FAILURE as i32, &[]),
+                    Some(mut w) => {
+                        w.truncate(room);
+                        let mut b = (w.len() as u32).to_le_bytes().to_vec();
+                        w.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                }
+            }
             // _host_page_size(host, out size)
             (Kind::Host, 202) => plain(0, &abi::PAGE_SIZE.to_le_bytes()),
             // host_request_notification(host, what, port): to be told when
