@@ -195,6 +195,20 @@ static void named(void) {
     t_show("and to no name at all", SYS(SYS_connect, s, &sa, salen));
 }
 
+// What a socket is ready for now, asked both ways.
+static void ready(const char *what, long fd) {
+    struct {
+        int fd;
+        short events, revents;
+    } p = {(int)fd, 1 | 4, 0};
+    long n = SYS(SYS_poll, &p, 1, 0);
+    u32 r[32] = {0}, w[32] = {0};
+    r[fd / 32] = w[fd / 32] = 1u << (fd % 32);
+    struct t_timeval none = {0, 0};
+    long m = SYS(SYS_select, fd + 1, r, w, 0, &none);
+    t_printf("%s: poll %ld (0x%x), select %ld (read %d, write %d)\n", what, n, p.revents, m, r[fd / 32] != 0, w[fd / 32] != 0);
+}
+
 static void tcp(int refusal) {
     static struct t_sockaddr_in sa, got;
     long ls = SYS(SYS_socket, AF_INET, SOCK_STREAM, 0);
@@ -204,8 +218,13 @@ static void tcp(int refusal) {
     t_memset(&sa, 0, sizeof sa);
     sa.sin_len = sizeof sa, sa.sin_family = AF_INET;
     sa.sin_addr[0] = 127, sa.sin_addr[3] = 1;
+    // A stream socket nothing has been done with is ready for nothing: a
+    // program that watches a socket before it connects it (Core Foundation
+    // does) waits. Nor is one that listens, with nobody there, to write to.
+    ready("a new stream socket", ls);
     t_show("bind 127.0.0.1, any port", SYS(SYS_bind, ls, &sa, sizeof sa));
     t_show("listen", SYS(SYS_listen, ls, 4));
+    ready("one that listens", ls);
     u32 len = sizeof got;
     t_memset(&got, 0x55, sizeof got);
     t_show("getsockname", SYS(SYS_getsockname, ls, &got, &len));

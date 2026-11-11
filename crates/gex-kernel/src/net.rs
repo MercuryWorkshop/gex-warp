@@ -1915,8 +1915,10 @@ impl Socket {
             // first bit, so a holder takes the table up only when it changed
             // (`poll_readable`).
             op::READABLE if self.kind == Kind::Udp => self.poll_readable() as i64 | (self.flow_names.lock().unwrap().gen << 1) as i64,
-            op::READABLE => self.poll_readable() as i64,
-            op::WRITABLE => self.poll_writable() as i64,
+            // (For a Mac's program or not, `a`: what a socket not yet
+            // connected says differs, `readable`.)
+            op::READABLE => self.readable(a != 0) as i64,
+            op::WRITABLE => self.writable(a != 0) as i64,
             op::LISTENING => self.is_listening() as i64,
             op::QUEUE => self.wait_queue() as i64,
             op::FLOW => {
@@ -2066,7 +2068,40 @@ impl FileHandle for Socket {
     }
 
     fn poll_readable(&self) -> bool {
-        if let Some(v) = self.fwd(op::READABLE, 0, 0, &mut []) {
+        self.readable(crate::darwin::on())
+    }
+
+    /// In a page, a listener's and a loopback connection's ends are in the
+    /// global kernel, and so is the queue their changes are announced on: a
+    /// thread parked in `accept`, `poll` or `read` on one had none, and slept
+    /// through the connection or the bytes (tests/x86-programs/tcp-loopback,
+    /// a forked child connecting to its parent).
+    fn wait_queue(&self) -> u32 {
+        if let Some(v) = self.fwd(op::QUEUE, 0, 0, &mut []) {
+            return v.max(0) as u32;
+        }
+        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
+            return (r.queue)(id);
+        }
+        self.transport.lock().unwrap().as_ref().map_or(0, |t| t.wait_queue())
+    }
+
+    /// Writable, which for a socket mid-`connect` means the connect has
+    /// finished either way. This is how a non-blocking connect reports itself:
+    /// the caller waits for writable, then asks `SO_ERROR`. The trait's
+    /// default `true` would signal "finished" before it was.
+    fn poll_writable(&self) -> bool {
+        self.writable(crate::darwin::on())
+    }
+}
+
+impl Socket {
+    /// Whether there is something to read, for a Mac's program (`mac`) or
+    /// Linux's: they differ in what a TCP socket not yet connected says.
+    /// (Asked with the asker's kind: in a page the socket's state is the
+    /// global kernel's, which is nobody's.)
+    fn readable(&self, mac: bool) -> bool {
+        if let Some(v) = self.fwd(op::READABLE, mac as u64, 0, &mut []) {
             if v & 1 != 0 || v < 0 || self.kind != Kind::Udp {
                 return v != 0;
             }
@@ -2090,31 +2125,19 @@ impl FileHandle for Socket {
             // A connection that has failed or finished is readable: the
             // answer is an error or an end, and either way it is ready.
             Some(t) => t.has_data() || matches!(t.status(), Status::Closed | Status::Refused),
-            None => true,
+            // No `connect` yet: an end, as Linux has it for a fresh TCP
+            // socket (it hangs up); to a Mac's program nothing, which is
+            // what a Mac says of one. Core Foundation has its sockets
+            // watched before it connects them, and took the first for a
+            // connection that had ended.
+            None => !mac,
         }
     }
 
-    /// In a page, a listener's and a loopback connection's ends are in the
-    /// global kernel, and so is the queue their changes are announced on: a
-    /// thread parked in `accept`, `poll` or `read` on one had none, and slept
-    /// through the connection or the bytes (tests/x86-programs/tcp-loopback,
-    /// a forked child connecting to its parent).
-    fn wait_queue(&self) -> u32 {
-        if let Some(v) = self.fwd(op::QUEUE, 0, 0, &mut []) {
-            return v.max(0) as u32;
-        }
-        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
-            return (r.queue)(id);
-        }
-        self.transport.lock().unwrap().as_ref().map_or(0, |t| t.wait_queue())
-    }
 
-    /// Writable, which for a socket mid-`connect` means the connect has
-    /// finished either way. This is how a non-blocking connect reports itself:
-    /// the caller waits for writable, then asks `SO_ERROR`. The trait's
-    /// default `true` would signal "finished" before it was.
-    fn poll_writable(&self) -> bool {
-        if let Some(v) = self.fwd(op::WRITABLE, 0, 0, &mut []) {
+    /// Whether it can be written to ([`Socket::readable`]'s `mac`).
+    fn writable(&self, mac: bool) -> bool {
+        if let Some(v) = self.fwd(op::WRITABLE, mac as u64, 0, &mut []) {
             return v != 0;
         }
         if self.kind == Kind::Udp {
@@ -2122,9 +2145,10 @@ impl FileHandle for Socket {
         }
         match &*self.transport.lock().unwrap() {
             Some(t) => !matches!(t.status(), Status::Connecting),
-            // No `connect` yet. A fresh TCP socket is writable on Linux too,
-            // and a caller polling one has not asked about a connection.
-            None => true,
+            // No `connect` yet. A fresh TCP socket is writable on Linux,
+            // and a caller polling one has not asked about a connection;
+            // a Mac's is not, until it is connected.
+            None => !mac,
         }
     }
 }
