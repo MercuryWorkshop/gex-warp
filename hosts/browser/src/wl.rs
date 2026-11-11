@@ -71,6 +71,20 @@ extern "C" {
     fn wl_clip_get(ptr: u32, max: u32) -> u32;
     fn wl_clip_set(ptr: u32, len: u32, from: u32) -> u32;
     fn wl_clip_from() -> u32;
+    /// A client's own drag (`wl_data_device.start_drag`), carried by the
+    /// page's compositor (wl-bridge.mjs `ClientDrags`): whether one carries
+    /// them; the drag begun (`client`, its source, actions, icon surface, and
+    /// its types, `len` bytes at `ptr`, NUL after each), its serial (0: not
+    /// carried); the drag ended by its client; for a target, the drag's
+    /// actions (a word) and types into `ptr` (the whole length); what the
+    /// target takes (the type's index + 1, the action); and its ask for the
+    /// data as the `type`th type, through global pipe `pipe`.
+    fn wl_cdrag_carried() -> u32;
+    fn wl_cdrag_begin(client: u32, source: u32, actions: u32, icon: u32, ptr: u32, len: u32) -> u32;
+    fn wl_cdrag_end(serial: u32);
+    fn wl_cdrag_info(ptr: u32, max: u32) -> u32;
+    fn wl_cdrag_status(serial: u32, accepted: u32, action: u32);
+    fn wl_cdrag_receive(serial: u32, ty: u32, pipe: i32);
 }
 
 /// The clipboard's text types, as offered to a client, best first; and the
@@ -143,7 +157,7 @@ enum InputEvent {
     /// The page's drag of host files: enters a surface at a point (`serial`
     /// the page's number for it), moves on it, is dropped (its data is the
     /// page's, `wl_drag_data`), leaves.
-    DragEnter { client: u32, surface: u32, x: i32, y: i32, serial: u32 },
+    DragEnter { client: u32, surface: u32, x: i32, y: i32, serial: u32, own: bool },
     DragMotion { client: u32, x: i32, y: i32, time: u32 },
     Drop { client: u32, serial: u32 },
     DragLeave { client: u32 },
@@ -152,6 +166,14 @@ enum InputEvent {
     /// in 1/256 pixel.
     PointerLock { client: u32, surface: u32, on: bool },
     Relative { client: u32, dx: i32, dy: i32, time: u32 },
+    /// A drag this client started, from the page's compositor: what the
+    /// target under the pointer takes (its type's index + 1 in the drag's
+    /// types, 0 none; the action); how it ended (0 cancelled, 1 dropped on a
+    /// target that takes it, 2 the target is done); a target's ask for its
+    /// data as its `ty`th type, through global pipe `pipe`.
+    DragSource { client: u32, accepted: u32, action: u32 },
+    DragSourceEnd { client: u32, how: u32 },
+    DragSend { client: u32, ty: u32, pipe: i32 },
 }
 
 impl InputEvent {
@@ -176,7 +198,10 @@ impl InputEvent {
             | InputEvent::Drop { client, .. }
             | InputEvent::DragLeave { client }
             | InputEvent::PointerLock { client, .. }
-            | InputEvent::Relative { client, .. } => client,
+            | InputEvent::Relative { client, .. }
+            | InputEvent::DragSource { client, .. }
+            | InputEvent::DragSourceEnd { client, .. }
+            | InputEvent::DragSend { client, .. } => client,
         }
     }
 }
@@ -235,12 +260,15 @@ fn poll_input() -> Vec<InputEvent> {
                 8 => InputEvent::Close { client, surface },
                 9 => InputEvent::DismissPopup { client, surface },
                 10 => InputEvent::Moved { client, surface, x: q[1], y: q[2] },
-                11 => InputEvent::DragEnter { client, surface, x: q[1], y: q[2], serial: q[3] as u32 },
+                11 => InputEvent::DragEnter { client, surface, x: q[1], y: q[2], serial: q[3] as u32, own: q[4] == 1 },
                 12 => InputEvent::DragMotion { client, x: q[1], y: q[2], time: q[3] as u32 },
                 13 => InputEvent::Drop { client, serial: q[1] as u32 },
                 14 => InputEvent::DragLeave { client },
                 15 => InputEvent::PointerLock { client, surface, on: q[1] != 0 },
                 16 => InputEvent::Relative { client, dx: q[1], dy: q[2], time: q[3] as u32 },
+                17 => InputEvent::DragSource { client, accepted: q[1] as u32, action: q[2] as u32 },
+                18 => InputEvent::DragSourceEnd { client, how: q[1] as u32 },
+                19 => InputEvent::DragSend { client, ty: q[1] as u32, pipe: q[2] },
                 _ => return None,
             })
         })
@@ -466,6 +494,12 @@ struct Session {
     drag: Option<SessionDrag>,
     /// The clipboard, between this client and the page.
     clip: SessionClip,
+    /// A drag this client started, while the page carries it.
+    own: Option<OwnDrag>,
+    /// Data of a client's drag on its way into this client's receives: the
+    /// global pipe the source writes, the client's descriptor, bytes read
+    /// and not yet written, and since when (ns).
+    copies: Vec<(Arc<OpenFile>, Arc<OpenFile>, Vec<u8>, u64)>,
     /// Event bytes the socket had no room for yet, and how many have gone.
     out: Vec<u8>,
     sent: usize,
@@ -479,9 +513,30 @@ struct Session {
     showing: std::collections::VecDeque<(u32, u64, u64)>,
 }
 
+/// A drag a client started (`Session::own`): the page's serial for it, its
+/// source and types, and whether it was dropped (the pointer is no longer
+/// its own; the source waits for the target's finish).
+struct OwnDrag {
+    serial: u32,
+    source: Option<u32>,
+    types: Vec<String>,
+    dropped: bool,
+}
+
+/// Bytes a global pipe end and a descriptor carry at most, between pumps.
+const COPY_CHUNK: usize = 16384;
+/// A copy into a receive that sees nothing in this long is given up: its
+/// source went without writing, or never had the ask.
+const COPY_STALL_NS: u64 = 10_000_000_000;
+
 /// The page's drag over one client (`Session::drag`).
 struct SessionDrag {
     serial: u32,
+    /// A client's own drag (any process's): its types, which the
+    /// receives name, and what was last said of it (`wl_cdrag_status`).
+    /// `None`: the page's drag of host files.
+    types: Option<Vec<String>>,
+    said2: u32,
     /// Its text/uri-list, from the page at the enter: a client may read it
     /// then, to decide whether it takes the drag (Wine does).
     data: Vec<u8>,
@@ -495,6 +550,19 @@ fn drag_data() -> Vec<u8> {
     let n = unsafe { wl_drag_data(buf.as_mut_ptr() as u32, buf.len() as u32) } as usize;
     buf.truncate(n.min(DRAG_DATA_MAX));
     buf
+}
+
+/// A client's own drag's actions and types (`wl_cdrag_info`), for a target
+/// it enters.
+fn client_drag_info() -> (u32, Vec<String>) {
+    let mut buf = vec![0u8; 4096];
+    let n = (unsafe { wl_cdrag_info(buf.as_mut_ptr() as u32, buf.len() as u32) } as usize).min(buf.len());
+    if n < 4 {
+        return (0, Vec::new());
+    }
+    let actions = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let types = buf[4..n].split(|b| *b == 0).filter(|t| !t.is_empty()).map(|t| String::from_utf8_lossy(t).into_owned()).collect();
+    (actions, types)
 }
 
 /// A publish the compositor has not drawn in this long is taken as drawn: a
@@ -647,8 +715,38 @@ impl Session {
             }
             return;
         };
+        if let Some(types) = d.types.clone() {
+            // A client's drag: the source writes into a global pipe (`DragSend`
+            // in its process), and this copies out of it into the receive.
+            for r in std::mem::take(&mut receives) {
+                let Some(file) = self.fds.get_mut(r.fd as usize).and_then(Option::take) else { continue };
+                let (Some(ty), Some(pipes)) = (types.iter().position(|t| *t == r.mime), crate::global_pipes()) else { continue };
+                let id = (pipes.new)(crate::my_pid());
+                if id < 0 {
+                    continue;
+                }
+                // The write end's reference goes to the source's process, which
+                // adopts it (`DragSend`); this one keeps the read end.
+                let read = OpenFile::new(
+                    Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write: false, remote: pipes }),
+                    format!("pipe:[{id}]"),
+                    0,
+                    true,
+                    false,
+                );
+                unsafe { wl_cdrag_receive(d.serial, ty as u32, id) };
+                self.copies.push((read, file, Vec::new(), crate::now_ns()));
+            }
+            let st = self.client.drag_status();
+            let accepted = st.as_ref().and_then(|st| st.accepted.as_ref()).and_then(|m| types.iter().position(|t| t == m)).map_or(0, |i| i as u32 + 1);
+            let said2 = accepted | st.as_ref().map_or(0, |st| st.action) << 8;
+            if said2 != d.said2 {
+                d.said2 = said2;
+                unsafe { wl_cdrag_status(d.serial, accepted, said2 >> 8) };
+            }
+        }
         let data = &d.data;
-        for r in receives {
+        for r in receives.into_iter().filter(|_| d.types.is_none()) {
             let Some(file) = self.fds.get_mut(r.fd as usize).and_then(Option::take) else { continue };
             if r.mime != "text/uri-list" {
                 continue;
@@ -682,6 +780,73 @@ impl Session {
         if (flags & DRAG_ANSWERED != 0 && flags & DRAG_TAKEN == 0) || flags & DRAG_FINISHED != 0 {
             self.drag = None;
         }
+    }
+}
+
+impl Session {
+    /// A client's drag's data on its way into this client's receives: as
+    /// much as the pipe has and the descriptor takes; at the pipe's end the
+    /// descriptor is let go, so the client reads to its end.
+    fn pump_copies(&mut self) {
+        let now = crate::now_ns();
+        self.copies.retain_mut(|(pipe, to, held, since)| {
+            loop {
+                while !held.is_empty() {
+                    match to.write(held) {
+                        Ok(n) if n > 0 => {
+                            held.drain(..n as usize);
+                        }
+                        Err(e) if e == gex_kernel::Errno::EAGAIN => return true,
+                        _ => return false,
+                    }
+                }
+                let mut buf = [0u8; COPY_CHUNK];
+                match pipe.read(&mut buf) {
+                    Ok(0) => return false,
+                    Ok(n) => {
+                        held.extend_from_slice(&buf[..n as usize]);
+                        *since = now;
+                    }
+                    Err(e) if e == gex_kernel::Errno::EAGAIN => return now.saturating_sub(*since) < COPY_STALL_NS,
+                    Err(_) => return false,
+                }
+            }
+        });
+    }
+
+    /// This client's own drag: taken for the page to carry when a page
+    /// compositor does, and ended when the client ends it.
+    fn pump_own_drag(&mut self) {
+        if let Some(o) = &self.own {
+            // Its source destroyed while the pointer was the drag's.
+            if !o.dropped && !self.client.is_dragging() {
+                unsafe { wl_cdrag_end(o.serial) };
+                self.own = None;
+            }
+        }
+        // (left alone where nothing would carry it: the pointer stays the
+        // client's, as before)
+        if unsafe { wl_cdrag_carried() } == 0 {
+            return;
+        }
+        let Some(start) = self.client.take_drag_start() else { return };
+        let mut types = Vec::new();
+        for m in &start.mimes {
+            types.extend_from_slice(m.as_bytes());
+            types.push(0);
+        }
+        let serial = unsafe {
+            wl_cdrag_begin(self.idx, start.source.unwrap_or(0), start.actions, start.icon.unwrap_or(0), types.as_ptr() as u32, types.len() as u32)
+        };
+        if serial == 0 {
+            // (the page stopped carrying them meanwhile)
+            self.client.drag_source_cancel(start.source);
+            return;
+        }
+        unsafe {
+            crate::write_stderr(&format!("[wl] dnd: client {} starts a drag of {:?} (serial {serial:#x})\n", self.idx, start.mimes));
+        }
+        self.own = Some(OwnDrag { serial, source: start.source, types: start.mimes, dropped: false });
     }
 }
 
@@ -801,6 +966,10 @@ impl WaylandDevice {
                 }
             }
             s.rbuf = buf;
+            // A drag this client started: the page's to carry.
+            s.pump_own_drag();
+            // Descriptors for this client's source's `send`s, riding with them.
+            let mut drag_fds: Vec<Arc<OpenFile>> = Vec::new();
             // Deliver this turn's events now that any `get_pointer`/
             // `get_keyboard` from this turn's bytes has been processed.
             if s.client.wants_input() {
@@ -888,10 +1057,83 @@ impl WaylandDevice {
                         }
                         // Host files, as a text/uri-list with copy (as the
                         // native compositor's scripted drag).
+                        // A client's own drag: its types and actions, from the page.
+                        InputEvent::DragEnter { surface, x, y, serial, own: true, .. } => {
+                            let (actions, types) = client_drag_info();
+                            let mimes: Vec<&str> = types.iter().map(String::as_str).collect();
+                            let actions = if actions == 0 { gex_wayland::data::DND_COPY } else { actions };
+                            let ok = s.client.drag_enter(surface, x, y, &mimes, actions);
+                            if ok {
+                                s.drag = Some(SessionDrag { serial, types: Some(types), said2: 0, data: Vec::new(), said: 0 });
+                            } else {
+                                s.drag = None;
+                                unsafe { wl_drag_status(serial, DRAG_ANSWERED) };
+                            }
+                        }
+                        InputEvent::DragSource { accepted, action, .. } => {
+                            if let Some(o) = s.own.as_ref().filter(|o| !o.dropped) {
+                                if let Some(source) = o.source {
+                                    let st = (accepted != 0).then(|| gex_wayland::data::DragStatus {
+                                        surface: 0,
+                                        accepted: o.types.get(accepted as usize - 1).cloned(),
+                                        action,
+                                        dropped: false,
+                                        finished: false,
+                                    });
+                                    s.client.drag_source_status(source, st.as_ref());
+                                }
+                            }
+                        }
+                        InputEvent::DragSourceEnd { how, .. } => {
+                            if let Some(o) = s.own.as_mut() {
+                                match how {
+                                    1 => {
+                                        o.dropped = true;
+                                        let source = o.source;
+                                        s.client.drag_source_drop(source);
+                                    }
+                                    2 => {
+                                        if let Some(source) = o.source {
+                                            s.client.drag_source_finished(source);
+                                        }
+                                        s.own = None;
+                                    }
+                                    _ => {
+                                        let source = o.source;
+                                        s.client.drag_source_cancel(source);
+                                        s.own = None;
+                                    }
+                                }
+                            }
+                        }
+                        InputEvent::DragSend { ty, pipe, .. } => {
+                            // The write end, adopted from the target's process
+                            // (it made the pipe), for the source's `send`.
+                            let ask = s.own.as_ref().and_then(|o| Some((o.source?, o.types.get(ty as usize)?.clone())));
+                            match (ask, crate::global_pipes()) {
+                                (Some((source, mime)), Some(pipes)) => {
+                                    let end = OpenFile::new(
+                                        Arc::new(gex_kernel::pipe::RemotePipeEnd { id: pipe, write: true, remote: pipes }),
+                                        format!("pipe:[{pipe}]"),
+                                        1,
+                                        false,
+                                        true,
+                                    );
+                                    s.client.ask_source(source, &mime);
+                                    drag_fds.push(end);
+                                }
+                                (_, Some(pipes)) => {
+                                    // No source to ask: the end is closed, and the
+                                    // target reads nothing.
+                                    drop(gex_kernel::pipe::RemotePipeEnd { id: pipe, write: true, remote: pipes });
+                                }
+                                _ => {}
+                            }
+                        }
                         InputEvent::DragEnter { surface, x, y, serial, .. } => {
                             let ok = s.client.drag_enter(surface, x, y, &["text/uri-list"], gex_wayland::data::DND_COPY);
                             if ok {
-                                s.drag = Some(SessionDrag { serial, data: drag_data(), said: 0 });
+                                s.drag = Some(SessionDrag { serial, types: None, said2: 0, data: drag_data(), said: 0 });
                             } else {
                                 // No data device, or no such surface: refused now.
                                 s.drag = None;
@@ -918,7 +1160,8 @@ impl WaylandDevice {
                 }
             }
             s.answer_drag();
-            let mut clip_fds = Vec::new();
+            s.pump_copies();
+            let mut clip_fds = drag_fds;
             s.pump_clip(&mut clip_fds);
             // The X window manager, if this client is an X server. Connected
             // lazily: the socket only exists once Xwayland has bound it, which
@@ -1213,6 +1456,8 @@ impl HostListener for WaylandDevice {
             fds: Vec::new(),
             drag: None,
             clip: SessionClip::default(),
+            own: None,
+            copies: Vec::new(),
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),

@@ -32,6 +32,8 @@ import {
   ROLE_POPUP,
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
+  ROLE_DRAG_ICON,
+  ClientDrags,
   F_CONFIGURE_PENDING,
   F_FULLSCREEN,
   F_POINTER_LOCK,
@@ -538,6 +540,7 @@ class Compositor {
   constructor(canvas, channel, stats, gpu) {
     this.#channel = channel;
     this.#stats = stats;
+    this.#cdrags = new ClientDrags(channel);
     const device = gpu.device;
     this.#device = device;
     this.#canvas = canvas;
@@ -557,6 +560,8 @@ class Compositor {
   }
 
   #canvas;
+  /** Clients' own drags, carried across every process's windows. */
+  #cdrags;
 
   /* start()'s background image: a texture, drawn first, covering the output
    * and anchored at `anchor` (top, center, bottom: the edge that always
@@ -1491,8 +1496,22 @@ class Compositor {
     return null;
   }
 
+  /** A client's drag, each frame: carried on (`ClientDrags.poll`); one
+   *  that began after the button it was pressed with was let go is released
+   *  now, where the pointer is. Whether its icon is to be drawn. */
+  #carryDrag() {
+    const fresh = this.#cdrags.drag === null;
+    if (!this.#cdrags.poll()) return false;
+    if (fresh && this.#cdrags.drag && !this.#cdrags.drag.over) {
+      this.#cdrags.move(this.windowAt(this.#pointer.x, this.#pointer.y));
+      if (!(this.#pointer.buttons & 1)) this.#cdrags.release();
+    }
+    return [...this.#windows.values()].some((w) => w.role === ROLE_DRAG_ICON);
+  }
+
   frame() {
-    if (this.#still()) {
+    const icon = this.#carryDrag();
+    if (this.#still() && !icon) {
       this.#skipped++;
       return;
     }
@@ -1518,7 +1537,7 @@ class Compositor {
     // readback where the browser composites in software (headless), and
     // wasted work everywhere else.
     const sig = this.#signature();
-    if (sig !== null && sig === this.#lastSig) {
+    if (sig !== null && sig === this.#lastSig && !icon) {
       for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
       if (!unread) this.#mark(blocks);
       this.#skipped++;
@@ -1545,6 +1564,15 @@ class Compositor {
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);
+      }
+    }
+    // A client's drag's icon, over everything, at the pointer.
+    if (icon) {
+      for (const [k, win] of this.#windows) {
+        if (win.role !== ROLE_DRAG_ICON) continue;
+        const t = this.#textures.get(k);
+        const kk = win.cs || 1;
+        if (t) this.#painter.textured(this.#pointer.x - (win.info?.relX ?? 0) * kk, this.#pointer.y - (win.info?.relY ?? 0) * kk, win.width, win.height, t.tex, { swizzle: 1, opaque: win.info?.format === 1 ? 1 : 0 });
       }
     }
     // No cursor: the client's is the page's own CSS cursor (`#updateCursor`),
@@ -1691,6 +1719,11 @@ class Compositor {
     }
     this.#pointer.x = x;
     this.#pointer.y = y;
+    // A client's drag has the pointer: the window under it is the drag's.
+    if (this.#cdrags.poll()) {
+      this.#cdrags.move(this.windowAt(x, y), time);
+      return;
+    }
     if (this.#resize) {
       this.#resizeTo(x, y, false);
       return;
@@ -1741,6 +1774,14 @@ class Compositor {
     const locked = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
     if (locked) {
       sendEvent(this.#channel, locked.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, locked.client, locked.surface);
+      return;
+    }
+    // A client's drag: its release drops it or cancels it (the press it
+    // began with was its source's).
+    if (!pressed && this.#cdrags.poll()) {
+      this.#pointer.buttons &= ~1;
+      if (!this.#pointer.buttons) this.#grab = null;
+      this.#cdrags.release();
       return;
     }
     if (pressed) {

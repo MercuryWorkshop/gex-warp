@@ -16,7 +16,7 @@
 // layout a page would otherwise do, and the `describe()` a harness reads from
 // the scene compositor (titles, the surface list, a content hash).
 
-import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR } from './dom-compositor.js';
+import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR, ROLE_DRAG_ICON } from './dom-compositor.js';
 
 /** Lay `desktop`'s windows out in `mount` (a positioned element). */
 export function bareDesktop(desktop, mount) {
@@ -86,7 +86,7 @@ export function bareDesktop(desktop, mount) {
     restack();
   };
   desktop.onwindow = (win) => {
-    if (win.role === ROLE_CURSOR) return;
+    if (win.role === ROLE_CURSOR || win.role === ROLE_DRAG_ICON) return;
     const c = win.canvas;
     c.style.position = 'absolute';
     size(win);
@@ -121,7 +121,7 @@ export function bareDesktop(desktop, mount) {
   /** What the scene compositor's `describe()` says, as far as a harness reads
    *  it: the toplevels' titles, every surface, and a hash of what is shown. */
   desktop.describe = async () => {
-    const wins = desktop.windows().filter((w) => w.role !== ROLE_CURSOR);
+    const wins = desktop.windows().filter((w) => w.role !== ROLE_CURSOR && w.role !== ROLE_DRAG_ICON);
     const tops = wins.filter((w) => w.role === ROLE_TOPLEVEL);
     let hash = 2166136261;
     let lit = 0;
@@ -158,7 +158,7 @@ export function bareDesktop(desktop, mount) {
     };
   };
   /** Whether a window's first pixels are in the page (app.js's progress). */
-  desktop.presented = () => desktop.windows().some((w) => w.role !== ROLE_CURSOR && w.paints > 0
+  desktop.presented = () => desktop.windows().some((w) => w.role !== ROLE_CURSOR && w.role !== ROLE_DRAG_ICON && w.paints > 0
     && w.canvas.isConnected && w.canvas.width > 1 && w.canvas.height > 1);
   return desktop;
 }

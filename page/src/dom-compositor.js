@@ -72,6 +72,8 @@ import {
   ROLE_POPUP,
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
+  ROLE_DRAG_ICON,
+  ClientDrags,
   takesPointer,
 } from '@gex/wl-bridge.mjs';
 import { pageParams } from './page-env.js';
@@ -387,6 +389,13 @@ export class DomDesktop {
   #locked = null;
   /** The window the last press was on. */
   #pressed = null;
+  /** Clients' own drags, carried across every process's windows, and the
+   *  icon of the one under way (drawn at the pointer, over everything);
+   *  the pointer's buttons as last seen. */
+  #drags = null;
+  #dragIcon = null;
+  #buttons = 0;
+  #pointerAt = { x: 0, y: 0 };
   #onLockChange = () => {
     const el = document.pointerLockElement;
     const win = el ? [...this.#windows.values()].find((w) => w.canvas === el) ?? null : null;
@@ -405,6 +414,7 @@ export class DomDesktop {
     const w = width || mount.clientWidth || 1280;
     const h = height || mount.clientHeight || 760;
     setOutputSize(channel, w, h);
+    d.#drags = new ClientDrags(channel);
     d.#listen();
     document.addEventListener('pointerlockchange', d.#onLockChange);
     d.#running = true;
@@ -571,6 +581,7 @@ export class DomDesktop {
 
   stop() {
     this.#running = false;
+    this.#drags?.stop();
     document.removeEventListener('pointerlockchange', this.#onLockChange);
     if (this.#locked) document.exitPointerLock?.();
     if (this.#raf) cancelAnimationFrame(this.#raf);
@@ -619,7 +630,7 @@ export class DomDesktop {
     const wins = [...this.#windows.values()];
     for (const el of document.elementsFromPoint(clientX, clientY)) {
       const win = wins.find((w) => w.canvas === el || w.glCanvas === el);
-      if (!win) continue;
+      if (!win || win.role === ROLE_DRAG_ICON || win.role === ROLE_CURSOR) continue;
       let top = win;
       for (let i = 0; top.parent && i < 16; i++) {
         const up = wins.find((w) => w.token === top.token && w.client === top.client && w.surface === top.parent);
@@ -660,6 +671,7 @@ export class DomDesktop {
         this.#gl?.display?.();
       }
       if (!this.#still()) this.#reconcile();
+      this.#carryDrag();
     } catch (e) {
       console.error('[dom-desktop]', e);
     }
@@ -707,6 +719,7 @@ export class DomDesktop {
         this.#windows.set(k, win);
         this.#attach(win);
         if (s.role === ROLE_CURSOR) this.#cursor = win;
+        else if (s.role === ROLE_DRAG_ICON) this.#showDragIcon(win);
         else this.onwindow?.(win);
         winNote(win, 'new');
         // Not a placed one: its client says when it has the keyboard
@@ -739,6 +752,10 @@ export class DomDesktop {
       this.#focus = null;
       const prev = [...this.#focusPrev].reverse().find((w) => this.#windows.get(w.key) === w);
       if (prev) this.focus(prev);
+    }
+    if (this.#dragIcon === win) {
+      win.canvas.remove();
+      this.#dragIcon = null;
     }
     if (this.#cursor === win) {
       // The client took its cursor away: back to the page's own pointer,
@@ -803,7 +820,8 @@ export class DomDesktop {
         && navigator.userActivation?.isActive && document.pointerLockElement !== win.canvas) {
       win.canvas.requestPointerLock?.()?.catch?.(() => {});
     }
-    const noInput = !takesPointer(s);
+    // (a drag's icon is never hit: `#showDragIcon`)
+    const noInput = !takesPointer(s) || s.role === ROLE_DRAG_ICON;
     if (noInput !== win.noInput) {
       win.noInput = noInput;
       win.canvas.style.pointerEvents = noInput ? 'none' : '';
@@ -896,6 +914,46 @@ export class DomDesktop {
   }
 
   oncursor = null;
+
+  // -- a client's own drag -------------------------------------------------
+
+  /** Each frame: what the drag's target says goes to its source, and a
+   *  drag that began after its buttons were let go (the release came
+   *  before the client's start_drag) is released now, where the pointer is. */
+  #carryDrag() {
+    const fresh = this.#drags.drag === null;
+    if (!this.#drags.poll()) return;
+    if (fresh && this.#drags.drag && !this.#drags.drag.over) {
+      this.#drags.move(this.windowAt(this.#pointerAt.x, this.#pointerAt.y));
+      if (!(this.#buttons & 1)) this.#drags.release();
+    }
+    if (this.#dragIcon) this.#placeDragIcon();
+  }
+
+  /** The pointer moved during a drag (its moves are the drag's, not the
+   *  window's): the window under it, as the browser's hit test has it. */
+  #dragTo(e) {
+    this.#pointerAt = { x: e.clientX, y: e.clientY };
+    this.#drags.move(this.windowAt(e.clientX, e.clientY), Math.round(e.timeStamp));
+    if (this.#dragIcon) this.#placeDragIcon();
+  }
+
+  /** A drag's icon: over everything, at the pointer, never hit. */
+  #showDragIcon(win) {
+    this.#dragIcon = win;
+    Object.assign(win.canvas.style, { position: 'fixed', pointerEvents: 'none', zIndex: '2147483647', left: '0px', top: '0px' });
+    document.body.append(win.canvas);
+    this.#placeDragIcon();
+  }
+
+  #placeDragIcon() {
+    const win = this.#dragIcon;
+    const scale = win.bufferScale || 1;
+    win.canvas.style.width = `${Math.round(win.width / scale)}px`;
+    win.canvas.style.height = `${Math.round(win.height / scale)}px`;
+    win.canvas.style.left = `${Math.round(this.#pointerAt.x - win.relX)}px`;
+    win.canvas.style.top = `${Math.round(this.#pointerAt.y - win.relY)}px`;
+  }
 
   // -- what the page asks for ---------------------------------------------
 
@@ -1039,6 +1097,14 @@ export class DomDesktop {
                 p.t, 0, win.client, win.surface);
     };
     c.addEventListener('pointermove', (e) => {
+      this.#buttons = e.buttons;
+      this.#pointerAt = { x: e.clientX, y: e.clientY };
+      // A client's drag has the pointer.
+      if (this.#drags.poll()) {
+        this.#dragTo(e);
+        if (e.button >= 0 && !(e.buttons & 1)) this.#drags.release();
+        return;
+      }
       // Locked: movement only, which the client's relative pointer takes.
       if (this.#locked === win) {
         if (e.movementX || e.movementY) {
@@ -1055,6 +1121,8 @@ export class DomDesktop {
     });
     c.addEventListener('pointerdown', (e) => {
       this.#pressed = win;
+      this.#buttons = e.buttons;
+      this.#pointerAt = { x: e.clientX, y: e.clientY };
       if (this.#locked === win) {
         button(e, true, { t: Math.round(e.timeStamp) });
         return;
@@ -1072,6 +1140,13 @@ export class DomDesktop {
       button(e, true, p);
     });
     c.addEventListener('pointerup', (e) => {
+      this.#buttons = e.buttons;
+      this.#pointerAt = { x: e.clientX, y: e.clientY };
+      // The drag's release: dropped where it is, or cancelled.
+      if (this.#drags.poll()) {
+        this.#dragTo(e);
+        this.#drags.release();
+      }
       const p = at(e);
       try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
       button(e, false, p);
@@ -1079,6 +1154,8 @@ export class DomDesktop {
     // The browser took the pointer (a touch turned into a scroll, the page
     // lost it): whatever is down is up, or the client keeps a drag going.
     c.addEventListener('pointercancel', (e) => {
+      this.#buttons = 0;
+      if (this.#drags.poll()) this.#drags.release();
       const t = Math.round(e.timeStamp);
       for (const code of held) sendEvent(this.#channel, win.block, EV_BUTTON, code, 0, t, 0, win.client, win.surface);
       held.clear();
@@ -1155,4 +1232,4 @@ export class DomDesktop {
   }
 }
 
-export { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR };
+export { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR, ROLE_DRAG_ICON };

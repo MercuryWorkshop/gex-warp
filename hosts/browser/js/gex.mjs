@@ -2521,6 +2521,14 @@ export class Gex {
         wl_clip_get: (ptr, max) => this.#wl?.clipGet?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         wl_clip_set: (ptr, len, from) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0, from >>> 0) ?? 0,
         wl_clip_from: () => this.#wl?.clipFrom?.() ?? 0,
+        // A client's own drag, carried by the page's compositor (wl-bridge.mjs ClientDrags).
+        wl_cdrag_carried: () => (this.#wl?.clientDragsCarried?.() ? 1 : 0),
+        wl_cdrag_begin: (client, source, actions, icon, ptr, len) =>
+          this.#wl?.clientDragBegin?.(this.#memory, client >>> 0, source >>> 0, actions >>> 0, icon >>> 0, ptr >>> 0, len >>> 0) ?? 0,
+        wl_cdrag_end: (serial) => this.#wl?.clientDragEnd?.(serial >>> 0),
+        wl_cdrag_info: (ptr, max) => this.#wl?.clientDragInfo?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        wl_cdrag_status: (serial, accepted, action) => this.#wl?.clientDragStatus?.(serial >>> 0, accepted >>> 0, action >>> 0),
+        wl_cdrag_receive: (serial, type, pipe) => this.#wl?.clientDragReceive?.(serial >>> 0, type >>> 0, pipe | 0),
     };
   }
 

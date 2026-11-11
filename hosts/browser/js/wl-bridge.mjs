@@ -163,6 +163,20 @@ export const DRAG_ACCEPTS = 1;
 export const DRAG_ANSWERED = 2;
 export const DRAG_TAKEN = 4;
 export const DRAG_FINISHED = 8;
+/** A client's own drag (`ClientDrags`), to the process whose source it
+ *  is: what the target under the pointer takes (a1 the type's index in the
+ *  drag's types + 1, 0 none; b1 the action); the drag's end (a1 0
+ *  cancelled, 1 dropped on a target that takes it, 2 the target is done);
+ *  and a target's ask for its data (a1 the type's index, b1 a global
+ *  pipe's id, whose write end the source's `send` is given). Its enter on a
+ *  target is `EV_DRAG_ENTER` with d1 1: the types are the drag's
+ *  (`clientDragInfo`), not the page's. */
+export const EV_DRAG_SOURCE = 17;
+export const EV_DRAG_SOURCE_END = 18;
+export const EV_DRAG_SEND = 19;
+/** A role: a client's drag's icon, drawn at the pointer, its hotspot at
+ *  `relX`, `relY` as a cursor's. */
+export const ROLE_DRAG_ICON = 5;
 
 // -- layout -----------------------------------------------------------------
 //
@@ -185,7 +199,11 @@ const M_RELAY = 5;
 const M_RELAY_BLOCKS = 6;
 /** The last pixel buffer number handed out (`WlProxy`'s buffers). */
 const M_PIXEL_IDS = 7;
-const M_WORDS = 8;
+/** Set by a compositor that carries clients' own drags (`ClientDrags`):
+ *  until one does, a process's compositor leaves a client's `start_drag`
+ *  alone, rather than give a drag the pointer that nothing would end. */
+const M_CDRAG = 8;
+const M_WORDS = 9;
 
 // Block header: the token that claimed it, a heartbeat so a dead process's
 // block can be reclaimed, how many surfaces it published, a generation that
@@ -204,7 +222,11 @@ const B_SLOTS = 6;
 /** The page's drag, as the guest last said of it (`wl_drag_status`):
  *  `serial << 4 | DRAG_*`. Notified when it changes. */
 const B_DRAG = 7;
-const B_WORDS = 8;
+/** What the guest says of a client's own drag (`wl_cdrag_status`): the
+ *  drag's serial's low 16 bits << 16, the action << 8, the accepted type's
+ *  index + 1. */
+const B_DRAG2 = 8;
+const B_WORDS = 9;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
 // Ring header: a monotonic write cursor and read cursor.
@@ -230,9 +252,45 @@ const C_HEAD = 4;
 const C_BYTES = 1 << 20;
 const C_WORDS = C_HEAD + C_BYTES / 4;
 
-const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS + C_WORDS;
+// A client's own drag (one at a time a page, as the pointer is): a lock, its
+// serial (moves with each new drag), whether it still has the pointer (1;
+// 0 once the page or its source ended it), the block and client that
+// started it, its source's id, its actions, its icon surface, then a queue
+// of targets' asks for its data (serial, type index, pipe id: X_ASKS of
+// them), then its types, NUL after each.
+const X_LOCK = 0;
+const X_SERIAL = 1;
+const X_STATE = 2;
+const X_BLOCK = 3;
+const X_CLIENT = 4;
+const X_SOURCE = 5;
+const X_ACTIONS = 6;
+const X_ICON = 7;
+const X_LEN = 8;
+const X_HEAD = 9;
+const X_TAIL = 10;
+const X_ASK = 11;
+const X_ASKS = 16;
+const X_TYPES = X_ASK + 3 * X_ASKS;
+const X_BYTES = 2048;
+const X_WORDS = X_TYPES + X_BYTES / 4;
+/** A client drag's serials are apart from the page's own (`PageDrag`). */
+const X_SERIAL_BIT = 0x08000000;
+
+const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS + C_WORDS + X_WORDS;
 const dragBase = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
 const clipBase = dragBase + D_WORDS;
+const xBase = clipBase + C_WORDS;
+
+function xLock(a) {
+  while (Atomics.compareExchange(a, xBase + X_LOCK, 0, 1) !== 0) {
+    if (typeof Atomics.wait === 'function' && !globalThis.document) Atomics.wait(a, xBase + X_LOCK, 1, 1);
+  }
+}
+function xUnlock(a) {
+  Atomics.store(a, xBase + X_LOCK, 0);
+  Atomics.notify(a, xBase + X_LOCK);
+}
 
 function clipLock(a) {
   while (Atomics.compareExchange(a, clipBase + C_LOCK, 0, 1) !== 0) {
@@ -589,6 +647,169 @@ export async function waitDrag(channel, block, serial, want, ms) {
     } else {
       await new Promise((res) => setTimeout(res, Math.min(left, 20)));
     }
+  }
+}
+
+/**
+ * Clients' own drags (`wl_data_device.start_drag`), carried by a page
+ * compositor across every process's windows. The process whose client
+ * started one says so in the arena (`WlProxy.clientDragBegin`); from then
+ * the pointer is the drag's: the compositor says what window it is over
+ * (`move`, its hit test's answer) and when its buttons are up (`release`),
+ * and calls `poll` each frame. This does the rest: enters, moves and
+ * leaves each target (with the drag's types and actions), drops on one that
+ * takes it or cancels, tells the source what the target takes and how the
+ * drag ends, and hands each target's ask for the data (a global pipe) to
+ * the source's process, whose `send` writes into it.
+ */
+export class ClientDrags {
+  #channel;
+  #a;
+  #seen;
+  /** The drag under way: `{ serial, block, client, icon, over, said,
+   *  dropped, on }` (`over`: the window it is over, as `move` was given it;
+   *  `dropped`: when, on `on`). */
+  drag = null;
+
+  constructor(channel) {
+    this.#channel = channel;
+    this.#a = new Int32Array(channel.arena);
+    this.#seen = Atomics.load(this.#a, xBase + X_SERIAL) >>> 0;
+    // Clients' drags are carried from now on.
+    Atomics.store(this.#a, M_CDRAG, 1);
+  }
+
+  /** No compositor carries them any more. */
+  stop() {
+    if (this.drag) this.#end(0);
+    Atomics.store(this.#a, M_CDRAG, 0);
+  }
+
+  #send(block, kind, a1, b1, c1, d1, client, surface) {
+    sendEvent(this.#channel, block, kind, a1, b1, c1, d1, client, surface);
+  }
+
+  /** Each frame: a drag a client began; what its target says, to its
+   *  source; targets' asks for its data, to its source; its finish. True
+   *  while a drag has the pointer (`move`, `release` are for it). */
+  poll(now = perf.now()) {
+    const a = this.#a;
+    const serial = Atomics.load(a, xBase + X_SERIAL) >>> 0;
+    if (serial !== this.#seen) {
+      this.#seen = serial;
+      if (this.drag) this.#end(0);
+      if (Atomics.load(a, xBase + X_STATE) === 1) {
+        this.drag = {
+          serial,
+          block: Atomics.load(a, xBase + X_BLOCK),
+          client: Atomics.load(a, xBase + X_CLIENT),
+          icon: Atomics.load(a, xBase + X_ICON),
+          over: null, said: 0, dropped: 0, on: null,
+        };
+      }
+    }
+    this.#asks();
+    const d = this.drag;
+    if (!d) return false;
+    // Its source ended it (destroyed it, or went).
+    if (!d.dropped && Atomics.load(a, xBase + X_STATE) !== 1) {
+      this.#end(0);
+      return false;
+    }
+    if (d.dropped) {
+      const st = dragState(this.#channel, d.on.block);
+      if (st.serial === (d.serial & 0x0fffffff)) {
+        if (st.flags & DRAG_FINISHED) this.#end(2);
+        else if ((st.flags & DRAG_ANSWERED) && !(st.flags & DRAG_TAKEN)) this.#end(0);
+      }
+      if (this.drag && now - d.dropped > 10000) this.#end(0);
+      return false;
+    }
+    // What the target takes, told to the source as it changes.
+    const said = d.over ? this.#said(d.over.block, d.serial) : 0;
+    if (said !== d.said) {
+      d.said = said;
+      this.#send(d.block, EV_DRAG_SOURCE, said & 0xff, (said >> 8) & 0xff, 0, 0, d.client, 0);
+    }
+    return true;
+  }
+
+  /** Block `block`'s word for drag `serial`: action << 8 | type + 1. */
+  #said(block, serial) {
+    const v = Atomics.load(this.#a, blockBase(block) + B_DRAG2) >>> 0;
+    return (v >>> 16) === (serial & 0xffff) ? v & 0xffff : 0;
+  }
+
+  /** Targets' asks for the data, to the source's process. */
+  #asks() {
+    const a = this.#a;
+    if (Atomics.load(a, xBase + X_HEAD) === Atomics.load(a, xBase + X_TAIL)) return;
+    xLock(a);
+    const head = Atomics.load(a, xBase + X_HEAD);
+    let tail = Atomics.load(a, xBase + X_TAIL);
+    const asks = [];
+    for (; tail < head; tail++) {
+      const q = xBase + X_ASK + (tail % X_ASKS) * 3;
+      asks.push([a[q] >>> 0, a[q + 1], a[q + 2]]);
+    }
+    Atomics.store(a, xBase + X_TAIL, tail);
+    xUnlock(a);
+    const d = this.drag;
+    for (const [serial, type, pipe] of asks) {
+      if (d && serial === d.serial) this.#send(d.block, EV_DRAG_SEND, type, pipe, 0, 0, d.client, 0);
+    }
+  }
+
+  /** The pointer, during the drag, is over `w` (`{ block, client, surface,
+   *  x, y }`, the point in the surface; null: over no window). */
+  move(w, t = Math.round(perf.now())) {
+    const d = this.drag;
+    if (!d || d.dropped) return;
+    const same = w && d.over && w.block === d.over.block && w.client === d.over.client && w.surface === d.over.surface;
+    if (same) {
+      this.#send(w.block, EV_DRAG_MOTION, w.x, w.y, t, 0, w.client, w.surface);
+    } else {
+      if (d.over) this.#send(d.over.block, EV_DRAG_LEAVE, 0, 0, 0, 0, d.over.client, 0);
+      d.over = w ? { block: w.block, client: w.client, surface: w.surface } : null;
+      if (w) {
+        this.#send(w.block, EV_DRAG_ENTER, w.x, w.y, d.serial & 0x0fffffff, 1, w.client, w.surface);
+        this.#send(w.block, EV_DRAG_MOTION, w.x, w.y, t, 0, w.client, w.surface);
+      }
+    }
+    d.at = w;
+  }
+
+  /** The pointer's buttons are up: dropped where it is if the target there
+   *  takes it, else cancelled. */
+  release() {
+    const d = this.drag;
+    if (!d || d.dropped) return;
+    const takes = d.over && (dragState(this.#channel, d.over.block).flags & DRAG_ACCEPTS) && dragState(this.#channel, d.over.block).serial === (d.serial & 0x0fffffff);
+    if (!takes) {
+      this.#end(0);
+      return;
+    }
+    this.#send(d.over.block, EV_DROP, d.serial & 0x0fffffff, 0, 0, 0, d.over.client, d.over.surface);
+    this.#send(d.block, EV_DRAG_SOURCE_END, 1, 0, 0, 0, d.client, 0);
+    d.dropped = perf.now() || 1;
+    d.on = d.over;
+    this.#letGo();
+  }
+
+  /** The drag no longer has the pointer. */
+  #letGo() {
+    const a = this.#a;
+    if ((Atomics.load(a, xBase + X_SERIAL) >>> 0) === this.drag?.serial) Atomics.store(a, xBase + X_STATE, 0);
+  }
+
+  /** Over: 0 cancelled (the target it is over left), 2 the target is done. */
+  #end(how) {
+    const d = this.drag;
+    this.drag = null;
+    if (!d) return;
+    if (!d.dropped && d.over) this.#send(d.over.block, EV_DRAG_LEAVE, 0, 0, 0, 0, d.over.client, 0);
+    this.#send(d.block, EV_DRAG_SOURCE_END, how, 0, 0, 0, d.client, 0);
+    if ((Atomics.load(this.#a, xBase + X_SERIAL) >>> 0) === d.serial) Atomics.store(this.#a, xBase + X_STATE, 0);
   }
 }
 
@@ -1194,6 +1415,84 @@ export class WlProxy {
     const at = this.#base + B_DRAG;
     Atomics.store(this.#a, at, ((serial << 4) | (flags & 15)) | 0);
     Atomics.notify(this.#a, at);
+  }
+
+  /** Whether a page compositor carries clients' own drags (`ClientDrags`). */
+  clientDragsCarried() {
+    return Atomics.load(this.#a, M_CDRAG) === 1;
+  }
+
+  /** A client of this process began a drag (`wl_cdrag_begin`): `client`,
+   *  its source's id, actions and icon surface, and its types (`len` bytes
+   *  at `ptr` of `memory`, NUL after each). Its serial, or 0 when no
+   *  compositor carries it. */
+  clientDragBegin(memory, client, source, actions, icon, ptr, len) {
+    if (this.#block < 0 || !this.clientDragsCarried()) return 0;
+    const a = this.#a;
+    const n = Math.min(len, X_BYTES);
+    xLock(a);
+    new Uint8Array(a.buffer, (xBase + X_TYPES) * 4, n).set(new Uint8Array(memory.buffer, ptr, n));
+    Atomics.store(a, xBase + X_LEN, n);
+    Atomics.store(a, xBase + X_BLOCK, this.#block);
+    Atomics.store(a, xBase + X_CLIENT, client | 0);
+    Atomics.store(a, xBase + X_SOURCE, source | 0);
+    Atomics.store(a, xBase + X_ACTIONS, actions | 0);
+    Atomics.store(a, xBase + X_ICON, icon | 0);
+    Atomics.store(a, xBase + X_STATE, 1);
+    let serial = ((Atomics.load(a, xBase + X_SERIAL) + 1) & 0x07ffffff) | X_SERIAL_BIT;
+    Atomics.store(a, xBase + X_SERIAL, serial);
+    xUnlock(a);
+    Atomics.add(a, M_PUB, 1);
+    Atomics.notify(a, M_PUB);
+    return serial >>> 0;
+  }
+
+  /** This process's client ended its drag `serial` itself (`wl_cdrag_end`). */
+  clientDragEnd(serial) {
+    const a = this.#a;
+    if ((Atomics.load(a, xBase + X_SERIAL) >>> 0) === (serial >>> 0)) Atomics.store(a, xBase + X_STATE, 0);
+  }
+
+  /** The client drag's actions and types, for a target it enters
+   *  (`wl_cdrag_info`): the actions as a word, then the types, into `ptr`
+   *  of `memory` as far as `max`; the whole length. */
+  clientDragInfo(memory, ptr, max) {
+    const a = this.#a;
+    xLock(a);
+    const n = Math.min(Atomics.load(a, xBase + X_LEN) >>> 0, X_BYTES);
+    const out = new Uint8Array(4 + n);
+    new DataView(out.buffer).setUint32(0, Atomics.load(a, xBase + X_ACTIONS) >>> 0, true);
+    out.set(new Uint8Array(a.buffer, (xBase + X_TYPES) * 4, n), 4);
+    xUnlock(a);
+    new Uint8Array(memory.buffer, ptr, Math.min(out.length, max)).set(out.subarray(0, Math.min(out.length, max)));
+    return out.length;
+  }
+
+  /** What this process's client says of the client drag `serial` it is
+   *  over (`wl_cdrag_status`): the accepted type's index + 1 (0 none), the
+   *  action. */
+  clientDragStatus(serial, accepted, action) {
+    if (this.#block < 0) return;
+    Atomics.store(this.#a, this.#base + B_DRAG2, (((serial & 0xffff) << 16) | ((action & 0xff) << 8) | (accepted & 0xff)) | 0);
+  }
+
+  /** This process's client asks for the client drag's data as its `type`th
+   *  type, through global pipe `pipe` (`wl_cdrag_receive`): for the page to
+   *  hand the source's process. */
+  clientDragReceive(serial, type, pipe) {
+    const a = this.#a;
+    xLock(a);
+    const head = Atomics.load(a, xBase + X_HEAD);
+    if (head - Atomics.load(a, xBase + X_TAIL) < X_ASKS) {
+      const q = xBase + X_ASK + (head % X_ASKS) * 3;
+      a[q] = serial | 0;
+      a[q + 1] = type | 0;
+      a[q + 2] = pipe | 0;
+      Atomics.store(a, xBase + X_HEAD, head + 1);
+    }
+    xUnlock(a);
+    Atomics.add(a, M_PUB, 1);
+    Atomics.notify(a, M_PUB);
   }
 
   /** Whether this process's input ring holds an event. */
