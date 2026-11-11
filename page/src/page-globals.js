@@ -15,6 +15,10 @@ export function setGlobals(get, b = {}) {
   // tree of Debian's arm64 packages), which picks the aarch64 shim, seed and
   // kernel (runtime.js).
   globalThis.GEX_ARCH = b.arch === 'aarch64' ? 'aarch64' : 'x86';
+  // Programs of the other architecture too (`?botharches=1`, System's
+  // `bothArches`): its shim and seed beside this one's, one kernel under
+  // both (runtime.js `makeProcessHost`, host.mjs `#otherArch`).
+  if (b.bothArches || get('botharches') === '1') globalThis.GEX_BOTH_ARCHES = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a 32-bit Wine program's

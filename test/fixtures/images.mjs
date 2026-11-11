@@ -15,7 +15,8 @@
 //            GEX_TEST_DARWIN_ROOT_X86; by default pyrus's out/root and
 //            out/root-x86_64 beside this repository); and beside each,
 //            darwin-window.ARCH, fixtures/darwin/page's programs built
-//            for a Mac where there is a compiler for one, and
+//            for a Mac where there is a compiler for one,
+//            darwin-arches.ARCH (fixtures/darwin/arches.c, static), and
 //            darwin-beside.ARCH, its Linux program (zig, or a musl
 //            cross gcc).
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
@@ -223,6 +224,15 @@ export const images = {
         const prog = join(work, `darwin-${name}.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin/page', `${name}.c`)], { stdio: 'ignore' });
+      }
+      // And one that needs no root (darwin/both): fixtures/darwin/arches.c
+      // over t.c, static, at the address the page's programs load.
+      {
+        const prog = join(work, `darwin-arches.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-ffreestanding', '-fno-stack-protector', '-fno-builtin', '-nostdlib',
+          `-I${join(HERE, 'darwin')}`, '-DT_STATIC', '-static', '-e', 'start', '-Wl,-pagezero_size,0x4000', '-Wl,-image_base,0x1000000', '-o', prog,
+          join(HERE, 'darwin', 'arches.c'), join(HERE, 'darwin', 't.c')], { stdio: 'ignore' });
       }
       // And the Linux program that runs beside a Mac one (darwin/beside),
       // where there is a compiler for it (zig, or a musl cross gcc:

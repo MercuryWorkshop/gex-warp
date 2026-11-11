@@ -84,6 +84,9 @@ thread_local! {
     /// The staged exec's memory (`exec_target`): 1 a 64-bit one, 0 a 32-bit
     /// one, -1 the parent's (a page that runs one flavour).
     static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
+    /// The staged exec's processor (`exec_arch`): 1 x86, 0 AArch64, -1
+    /// whichever its Worker's is.
+    static EXEC_ARCH: Cell<i32> = const { Cell::new(-1) };
     /// The staged exec's program's image span and header flags when it is a
     /// native wasm one.
     static EXEC_WASM: Cell<Option<(u64, u64, u32)>> = const { Cell::new(None) };
@@ -376,6 +379,8 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     let state = state_bytes(&h.kernel, true);
     let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
     EXEC_MEM64.with(|c| c.set(mem64));
+    let arch = if page_flavours() & 4 != 0 { exec_arch_of(h, path).map_or(-1, |x86| x86 as i32) } else { -1 };
+    EXEC_ARCH.with(|c| c.set(arch));
     let wasm = exec_wasm_image(h, path);
     EXEC_WASM.with(|c| c.set(wasm));
     EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
@@ -412,10 +417,13 @@ fn exec_memory_of(h: &Host, path: &str) -> Need {
     }
 }
 
-/// The page's memory flavours, from JS (`gex_set_page_flavours`): bit 0 the
+/// The page's flavours, from JS (`gex_set_page_flavours`): bit 0 the
 /// page's own is a 64-bit memory (`?mem64=1`), bit 1 it runs the other one
-/// too (a global kernel, host.mjs `#other`). Unset (-1): this Worker's
-/// flavour is the page's, and only a 64-bit memory's page runs the other.
+/// too (a global kernel, host.mjs `#other`); bit 2 it runs the other
+/// processor's programs as well (host.mjs `#otherArch`: an x86-64 system
+/// with an arm64 program in it, or the other way round). Unset (-1): this
+/// Worker's flavour is the page's, and only a 64-bit memory's page runs the
+/// other.
 static PAGE_FLAVOURS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn page_flavours() -> i32 {
@@ -434,11 +442,76 @@ pub(crate) fn page_runs_mem64() -> bool {
 }
 
 /// Bit 0: the page's memory is a 64-bit one; bit 1: it runs the other
-/// flavour as well ([`exec_target`]). Set in every Worker before the guest
+/// flavour as well ([`exec_target`]); bit 2: it runs the other processor's
+/// programs ([`exec_other_arch`]). Set in every Worker before the guest
 /// runs.
 #[no_mangle]
 pub extern "C" fn gex_set_page_flavours(bits: i32) {
-    PAGE_FLAVOURS.store(bits & 3, std::sync::atomic::Ordering::Relaxed);
+    PAGE_FLAVOURS.store(bits & 7, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The processor the program at `path` is for, true x86 (x86-64 or i386),
+/// false AArch64: by its ELF header's machine, or a Mach-O's (of a
+/// universal one's, this Worker's own when it is among them). `None`: for
+/// neither, or no program this can tell of (a script's interpreter is what
+/// an exec names by now; a gex wasm container runs no translated code).
+fn exec_arch(path: &str) -> Option<bool> {
+    let home = crate::sigs::proc_home();
+    let mut head = [0u8; 4096];
+    let n = home.read_file_at(path, 0, &mut head)?;
+    let head = &head[..n];
+    if head.len() >= 20 && &head[..4] == b"\x7fELF" {
+        return match u16::from_le_bytes([head[18], head[19]]) {
+            3 | 62 => Some(true),
+            183 => Some(false),
+            _ => None,
+        };
+    }
+    // Mach-O's CPU types: x86-64 0x0100_0007, arm64 0x0100_000c.
+    let of = |cpu: u32| match cpu {
+        0x0100_0007 => Some(true),
+        0x0100_000c => Some(false),
+        _ => None,
+    };
+    if head.len() >= 8 && head[..4] == [0xcf, 0xfa, 0xed, 0xfe] {
+        return of(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+    }
+    // A universal file: big-endian, a count and that many of (CPU type,
+    // subtype, offset, size, alignment), 20 bytes each (64-bit offsets: 32).
+    if head.len() >= 8 && (head[..4] == [0xca, 0xfe, 0xba, 0xbe] || head[..4] == [0xca, 0xfe, 0xba, 0xbf]) {
+        let each = if head[3] == 0xbf { 32 } else { 20 };
+        let count = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        let mut found = None;
+        for i in 0..count.min(16) {
+            let at = 8 + i * each;
+            let Some(b) = head.get(at..at + 4) else { break };
+            match of(u32::from_be_bytes([b[0], b[1], b[2], b[3]])) {
+                Some(x86) if x86 == gex_abi::X86 => return Some(x86),
+                Some(x86) => found = Some(x86),
+                None => {}
+            }
+        }
+        return found;
+    }
+    None
+}
+
+/// [`exec_arch`] for an exec's path, relative to the caller's cwd.
+fn exec_arch_of(h: &Host, path: &str) -> Option<bool> {
+    if path.starts_with('/') {
+        exec_arch(path)
+    } else {
+        let cwd = h.kernel.caller_cwd();
+        exec_arch(&format!("{}/{path}", cwd.trim_end_matches('/')))
+    }
+}
+
+/// Whether this process's exec of `path` is of a program for the processor
+/// this Worker's runtime is not for, on a page that runs both
+/// ([`PAGE_FLAVOURS`], bit 2): it goes on in a Worker of the other's
+/// runtime (lib.rs `exec_away`), as one of the other memory flavour does.
+pub(crate) fn exec_other_arch(h: &Host, path: &str) -> bool {
+    page_flavours() & 4 != 0 && exec_arch_of(h, path) == Some(!gex_abi::X86)
 }
 
 /// The memory flavour an exec of `path` goes on in, true
@@ -519,7 +592,7 @@ pub(crate) fn exec_unrunnable(h: &Host, path: &str) -> bool {
 /// program's memory flavour ([`exec_target`]) is not this Worker's (lib.rs
 /// `exec_away`).
 pub(crate) fn exec_elsewhere(h: &Host, path: &str) -> bool {
-    page_flavours() & 2 != 0 && exec_target(h, path) != gex_abi::mem64()
+    (page_flavours() & 2 != 0 && exec_target(h, path) != gex_abi::mem64()) || exec_other_arch(h, path)
 }
 
 /// What memory a program needs: [`Need::Is`] the one it can run in, or
@@ -631,6 +704,14 @@ pub extern "C" fn gex_vfork_exec_wasm(which: u32) -> u64 {
 #[no_mangle]
 pub extern "C" fn gex_vfork_exec_mem64() -> i32 {
     EXEC_MEM64.with(|c| c.get())
+}
+
+/// The staged exec's processor (`exec_arch`): 1 x86, 0 AArch64, -1 its
+/// Worker's own (and always -1 on a page that runs one processor's
+/// programs).
+#[no_mangle]
+pub extern "C" fn gex_vfork_exec_arch() -> i32 {
+    EXEC_ARCH.with(|c| c.get())
 }
 
 /// Why the child's run ended: 0 (it exited, or crashed), 2 an exec staged,

@@ -4654,6 +4654,9 @@ export class Gex {
       // The memory its program needs, in a 64-bit memory's page (vfork.rs
       // `exec_memory`): true or false, or undefined for the parent's.
       mem64: (() => { const m = e.gex_vfork_exec_mem64?.() ?? -1; return m < 0 ? undefined : m === 1; })(),
+      // The processor its program is for, on a page that runs both (vfork.rs
+      // `exec_arch`): 'x86' or 'aarch64', or undefined for its Worker's own.
+      arch: (() => { const a = e.gex_vfork_exec_arch?.() ?? -1; return a < 0 ? undefined : a === 1 ? 'x86' : 'aarch64'; })(),
       // How long the child ran in its parent's Worker before this exec, for
       // the process's exit line: a child with this ran in place, nothing copied.
       vforkMs: ms,

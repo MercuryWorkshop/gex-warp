@@ -195,14 +195,19 @@ export class System extends EventTarget {
    * with `require` makes a program image without one fail. `xcache`: keep
    * the translated code across loads (in the origin's private storage, a
    * directory under Node: GEX_XCACHE_DIR); a string names the cache, kept
-   * apart from other names' on the same page. `debug`: the runtime's switches,
+   * apart from other names' on the same page. `arch`: the architecture of
+   * the system's programs ('x86' or 'aarch64'), told from the tree when not
+   * given. `bothArches`: programs of the other architecture run too, each
+   * in a process of its own runtime under the one kernel (an x86-64 system
+   * with an arm64 program in it, or the other way round); the other's shim
+   * is loaded with the system's own. `debug`: the runtime's switches,
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
-  constructor({ baseUrl, units, xcache = false, arch, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, bothArches = false, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'arch', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'bothArches', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
     // The page runtime keeps its state in the page's globals.
@@ -216,6 +221,7 @@ export class System extends EventTarget {
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
       xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
+      bothArches: !!bothArches,
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the
@@ -395,7 +401,7 @@ export class System extends EventTarget {
     let kernelEarly = null;
     if (given) {
       const { setGlobals } = await import('../../src/page-globals.js');
-      setGlobals((name) => q.get(name), { arch: given });
+      setGlobals((name) => q.get(name), { arch: given, bothArches: this.#opts.bothArches });
       const rt = await import('../../src/runtime.js');
       if (SP_CODE && SINGLE) this.#earlyWorker?.postMessage({ prepare: { globals: rt.pageGlobals(), arch: given } });
       // Not under Node, whose runtime is primed from files first (below).
@@ -416,10 +422,12 @@ export class System extends EventTarget {
     // wasm32 /bin/sh says nothing. A tree with none yet (wasm32 only, its
     // native packages to come) gets aarch64, Debian's arm64 being the usual
     // second architecture of a wasm32 tree, so apt can install them later.
-    // A program of the other one does not run.
+    // A program of the other one does not run, unless the page asked for
+    // both (`bothArches`): then the other's shim is loaded beside this
+    // one's, and a program of either runs, under the one kernel.
     const arch = given ?? (await layersArch(opts.layers)) ?? 'aarch64';
     const { setGlobals } = await import('../../src/page-globals.js');
-    setGlobals((name) => q.get(name), { arch });
+    setGlobals((name) => q.get(name), { arch, bothArches: this.#opts.bothArches });
     const rt = await import('../../src/runtime.js');
     if (SP_CODE && SINGLE) return this.#bootSingle(rt, arch, opts);
     // Under Node (the runtime's tests) there is no fetch of a file URL.

@@ -442,6 +442,21 @@ if (MEM64 && SHARED && kernel) {
   });
 }
 
+// GEX_BOTH_ARCHES=1: the other processor's runtime too (host.mjs
+// `#otherArch`), so that a program of either runs: an x86-64 run (GEX_ARCH=x86)
+// with an arm64 program exec'd in it, or the other way round. With the
+// global kernel, which serves both; not with GEX_MEM64, whose runtime is
+// built for x86-64 alone.
+let otherArch = null;
+if (process.env.GEX_BOTH_ARCHES && SHARED && !SINGLE && !MEM64 && kernel) {
+  const infix = ARCH_INFIX ? '' : '.x86';
+  otherArch = {
+    arch: ARCH_INFIX ? 'aarch64' : 'x86',
+    shim: readFileSync(new URL(`gex_browser${infix}.shared.wasm`, PUB)),
+    guest: readFileSync(new URL(`seed${infix}.shared.wasm`, PUB)),
+  };
+}
+
 // GEX_SNAP_OUT=DIR GEX_SNAP_AT=TEXT: once the guest's output has said TEXT,
 // a session snapshot (`ProcessHost.snapshot`) into DIR, after
 // GEX_SNAP_DELAY_MS (200); the run then ends (status 0), or goes on with
@@ -570,6 +585,7 @@ const host = new ProcessHost({
   guest: guestWasm,
   kernel,
   other,
+  otherArch,
   // Merged into every process's start message, because on a real machine
   // every process gets the same of all of this.
   extra: {

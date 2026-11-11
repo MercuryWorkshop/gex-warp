@@ -331,6 +331,19 @@ export class ProcessHost {
   #otherGate = null; #otherError = null; #otherRetryAt = 0; #otherBackoff = 0; #otherSaid = false;
   /// Each process's memory flavour, by pid, where it is not the page's.
   #flavourOf = new Map();
+  /// The other processor's runtime, `{ arch, shim, guest }` (`arch` 'x86'
+  /// or 'aarch64': the one the page's own runtime is not for), for a page
+  /// whose programs are not all one processor's: an x86-64 system that
+  /// runs an arm64 program too, or the other way round. The kernel is the
+  /// page's own, which serves either (what differs by processor -- the
+  /// lifter, a call's numbers, a structure's layout -- is the shim's). A
+  /// process gets it as it gets the other memory flavour: its exec record
+  /// says (`arch`, vfork.rs `exec_arch`), a fork child has its parent's.
+  /// Here from the start, not fetched at a first exec: the shim is told the
+  /// page runs both (`#pageFlavours`, bit 2) only when it does.
+  #otherArch = null; #otherArchShim = null;
+  /// The processes of the other processor, by pid.
+  #archOf = new Set();
   /// Per Worker, a shared counter of the output messages this host has
   /// delivered. A Worker about to publish its process's exit waits until the
   /// count reaches what it sent (see `drainOutput` in worker.mjs): output from
@@ -689,12 +702,15 @@ export class ProcessHost {
     // The other memory flavour's `{ shim, guest, kernel }` (`#other`), or
     // an async function that fetches it.
     other = null,
+    // The other processor's `{ arch, shim, guest }` (`#otherArch`).
+    otherArch = null,
     // `(url) => Promise<WebAssembly.Module>`: how a unit `prefetchUnit` names
     // is fetched and compiled, when not with fetch and WebAssembly.compile
     // here (a compressed one, decoded elsewhere).
     unitModule = null,
   }) {
     this.#other = other;
+    this.#otherArch = otherArch;
     if (typeof other === 'function' && typeof SharedArrayBuffer === 'function') this.#otherGate = new Int32Array(new SharedArrayBuffer(4));
     this.#unitModule = unitModule;
     this.#makeWorker = makeWorker;
@@ -730,22 +746,45 @@ export class ProcessHost {
     return f ?? !!this.#extra?.mem64;
   }
 
-  /** The page's memory flavours, for the shim (vfork.rs
+  /** The page's flavours, for the shim (vfork.rs
    *  `gex_set_page_flavours`): bit 0 its own is a 64-bit memory, bit 1 it
-   *  runs the other too (`#other`), so that an exec may ask for that one. */
+   *  runs the other too (`#other`), so that an exec may ask for that one;
+   *  bit 2 it runs the other processor's programs (`#otherArch`). */
   #pageFlavours() {
-    return (this.#extra?.mem64 ? 1 : 0) | (this.#other && this.#kernel ? 2 : 0);
+    return (this.#extra?.mem64 ? 1 : 0) | (this.#other && this.#kernel ? 2 : 0) | (this.#otherArch && this.#kernel ? 4 : 0);
   }
 
-  /** Whether `pid` runs on the other flavour's runtime (`#other`). */
+  /** Whether process `pid` (or a thread's `pid:tid`) is of the other
+   *  processor (`#otherArch`). */
+  #otherArchPid(pid) {
+    return this.#archOf.has(Number(String(pid).split(':')[0]));
+  }
+
+  /** A process's processor as its exec or fork record says (`arch`), or
+   *  its parent's (`from`, a pid) when the record says none: noted. */
+  #noteArch(pid, arch, from = null) {
+    const other = arch !== undefined ? !!this.#otherArch && arch === this.#otherArch.arch : from !== null && this.#otherArchPid(from);
+    if (other) this.#archOf.add(Number(pid));
+    else this.#archOf.delete(Number(pid));
+  }
+
+  /** Whether `pid` runs on a runtime that is not the page's own: the other
+   *  memory flavour's (`#other`) or the other processor's (`#otherArch`). */
   #foreign(pid) {
-    return this.#mem64(pid) !== !!this.#extra?.mem64;
+    return this.#mem64(pid) !== !!this.#extra?.mem64 || this.#otherArchPid(pid);
   }
 
   /** What a Worker of process `pid` starts on: `{ shim, guest, kernel,
    *  mem64 }`, the shim compiled. */
   async #runtimeFor(pid) {
     const mem64 = this.#mem64(pid);
+    if (this.#otherArchPid(pid)) {
+      // (In the page's own kind of memory: the other processor's runtime is
+      // one flavour, not two.)
+      const o = this.#otherArch;
+      this.#otherArchShim ??= o.shim instanceof WebAssembly.Module ? Promise.resolve(o.shim) : WebAssembly.compile(o.shim);
+      return { shim: await this.#otherArchShim, guest: o.guest, kernel: this.#kernel ?? undefined, mem64: !!this.#extra?.mem64 };
+    }
     if (!this.#foreign(pid)) {
       return { shim: await this.#shimModule(), guest: this.#guest, kernel: this.#kernel ?? undefined, mem64 };
     }
@@ -855,6 +894,7 @@ export class ProcessHost {
    */
   spawnExec({ pid, exec, fds, cwd = '/', wasmImage = null, opts = {} }) {
     this.#flavourOf.delete(pid);
+    this.#archOf.delete(Number(pid));
     const child = {
       pid,
       // Its first thread's registers, at the first context
@@ -991,6 +1031,7 @@ export class ProcessHost {
       threads,
       maxPages,
       flavourOf: [...this.#flavourOf],
+      archOf: [...this.#archOf],
       at,
       // what the references are to (`restore` takes only the same)
       bundle: kernel.refs.length ? sources.id ?? null : null,
@@ -1034,6 +1075,7 @@ export class ProcessHost {
     Atomics.store(words, word, 1);
     this.#stacks = meta.stacks;
     for (const [p, f] of meta.flavourOf ?? []) this.#flavourOf.set(p, f);
+    for (const p of meta.archOf ?? []) if (this.#otherArch) this.#archOf.add(p);
     inform(`[gex] restore: ${meta.threads.length} threads of ${memories.size} processes`);
     const byPid = new Map();
     for (const t of meta.threads) {
@@ -1945,6 +1987,8 @@ export class ProcessHost {
           const f = m.child.mem64 ?? this.#mem64(pid);
           if (f !== !!this.#extra?.mem64) this.#flavourOf.set(m.child.pid, f);
           else this.#flavourOf.delete(m.child.pid);
+          // And its processor, likewise.
+          this.#noteArch(m.child.pid, m.child.arch, pid);
         }
         this.#onFork(m.child, pid);
         if (TEST_FORK_RECORDS) this.#forkRecords.set(m.child.pid, new WeakRef(m.child));
@@ -1970,6 +2014,8 @@ export class ProcessHost {
         const child = m.child;
         if (child.mem64 !== undefined && child.mem64 !== !!this.#extra?.mem64) this.#flavourOf.set(Number(pid), child.mem64);
         else this.#flavourOf.delete(Number(pid));
+        // (An exec that says no processor stays with its Worker's.)
+        this.#noteArch(pid, child.arch, pid);
         this.#releaseNow(pid, w);
         this.#spawn(pid, { kind: 'adopt', child }).then(resolve, reject);
         break;

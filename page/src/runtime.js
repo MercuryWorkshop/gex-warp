@@ -590,6 +590,16 @@ export async function makeProcessHost({
 }, on) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const makeGuestWorker = await guestWorkerFactory();
+  // The other architecture's shim and seed (`GEX_BOTH_ARCHES`), here before
+  // any process starts: each is told at its start whether the page runs
+  // both. With the global kernel, which serves either; not on a 64-bit
+  // memory's page (`?mem64=1`), whose runtime is built for x86-64 alone.
+  const otherInfix = guestArch() === 'x86' ? '' : '.x86';
+  const otherArch = globalThis.GEX_BOTH_ARCHES && kernel && !globalThis.GEX_MEM64 ? {
+    arch: guestArch() === 'x86' ? 'aarch64' : 'x86',
+    shim: await otherBytes(assetUrl(`/gex/gex_browser${otherInfix}.shared.wasm`)),
+    guest: await otherBytes(assetUrl(`/gex/seed${otherInfix}.shared.wasm`)),
+  } : null;
   const host = new ProcessHost({
   makeWorker: makeGuestWorker,
   // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
@@ -617,6 +627,7 @@ export async function makeProcessHost({
     guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
     kernel: kernel.module,
   }) : null,
+  otherArch,
   extra: {
     // The switches every page takes (hosts/browser/js/options.mjs).
     ...startOptions('extra'),
