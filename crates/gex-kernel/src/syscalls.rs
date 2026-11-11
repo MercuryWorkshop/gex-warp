@@ -1700,7 +1700,8 @@ impl FdIo<'_> {
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
         let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
-        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        // read-write, as F_GETFL says (and as a fork's child rebuilds it)
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), crate::fs::oflags::O_RDWR, true, true);
         self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
     /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
@@ -4738,27 +4739,88 @@ impl MapIo<'_> {
     pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         const MREMAP_MAYMOVE: u64 = 1;
         let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        // Whole pages, as Linux moves and keeps them: an old length short
+        // of a page (sqlite passes its file's size) still has the page.
+        let (old_al, new_al) = (crate::mem::page_align_up(old_len), crate::mem::page_align_up(new_len));
+        if addr.is_multiple_of(crate::mem::PAGE_SIZE) && old_len != 0 && new_len != 0 {
+            if let Some(r) = self.mremap_shared(m, addr, old_al, new_al, flags & MREMAP_MAYMOVE != 0) {
+                return r;
+            }
+        }
         // The map's lock held through the copy: the old range is free in
         // the map once it has moved, and another thread's mapping there
         // must not land before its bytes are out.
         let mut mm = self.mem.lock();
         let (dst, moved) = mm.mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
         if moved {
-            let keep = old_len.min(new_len) as usize;
+            let keep = old_al.min(new_al) as usize;
             let bytes = m.read(addr, keep)?.to_vec();
             m.write(dst, &bytes)?;
             // The grown tail at the new location is fresh anonymous memory,
             // which Linux exposes as zero -- but `dst` may be a reused hole
             // holding stale bytes, and only `keep` of them were overwritten.
-            if new_len > old_len {
-                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
+            if new_al > old_al {
+                m.zero_dirty(dst + keep as u64, (new_al - keep as u64) as usize)?;
             }
-        } else if new_len > old_len {
+        } else if new_al > old_al {
             // Growing in place must expose zeroes, not whatever the guest
             // left behind the last time this range was mapped.
-            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
+            m.zero_dirty(addr + old_al, (new_al - old_al) as usize)?;
         }
         Ok(dst)
+    }
+
+    /// `mremap` of a shared file mapping (`[addr, addr + old_len)`, page
+    /// lengths), or `None` when the range is none of one. The pages are the
+    /// file's, so it is written back, moved in the map, and read again from
+    /// the file at its new place and length; its entry follows it, so the
+    /// process's `write`s to the file land there and not at the old address
+    /// (by then anything's: sqlite grows its mapping of a database this
+    /// way, and its writes went into whatever malloc put there next).
+    /// One mapping's whole range only: a part of one, or one of several
+    /// holders of the same pages, cannot move without the others (`ENOMEM`,
+    /// on which a caller maps afresh, as sqlite does).
+    fn mremap_shared(&self, m: &mut GuestMem<'_>, addr: u64, old_len: u64, new_len: u64, may_move: bool) -> Option<SysResult> {
+        let end = addr.saturating_add(old_len);
+        let file = {
+            let mm = self.mem.lock();
+            let s = mm.log.shared_maps.iter().find(|s| s.start < end && addr < s.start + s.len)?;
+            if s.start != addr || s.len != old_len || s.holders != [(addr, old_len)] {
+                return Some(Err(Errno::ENOMEM));
+            }
+            Arc::clone(&s.file)
+        };
+        if let Err(e) = self.flush_shared(m, addr, old_len) {
+            return Some(Err(e));
+        }
+        let pages: Arc<[std::sync::atomic::AtomicU64]> =
+            (0..new_len / crate::mem::PAGE_SIZE).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let (dst, offset) = {
+            let mut mm = self.mem.lock();
+            let (dst, _) = match mm.mremap(addr, old_len, new_len, may_move) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            // In the list before the read: a `write` from now on lands in
+            // the new pages, and the read after it sees the file with it.
+            match mm.log.shared_maps.moved(addr, dst, new_len, Arc::clone(&pages)) {
+                Some(offset) => (dst, offset),
+                None => return Some(Ok(dst)),
+            }
+        };
+        let read = match m.read_mut(dst, new_len as usize) {
+            Ok(buf) => file.pread(offset, buf).unwrap_or(0) as u64,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = m.zero_dirty(dst + read, (new_len - read) as usize) {
+            return Some(Err(e));
+        }
+        if let Ok(bytes) = m.read(dst, new_len as usize) {
+            for (h, p) in pages.iter().zip(bytes.chunks(crate::mem::PAGE_SIZE as usize)) {
+                h.store(page_hash(p), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Some(Ok(dst))
     }
 
     /// The pinned base for a path a closure build named, if there is one.
@@ -7808,6 +7870,26 @@ pub struct FreeCall {
 /// the 32-bit ABI's `pread64`, `pwrite64`,
 /// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
 /// call translates them.
+/// `TIOCGPTPEER` (Linux 4.13): the slave of the pty master `fd`, opened
+/// with the flags in `arg` and without its name, as openpty implementations
+/// try first (rustix's falls back to the name only on ENOSYS or EPERM).
+/// `None` for any other request, or a descriptor that is not a master. The
+/// slave of a master still locked (`TIOCSPTLCK`) is refused, as its name is.
+/// The full call and the free path both answer it here.
+pub fn pty_peer_ioctl(fds: &FdTable, path: &PathIo<'_>, fd: i32, req: u64, arg: u64) -> Option<SysResult> {
+    const TIOCGPTPEER: u64 = 0x5441;
+    if req & 0xffff_ffff != TIOCGPTPEER {
+        return None;
+    }
+    let ptn = match fds.get(fd) {
+        Ok(f) => f.handle.pty_peer()?,
+        Err(e) => return Some(Err(e)),
+    };
+    // Linux takes the access mode and these, and ignores any other bit.
+    let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
+    Some(path.open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO)))
+}
+
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     free_class_of(m, call_regs(m, ctx_addr, compat), compat)
 }
@@ -8030,7 +8112,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         }
         r
     } else if n == nr::IOCTL {
-        let r = f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]);
+        let r = match pty_peer_ioctl(f.io.fds, &f.path, a[0] as i32, a[1], a[2]) {
+            Some(r) => r,
+            None => f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]),
+        };
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
@@ -9961,6 +10046,21 @@ impl SharedMaps {
         s.holders.remove(h);
         self.publish();
         Unalias::Keep
+    }
+
+    /// Mapping `[addr, ..)`, its only holder's, moved to `[dst, dst + len)`
+    /// with `pages` for its hashes (`mremap`): its file offset, or `None`
+    /// when no mapping starts at `addr`. Its count is unknown from here on.
+    pub fn moved(&mut self, addr: u64, dst: u64, len: u64, pages: Arc<[std::sync::atomic::AtomicU64]>) -> Option<u64> {
+        let s = self.list.iter_mut().find(|s| s.start == addr)?;
+        s.start = dst;
+        s.len = len;
+        s.holders = vec![(dst, len)];
+        s.pages = pages;
+        s.changes = Default::default();
+        let offset = s.offset;
+        self.publish();
+        Some(offset)
     }
 
     /// Keep the mappings `keep` says to; publishes only on a change.
@@ -13092,15 +13192,8 @@ fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, sign
 
 impl Kernel {
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
-        // TIOCGPTPEER (Linux 4.13): the slave of a master, opened with the
-        // flags in `arg` without its name, as openpty implementations try
-        // first (rustix's falls back to the name only on ENOSYS or EPERM).
-        const TIOCGPTPEER: u64 = 0x5441;
-        if req & 0xffff_ffff == TIOCGPTPEER {
-            if let Some(ptn) = self.fds.get(fd)?.handle.pty_peer() {
-                let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
-                return self.path_io().open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO));
-            }
+        if let Some(r) = pty_peer_ioctl(&self.fds, &self.path_io(), fd, req, arg) {
+            return r;
         }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }

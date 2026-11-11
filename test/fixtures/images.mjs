@@ -21,7 +21,7 @@
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
-//            @gex/runtime-single).
+//            @gexemu/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
 //            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
@@ -77,6 +77,7 @@ const PROBES = {
   'rt-sockpass': [],
   'rt-repaint': [],
   'rt-deadclient': [],
+  'rt-unix': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
   // static, serving what rt-side.so imports (SIDES)
   'rt-dlstatic': ['-pthread', ...['malloc', 'snprintf', 'strlen', 'fprintf', 'stderr', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'sin', 'cos'].map((s) => `-Wl,--export=${s}`)],
@@ -595,7 +596,7 @@ export const images = {
   },
 
   // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
-  // @gex/runtime-single.
+  // @gexemu/runtime-single.
   async package(work, { single = false } = {}) {
     execFileSync(join(ROOT, 'page/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
     // A copy without the memory64 shim, for core/mem64-missing.
