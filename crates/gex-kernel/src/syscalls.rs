@@ -17598,7 +17598,8 @@ mod tests {
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
         assert_eq!(ret(&m, at), 5);
         assert_eq!(m.read(0x25000, 5).unwrap(), b"hello");
-        assert_eq!(m.read_u64(rmsg + 40).unwrap(), 20, "one descriptor's control message");
+        // (With its padding, where there is room for it: Linux's CMSG_SPACE.)
+        assert_eq!(m.read_u64(rmsg + 40).unwrap(), 24, "one descriptor's control message");
         let got = m.read_u32(rctl + 16).unwrap() as i32;
         assert_ne!(got, pipe_r);
         assert!(Arc::ptr_eq(&k.fds.get(got).unwrap().handle, &k.fds.get(pipe_r).unwrap().handle));
