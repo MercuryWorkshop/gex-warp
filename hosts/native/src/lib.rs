@@ -7664,6 +7664,9 @@ fn retire_translations(
     pe_units::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     pe_units::forget_gone(&mut sh.elf_units, &gone);
+    // (a library's builtins go with its code: another object mapped there
+    // later has other functions at those addresses)
+    sh.lib_intrinsics.retain(|a, _| !ranges.iter().any(|&(start, end)| *a >= start && *a < end));
     let mut pages = 0usize;
     for &(start, end) in ranges {
         sh.translated.retain(|a| (*a & !gex_abi::ALT_ADDR) < start || (*a & !gex_abi::ALT_ADDR) >= end);
@@ -7753,7 +7756,9 @@ fn note_macho_intrinsics(caller: &mut Caller<'_, HostState>, mapped: &[gex_kerne
         if std::env::var_os("GEX_PROVIDER_TRACE").is_some() {
             eprintln!("gex: {} builtins for {} at {bias:#x}", found.len(), m.path);
         }
-        shared.lock().unwrap_or_else(|e| e.into_inner()).lib_intrinsics.extend(found);
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.lib_intrinsics.retain(|a, _| *a < m.start || *a >= m.end);
+        sh.lib_intrinsics.extend(found);
     }
 }
 
