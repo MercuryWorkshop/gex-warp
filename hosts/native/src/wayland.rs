@@ -52,7 +52,8 @@ struct Session {
     /// a game more than ten times faster.
     rbuf: Vec<u8>,
     /// The scripted drag over this client: its text/uri-list, and what the
-    /// client last said of it (printed when it changes).
+    /// client last said of it (printed when it changes). A client's own drag
+    /// over it is `Inner::own`'s, not this.
     drag: Option<String>,
     drag_said: Option<gex_wayland::data::DragStatus>,
 }
@@ -83,7 +84,42 @@ struct Inner {
     /// The paced frame clock (`frame_tick`): when it started, and its last
     /// tick.
     clock: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+    /// A drag a client started, carried across the clients' windows.
+    own: Mutex<Option<OwnDrag>>,
+    /// `over TITLE`: the window, by its title, that scripted input to
+    /// windows nobody places is in (else every client's focused window).
+    over: Mutex<Option<String>>,
+    /// The scripted pointer's last point: the screen's with placed
+    /// windows, else the window's.
+    at: Mutex<(i32, i32)>,
+    /// The scripted host drag over windows nobody places: its file list,
+    /// and the surface it is over.
+    host_drag: Mutex<Option<(usize, Option<Key>)>>,
 }
+
+/// A drag a client started (`wl_data_device.start_drag`), carried by this
+/// host: the pointer's moves take it to the surface under them, of any
+/// client, which is offered the source's types; the release drops it there
+/// or cancels it; the target's `receive` is handed to the source's `send`.
+struct OwnDrag {
+    /// The session that started it, and what it started.
+    src: u64,
+    start: gex_wayland::data::DragStart,
+    /// The surface it is over.
+    over: Option<Key>,
+    /// Dropped on a session that took it: waiting for its finish, since.
+    dropped: Option<(u64, std::time::Instant)>,
+}
+
+impl OwnDrag {
+    /// The session whose offer is this drag's: over, or dropped on.
+    fn target(&self) -> Option<u64> {
+        self.dropped.map(|d| d.0).or(self.over.map(|k| k.0))
+    }
+}
+
+/// How long a target that took a drop has to say it is done with it.
+const DROP_FINISH: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often frames are "shown" natively, which is when a client's frame
 /// callbacks are answered (`GEX_WL_HZ`, default 60; 0: at once, at the
@@ -113,6 +149,8 @@ enum Ev {
     DragMove(i32, i32),
     Drop,
     DragLeave,
+    /// `over TITLE`: the script's Nth title (`Input::titles`), or none.
+    Over(usize),
 }
 
 /// A script of input events at times (seconds) after the compositor's Nth
@@ -136,6 +174,8 @@ enum Ev {
 /// 51    drop                 # released: the window under it takes it or refuses it
 /// 52    dragleave            # (or cancelled)
 /// 60    output 1000 650      # the output is resized: every client is told
+/// 70    over Some Title      # what follows is in the window titled so
+/// 71    over                 # and back to every client's focused window
 /// ```
 ///
 /// `window W H` in place of `frames N` starts the clock once a placed window
@@ -151,10 +191,23 @@ enum Ev {
 /// between them; a point over none of them reaches nothing, and a press
 /// there or on the window outside an open popup dismisses the popup. With
 /// placed windows (`gex_window_placement_v1`), the screen's pixels.
+///
+/// With windows nobody places, every client's focused window is at the
+/// same place: `over TITLE` says which window (of any client) the events
+/// after it are in -- they go to that one alone, and the pointer leaves the
+/// window it was in -- and `over` alone goes back. A drag a client starts
+/// (`wl_data_device.start_drag`, at a press) has the pointer until the
+/// release: a `move` takes it to the surface there -- of the window `over`
+/// names, or the one it started in -- and the release drops it or cancels
+/// it. The script's own drag (`drag`, `dragmove`, `drop`, `dragleave`) of
+/// files goes the same way: to the window `over` names, or the newest
+/// client's. With placed windows the screen's hit test picks the window.
 struct Input {
     events: Vec<(f64, Ev, String)>,
     /// Each `drag` line's files, as the text/uri-list the host offers.
     drags: Vec<String>,
+    /// Each `over` line's title.
+    titles: Vec<String>,
     next: usize,
     start: Option<std::time::Instant>,
     /// Frames to see before the clock starts, and how many have been.
@@ -213,6 +266,7 @@ impl Input {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let mut events = Vec::new();
         let mut drags = Vec::new();
+        let mut titles = Vec::new();
         let mut after = 1;
         let mut window = None;
         let mut clients = None;
@@ -273,6 +327,16 @@ impl Input {
                 Some("dragmove") => events.push((t, Ev::DragMove(num(2)?, num(3)?), l)),
                 Some("drop") => events.push((t, Ev::Drop, l)),
                 Some("dragleave") => events.push((t, Ev::DragLeave, l)),
+                Some("over") => {
+                    let title = w[2..].join(" ");
+                    let n = if title.is_empty() {
+                        usize::MAX
+                    } else {
+                        titles.push(title);
+                        titles.len() - 1
+                    };
+                    events.push((t, Ev::Over(n), l));
+                }
                 Some("output") => outputs.push((t, num(2)?.max(1), num(3)?.max(1))),
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
@@ -285,7 +349,7 @@ impl Input {
         outputs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
         let start = if after == 0 && window.is_none() && clients.is_none() { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, drags, next: 0, start, after, seen: 0, window, clients, connected: 0, outputs })
+        Ok(Input { events, drags, titles, next: 0, start, after, seen: 0, window, clients, connected: 0, outputs })
     }
 }
 
@@ -373,6 +437,11 @@ impl Wayland {
             eprintln!("[gex] input: the script's clock starts with client {}", inp.connected);
             inp.start = Some(std::time::Instant::now());
         }
+    }
+
+    /// The script's Nth `over` title (none for `usize::MAX`).
+    fn title(&self, n: usize) -> Option<String> {
+        self.inner.input.lock().unwrap().as_ref()?.titles.get(n).cloned()
     }
 
     /// The script's Nth drag's text/uri-list.
@@ -474,7 +543,7 @@ impl Wayland {
         let mut gpu = self.inner.gpu.lock().unwrap();
         let screen = self.inner.screen.lock().unwrap();
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
-            let drawn = if screen.active() { c.draw_at(&screen.items()) } else { c.draw(frames) };
+            let drawn = if screen.active() || screen.icon.is_some() { c.draw_at(&screen.items(c.size())) } else { c.draw(frames) };
             match drawn.and_then(|()| c.read_back()) {
                 Ok(rgba) => {
                     let (w, h) = c.size();
@@ -583,8 +652,32 @@ impl Wayland {
             if placing { s.client.wants_input() } else { s.client.input_ready() }
         });
         let due = if ready { self.due_input() } else { Vec::new() };
+        // Each event with the window `over` names in effect for it, and the
+        // scripted pointer's last point.
+        let over_start = self.inner.over.lock().unwrap().clone();
+        let mut cur = over_start.clone();
+        let due: Vec<(Ev, u32, Option<String>)> = due
+            .into_iter()
+            .map(|(ev, ms)| {
+                match ev {
+                    Ev::Over(n) => cur = if n == usize::MAX { None } else { self.title(n) },
+                    Ev::Motion(x, y) => *self.inner.at.lock().unwrap() = (x, y),
+                    _ => {}
+                }
+                (ev, ms, cur.clone())
+            })
+            .collect();
+        *self.inner.over.lock().unwrap() = cur;
+        // A client's own drag has the pointer: its moves and its release are
+        // the drag's (`carry`), not any client's.
+        let (dragging, own_target) = {
+            let own = self.inner.own.lock().unwrap();
+            (own.is_some(), own.as_ref().and_then(|d| d.target()))
+        };
+        let pointer = |ev: &Ev| matches!(ev, Ev::Motion(..) | Ev::Button(..));
         let mut routed = if placing && !due.is_empty() {
-            self.inner.screen.lock().unwrap().route(&due)
+            let plain: Vec<(Ev, u32)> = due.iter().filter(|e| !(dragging && pointer(&e.0))).map(|e| (e.0, e.1)).collect();
+            self.inner.screen.lock().unwrap().route(&plain)
         } else {
             Vec::new()
         };
@@ -638,17 +731,36 @@ impl Wayland {
                 eprintln!("[gex] input: {}", s.client.describe_input());
             }
             let take = s.client.input_ready() && !placing;
-            for &(ev, ms) in due.iter().filter(|_| take) {
+            let mut prev = over_start.clone();
+            for (ev, ms, over) in due.iter() {
+                let (ev, ms) = (*ev, *ms);
+                // The window `over` names: this client's or another's.
+                let top = over.as_ref().map(|t| s.client.toplevel_titled(t));
+                if let Ev::Over(_) = ev {
+                    // The pointer was in one of this client's windows and is
+                    // now in another client's: it leaves.
+                    let was = prev.as_ref().is_some_and(|t| s.client.toplevel_titled(t).is_some());
+                    if was && !top.is_some_and(|t| t.is_some()) {
+                        s.client.pointer_clear();
+                    }
+                    s.client.point_window(top.flatten());
+                    prev = over.clone();
+                    continue;
+                }
+                if !take || top == Some(None) {
+                    continue;
+                }
                 match ev {
+                    // (the drag's)
+                    Ev::Motion(..) | Ev::Button(..) if dragging => {}
                     // (the window's own hit test: a popup's point in the
                     // popup's coordinates, as the page's desktop sends it)
                     Ev::Motion(x, y) => s.client.pointer_in_window(x, y, ms),
                     Ev::Button(b, down) => s.client.pointer_button_in_window(b, down, ms),
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
                     Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
-                    Ev::Drag(..) | Ev::DragMove(..) | Ev::Drop | Ev::DragLeave => {
-                        eprintln!("[gex] input: a drag needs placed windows (gex_window_placement_v1)");
-                    }
+                    // (the script's drag of files: `carry`)
+                    Ev::Drag(..) | Ev::DragMove(..) | Ev::Drop | Ev::DragLeave | Ev::Over(_) => {}
                 }
             }
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
@@ -674,7 +786,7 @@ impl Wayland {
                     Routed::DragLeave => s.client.drag_leave(),
                 }
             }
-            s.answer_drag();
+            s.answer_drag(own_target == Some(s.id));
             routed.retain(|r| r.0 != s.id);
             // A window that asked to be fullscreen (a rootful Xwayland, a
             // nested compositor) is given the whole output, and one that took
@@ -735,12 +847,301 @@ impl Wayland {
             }
             keep
         });
+        self.carry(&mut sessions, &due, dragging, placing);
         drop(sessions);
         if !produced.is_empty() {
             self.note_frame();
             // One screen per batch of commits, not one per surface.
             self.save(&produced);
             self.note_screen();
+        }
+    }
+}
+
+impl Wayland {
+    /// The drags, after every session's requests are read: a client's own
+    /// (`OwnDrag`) -- its start, the pointer's moves and release, what the
+    /// target says told to the source, the target's receives handed to the
+    /// source's sends, the target's finish -- and the script's drag of files
+    /// over windows nobody places.
+    fn carry(&self, sessions: &mut [Session], due: &[(Ev, u32, Option<String>)], dragging: bool, placing: bool) {
+        let mut own = self.inner.own.lock().unwrap();
+        // A drag started: the pointer is its own from now on, where it is.
+        for i in 0..sessions.len() {
+            let Some(start) = sessions[i].client.take_drag_start() else { continue };
+            if let Some(old) = own.take() {
+                eprintln!("[gex] dnd: a new drag ends the one from {}", old.src);
+                Self::end_own(sessions, old, false);
+            }
+            eprintln!(
+                "[gex] dnd: {} starts a drag of {:?} (actions {}) from surface {}{}",
+                sessions[i].id,
+                start.mimes,
+                start.actions,
+                start.origin,
+                start.icon.map(|i| format!(", icon {i}")).unwrap_or_default()
+            );
+            let mut d = OwnDrag { src: sessions[i].id, start, over: None, dropped: None };
+            let at = *self.inner.at.lock().unwrap();
+            let over = self.inner.over.lock().unwrap().clone();
+            self.drag_to(sessions, &mut d, over.as_ref(), placing, at, 0);
+            *own = Some(d);
+        }
+        // Its moves and its release (what was due before it started went to
+        // the clients as ever).
+        if dragging {
+            for (ev, ms, over) in due {
+                let Some(d) = own.as_mut().filter(|d| d.dropped.is_none()) else { break };
+                match *ev {
+                    Ev::Motion(x, y) => self.drag_to(sessions, d, over.as_ref(), placing, (x, y), *ms),
+                    Ev::Button(_, false) => {
+                        let idx = |sessions: &[Session], id: u64| sessions.iter().position(|s| s.id == id);
+                        let target = d.over.and_then(|k| idx(sessions, k.0).map(|i| (i, k)));
+                        let src = idx(sessions, d.src);
+                        let taken = target.is_some_and(|(i, _)| sessions[i].client.drag_drop());
+                        match (taken, target, src) {
+                            (true, Some((ti, k)), Some(si)) => {
+                                eprintln!("[gex] dnd: dropped on {}:{}: taken", k.0, k.1);
+                                sessions[si].client.drag_source_drop(d.start.source);
+                                d.dropped = Some((sessions[ti].id, std::time::Instant::now()));
+                                d.over = None;
+                            }
+                            _ => {
+                                eprintln!("[gex] dnd: released over {:?}: cancelled", d.over);
+                                if let Some(d) = own.take() {
+                                    Self::end_own(sessions, d, false);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut end = None;
+        if let Some(d) = own.as_mut() {
+            let idx = |id: u64| sessions.iter().position(|s| s.id == id);
+            let src = idx(d.src);
+            // The source gone, or its drag ended by itself (it destroyed its
+            // source): over.
+            if src.is_none() || (d.dropped.is_none() && !src.is_some_and(|i| sessions[i].client.is_dragging())) {
+                eprintln!("[gex] dnd: the drag's source has gone");
+                end = Some(false);
+            }
+            let target = d.target().and_then(idx);
+            if d.target().is_some() && target.is_none() {
+                // Its target went: over nothing.
+                d.over = None;
+                if d.dropped.is_some() {
+                    end = Some(false);
+                }
+            }
+            let status = target.and_then(|i| sessions[i].client.drag_status());
+            // What the target takes, to the source, as it changes.
+            if let (Some(si), Some(source), None) = (src, d.start.source, d.dropped) {
+                sessions[si].client.drag_source_status(source, status.as_ref());
+            }
+            // The target's receives: its descriptor, for the source to write
+            // into, with the source's `send`.
+            if let Some(ti) = target {
+                for r in sessions[ti].client.take_receives() {
+                    let file = sessions[ti].fds.remove(&r.fd);
+                    sessions[ti].fresh.retain(|t| *t != r.fd);
+                    match (file, src, d.start.source) {
+                        (Some(file), Some(si), Some(source)) => {
+                            eprintln!("[gex] dnd: {} asks for {}: {}'s source is asked to send it", sessions[ti].id, r.mime, d.src);
+                            sessions[si].socket.stage_send(vec![file]);
+                            sessions[si].client.ask_source(source, &r.mime);
+                            sessions[si].flush();
+                        }
+                        // (dropped here: the receiver reads its end)
+                        _ => eprintln!("[gex] dnd: nothing to send as {}", r.mime),
+                    }
+                }
+            }
+            // Dropped: the source is told when the target is done with it.
+            if let Some((_, since)) = d.dropped {
+                if status.as_ref().is_none_or(|st| st.finished) {
+                    eprintln!("[gex] dnd: the target is done with the drop");
+                    if let (Some(si), Some(source)) = (src, d.start.source) {
+                        sessions[si].client.drag_source_finished(source);
+                    }
+                    end = Some(true);
+                } else if since.elapsed() > DROP_FINISH {
+                    eprintln!("[gex] dnd: the target never finished the drop: cancelled");
+                    end = Some(false);
+                }
+            }
+        }
+        if let Some(finished) = end {
+            if let Some(d) = own.take() {
+                Self::end_own(sessions, d, finished);
+            }
+        }
+        // Its icon, at the pointer while the pointer is the drag's.
+        {
+            let mut screen = self.inner.screen.lock().unwrap();
+            screen.icon = own.as_ref().filter(|d| d.dropped.is_none()).and_then(|d| {
+                let s = sessions.iter().find(|s| s.id == d.src)?;
+                let (icon, hx, hy) = s.client.drag_icon()?;
+                let at = screen.icon_at?;
+                Some(((d.src, icon), at, hx, hy))
+            });
+        }
+        drop(own);
+        if !placing {
+            self.carry_host_drag(sessions, due);
+        }
+        for s in sessions.iter_mut() {
+            s.flush();
+        }
+    }
+
+    /// A client's drag is at `(x, y)` (the screen's, or the window's): it
+    /// enters the surface there (leaving the one it was over), or moves on
+    /// it. With placed windows the screen's hit test picks the surface; else
+    /// the window `over` names, or the one the drag started in.
+    fn drag_to(&self, sessions: &mut [Session], d: &mut OwnDrag, over: Option<&String>, placing: bool, (x, y): (i32, i32), ms: u32) {
+        let mut screen = self.inner.screen.lock().unwrap();
+        let hit = if placing {
+            let h = screen.hit(x, y);
+            screen.icon_at = Some(IconAt::Screen(x, y));
+            h
+        } else {
+            let i = match over {
+                Some(t) => sessions.iter().position(|s| s.client.toplevel_titled(t).is_some()),
+                None => sessions.iter().position(|s| s.id == d.src),
+            };
+            i.and_then(|i| {
+                let s = &mut sessions[i];
+                let top = match over {
+                    Some(t) => s.client.toplevel_titled(t),
+                    None => s.client.toplevel_of(d.start.origin),
+                };
+                s.client.point_window(top);
+                if let Some(top) = top {
+                    screen.icon_at = Some(IconAt::Window((s.id, top), x, y));
+                }
+                s.client.window_point(x, y).map(|(surface, lx, ly)| ((s.id, surface), lx, ly))
+            })
+        };
+        drop(screen);
+        let idx = |sessions: &[Session], id: u64| sessions.iter().position(|s| s.id == id);
+        match (d.over, hit) {
+            (Some(o), Some((k, lx, ly))) if o == k => {
+                if let Some(i) = idx(sessions, k.0) {
+                    sessions[i].client.drag_motion(lx, ly, ms);
+                }
+            }
+            (old, new) => {
+                if let Some(i) = old.and_then(|o| idx(sessions, o.0)) {
+                    sessions[i].client.drag_leave();
+                }
+                d.over = None;
+                let Some((k, lx, ly)) = new else {
+                    eprintln!("[gex] dnd: the drag at {x},{y} is over no window");
+                    return;
+                };
+                let Some(i) = idx(sessions, k.0) else { return };
+                if placing {
+                    sessions[i].client.placement_origin(k.1, x - lx, y - ly);
+                }
+                let mimes: Vec<&str> = d.start.mimes.iter().map(String::as_str).collect();
+                // A source below version 3 says no actions: its drops are copies.
+                let actions = if d.start.actions == 0 { gex_wayland::data::DND_COPY } else { d.start.actions };
+                let ok = sessions[i].client.drag_enter(k.1, lx, ly, &mimes, actions);
+                eprintln!("[gex] dnd: the drag enters {}:{} at {lx},{ly}{}", k.0, k.1, if ok { "" } else { ": the client has no data device" });
+                if ok {
+                    d.over = Some(k);
+                }
+            }
+        }
+    }
+
+    /// A client's drag is over: the target it is over left (a dropped one's
+    /// offer is the target's until it destroys it), the source told it was
+    /// cancelled unless it `finished`.
+    fn end_own(sessions: &mut [Session], d: OwnDrag, finished: bool) {
+        for s in sessions.iter_mut() {
+            if Some(s.id) == d.target() {
+                s.client.drag_leave();
+            }
+            if s.id == d.src {
+                if !finished {
+                    s.client.drag_source_cancel(d.start.source);
+                }
+                s.client.point_window(None);
+            }
+        }
+    }
+
+    /// The script's drag of files over windows nobody places: to the window
+    /// `over` names, or the newest client's.
+    fn carry_host_drag(&self, sessions: &mut [Session], due: &[(Ev, u32, Option<String>)]) {
+        let mut hd = self.inner.host_drag.lock().unwrap();
+        let idx = |sessions: &[Session], id: u64| sessions.iter().position(|s| s.id == id);
+        for (ev, ms, over) in due {
+            let to = match *ev {
+                Ev::Drag(x, y, n) => {
+                    if let Some(i) = hd.take().and_then(|h| h.1).and_then(|k| idx(sessions, k.0)) {
+                        sessions[i].client.drag_leave();
+                    }
+                    *hd = Some((n, None));
+                    Some((x, y))
+                }
+                Ev::DragMove(x, y) => Some((x, y)),
+                Ev::Drop => {
+                    match hd.take().and_then(|h| h.1).and_then(|k| idx(sessions, k.0)) {
+                        Some(i) => {
+                            let taken = sessions[i].client.drag_drop();
+                            eprintln!("[gex] dnd: drop on {}: {}", sessions[i].id, if taken { "taken" } else { "refused" });
+                        }
+                        None => eprintln!("[gex] input: drop over no window"),
+                    }
+                    None
+                }
+                Ev::DragLeave => {
+                    if let Some(i) = hd.take().and_then(|h| h.1).and_then(|k| idx(sessions, k.0)) {
+                        sessions[i].client.drag_leave();
+                    }
+                    None
+                }
+                _ => None,
+            };
+            let (Some((x, y)), Some((n, was))) = (to, hd.as_mut()) else { continue };
+            let i = match over {
+                Some(t) => sessions.iter().position(|s| s.client.toplevel_titled(t).is_some()),
+                None => sessions.iter().rposition(|s| s.client.wants_input() && s.client.has_data_device()),
+            };
+            let hit = i.and_then(|i| {
+                let s = &mut sessions[i];
+                let top = over.as_ref().and_then(|t| s.client.toplevel_titled(t));
+                s.client.point_window(top);
+                s.client.window_point(x, y).map(|(surface, lx, ly)| ((s.id, surface), lx, ly))
+            });
+            eprintln!("[gex] input: drag at {x},{y} is over {:?}", hit.map(|h| h.0));
+            match (*was, hit) {
+                (Some(o), Some((k, lx, ly))) if o == k => {
+                    if let Some(i) = idx(sessions, k.0) {
+                        sessions[i].client.drag_motion(lx, ly, *ms);
+                    }
+                }
+                (o, h) => {
+                    if let Some(i) = o.and_then(|o| idx(sessions, o.0)) {
+                        sessions[i].client.drag_leave();
+                    }
+                    *was = None;
+                    if let Some((k, lx, ly)) = h {
+                        if let Some(i) = idx(sessions, k.0) {
+                            let s = &mut sessions[i];
+                            s.drag = self.drag_list(*n);
+                            let ok = s.client.drag_enter(k.1, lx, ly, &["text/uri-list"], gex_wayland::data::DND_COPY);
+                            eprintln!("[gex] dnd: enter {}:{} at {lx},{ly}{}", k.0, k.1, if ok { "" } else { ": the client has no data device" });
+                            *was = ok.then_some(k);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -777,10 +1178,25 @@ struct Screen {
     pointer: Option<Key>,
     /// The scripted drag: which file list, and the surface it is over.
     drag: Option<(usize, Option<Key>)>,
+    /// A client's drag's icon: its surface, where the pointer is, and its
+    /// hotspot; and where the pointer was last put by a drag.
+    icon: Option<(Key, IconAt, i32, i32)>,
+    icon_at: Option<IconAt>,
+    /// The last frame of each surface that has no role: a drag's icon is
+    /// drawn before its drag starts, and is no window until then.
+    spare: HashMap<Key, Frame>,
     /// Sessions owed a keyboard leave: the keyboard went to another client.
     leaves: Vec<u64>,
     /// The window list last printed.
     listed: String,
+}
+
+/// Where a drag's pointer is: a point of the screen, or of a window (one
+/// nobody places, drawn centred).
+#[derive(Clone, Copy, Debug)]
+enum IconAt {
+    Screen(i32, i32),
+    Window(Key, i32, i32),
 }
 
 /// Scripted input, routed by the screen to one client.
@@ -812,6 +1228,7 @@ impl Screen {
     /// A client hung up: its windows are gone.
     fn forget(&mut self, sid: u64) {
         self.frames.retain(|k, _| k.0 != sid);
+        self.spare.retain(|k, _| k.0 != sid);
         self.placed.retain(|k, _| k.0 != sid);
         self.order.retain(|k| k.0 != sid);
         self.acted.retain(|k, _| k.0 != sid);
@@ -835,7 +1252,14 @@ impl Screen {
         for f in produced {
             self.frames.insert((sid, f.surface), f.clone());
         }
-        self.frames.retain(|k, _| k.0 != sid || client.is_mapped(k.1));
+        // (a surface with no role yet, kept aside: a drag's icon)
+        let unmapped: Vec<Key> = self.frames.keys().filter(|k| k.0 == sid && !client.is_mapped(k.1)).copied().collect();
+        for k in unmapped {
+            if let Some(f) = self.frames.remove(&k) {
+                self.spare.insert(k, f);
+            }
+        }
+        self.spare.retain(|k, _| k.0 != sid || (client.has_surface(k.1) && !client.is_mapped(k.1)));
         let now = client.placed();
         self.placed.retain(|k, _| k.0 != sid || now.iter().any(|p| p.0 == k.1));
         self.order.retain(|k| self.placed.contains_key(k));
@@ -941,6 +1365,8 @@ impl Screen {
                         out.push((k.0, Routed::DragLeave));
                     }
                 }
+                // (for windows nobody places)
+                Ev::Over(_) => {}
                 Ev::Axis(axis, v) => {
                     if let Some((sid, _)) = self.pointer {
                         out.push((sid, Routed::Axis(axis, v, ms)));
@@ -991,15 +1417,30 @@ impl Screen {
     }
 
     /// What to draw, bottom to top: windows nobody placed centred, as
-    /// before, then the placed ones where they are.
-    fn items(&self) -> Vec<(u64, &Frame, Option<(i32, i32)>)> {
+    /// before, then the placed ones where they are, then a drag's icon at
+    /// the pointer. `size`: the screen's, which centres a window.
+    fn items(&self, size: (u32, u32)) -> Vec<(u64, &Frame, Option<(i32, i32)>)> {
         let key = |k: &Key| (k.0 << 32) | u64::from(k.1);
-        let mut loose: Vec<_> = self.frames.iter().filter(|(k, _)| !self.placed.contains_key(k)).collect();
+        let icon = self.icon.map(|i| i.0);
+        let mut loose: Vec<_> = self.frames.iter().filter(|(k, _)| !self.placed.contains_key(k) && Some(**k) != icon).collect();
         loose.sort_by_key(|(k, _)| **k);
         let mut out: Vec<_> = loose.into_iter().map(|(k, f)| (key(k), f, None)).collect();
         for k in self.stack() {
             if let (Some(f), Some(&(x, y, _))) = (self.frames.get(&k), self.placed.get(&k)) {
                 out.push((key(&k), f, Some((x, y))));
+            }
+        }
+        if let Some((k, at, hx, hy)) = self.icon {
+            let point = match at {
+                IconAt::Screen(x, y) => Some((x, y)),
+                IconAt::Window(w, x, y) => match (self.placed.get(&w), self.frames.get(&w)) {
+                    (Some(&(px, py, _)), _) => Some((px + x, py + y)),
+                    (None, Some(f)) => Some((((size.0 as i32 - f.width) / 2).max(0) + x, ((size.1 as i32 - f.height) / 2).max(0) + y)),
+                    _ => None,
+                },
+            };
+            if let (Some((x, y)), Some(f)) = (point, self.frames.get(&k).or_else(|| self.spare.get(&k))) {
+                out.push((key(&k), f, Some((x - hx, y - hy))));
             }
         }
         out
@@ -1059,10 +1500,29 @@ impl HostListener for Wayland {
 }
 
 impl Session {
+    /// Send what the client is owed now, as far as its socket takes it.
+    fn flush(&mut self) {
+        self.out.extend_from_slice(&self.client.take_outgoing());
+        while self.sent < self.out.len() {
+            match self.socket.send(&self.out[self.sent..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => self.sent += n as usize,
+            }
+        }
+        if self.sent == self.out.len() {
+            self.out.clear();
+            self.sent = 0;
+        }
+    }
+
     /// The drag's data to every client that asked (`wl_data_offer.receive`):
     /// written into its descriptor, which is then closed. And what the client
-    /// says of the drag, when that changes.
-    fn answer_drag(&mut self) {
+    /// says of the drag, when that changes. Not the receives of a client's
+    /// own drag over this one (`own`): those go to its source (`carry`).
+    fn answer_drag(&mut self, own: bool) {
+        if own {
+            return;
+        }
         for r in self.client.take_receives() {
             let file = self.fds.remove(&r.fd);
             self.fresh.retain(|t| *t != r.fd);
