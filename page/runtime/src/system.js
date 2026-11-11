@@ -567,7 +567,7 @@ export class System extends EventTarget {
     let census = { pids: [], threads: 0, memory: 0 };
     const early = this.#earlyWorker;
     this.#earlyWorker = null;
-    const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale, dom: !!single.wl.dom };
+    const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale, dom: !!single.wl.dom, menus: !!single.wl.menus };
     const gl = single.gl && { d3d: !!single.gl.d3d };
     // A rest bundle's lazy files (`BUNDLE#OFFSET`) are read through zstd
     // frames: the system Worker loads the decoder before its kernel starts.

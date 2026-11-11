@@ -59,6 +59,10 @@ export default async function (t) {
   await t.key('KeyA', 'a');
   await until(() => /^window: key \d+ up/m.test(text), 'the key reached the program', 30000).catch(() => {});
   check('and a key pressed, by its number', /^window: key 30 down$/m.test(text) && /^window: key 30 up$/m.test(text), text.slice(-300));
+  // (And no menu protocol: this page's compositor draws no menus, so the
+  // program is not offered `gex_menu_manager_v1`. darwin/menu is the page
+  // that presents them.)
+  check('a page that presents no menus offers the program no menu protocol', /^window: the shell presents menus: no$/m.test(text), text.slice(-300));
   p.kill('SIGTERM');
   await until(async () => !(seen = await out.describe())?.titles?.includes(TITLE), 'the window went', 30000).catch(() => {});
   check('its window goes when it ends', !seen?.titles?.includes(TITLE), (seen?.log ?? []).slice(-8).join(' / '));

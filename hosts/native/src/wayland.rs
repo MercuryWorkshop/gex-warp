@@ -1252,6 +1252,20 @@ impl Buffers for PoolView<'_, '_> {
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }
+
+    fn read(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
+        let file = self.fds.get(&fd)?;
+        let mut out = vec![0u8; size];
+        let mut at = 0;
+        while at < size {
+            match file.handle.read_at(at as u64, &mut out[at..]) {
+                Ok(n) if n > 0 => at += n as usize,
+                _ => break,
+            }
+        }
+        out.truncate(at);
+        Some(out)
+    }
 }
 
 #[cfg(test)]

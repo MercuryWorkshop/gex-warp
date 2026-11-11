@@ -2521,6 +2521,10 @@ export class Gex {
         wl_clip_get: (ptr, max) => this.#wl?.clipGet?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         wl_clip_set: (ptr, len, from) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0, from >>> 0) ?? 0,
         wl_clip_from: () => this.#wl?.clipFrom?.() ?? 0,
+        // Menus the page's shell presents (wl_menu.rs): whether it does,
+        // and a message for it.
+        wl_menus: () => this.#wl?.menus?.() ?? 0,
+        wl_menu_post: (ptr, len) => this.#wl?.menuPost?.(this.#memory, ptr >>> 0, len >>> 0) ?? 1,
     };
   }
 

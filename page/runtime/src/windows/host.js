@@ -12,6 +12,152 @@ const KINDS = { 1: 'toplevel', 2: 'popup', 3: 'subsurface' };
 /** `DomDesktop.STATE_*`. */
 const STATE = { maximized: 2, resizing: 4, fullscreen: 8 };
 
+const MENU_STATES = ['off', 'on', 'mixed'];
+/** `gex_menu_v1.modifiers`, by the names a page's key and pointer events
+ *  have for them (and the protocol's own). */
+const MENU_MODS = [['shift', 'shiftKey', 1], ['control', 'ctrlKey', 2], ['alt', 'altKey', 4], ['logo', 'metaKey', 8]];
+
+/** A tree's items as plain, frozen data (README "Menus"). */
+function menuItems(d, tree, items) {
+  return Object.freeze(items.map((i) => Object.freeze({
+    id: i.id,
+    title: i.title,
+    enabled: !(i.flags & 1),
+    hidden: !!(i.flags & 2),
+    separator: !!(i.flags & 4),
+    alternate: !!(i.flags & 16),
+    header: !!(i.flags & 32),
+    state: MENU_STATES[i.state] ?? 'off',
+    indent: i.indent | 0,
+    role: i.role ?? null,
+    shortcut: i.key ? Object.freeze({ key: i.key, shift: !!(i.modifiers & 1), control: !!(i.modifiers & 2), alt: !!(i.modifiers & 4), logo: !!(i.modifiers & 8) }) : null,
+    tooltip: i.tooltip ?? null,
+    image: i.image ? d.menuImage(tree, i.image) : null,
+    submenu: i.items ? menuItems(d, tree, i.items) : null,
+  })));
+}
+
+function findItem(items, id) {
+  for (const i of items) {
+    if (i.id === id) return i;
+    const below = i.submenu && findItem(i.submenu, id);
+    if (below) return below;
+  }
+  return null;
+}
+
+/** A shortcut as a menu shows it: `'mac'` the Mac's symbols ("⇧⌘S"),
+ *  `'plus'` names joined by + ("Ctrl+Shift+S", the logo key as `logo`,
+ *  default "Super"). */
+export function shortcutLabel(shortcut, { style = 'mac', logo = 'Super' } = {}) {
+  if (!shortcut) return '';
+  const k = shortcut.key;
+  const mac = style === 'mac';
+  const names = mac
+    ? { Enter: '↩', Tab: '⇥', Backspace: '⌫', Delete: '⌦', Escape: '⎋', ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', Home: '↖', End: '↘', PageUp: '⇞', PageDown: '⇟', ' ': 'Space' }
+    : { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Escape: 'Esc', ' ': 'Space' };
+  const key = names[k] ?? (k.length === 1 ? k.toUpperCase() : k);
+  if (mac) return `${shortcut.control ? '⌃' : ''}${shortcut.alt ? '⌥' : ''}${shortcut.shift ? '⇧' : ''}${shortcut.logo ? '⌘' : ''}${key}`;
+  return [shortcut.control && 'Ctrl', shortcut.alt && 'Alt', shortcut.shift && 'Shift', shortcut.logo && logo, key].filter(Boolean).join('+');
+}
+
+/** One tree of menus a program handed to the page (README "Menus"): its
+ *  menu bar, its dock menu, or one window's menu bar. Events: `change` (the
+ *  items or the title are different) and `closed` (the program took it
+ *  away, or ended). */
+export class GuestMenu extends EventTarget {
+  #d;
+  #host;
+  #t;
+  #items;
+  #gone = false;
+
+  constructor(host, desktop, tree) {
+    super();
+    this.#host = host;
+    this.#d = desktop;
+    this[INTERNAL] = { update: (t) => this.#update(t), gone: () => this.#end(), tree: () => this.#t };
+    this.#t = tree;
+    this.#items = menuItems(desktop, tree, tree.items);
+  }
+
+  #update(tree) {
+    this.#t = tree;
+    this.#items = menuItems(this.#d, tree, tree.items);
+    this.dispatchEvent(new Event('change'));
+  }
+
+  #end() {
+    this.#gone = true;
+    this.dispatchEvent(new Event('closed'));
+  }
+
+  /** `'menu-bar'` (the application's, shown while any of its windows has
+   *  the keyboard), `'dock'` (items for the menu of the application's icon)
+   *  or `'window'` (one window's own menu bar). */
+  get scope() {
+    return this.#t.scope;
+  }
+
+  /** The application's name, as it says it. */
+  get title() {
+    return this.#t.title;
+  }
+
+  /** The pid of the program whose menu this is. */
+  get pid() {
+    return this.#t.token;
+  }
+
+  /** The windows this is the menu of (`window.menu === this`). */
+  get windows() {
+    return this.#host.windows().filter((w) => w.menu === this);
+  }
+
+  /** The bar's items (a dock menu's: the items themselves), in order:
+   *  plain frozen data, new objects after each `change`. */
+  get items() {
+    return this.#items;
+  }
+
+  /** The item numbered `id`, wherever it is in the tree, or null. */
+  item(id) {
+    return findItem(this.#items, id);
+  }
+
+  /** Before showing a menu: tells the program, which brings the menu's
+   *  items up to date (enabled, check marks, titles, which there are), and
+   *  resolves with them once it has, or after `timeout` ms with what there
+   *  is (a busy program must not make the bar dead; a `change` follows when
+   *  it does answer). `id`: an item with a `submenu`, or 0 for the bar
+   *  itself. Pair each with `closeMenu`. */
+  async openMenu(id = 0, { timeout = 300 } = {}) {
+    if (!this.#gone) {
+      let timer;
+      await Promise.race([this.#d.menuOpen(this.#t, id), new Promise((res) => (timer = setTimeout(res, timeout)))]);
+      clearTimeout(timer);
+    }
+    return id ? this.item(id)?.submenu ?? Object.freeze([]) : this.#items;
+  }
+
+  /** The page stopped showing the menu it opened. */
+  closeMenu(id = 0) {
+    if (!this.#gone) this.#d.menuClosed(this.#t, id);
+  }
+
+  /** The item was chosen: the program acts as on a click in a menu of its
+   *  own (and does nothing if the item cannot be chosen now). `modifiers`:
+   *  what was held, as `{ shift, control, alt, logo }` or the page's own
+   *  event (`shiftKey`, `ctrlKey`, `altKey`, `metaKey`). No `openMenu` is
+   *  needed first: a page may run an item from a shortcut of its own. */
+  activate(id, { modifiers } = {}) {
+    if (this.#gone) return;
+    let bits = 0;
+    for (const [name, key, bit] of MENU_MODS) if (modifiers?.[name] || modifiers?.[key]) bits |= bit;
+    this.#d.menuActivate(this.#t, id, bits);
+  }
+}
+
 /** One guest window, as the page sees it. Events: `title`, `appid`,
  *  `resized`, `position` (a popup's or a placed window's place changed),
  *  `request` (`kind`: 'move', 'resize' with `edges`, 'maximize',
@@ -63,6 +209,14 @@ export class GuestWindow extends EventTarget {
    *  says (`_NET_WM_PID`), else its X server's. */
   get pid() {
     return this.#w.guestPid || this.#w.token;
+  }
+
+  /** The menu a shell shows for this window (README "Menus"): its own menu
+   *  bar if it has one, else its application's; null when the program
+   *  published none, or the page does not present menus. */
+  get menu() {
+    const w = this.#w;
+    return this.#host[INTERNAL].menuOf(w.token, w.client, w.surface);
   }
 
   /** The window it belongs to (a popup's or a subsurface's), or null. */
@@ -172,6 +326,7 @@ export class HostWindows extends EventTarget {
   #mount = null;
   #size;
   #wins = new Map();
+  #menus = new Map();
 
   /**
    * The guest's windows, each handed to the page (`window` event) to frame
@@ -179,9 +334,11 @@ export class HostWindows extends EventTarget {
    * program asking for the screen's size sees (default the viewport);
    * `scale`: device pixels per CSS pixel (default devicePixelRatio, rounded).
    * X11 programs' windows come as any other, through the runtime's X server,
-   * started for the first of them.
+   * started for the first of them. `menus`: the page presents the programs'
+   * menus itself (README "Menus"); a program that can then draws no menu
+   * bar and hands its menus over (`menu` events, `window.menu`).
    */
-  constructor(sys, { width, height, scale } = {}) {
+  constructor(sys, { width, height, scale, menus = false } = {}) {
     super();
     const i = internals(sys, 'HostWindows');
     i.attach('windows', this, { beforeBoot: true });
@@ -202,15 +359,25 @@ export class HostWindows extends EventTarget {
       // here (runtime.js `openWaylandMirror`).
       if (dev.single) {
         const { w, h, scale } = this.#size;
-        mirrored(dev, m, { width: w * scale, height: h * scale, scale }, (d) => this.#start(d));
+        mirrored(dev, m, { width: w * scale, height: h * scale, scale, menus: !!menus }, (d) => this.#start(d));
         return;
       }
-      Object.assign(dev, await dev.rt.openWayland({ wl: m, onDesktop: (d) => this.#start(d), say: (t) => dev.say(`${t}\n`) }));
+      Object.assign(dev, await dev.rt.openWayland({ wl: m, onDesktop: (d) => this.#start(d), menus: !!menus, say: (t) => dev.say(`${t}\n`) }));
     });
     const self = this;
     this[INTERNAL] = {
       x,
       byKey: (k) => self.#wins.get(k) ?? null,
+      menuOf: (token, client, surface) => {
+        let bar = null;
+        for (const m of self.#menus.values()) {
+          const t = m[INTERNAL].tree();
+          if (t.token !== token || t.client !== client) continue;
+          if (t.scope === 'window' && t.surface === surface) return m;
+          if (t.scope === 'menu-bar') bar = m;
+        }
+        return bar;
+      },
       of: (pid) => [...self.#wins.values()].filter((w) => w.pid === pid),
       shutdown: () => {
         self.#d?.stop();
@@ -248,6 +415,11 @@ export class HostWindows extends EventTarget {
     return [...this.#wins.values()];
   }
 
+  /** Every menu tree programs have handed over, oldest first. */
+  menus() {
+    return [...this.#menus.values()];
+  }
+
   /** The window with the keyboard, or null. */
   get focused() {
     const w = this.#d?.focused();
@@ -269,6 +441,21 @@ export class HostWindows extends EventTarget {
     d.oncursor = (css) => {
       for (const win of this.#wins.values()) win.canvas.style.cursor = css;
       this.dispatchEvent(Object.assign(new Event('cursor'), { css }));
+    };
+    // A program's menus (`menus: true`): a `menu` event for each new tree,
+    // `change` and `closed` on the tree after.
+    d.onmenu = (key, tree) => {
+      const menu = this.#menus.get(key);
+      if (!tree) {
+        this.#menus.delete(key);
+        menu?.[INTERNAL].gone();
+      } else if (menu) {
+        menu[INTERNAL].update(tree);
+      } else {
+        const m = new GuestMenu(this, d, tree);
+        this.#menus.set(key, m);
+        this.dispatchEvent(Object.assign(new Event('menu'), { menu: m }));
+      }
     };
     d.onwindow = (dw) => {
       const win = new GuestWindow(this, d, dw);

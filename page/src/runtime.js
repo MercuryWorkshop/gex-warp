@@ -849,12 +849,15 @@ export function glOnFirstRequest(glChannel, start) {
  * scene compositor) or an element (DomDesktop: windows as DOM elements,
  * decorations in the page's own HTML). `{ wlChannel, compositor, dom }`.
  */
-export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop = null, say = () => {} }) {
+export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop = null, menus = false, say = () => {} }) {
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the Wayland compositor needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
-  const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
+  const { makeWlChannel, setOutputSize, setMenusPresented } = await import('@gex/wl-bridge.mjs');
   const wlChannel = makeWlChannel();
+  // `menus`: the page's shell presents the programs' menus (`gex_menu_v1`),
+  // said before any program connects.
+  if (menus) setMenusPresented(wlChannel, true);
   const element = typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
   if (element) {
     const { DomDesktop } = await import('./dom-compositor.js');

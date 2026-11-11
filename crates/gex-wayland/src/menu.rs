@@ -526,7 +526,13 @@ impl Client {
                     return false;
                 };
                 let size = (w as usize) * (h as usize) * 4;
-                let pixels = if w == 0 || h == 0 || w > IMAGE_MAX || h > IMAGE_MAX { None } else { buffers.map(fd, size) };
+                // What a mapping of the file holds, if the client has one of
+                // the whole picture (it drew there); else the file's bytes.
+                let pixels = if w == 0 || h == 0 || w > IMAGE_MAX || h > IMAGE_MAX {
+                    None
+                } else {
+                    buffers.map(fd, size).filter(|p| p.len() >= size).or_else(|| buffers.read(fd, size))
+                };
                 let Some(mut argb) = pixels.filter(|p| p.len() >= size) else {
                     self.error(object, menu_error::BAD_IMAGE, &format!("gex_menu_v1: no {w}x{h} image in the file"));
                     return true;
@@ -772,8 +778,21 @@ mod tests {
     use super::*;
     use crate::wire::header;
 
+    /// A file's bytes, read (not mapped: a client writes a picture and
+    /// sends its descriptor).
     struct Files(Vec<u8>);
     impl Buffers for Files {
+        fn map(&self, _fd: u32, _size: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn read(&self, _fd: u32, size: usize) -> Option<Vec<u8>> {
+            Some(self.0[..size.min(self.0.len())].to_vec())
+        }
+    }
+
+    /// The same bytes in a mapping the client still has.
+    struct Mapped(Vec<u8>);
+    impl Buffers for Mapped {
         fn map(&self, _fd: u32, size: usize) -> Option<Vec<u8>> {
             Some(self.0[..size.min(self.0.len())].to_vec())
         }
@@ -1087,6 +1106,11 @@ mod tests {
         assert_eq!(t.images().len(), 1);
         assert!(t.describe(1, false)[0].ends_with("image=2x1@2 template"), "{:?}", t.describe(1, false));
         assert!(image.json().starts_with(&format!("{{\"image\":{},\"width\":2,\"height\":1,\"scale\":2,\"template\":true,\"rgba\":\"/wAA/wD/AIA=\"", image.serial)));
+        // From a mapping the client holds, the same.
+        c.receive(&Writer::new(4, 6).uint(12).uint(2).uint(1).uint(1).uint(0).finish(), &[7], &Mapped(file.0.clone()));
+        c.receive(&Writer::new(4, 10).finish(), &[], &file);
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+        assert_eq!(c.menu_tree(4).unwrap().item(12).unwrap().image.as_ref().unwrap().rgba(), image.rgba());
         // Taken away again.
         send(&mut c, Writer::new(4, 7).uint(10));
         commit(&mut c);

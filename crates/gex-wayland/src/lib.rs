@@ -62,6 +62,14 @@ pub trait Buffers {
     fn locate(&self, _fd: u32, _size: usize) -> Option<(u64, u64)> {
         None
     }
+
+    /// The first `size` bytes of the file behind a descriptor, as they were
+    /// written to it: for a small thing a client sends once and does not
+    /// keep mapped (a menu item's image, menu.rs). `map` is what a mapping
+    /// of the file holds, which is where a client that maps it has drawn.
+    fn read(&self, _fd: u32, _size: usize) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// A committed surface: what to draw, and where its pixels are.
