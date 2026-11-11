@@ -1109,17 +1109,21 @@ impl ProcTable {
         if !ended.is_empty() {
             self.lock().forget(|p| ended.contains(&p.pid) && p.ppid == INIT_PID);
         }
-        // Published outside the table lock: a waiter wakes on `done` then wants
-        // the table, so holding both here in the other order deadlocks.
-        *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
-        done.notify_all();
+        // Published with the table let go: a waiter that finds a status
+        // then wants the table (to forget the child), so the status is held
+        // first and the table second by everyone, here too.
+        let mut published = cell.lock().unwrap_or_else(|e| e.into_inner());
+        *published = Some(status);
         // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
         // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
         // `sigsuspend` between polls has nothing else to wake it -- coreutils
         // `timeout` does exactly that. Raised only now that the child is
         // collectable: a handler's `WNOHANG` wait would otherwise find it
         // still running and wait for a SIGCHLD that has already come (as
-        // dbus-daemon's activation helper does).
+        // dbus-daemon's activation helper does). And raised before anyone
+        // can collect it, the status still held: a `wait4` that returns the
+        // child finds the signal there already, as it is of any kernel,
+        // where the handler has run by the time the call is back.
         let parent_q = {
             let mut t = self.lock();
             // its parent now (it may have been given to init since), or, if
@@ -1148,6 +1152,8 @@ impl ProcTable {
                 },
             }
         };
+        drop(published);
+        done.notify_all();
         // The parent's `wait4`, and its SIGCHLD.
         crate::wait::notify(parent_q);
         // A process descriptor for it (`crate::pidfd`), wherever it is held.
@@ -1675,20 +1681,33 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.stop)(pid, signo) != 0;
         }
-        let parent_q = {
+        let parent_q = loop {
             let mut t = self.lock();
             if pid == INIT_PID || (signo != SIGSTOP && t.orphaned(pid)) {
                 return false;
             }
             let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
-            // (One that has ended is not stopped by what it left behind.)
-            if p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
-                return false;
+            // (One that has ended is not stopped by what it left behind. Its
+            // status is not waited for with the table held -- whoever holds
+            // it may want the table next, as `end` does -- but asked again.)
+            let ended = match p.child.status.try_lock() {
+                Ok(st) => Some(st.is_some()),
+                Err(std::sync::TryLockError::Poisoned(_)) => Some(true),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            match ended {
+                Some(true) => return false,
+                Some(false) => {}
+                None => {
+                    drop(t);
+                    std::thread::yield_now();
+                    continue;
+                }
             }
             p.stop = signo;
             p.stop_news = signo << 8 | 0x7f;
             let ppid = p.ppid;
-            t.tell_parent(ppid)
+            break t.tell_parent(ppid);
         };
         crate::wait::notify(parent_q);
         true
