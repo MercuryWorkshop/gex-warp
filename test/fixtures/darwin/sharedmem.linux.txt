@@ -1,0 +1,19 @@
+anonymous shared: child saw 1 at fork, then 3 and 0; parent saw 2 at the pipe, 7 after the exit
+anonymous shared: the parent saw the child start yes; the child saw the parent's store with no call yes
+anonymous shared: atomic adds of both, 200000 wanted: 200000
+anonymous private: child saw 1 at fork, then 2 and 0; parent saw 1 at the pipe, 0 after the exit
+shm_open: child saw 1 at fork, then 3 and 0; parent saw 2 at the pipe, 7 after the exit
+shm_open: the parent saw the child start yes; the child saw the parent's store with no call yes
+shm_open: atomic adds of both, 200000 wanted: 200000
+shm_open: a child's own mapping of the name, seen after its exit: 42
+file: child saw 1 at fork, then 3 and 0; parent saw 2 at the pipe, 7 after the exit
+file: the parent saw the child start yes; the child saw the parent's store with no call yes
+file: atomic adds of both, 200000 wanted: 200000
+file: the child's store read from the file: 7
+memfd: child saw 1 at fork, then 3 and 0; parent saw 2 at the pipe, 7 after the exit
+memfd: the parent saw the child start yes; the child saw the parent's store with no call yes
+memfd: atomic adds of both, 200000 wanted: 200000
+mutex: setpshared 0, init 0
+mutex: the child found it held yes; counted under it, 40000 wanted: 40000
+semaphore: sem_init shared 0 (errno 0)
+semaphore: the child took all 1000 posts yes

@@ -29,6 +29,7 @@ mod pty;
 mod sys_waits;
 mod stall;
 mod usage;
+mod shmem;
 pub(crate) mod ftab;
 pub(crate) mod door;
 pub mod wayland;
@@ -2471,6 +2472,7 @@ fn run_thread_loop(
     store.data_mut().root_enter = Some(enter.clone());
     // This host thread's processor time is its process's while it runs here.
     usage::install();
+    shmem::install();
     let _cpu = store.data_mut().with_kernel(|k| usage::Counting::enter(k));
     // Units for code that is in place before the first instruction (the
     // interpreter, which gex's loader places): installed now, not at the
@@ -3007,6 +3009,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         child.forget_own_pidfds();
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
+    // The parent's MAP_SHARED mappings, which the child is to share.
+    let shares: Vec<gex_kernel::mem::Share> = child_kernel.mem.lock().shares().to_vec();
 
     // A program with shared libraries gets its own function table and link
     // map: a library the child dlopens is mapped and initialised in the
@@ -3082,6 +3086,14 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         }
         // A monitor is per-thread; the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+    }
+    // The shared mappings' pages: the parent's own in the child too, with
+    // the copy just made of them dropped (`shmem`). Still with the parent's
+    // threads held, so the two are the same bytes from here on.
+    if !shares.is_empty() {
+        let backed = shmem::share(&shares, &parent_mem, &child_mem);
+        cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).mem.lock().set_shared_backing(parent_mem.base(), &backed);
+        child_kernel.mem.lock().set_shared_backing(child_mem.base(), &backed);
     }
     drop(paused);
     publish_vm(&child_kernel, &child_mem);

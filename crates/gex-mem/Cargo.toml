@@ -6,4 +6,5 @@ license.workspace = true
 description = "Access to the guest's shared linear memory"
 
 [dependencies]
+libc = "0.2"
 wasmtime = { version = "49", default-features = false, features = ["runtime", "std", "threads", "gc", "gc-null", "anyhow"] }

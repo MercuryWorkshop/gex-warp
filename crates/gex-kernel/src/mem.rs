@@ -172,6 +172,10 @@ impl Vma {
 /// [`MapView::mapped`] is never asked, and the host reads the map itself.
 pub struct MapView {
     cur: gex_atomic::rcu::Published<Vec<(u64, u64, u32)>>,
+    /// The map's shares ([`Share`]) as (start, end, key of start), for a
+    /// futex's key ([`Self::share_key`]); `any` whether there are some.
+    shares: gex_atomic::rcu::Published<Vec<(u64, u64, u64)>>,
+    any_shares: std::sync::atomic::AtomicBool,
 }
 
 /// Reader slots in a view's epoch array, as the descriptor table's
@@ -184,7 +188,28 @@ pub const KEEPS_VIEWS: bool = !cfg!(all(target_family = "wasm", not(target_featu
 
 impl MapView {
     fn new(vmas: &[Vma]) -> MapView {
-        MapView { cur: gex_atomic::rcu::Published::new(Self::ranges(vmas), VIEW_READER_SLOTS) }
+        MapView {
+            cur: gex_atomic::rcu::Published::new(Self::ranges(vmas), VIEW_READER_SLOTS),
+            shares: gex_atomic::rcu::Published::new(Vec::new(), VIEW_READER_SLOTS),
+            any_shares: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn share_ranges(shares: &[Share]) -> Vec<(u64, u64, u64)> {
+        shares.iter().map(|s| (s.start, s.end, s.id << 40 | s.off)).collect()
+    }
+
+    /// The key a futex word at `addr` has in every process that shares its
+    /// page ([`Share`]): the mapping's id and the word's offset in it.
+    /// `None` for a word of the process's own (its address is its key).
+    pub fn share_key(&self, addr: u64) -> Option<u64> {
+        if !self.any_shares.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.shares.read(crate::sync::me() as usize, |r| {
+            let i = r.partition_point(|&(s, _, _)| s <= addr);
+            r[..i].last().filter(|&&(_, e, _)| addr < e).map(|&(s, _, k)| k + (addr - s))
+        })
     }
 
     fn ranges(vmas: &[Vma]) -> Vec<(u64, u64, u32)> {
@@ -222,6 +247,8 @@ impl Clone for ViewCell {
     fn clone(&self) -> ViewCell {
         ViewCell(std::sync::Arc::new(MapView {
             cur: gex_atomic::rcu::Published::new(self.0.cur.read(crate::sync::me() as usize, |r| r.clone()), VIEW_READER_SLOTS),
+            shares: gex_atomic::rcu::Published::new(self.0.shares.read(crate::sync::me() as usize, |r| r.clone()), VIEW_READER_SLOTS),
+            any_shares: std::sync::atomic::AtomicBool::new(self.0.any_shares.load(std::sync::atomic::Ordering::Acquire)),
         }))
     }
 }
@@ -345,9 +372,72 @@ impl std::fmt::Debug for Mm {
 /// (see `MemoryMap::grows_on_demand`).
 pub const BACKED_ISLAND: u64 = u64::MAX;
 
+/// A `MAP_SHARED` mapping's pages, as a fork shares them with the child
+/// (anonymous, `shm_open`, `memfd`, a file): `[start, end)` holds the
+/// bytes at `off` of the mapping `id` made (one id per `mmap`, the same in
+/// every process forked since, so a futex word in it is the same word in
+/// each: [`MapView::share_key`]). `backed`: the host has this process's
+/// pages of it in memory another process sees too
+/// ([`MemoryMap::set_shared_backing`]), which an unmap or a mapping over it
+/// must undo ([`set_unshare_hook`]) before anything else is written there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub start: u64,
+    pub end: u64,
+    pub id: u64,
+    pub off: u64,
+    pub backed: bool,
+}
+
+/// Each `MAP_SHARED` mapping's [`Share::id`], unique in the system (the
+/// processes of a native host are one host process).
+static NEXT_SHARE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The host's undoing of a backed share ([`Share::backed`]): `(the
+/// process's memory's base as the host knows it, start, end)`, to give the
+/// range private zeroed pages again.
+static UNSHARE_HOOK: std::sync::OnceLock<fn(u64, u64, u64)> = std::sync::OnceLock::new();
+
+/// Have `f` undo a host's sharing of a range ([`Share::backed`]).
+pub fn set_unshare_hook(f: fn(u64, u64, u64)) {
+    let _ = UNSHARE_HOOK.set(f);
+}
+
+/// The host's page, where it is larger than the guest's: what it can share
+/// between processes goes by its pages (16 KiB on an Apple processor), so a
+/// `MAP_SHARED` mapping the kernel places is placed on one, its length
+/// rounded up to them ([`set_share_granule`]).
+static SHARE_GRANULE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(PAGE_SIZE);
+
+/// Say the host's page size for shared mappings ([`SHARE_GRANULE`]).
+pub fn set_share_granule(bytes: u64) {
+    SHARE_GRANULE.store(bytes.max(PAGE_SIZE), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`SHARE_GRANULE`].
+pub fn share_granule() -> u64 {
+    SHARE_GRANULE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`MemoryMap::host_base`]: not copied with the map.
+#[derive(Debug, Default)]
+struct HostBase(u64);
+
+impl Clone for HostBase {
+    fn clone(&self) -> HostBase {
+        HostBase(0)
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
+    /// Its `MAP_SHARED` mappings ([`Share`]), sorted, disjoint.
+    shares: Vec<Share>,
+    /// The host's name for this process's memory, given when it backs a
+    /// share ([`Self::set_shared_backing`]): 0 while none is backed, and in
+    /// a copy (a fork's child is another memory, which the host names).
+    host_base: HostBase,
     vmas: Vec<Vma>,
     /// What readers that do not own the map see of it ([`MapView`]).
     view: ViewCell,
@@ -618,6 +708,8 @@ pub fn page_align_down(v: u64) -> u64 {
 impl MemoryMap {
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
+            shares: Vec::new(),
+            host_base: HostBase(0),
             vmas: Vec::new(),
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -653,6 +745,9 @@ impl MemoryMap {
     /// same [`MapView`], which readers without the kernel lock already hold
     /// (a new map would leave them reading the old program's).
     pub fn renew(&mut self, brk_start: u64) {
+        // The new image's memory is its own: whatever the old one shared
+        // with another process is given back first.
+        self.drop_shares(0, u64::MAX);
         let mut fresh = MemoryMap::new(brk_start);
         std::mem::swap(&mut fresh.view, &mut self.view);
         std::mem::swap(&mut fresh.log, &mut self.log);
@@ -866,6 +961,76 @@ impl MemoryMap {
         if KEEPS_VIEWS {
             let ranges = MapView::ranges(&self.vmas);
             self.view.0.cur.write(|_| (Some(ranges), ()));
+        }
+    }
+
+    /// Publish the shares ([`MapView::share_key`]).
+    fn publish_shares(&self) {
+        if KEEPS_VIEWS {
+            let any = !self.shares.is_empty();
+            if any || self.view.0.any_shares.load(std::sync::atomic::Ordering::Acquire) {
+                let ranges = MapView::share_ranges(&self.shares);
+                self.view.0.shares.write(|_| (Some(ranges), ()));
+                self.view.0.any_shares.store(any, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// `[start, end)` was just mapped `MAP_SHARED`: a share of its own
+    /// ([`Share`]), until it is unmapped or mapped over.
+    pub fn add_share(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.drop_shares(start, end);
+        let id = NEXT_SHARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let i = self.shares.partition_point(|s| s.start < start);
+        self.shares.insert(i, Share { start, end, id, off: 0, backed: false });
+        self.publish_shares();
+    }
+
+    /// The shares over `[start, end)` end there (an unmap, a mapping over
+    /// them, an exec); a backed one's pages are made private again first
+    /// ([`set_unshare_hook`]). What is left of one either side keeps its id.
+    fn drop_shares(&mut self, start: u64, end: u64) {
+        if !self.shares.iter().any(|s| s.start < end && start < s.end) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.shares.len() + 1);
+        for s in std::mem::take(&mut self.shares) {
+            if s.end <= start || s.start >= end {
+                out.push(s);
+                continue;
+            }
+            if s.backed && self.host_base.0 != 0 {
+                if let Some(f) = UNSHARE_HOOK.get() {
+                    f(self.host_base.0, s.start.max(start), s.end.min(end));
+                }
+            }
+            if s.start < start {
+                out.push(Share { end: start, ..s });
+            }
+            if s.end > end {
+                out.push(Share { start: end, off: s.off + (end - s.start), ..s });
+            }
+        }
+        self.shares = out;
+        self.publish_shares();
+    }
+
+    /// The process's shares ([`Share`]).
+    pub fn shares(&self) -> &[Share] {
+        &self.shares
+    }
+
+    /// The host has every share of this process backed by memory another
+    /// process sees too (a fork, the parent's and the child's alike), in
+    /// the memory it calls `host_base`: from now on an unmap or a mapping
+    /// over one undoes that first. `backed` says which were.
+    pub fn set_shared_backing(&mut self, host_base: u64, backed: &[bool]) {
+        self.host_base = HostBase(host_base);
+        for (s, &b) in self.shares.iter_mut().zip(backed) {
+            s.backed |= b;
         }
     }
 
@@ -1742,6 +1907,7 @@ impl MemoryMap {
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
         self.note_code(addr, end, 0);
+        self.drop_shares(addr, end);
         let mut out = Vec::with_capacity(self.vmas.len() + 1);
         for v in std::mem::take(&mut self.vmas) {
             if v.end <= addr || v.start >= end {
@@ -2374,6 +2540,40 @@ mod tests {
         m.unmap(base + 0x2000, 0x1000).unwrap();
         assert_eq!(m.vmas().len(), 5);
         assert!(m.check_access(base + 0x8000, 0x1000, prot::READ));
+    }
+
+    #[test]
+    fn a_share_is_cut_by_an_unmap_and_given_back_when_backed() {
+        static GIVEN: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        set_unshare_hook(|b, s, e| GIVEN.lock().unwrap().push((b, s, e)));
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::SHARED | flags::FIXED;
+        let base = 0x2000_0000;
+        m.mmap(base, 0x10000, prot::READ | prot::WRITE, anon, "").unwrap();
+        m.add_share(base, base + 0x10000);
+        let id = m.shares()[0].id;
+        let key = |a: u64| m.view().share_key(a);
+        assert_eq!(key(base + 0x24), Some(id << 40 | 0x24));
+        assert_eq!(key(base + 0x10000), None);
+        // Not backed: an unmap cuts it and tells the host nothing.
+        m.unmap(base + 0x4000, 0x4000).unwrap();
+        assert_eq!(m.shares().len(), 2);
+        assert_eq!((m.shares()[1].start, m.shares()[1].off), (base + 0x8000, 0x8000));
+        assert_eq!(m.view().share_key(base + 0x8010), Some(id << 40 | 0x8010));
+        assert_eq!(m.view().share_key(base + 0x4010), None);
+        assert!(GIVEN.lock().unwrap().is_empty());
+        // Backed (a fork): a mapping over part of it gives that part back
+        // first; a copy of the map does not (another memory).
+        m.set_shared_backing(0x7000_0000, &[true, true]);
+        let mut copy = m.clone();
+        copy.unmap(base, 0x1000).unwrap();
+        assert!(GIVEN.lock().unwrap().is_empty());
+        m.mmap(base + 0x9000, 0x1000, prot::READ, flags::ANONYMOUS | flags::PRIVATE | flags::FIXED, "").unwrap();
+        assert_eq!(*GIVEN.lock().unwrap(), vec![(0x7000_0000, base + 0x9000, base + 0xa000)]);
+        // An exec gives back the rest.
+        m.renew(0x40_1000);
+        assert_eq!(GIVEN.lock().unwrap().len(), 4);
+        assert!(m.shares().is_empty() && m.view().share_key(base).is_none());
     }
 
     /// The arena is shared with the shim's heap through one cursor. A hint,

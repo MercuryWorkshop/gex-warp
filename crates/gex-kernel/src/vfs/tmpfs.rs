@@ -1458,13 +1458,8 @@ impl TmpFs {
     /// A directory's link count: `.`, its name in the parent, and a `..` from
     /// each immediate subdirectory -- i.e. `2 + immediate subdirs`. An empty
     /// directory is 2, which is what programs test to decide it has no
-    /// subdirectories without reading it.
-    fn dir_nlink(inner: &Inner, path: &str) -> u32 {
-        TmpFs::dir_counts(inner, path).0
-    }
-
-    /// A directory's link count (two and one for each directory in it) and
-    /// how many entries it has, `.` and `..` aside.
+    /// subdirectories without reading it. And how many entries it has, `.`
+    /// and `..` aside.
     fn dir_counts(inner: &Inner, path: &str) -> (u32, u64) {
         let prefix = if path.is_empty() {
             String::new()
@@ -1747,7 +1742,7 @@ impl FileHandle for TmpHandle {
             },
         ];
         // The immediate children only, each child's own subtree passed in one
-        // seek (as `dir_nlink`). A scan of every node in the filesystem was
+        // seek (as `dir_counts`). A scan of every node in the filesystem was
         // each listing's cost: a page start with a lazily mounted tree of
         // ~29,000 files spent 43 of 60 profiled seconds here, in
         // Wine's case-insensitive lookups (each a directory read) and its
