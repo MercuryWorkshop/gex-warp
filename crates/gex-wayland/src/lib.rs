@@ -5369,7 +5369,7 @@ mod tests {
     }
 
     #[test]
-    fn a_taken_drag_leaves_the_pointer_and_shows_its_icon_until_it_ends() {
+    fn a_taken_drag_has_the_pointer_and_shows_its_icon_until_it_ends() {
         let mut src = with_data_device(3);
         // get_pointer(13), on the window with a button down: the press.
         src.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
@@ -5384,7 +5384,7 @@ mod tests {
         src.receive(&Writer::new(21, 0).object(30).object(6).object(40).uint(1).finish(), &[], &no_pool());
         let _ = src.take_outgoing();
         assert_eq!(src.take_drag_start().and_then(|d| d.icon), Some(40));
-        assert!(messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 13 && *op == 1), "the pointer leaves for the drag");
+        assert!(!messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 13 && *op == 1), "no leave: the press's release would be taken from it");
         assert_eq!(src.surfaces[&40].role, Role::DragIcon);
         assert_eq!(src.drag_icon(), Some((40, 0, 0)));
         // An attach of (-4, -6) moves the icon up and left: its hotspot (4, 6).
@@ -5393,10 +5393,10 @@ mod tests {
         src.drag_source_cancel(Some(30));
         assert_eq!(src.surfaces[&40].role, Role::None, "not drawn once the drag is over");
         assert_eq!(src.drag_icon(), None);
-        // No implicit grab left from the press: the pointer is anyone's again.
+        // No implicit grab left from the press: the pointer moves on again.
         src.pointer_to(6, 1, 1, 3);
         let msgs = messages(&src.take_outgoing());
-        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 0), "entered again");
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 2), "moves again");
         assert!(src.grab_surface.is_none() && src.held.is_empty());
         assert!(src.failed.is_none(), "{:?}", src.failed);
     }

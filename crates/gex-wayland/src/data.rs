@@ -468,10 +468,14 @@ impl Client {
     /// pointer as it was, and its drags do nothing, as before.
     pub fn take_drag_start(&mut self) -> Option<DragStart> {
         let d = self.data.drag_start.take()?;
-        // The pointer leaves the client's surfaces for the drag (as wlroots'
-        // grab clears the pointer's focus), and the press that started it is
-        // the drag's: no implicit grab is left behind for after it.
-        self.pointer_clear();
+        // The press that started it is the drag's: no implicit grab is left
+        // behind for after it. The pointer is not made to leave the client's
+        // surface (wlroots' and Weston's grabs clear its focus; the protocol
+        // asks neither): a window layer that takes a leave with a button held
+        // for that button's release -- pyrus's libpyruswindow does, and its
+        // AppKit then ends the drag session the press began -- would end the
+        // drag as it starts. The client is sent no pointer events while it
+        // lasts (`Client::is_dragging`).
         self.held.clear();
         self.grab_surface = None;
         self.data.dragging = Some(d.source.unwrap_or(0));
