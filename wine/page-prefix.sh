@@ -19,8 +19,9 @@ src=$1 dist=$2 out=$3; shift 3
 # must have each of DIST's: one made for another install lacks them, and is
 # never updated in the page (stamped current below), so a DLL it never
 # installed or registered (winegstreamer's classes) fails only in a program.
-# The display driver aside: a 64-bit prefix has none (made without a
-# display), and Wine loads it from the install.
+# The display driver aside: dist.sh's session prefix has it in system32
+# (and syswow64), copied in, but one made before it did lacks it (a win64
+# one), and mac-export.sh refuses that one itself.
 if [ -f "$src/.gex-builtins" ]; then
 	lacks=$(for a in x86_64 i386; do
 		[ -d "$dist/lib/wine/$a-windows" ] || continue

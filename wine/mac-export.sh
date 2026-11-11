@@ -21,9 +21,9 @@ docker run --rm --platform linux/amd64 -v "$VOLUME":/root/.cache/gex -v "$dest":
   # files, the page user): GNU tar and the xattrs are in this image
   echo "export: $WINE64_PREFIX" >&2
   GRAPHICS=${GRAPHICS:-wayland} bash /gex/wine/page-prefix.sh "$WINE64_PREFIX" "$WINE64_DIST" /dest/pfx >&2
-  # make wine-x64 puts the display driver (winewayland.drv) in no prefix (only
-  # WoW64 builds do: dist.sh WD): without it in system32 the page finds no
-  # driver ("no driver could be loaded"). The install'"'"'s is the same stub.
-  cp -p "$WINE64_DIST/lib/wine/x86_64-windows/winewayland.drv" /dest/pfx/drive_c/windows/system32/'
+  # (the display driver in its system32, as dist.sh puts it there: a prefix
+  # made before it did has none, and the page then finds no driver)
+  [ -f /dest/pfx/drive_c/windows/system32/winewayland.drv ] ||
+    { echo "export: $WINE64_PREFIX has no system32/winewayland.drv: make it again (wine/dist.sh)" >&2; exit 1; }'
 echo "WINE64_DIST=$dest/dist"
 echo "WINE64_PAGE_PREFIX=$dest/pfx"

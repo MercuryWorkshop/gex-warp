@@ -17,8 +17,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
 #               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
-#   wwl-P       with WINE64_WOW64=1, the i386 and x86_64 PE winewayland.drv
-#               (a tree of its own: the display driver's PE halves)
+#   wwl-P       the x86_64 PE winewayland.drv, and with WINE64_WOW64=1 the
+#               i386 one (a tree of its own: the display driver's PE halves)
 #   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy, the default)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
@@ -48,8 +48,8 @@
 #               and that build's modules in x86_64-windows, each as
 #               NAME.wasm.m64 (M: its core's key)
 #   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so,libSDL2-2.0.so.0 and their gex-rest-only}, x86_64-windows,
-#               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
-#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst; game controllers: -sdl)
+#               (with WINE64_WOW64=1 i386-windows; and the display
+#               driver's PE halves, winewayland.drv: the name gets -wwl2; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst; game controllers: -sdl)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -270,22 +270,24 @@ pe_build() {
 log "$ARCHS PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
 
-# WoW64: the display driver's PE halves. A 32-bit process's user32 loads
-# the i386 one from lib/wine/i386-windows; the prefix needs both in its
-# system directories, since a process loads a driver only from there (the
-# 64-bit one is the native core's when there is one). They need no Wayland
+# The display driver's PE halves: x86_64's, and with WoW64 i386's (a 32-bit
+# process's user32 loads the i386 one from lib/wine/i386-windows). The prefix
+# needs each in its system directory, since a process loads a driver only
+# from there (the 64-bit one is the native core's when there is one): a
+# win64 prefix without one in system32 has no display ("Failed to load
+# module L"winewayland.drv""). They need no Wayland
 # libraries, but the PE tree's configure (--without-wayland: no host
 # libraries) leaves the whole module out, and enabling the module there has
 # `make` build its Unix half as well, which cannot build without them. A
 # tree of its own, configured with the module enabled, makes the PE files
 # alone; the Unix half is the loader's (link-wine64.sh, with its WoW64 table).
 wwl_build() {
-	"$W/configure" --enable-archs=i386,x86_64 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
-	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv dlls/winewayland.drv/x86_64-windows/winewayland.drv
+	"$W/configure" --enable-archs=$ARCHS --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	local a t=""; for a in ${ARCHS//,/ }; do t="$t dlls/winewayland.drv/$a-windows/winewayland.drv"; done
+	# shellcheck disable=SC2086
+	nice -n 10 make -j"$J" $t
 }
-WD=; WL=; if [ "$WOW" != 0 ]; then
-	log "winewayland.drv's PE halves ($P)"; step wwl-$P wwl_build; WD=-wwl2; WL=$C/wwl-$P/dlls/winewayland.drv
-fi
+log "winewayland.drv's PE halves ($P)"; step wwl-$P wwl_build; WD=-wwl2; WL=$C/wwl-$P/dlls/winewayland.drv
 # winegstreamer's PE halves the same way (its Unix half is the side module)
 wgs_build() {
 	"$W/configure" --enable-archs=$ARCHS --enable-winegstreamer --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
@@ -331,15 +333,15 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # for a click.
 # And 64-bit Wine's own (wine64-session.reg): no winemenubuilder process
 # in each session, as 32-bit Wine's dist has none.
-# WoW64: the display driver in system32 and syswow64 (wwl's: the prefix's
-# Wine has none), where a process loads it from.
+# The display driver in system32 (and with WoW64 syswow64): wwl's, the
+# prefix's Wine has none, and a process loads it only from there.
 # winegstreamer's halves there too, registered (its classes, filters and
 # transforms: DllRegisterServer is PE code alone, and its DllMain starts
 # without a Unix side), by the native Wine's regsvr32 of each arch.
 R=$( (cat "$here"/session.reg "$here"/wine64-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs; [ "$PADS" = 0 ] || echo pads) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
-	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
+	[ -z "$WD" ] || [ "$WOW" = 0 ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	if [ "$WOW" != 0 ]; then
 		printf '[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug]\n"Debugger"=-\n' > aedebug32.reg
@@ -441,7 +443,7 @@ dist_make() {
 	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
-	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
+	[ -z "$WD" ] || [ "$WOW" = 0 ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" lib/wine/x86_64-windows/
 	[ -z "$W16" ] || (cd lib/wine/i386-windows && rm -f $WIN16_GLOB)
 	[ -z "$WICU" ] || for a in x86_64-windows i386-windows; do [ ! -d lib/wine/$a ] || (cd lib/wine/$a && rm -f $ICU_GLOB); done
