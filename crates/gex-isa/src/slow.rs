@@ -237,6 +237,34 @@ fn sha256_rounds(x: u128, y: u128, wk: u128, part1: bool) -> u128 {
     if part1 { s0 } else { s1 }
 }
 
+fn w64(v: u128, i: u32) -> u64 {
+    (v >> (64 * i)) as u64
+}
+fn from_w64(lo: u64, hi: u64) -> u128 {
+    lo as u128 | (hi as u128) << 64
+}
+
+/// `sha512h`: two rounds' worth of the half of the state that takes `T1`. `w` (the
+/// destination) carries the message and constant words already summed with one pair of the
+/// state, `x` and `y` two more pairs of it.
+fn sha512h(w: u128, x: u128, y: u128) -> u128 {
+    let big1 = |e: u64| e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+    let (y0, y1, x0, x1) = (w64(y, 0), w64(y, 1), w64(x, 0), w64(x, 1));
+    let hi = ((y1 & x0) ^ (!y1 & x1)).wrapping_add(big1(y1)).wrapping_add(w64(w, 1));
+    let t = hi.wrapping_add(y0);
+    let lo = ((t & y1) ^ (!t & x0)).wrapping_add(big1(t)).wrapping_add(w64(w, 0));
+    from_w64(lo, hi)
+}
+
+/// `sha512h2`: the other half, the one that takes `T2` as well.
+fn sha512h2(w: u128, x: u128, y: u128) -> u128 {
+    let big0 = |a: u64| a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+    let (y0, y1, x0) = (w64(y, 0), w64(y, 1), w64(x, 0));
+    let hi = ((x0 & y1) ^ (x0 & y0) ^ (y1 & y0)).wrapping_add(big0(y0)).wrapping_add(w64(w, 1));
+    let lo = ((hi & y0) ^ (hi & y1) ^ (y1 & y0)).wrapping_add(big0(hi)).wrapping_add(w64(w, 0));
+    from_w64(lo, hi)
+}
+
 // ---- Polynomial multiply --------------------------------------------------
 
 fn clmul(a: u64, b: u64) -> u128 {
@@ -344,6 +372,35 @@ pub fn execute(raw: u32, v: &mut VRegs, fpsr: &mut u32) -> bool {
                     w[2].wrapping_add(s(w[3])),
                     w[3].wrapping_add(s(w[4])),
                 ])
+            }
+            _ => return false,
+        };
+        v.set(rd, r);
+        return true;
+    }
+    // SHA-512 and SHA-3 (FEAT_SHA512, FEAT_SHA3), under 1100 1110: sha512h, sha512h2,
+    // sha512su1 and rax1 `011 Rm 1000 opc Rn Rd`, sha512su0 `110 00000 100000 Rn Rd`, eor3
+    // and bcax `00 op Rm 0 Ra Rn Rd`, xar `100 Rm imm6 Rn Rd`. (The lifter lowers SHA-3's
+    // four itself; they are here as what it is checked against.)
+    if raw >> 24 == 0xce {
+        let (d, n, m, a) = (v.get(rd), v.get(rn), v.get(rm), v.get(bits(raw, 14, 10)));
+        let each = |x: u128, f: &dyn Fn(u64) -> u64| from_w64(f(w64(x, 0)), f(w64(x, 1)));
+        let r = match (bits(raw, 23, 21), bits(raw, 15, 10)) {
+            (0b000, o) if o < 32 => n ^ m ^ a,
+            (0b001, o) if o < 32 => n ^ (m & !a),
+            (0b100, by) => each(n ^ m, &|x| x.rotate_right(by)),
+            (0b011, 0b100000) => sha512h(d, n, m),
+            (0b011, 0b100001) => sha512h2(d, n, m),
+            (0b011, 0b100010) => {
+                // sha512su1: each half of d, plus sigma1 of n's, plus m's
+                let s = |x: u64| x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6);
+                from_w64(w64(d, 0).wrapping_add(s(w64(n, 0))).wrapping_add(w64(m, 0)), w64(d, 1).wrapping_add(s(w64(n, 1))).wrapping_add(w64(m, 1)))
+            }
+            (0b011, 0b100011) => n ^ each(m, &|x| x.rotate_left(1)),
+            (0b110, 0b100000) if rm == 0 => {
+                // sha512su0: each word plus sigma0 of the one after it, n's low after d's high
+                let s = |x: u64| x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
+                from_w64(w64(d, 0).wrapping_add(s(w64(d, 1))), w64(d, 1).wrapping_add(s(w64(n, 0))))
             }
             _ => return false,
         };
@@ -975,6 +1032,98 @@ mod tests {
         regs[0] = 2;
         run(0x4f403041, &mut regs);
         assert_eq!(w32(regs[1], 0), 29);
+    }
+
+    /// SHA-512 of "abc" (FIPS 180-4's example), the way a program does it with
+    /// `sha512h`, `sha512h2`, `sha512su0` and `sha512su1`: two rounds to each pair.
+    #[test]
+    fn sha512_digests_abc() {
+        #[rustfmt::skip]
+        const K: [u64; 80] = [
+            0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+            0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+            0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+            0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+            0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+            0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+            0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+            0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+            0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+            0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+            0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+            0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+            0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+            0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+            0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+            0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+            0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+            0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+            0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+            0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+        ];
+        let add = |a: u128, b: u128| from_w64(w64(a, 0).wrapping_add(w64(b, 0)), w64(a, 1).wrapping_add(w64(b, 1)));
+        // `ext #8`: the high doubleword of one, then the low one of the next.
+        let ext = |a: u128, b: u128| from_w64(w64(a, 1), w64(b, 0));
+        let ins = |raw: u32, d: u128, n: u128, m: u128| {
+            let mut regs = zeroed();
+            (regs[0], regs[1], regs[2]) = (d, n, m);
+            run(raw, &mut regs);
+            regs[0]
+        };
+        let mut block = [0u8; 128];
+        block[..3].copy_from_slice(b"abc");
+        block[3] = 0x80;
+        block[127] = 24;
+        let word = |i: usize| u64::from_be_bytes(block[8 * i..8 * i + 8].try_into().unwrap());
+        let mut s: [u128; 8] = core::array::from_fn(|i| from_w64(word(2 * i), word(2 * i + 1)));
+        let iv = [
+            from_w64(0x6a09e667f3bcc908, 0xbb67ae8584caa73b),
+            from_w64(0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1),
+            from_w64(0x510e527fade682d1, 0x9b05688c2b3e6c1f),
+            from_w64(0x1f83d9abfb41bd6b, 0x5be0cd19137e2179),
+        ];
+        // The pairs (a, b), (c, d), (e, f), (g, h); which of them is which turns each time.
+        let mut st = iv;
+        for t in 0..40 {
+            if t >= 8 {
+                let su0 = ins(0xcec08020, s[t % 8], s[(t + 1) % 8], 0); // sha512su0 v0.2d, v1.2d
+                s[t % 8] = ins(0xce628820, su0, s[(t + 7) % 8], ext(s[(t + 4) % 8], s[(t + 5) % 8])); // sha512su1 v0.2d, v1.2d, v2.2d
+            }
+            let [ab, cd, ef, gh] = [st[(4 - t % 4) % 4], st[(5 - t % 4) % 4], st[(6 - t % 4) % 4], st[(7 - t % 4) % 4]];
+            let wk = add(s[t % 8], from_w64(K[2 * t], K[2 * t + 1]));
+            let sum = add(ext(wk, wk), gh);
+            let mid = ins(0xce628020, sum, ext(ef, gh), ext(cd, ef)); // sha512h q0, q1, v2.2d
+            st[(7 - t % 4) % 4] = ins(0xce628420, mid, cd, ab); // sha512h2 q0, q1, v2.2d
+            st[(5 - t % 4) % 4] = add(cd, mid);
+        }
+        let out: Vec<u64> = (0..4).flat_map(|i| { let x = add(st[i], iv[i]); [w64(x, 0), w64(x, 1)] }).collect();
+        assert_eq!(
+            out,
+            [
+                0xddaf35a193617aba, 0xcc417349ae204131, 0x12e6fa4e89a97ea2, 0x0a9eeee64b55d39a,
+                0x2192992a274fc1a8, 0x36ba3c23a3feebbd, 0x454d4423643ce80e, 0x2a9ac94fa54ca49f,
+            ],
+            "{out:016x?}"
+        );
+    }
+
+    /// FEAT_SHA3's four: plain to say, so said.
+    #[test]
+    fn sha3_helpers() {
+        let mut regs = zeroed();
+        let (n, m, a) = (0x0123456789abcdef_fedcba9876543210u128, 0x8000000000000001_c000000000000003u128, 0x0f0f0f0f0f0f0f0f_00ff00ff00ff00ffu128);
+        let mut go = |raw: u32| {
+            (regs[1], regs[2], regs[3]) = (n, m, a);
+            run(raw, &mut regs);
+            regs[0]
+        };
+        assert_eq!(go(0xce020c20), n ^ m ^ a, "eor3 v0.16b, v1.16b, v2.16b, v3.16b");
+        assert_eq!(go(0xce220c20), n ^ (m & !a), "bcax v0.16b, v1.16b, v2.16b, v3.16b");
+        assert_eq!(go(0xce628c20), n ^ 0x0000000000000003_8000000000000007u128, "rax1 v0.2d, v1.2d, v2.2d");
+        let x = n ^ m;
+        assert_eq!(go(0xce820420), from_w64(w64(x, 0).rotate_right(1), w64(x, 1).rotate_right(1)), "xar v0.2d, v1.2d, v2.2d, #1");
+        assert_eq!(go(0xce82fc20), from_w64(w64(x, 0).rotate_right(63), w64(x, 1).rotate_right(63)), "xar #63");
+        assert_eq!(go(0xce820020), x, "xar #0");
     }
 
     #[test]

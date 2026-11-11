@@ -767,6 +767,38 @@ mod tests {
         }
     }
 
+    /// FEAT_SHA3's `eor3`, `bcax`, `rax1` and `xar` (every rotation) are lowered, and to
+    /// what the reference says of them.
+    #[test]
+    fn sha3_words_match_the_reference() {
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let words_of = [0xce020c20u32, 0xce220c20, 0xce628c20].into_iter().chain((0..64).map(|r| 0xce820020 | r << 10));
+        for raw in words_of {
+            let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+            assert!(!block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })), "{raw:08x} goes to the host");
+            for _ in 0..8 {
+                let mut v = [0u128; 32];
+                for r in v.iter_mut().take(4) {
+                    *r = (rnd() as u128) << 64 | rnd() as u128;
+                }
+                let mut bytes = [0u8; 512];
+                for (i, r) in v.iter().enumerate() {
+                    bytes[i * 16..i * 16 + 16].copy_from_slice(&r.to_le_bytes());
+                }
+                let mut fpsr = 0;
+                assert!(gex_isa::slow::execute(raw, &mut gex_isa::slow::VRegs(&mut bytes), &mut fpsr), "{raw:08x}");
+                let want = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+                assert_eq!(eval_vectors(&block, &v)[&0], want, "{raw:08x} on {v:x?}");
+            }
+        }
+    }
+
     /// `udf` and data stay refusals: only understood words reach the host.
     #[test]
     fn what_nothing_understands_stays_illegal() {

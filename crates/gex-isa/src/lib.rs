@@ -751,6 +751,12 @@ pub enum Inst {
         /// Fractional bits for the fixed-point form; zero for the plain one.
         fbits: u32,
     },
+    /// FEAT_FlagM's and FEAT_FlagM2's: the instructions that work on NZCV alone.
+    Flags(FlagOp),
+    /// `fjcvtzs` (FEAT_JSCVT): a double to a 32-bit integer as JavaScript's
+    /// `ToInt32` has it -- toward zero, and modulo 2^32 where `fcvtzs`
+    /// saturates -- with Z saying whether the double was that integer exactly.
+    FpJsToInt { rd: RegSel, vn: VReg },
     /// `fmov` between a general register and a float register.
     FpMoveGeneral {
         sz: FpSz,
@@ -845,6 +851,18 @@ pub enum Inst {
     },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
+    /// FEAT_SHA3's four on whole registers: `eor3` (`vn ^ vm ^ va`), `bcax`
+    /// (`vn ^ (vm & !va)`), `rax1` (`vn ^ rol(vm, 1)` in each doubleword) and
+    /// `xar` (`ror(vn ^ vm, rot)` in each doubleword). `va` is only the first
+    /// two's, `rot` only the last's.
+    VSha3 {
+        op: VSha3Op,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        va: VReg,
+        rot: u8,
+    },
     /// `bsl`/`bit`/`bif`.
     VSelect {
         kind: VSelKind,
@@ -1418,6 +1436,33 @@ pub enum VSelKind {
 }
 
 /// Fixed byte permutations expressible as a single shuffle.
+/// What an [`Inst::Flags`] does to NZCV.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FlagOp {
+    /// `cfinv`: C inverted.
+    Cfinv,
+    /// `axflag`: a floating-point comparison's flags from Arm's form to the
+    /// "external" one -- Z takes in V, C drops where V was set, N and V clear.
+    Axflag,
+    /// `xaflag`: and back.
+    Xaflag,
+    /// `rmif`: the flags `mask` names (N, Z, C, V from bit 3 down) from the
+    /// low four bits of `rn` rotated right by `shift`.
+    Rmif { rn: RegSel, shift: u8, mask: u8 },
+    /// `setf8` and `setf16`: N, Z and V as for the low 8 or 16 `bits` of `rn`
+    /// taken as a result of that width; C stays.
+    Setf { rn: RegSel, bits: u8 },
+}
+
+/// Which of FEAT_SHA3's instructions an [`Inst::VSha3`] is.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VSha3Op {
+    Eor3,
+    Bcax,
+    Rax1,
+    Xar,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VPermOp {
     Trn1,

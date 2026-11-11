@@ -2032,6 +2032,114 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // FEAT_FlagM's and FEAT_FlagM2's: each flag is its own 0 or 1.
+            Inst::Flags(op) => {
+                let one = self.b.const_i32(1);
+                let zero = self.b.const_i32(0);
+                match op {
+                    gex_isa::FlagOp::Cfinv => {
+                        let c = self.b.read(GuestReg::C);
+                        let c = self.b.bin(BinOp::Xor, Ty::I32, c, one);
+                        self.b.write(GuestReg::C, c);
+                    }
+                    gex_isa::FlagOp::Axflag => {
+                        let (z, c, v) = (self.b.read(GuestReg::Z), self.b.read(GuestReg::C), self.b.read(GuestReg::V));
+                        let z = self.b.bin(BinOp::Or, Ty::I32, z, v);
+                        let not_v = self.b.bin(BinOp::Xor, Ty::I32, v, one);
+                        let c = self.b.bin(BinOp::And, Ty::I32, c, not_v);
+                        self.b.write(GuestReg::N, zero);
+                        self.b.write(GuestReg::Z, z);
+                        self.b.write(GuestReg::C, c);
+                        self.b.write(GuestReg::V, zero);
+                    }
+                    gex_isa::FlagOp::Xaflag => {
+                        let (z, c) = (self.b.read(GuestReg::Z), self.b.read(GuestReg::C));
+                        let not_c = self.b.bin(BinOp::Xor, Ty::I32, c, one);
+                        let not_z = self.b.bin(BinOp::Xor, Ty::I32, z, one);
+                        let n = self.b.bin(BinOp::And, Ty::I32, not_c, not_z);
+                        let new_z = self.b.bin(BinOp::And, Ty::I32, z, c);
+                        let new_c = self.b.bin(BinOp::Or, Ty::I32, c, z);
+                        let v = self.b.bin(BinOp::And, Ty::I32, not_c, z);
+                        self.b.write(GuestReg::N, n);
+                        self.b.write(GuestReg::Z, new_z);
+                        self.b.write(GuestReg::C, new_c);
+                        self.b.write(GuestReg::V, v);
+                    }
+                    gex_isa::FlagOp::Rmif { rn, shift, mask } => {
+                        let x = self.rd_gp(rn, Sz::X);
+                        for (bit, flag) in [(3u64, GuestReg::N), (2, GuestReg::Z), (1, GuestReg::C), (0, GuestReg::V)] {
+                            if mask >> bit & 1 == 0 {
+                                continue;
+                            }
+                            // Bit `bit` of the rotated register is bit `bit + shift` of the register.
+                            let by = self.b.const_i64((bit + shift as u64) % 64);
+                            let down = self.b.bin(BinOp::ShrU, Ty::I64, x, by);
+                            let low = self.b.def(Expr::Wrap(down));
+                            let f = self.b.bin(BinOp::And, Ty::I32, low, one);
+                            self.b.write(flag, f);
+                        }
+                    }
+                    gex_isa::FlagOp::Setf { rn, bits } => {
+                        let w = self.rd_gp(rn, Sz::W);
+                        let (msb, width, field) = (self.b.const_i32(bits as u32 - 1), self.b.const_i32(bits as u32), self.b.const_i32((1 << bits) - 1));
+                        let top = self.b.bin(BinOp::ShrU, Ty::I32, w, msb);
+                        let n = self.b.bin(BinOp::And, Ty::I32, top, one);
+                        let low = self.b.bin(BinOp::And, Ty::I32, w, field);
+                        let z = self.b.cmp(CmpOp::Eq, Ty::I32, low, zero);
+                        let above = self.b.bin(BinOp::ShrU, Ty::I32, w, width);
+                        let differ = self.b.bin(BinOp::Xor, Ty::I32, above, top);
+                        let v = self.b.bin(BinOp::And, Ty::I32, differ, one);
+                        self.b.write(GuestReg::N, n);
+                        self.b.write(GuestReg::Z, z);
+                        self.b.write(GuestReg::V, v);
+                    }
+                }
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+
+            // `fjcvtzs`, in integers so that every double has an answer: the significand
+            // moved by the exponent, the low 32 bits of that, negated for a negative. A shift
+            // of 64 or more leaves nothing (nothing below bit 32 from 32 up, but 64 is where
+            // the shift itself would wrap), and that is every infinity and NaN too. Z is
+            // whether the result converted back is the very double: so not for a fraction,
+            // a value out of range, a NaN or minus zero.
+            Inst::FpJsToInt { rd, vn } => {
+                let bits = self.rd_fp(vn, FpSz::D);
+                let c = |lift: &mut Self, v: u64| lift.b.const_i64(v);
+                let (k52, k63, kexp, kfrac, kone) = (c(self, 52), c(self, 63), c(self, 0x7ff), c(self, (1 << 52) - 1), c(self, 1 << 52));
+                let (bias, zero, top) = (c(self, 1075), c(self, 0), c(self, 64));
+                let shifted = self.b.bin(BinOp::ShrU, Ty::I64, bits, k52);
+                let exp = self.b.bin(BinOp::And, Ty::I64, shifted, kexp);
+                let frac = self.b.bin(BinOp::And, Ty::I64, bits, kfrac);
+                let sig = self.b.bin(BinOp::Or, Ty::I64, frac, kone);
+                let up = self.b.bin(BinOp::Sub, Ty::I64, exp, bias);
+                let down = self.b.bin(BinOp::Sub, Ty::I64, bias, exp);
+                let raised = self.b.bin(BinOp::Shl, Ty::I64, sig, up);
+                let lowered = self.b.bin(BinOp::ShrU, Ty::I64, sig, down);
+                let up_fits = self.b.cmp(CmpOp::LtU, Ty::I64, up, top);
+                let down_fits = self.b.cmp(CmpOp::LtU, Ty::I64, down, top);
+                let raised = self.b.def(Expr::Select { cond: up_fits, a: raised, b: zero, ty: Ty::I64 });
+                let lowered = self.b.def(Expr::Select { cond: down_fits, a: lowered, b: zero, ty: Ty::I64 });
+                let is_up = self.b.cmp(CmpOp::LeU, Ty::I64, bias, exp);
+                let mag = self.b.def(Expr::Select { cond: is_up, a: raised, b: lowered, ty: Ty::I64 });
+                let negative = self.b.bin(BinOp::ShrU, Ty::I64, bits, k63);
+                let negated = self.b.bin(BinOp::Sub, Ty::I64, zero, mag);
+                let negative = self.b.def(Expr::Wrap(negative));
+                let wide = self.b.def(Expr::Select { cond: negative, a: negated, b: mag, ty: Ty::I64 });
+                let v = self.b.def(Expr::Wrap(wide));
+                let back = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: true }, src_wide: false, dst_wide: true, a: v });
+                let exact = self.b.cmp(CmpOp::Eq, Ty::I64, back, bits);
+                let zero32 = self.b.const_i32(0);
+                self.flags = FlagSource::Unknown;
+                self.b.write(GuestReg::N, zero32);
+                self.b.write(GuestReg::Z, exact);
+                self.b.write(GuestReg::C, zero32);
+                self.b.write(GuestReg::V, zero32);
+                self.wr_gp(rd, Sz::W, v);
+                Flow::Next
+            }
+
             Inst::FpMoveGeneral {
                 sz,
                 to_vector,
@@ -2303,6 +2411,45 @@ impl<'a> Lifter<'a> {
                     });
                 }
                 self.finish_address(&a);
+                Flow::Next
+            }
+
+            // FEAT_SHA3's, each a few whole-register operations: the two rotates are a
+            // pair of doubleword shifts, joined.
+            Inst::VSha3 { op, vd, vn, vm, va, rot } => {
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let m = self.b.read(GuestReg::V128(vm.0));
+                let vbin = |lift: &mut Self, op, a, b| lift.b.def(Expr::VBin { op, a, b });
+                let rotr = |lift: &mut Self, a: Value, by: u32| {
+                    if by % 64 == 0 {
+                        return a;
+                    }
+                    let (down, up) = (lift.b.const_i32(by % 64), lift.b.const_i32(64 - by % 64));
+                    let lo = lift.b.def(Expr::VShift { op: VShiftOp::ShrU, lane: VLane::I64, a, amount: down });
+                    let hi = lift.b.def(Expr::VShift { op: VShiftOp::Shl, lane: VLane::I64, a, amount: up });
+                    lift.b.def(Expr::VBin { op: VBinOp::Or, a: lo, b: hi })
+                };
+                let r = match op {
+                    gex_isa::VSha3Op::Eor3 => {
+                        let a = self.b.read(GuestReg::V128(va.0));
+                        let nm = vbin(self, VBinOp::Xor, n, m);
+                        vbin(self, VBinOp::Xor, nm, a)
+                    }
+                    gex_isa::VSha3Op::Bcax => {
+                        let a = self.b.read(GuestReg::V128(va.0));
+                        let kept = vbin(self, VBinOp::AndNot, m, a);
+                        vbin(self, VBinOp::Xor, n, kept)
+                    }
+                    gex_isa::VSha3Op::Rax1 => {
+                        let turned = rotr(self, m, 63);
+                        vbin(self, VBinOp::Xor, n, turned)
+                    }
+                    gex_isa::VSha3Op::Xar => {
+                        let nm = vbin(self, VBinOp::Xor, n, m);
+                        rotr(self, nm, rot as u32)
+                    }
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
                 Flow::Next
             }
 
