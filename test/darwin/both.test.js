@@ -52,5 +52,39 @@ export default async function (t) {
   // The other processor's program, started by the page itself.
   const s = await timeout(sys.run(['/tmp/arches-other', 'say', 'from', 'the', 'page'], { env, cwd: '/tmp' }), 120000, 'the other alone');
   eq('the other, started by the page', [s.stdout, s.code], [`${said(other, 'from the page')}\n`, 3]);
+  await bothRoots(t, sys, fs, arch, other);
   await sys.shutdown();
+}
+
+// Two Mac roots, one of each processor (the `darwin-root` image's two
+// trees, at /opt/mac and /opt/mac-other), whose libraries have the same
+// names in each: the system's own processor's shell does some work and stays
+// up while the other processor's shell starts and does its own. Each
+// library is a file of its own root, and a process of one processor took
+// the other's translations of the same name (slot numbering, units): the
+// second Cocoa program of the demo never showed its window, and a shell so
+// started went no further.
+async function bothRoots(t, sys, fs, arch, other) {
+  const { eq, check, timeout, until } = t;
+  const tar = (a) => t.work(`darwin-root.${a}.tar`);
+  try {
+    await bytesOf(tar(arch));
+    await bytesOf(tar(other));
+  } catch {
+    return t.say('(not with two Mac roots: the darwin-root image has one processor\'s only)');
+  }
+  await timeout(Promise.all([fs.addTar(tar(arch), { at: '/opt/mac' }), fs.addTar(tar(other), { at: '/opt/mac-other' })]), 180000, 'the two roots');
+  const env = { PATH: '/usr/bin:/bin', HOME: '/var/root' };
+  let text = '';
+  const first = sys.spawn(['/opt/mac/bin/zsh', '-c', 'n=0; for i in {1..400}; do n=$(( n + i * i )); done; echo own $n; /bin/sleep 20; echo own done'], { env, cwd: '/' });
+  const dec = new TextDecoder();
+  const reading = first.stdout.pipeTo(new WritableStream({ write: (b) => { text += dec.decode(b, { stream: true }); } })).catch(() => {});
+  await until(() => /^own \d+$/m.test(text), 'the system\'s own shell has worked', 120000)
+    .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(text)}`); });
+  const r = await timeout(sys.run(['/opt/mac-other/bin/zsh', '-c', 'n=0; for i in {1..300}; do n=$(( n + i )); done; echo other $n; /bin/ls /usr/lib/dyld; /usr/bin/uname -m'], { env, cwd: '/' }), 120000, 'the other processor\'s shell while the first runs');
+  eq('the other processor\'s shell, in its root, with the first still up', [r.stdout, r.code], [`other 45150\n/usr/lib/dyld\n${MACHINE[other]}\n`, 0]);
+  check('the first was still up meanwhile', !/own done/.test(text), JSON.stringify(text));
+  await timeout(first.exited, 120000, 'the first ends');
+  await reading;
+  eq('and the first ends as it would have', text, 'own 21413400\nown done\n');
 }
