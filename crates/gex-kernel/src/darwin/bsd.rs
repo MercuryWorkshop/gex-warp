@@ -265,6 +265,9 @@ impl Kernel {
             d::FCHOWN => set(nr::FCHOWN, &x[..3]),
             // (A descriptor named by its number is there or is not.)
             d::ACCESS if fd_named(m, x[0], true).is_some() => NATIVE + code,
+            // (Whether it may be executed is asked of its mode first.)
+            d::ACCESS if x[1] & 1 != 0 => NATIVE + code,
+            d::FACCESSAT if x[2] & 1 != 0 => NATIVE + code,
             d::ACCESS => set(nr::FACCESSAT, &[CWD, x[0], x[1]]),
             d::FACCESSAT => set(nr::FACCESSAT, &[dirfd(x[0]), x[1], x[2]]),
             d::UMASK => set(nr::UMASK, &x[..1]),
@@ -612,7 +615,21 @@ impl Kernel {
             // to here.)
             d::KQUEUE | d::GUARDED_KQUEUE_NP => self.darwin_kqueue(),
             d::GUARDED_CLOSE_NP => self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF)),
-            d::ACCESS => self.fds.get(fd_named(m, x[0], true).ok_or(Errno::ENOENT)? as i32).map(|_| 0),
+            d::ACCESS if fd_named(m, x[0], true).is_some() => self.fds.get(fd_named(m, x[0], true).ok_or(Errno::ENOENT)? as i32).map(|_| 0),
+            // A file nobody may execute is not executable, whoever asks and
+            // whatever keeps it: a filesystem that models no permissions (a
+            // tree in memory, the page's) says yes to anything that is
+            // there. Asked of the modes as `execve` asks before it runs
+            // one, and as there only where modes say something
+            // (`Kernel::nobody_may_execute`).
+            d::ACCESS | d::FACCESSAT => {
+                let (dir, path, mode) = if code == d::ACCESS { (CWD, x[0], x[1]) } else { (dirfd(x[0]), x[1], x[2]) };
+                let p = self.path_io().at_path(m, dir as i32, path)?;
+                if self.nobody_may_execute(&p) {
+                    return Err(Errno::EACCES);
+                }
+                self.dispatch(m, nr::FACCESSAT, [dir, path, mode, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))
+            }
             d::OPEN | d::OPEN_NOCANCEL => self.darwin_open(m, CWD, x[0], x[1], x[2]),
             d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
             d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),

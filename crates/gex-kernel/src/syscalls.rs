@@ -10489,11 +10489,8 @@ impl Kernel {
         }
         // A file nobody may execute is refused for that before it is asked
         // what it is: a shell takes `ENOEXEC` to mean a script with no `#!`
-        // line, and runs it. (Where files have their modes, which a tree a
-        // page made may not: if the program asking is itself a file nobody
-        // may execute, the modes here say nothing.)
-        let nobody_may = |p: &str| self.vfs.metadata(p).ok().filter(|md| md.file_type == crate::vfs::FileType::Regular).map(|md| md.mode & 0o111 == 0);
-        if crate::darwin::on() && nobody_may(&path) == Some(true) && nobody_may(&self.exe_path) == Some(false) {
+        // line, and runs it.
+        if crate::darwin::on() && self.nobody_may_execute(&path) {
             return Err(Errno::EACCES);
         }
         let (path, argv) = self.resolve_interpreter_as(path, argv, given)?;
@@ -10506,6 +10503,17 @@ impl Kernel {
             return Err(Errno::ENOEXEC);
         }
         Ok((path, argv, envp))
+    }
+
+    /// Whether `path` is a file whose mode lets nobody execute it. Where
+    /// files have their modes, which a tree a page made may not: if the
+    /// program asking is itself a file nobody may execute, the modes here
+    /// say nothing, and neither does this. (A program that is no file of
+    /// this namespace -- one a host runs from outside the root -- says
+    /// nothing against them.)
+    pub(crate) fn nobody_may_execute(&self, path: &str) -> bool {
+        let nobody_may = |p: &str| self.vfs.metadata(p).ok().filter(|md| md.file_type == crate::vfs::FileType::Regular).map(|md| md.mode & 0o111 == 0);
+        nobody_may(path) == Some(true) && nobody_may(&self.exe_path) != Some(true)
     }
 
     /// Follow a `#!` line, so a script can be executed like a program.
