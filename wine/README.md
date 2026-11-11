@@ -26,8 +26,10 @@ programs, and one prefix holds both (`system32` and `syswow64`).
 first build takes about 40 minutes on 16 threads.
 
 What it fetches and builds, in order:
-- 64-bit Wine at `WINE64_COMMIT`. `WINE_DIR=` builds a Wine worktree of
-  your own instead.
+- 64-bit Wine at `WINE64_COMMIT`, with gex's changes to it in
+  `patches/*.patch` applied over it as one commit (`patches.sh`; the fork is
+  not ours to push to). `WINE_DIR=` builds a Wine worktree of your own
+  instead, as it is.
 - The LP64 sysroot, from musl at `MUSL64_COMMIT` (`make sysroot64`).
 - A configured 32-bit Wine build tree, which the wineserver is linked from
   (`make -C wine build`).

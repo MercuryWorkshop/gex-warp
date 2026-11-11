@@ -170,8 +170,9 @@ musl64-src:
 # A given LLVM_SRC is used as it is (build-cxx.sh checks it is at the pin).
 llvm-src:
 	$(if $(filter file,$(origin LLVM_SRC)),GEX_SRC_SEED=$(LLVM_SEED) $(FETCH) --worktree $(LLVM_REPO) $(LLVM_COMMIT) $(CACHE)/mirror/llvm.git $(LLVM_SRC),@echo "LLVM from LLVM_SRC=$(LLVM_SRC)")
+# The pin with gex's patches to it (wine/patches.sh), left as it is when it is already so.
 wine64-src:
-	$(if $(WINE_DIR),@echo "64-bit Wine from WINE_DIR=$(WINE64_SRC)",GEX_SRC_SEED=$(WINE64_SEED) $(FETCH) --worktree $(WINE64_REPO) $(WINE64_COMMIT) $(CACHE)/mirror/wine64.git $(WINE64_SRC))
+	$(if $(WINE_DIR),@echo "64-bit Wine from WINE_DIR=$(WINE64_SRC)",$(ROOT)/wine/patches.sh --check $(WINE64_SRC) $(WINE64_COMMIT) || { GEX_SRC_SEED=$(WINE64_SEED) $(FETCH) --worktree $(WINE64_REPO) $(WINE64_COMMIT) $(CACHE)/mirror/wine64.git $(WINE64_SRC) && $(ROOT)/wine/patches.sh $(WINE64_SRC) $(WINE64_COMMIT); })
 
 # ---- the toolchain ----
 ifeq ($(SNAPSHOT),1)

@@ -98,7 +98,8 @@ J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
 pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine.pins")
-[ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine.pins' $(printf %.12s "$pin")" >&2
+# (or at it with wine/patches, wine/patches.sh's commit over it)
+"$here/patches.sh" --check "$W" "$pin" || echo "wine64-dist: $W is at $K, not wine.pins' $(printf %.12s "$pin") (with wine/patches)" >&2
 log() { echo "wine64-dist: $*" >&2; }
 # The 32-bit prerequisites first, so a missing one fails now, not after the
 # Wine builds: the sysroot and the libraries (no 32-bit Wine tree, and
