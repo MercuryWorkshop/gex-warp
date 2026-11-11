@@ -16,6 +16,7 @@
 //! or `wl_drm`, so a client insisting on a GPU buffer finds none.
 
 pub mod data;
+pub mod menu;
 mod pointer;
 pub mod wire;
 
@@ -625,6 +626,9 @@ enum Object {
     PointerConstraints,
     LockedPointer,
     ConfinedPointer,
+    /// `gex_menu_manager_v1` and `gex_menu_v1` (menu.rs).
+    MenuManager,
+    Menu,
 }
 
 /// An `xdg_positioner`: where a popup wants to be, expressed the way the
@@ -912,6 +916,8 @@ pub struct Client {
     /// confinements by object id (pointer.rs).
     relative_pointers: Vec<u32>,
     constraints: HashMap<u32, pointer::Constraint>,
+    /// Menus handed to the shell (menu.rs).
+    menus: menu::MenuState,
 }
 
 /// Wayland's error codes on `wl_display`.
@@ -972,6 +978,7 @@ impl Client {
             data: data::DataState::default(),
             relative_pointers: Vec::new(),
             constraints: HashMap::new(),
+            menus: menu::MenuState::default(),
         }
     }
 
@@ -1155,6 +1162,8 @@ impl Client {
                 Object::RelativePointer => self.relative_pointer(object, opcode),
                 Object::PointerConstraints => self.pointer_constraints(object, opcode, &mut r),
                 Object::LockedPointer | Object::ConfinedPointer => self.constrained_pointer(object, opcode, &mut r),
+                Object::MenuManager => self.menu_manager(object, opcode, &mut r),
+                Object::Menu => self.menu(object, opcode, &mut r, buffers),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager { version } => self.data_device_manager(version, opcode, &mut r),
                 Object::DataDevice => self.data_device(object, opcode, &mut r),
@@ -1289,6 +1298,7 @@ impl Client {
                         .uint(*version);
                     self.send(w);
                 }
+                self.advertise_menus(id);
                 true
             }
             _ => false,
@@ -1308,6 +1318,9 @@ impl Client {
         };
         if Self::tracing() {
             trace_out(&format!("[wl] bind {interface} v{version} as {id}"));
+        }
+        if self.bind_menus(name, &interface, id) {
+            return true;
         }
         let Some((expected, _)) = GLOBALS.get(name as usize - 1) else {
             return false;

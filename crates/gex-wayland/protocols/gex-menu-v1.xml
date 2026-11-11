@@ -1,0 +1,412 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="gex_menu_v1">
+  <description summary="a program's menus, presented by the compositor's shell">
+    A program with a menu bar -- a Mac application's main menu, a GTK or Qt
+    application's exported menus, a Win32 window's HMENU -- can hand the
+    menu's description to the compositor instead of drawing it inside its
+    window. The shell then presents it by its own conventions: a global menu
+    bar at the top of the screen, a strip in the frame it draws round the
+    window, a button that opens it. The program keeps the menu's meaning: it
+    says what the items are, brings them up to date when one of its menus is
+    about to be shown, and acts when the shell says an item was chosen.
+
+    Negotiation is by the global's presence. A compositor advertises
+    gex_menu_manager_v1 only when its shell presents menus; a client that
+    sees it publishes its menus and draws no menu bar of its own, and one
+    that does not sees and does everything as before. A client's context
+    menus, pop-up buttons and other menus it opens itself are not part of
+    this: they stay its own windows (xdg_popup).
+
+    The model
+
+    A gex_menu_v1 object is one tree. Its nodes are items, each named by a
+    number the client chooses, unique within the tree and opaque to the
+    compositor (zero is not an item: it names the tree's root, the menu bar
+    itself). An item with the submenu flag is also a menu: its children are
+    the items shown when it opens, and where a request or event takes a
+    "menu" it is that item's number, or zero for the root. A number keeps
+    meaning the same item for as long as the client goes on describing it,
+    so a shell can keep a menu open across updates, and remember an item to
+    activate from a shortcut of its own.
+
+    A tree belongs either to the whole client -- an application's menu bar,
+    shown while any of the client's toplevels has the keyboard; or the menu
+    a shell shows for the application's icon in its dock or taskbar -- or to
+    one toplevel (a window that has a menu bar of its own). The menu for a
+    window is its own tree if it has one, else its client's menu bar tree.
+
+    State is double-buffered. The requests that describe items (item, the
+    item_* requests, set_items, remove_item, set_title) accumulate and take
+    effect together at commit, so a shell never sees half an update. The
+    first commit publishes the tree; later ones change it, and a client
+    sends only what changed. Nothing a client describes is lost by not
+    being mentioned again: an item keeps its properties and a menu its
+    children until the client sets them anew or removes the item.
+
+    Liveness
+
+    Programs keep their menus lazily: whether Undo is enabled, what its title
+    is, which documents the Window menu lists, is worked out when the menu is
+    about to be seen. So before a shell shows a menu it sends about_to_open,
+    and the client brings that menu's items up to date (item requests and a
+    commit, if anything changed) and answers ack_open with the event's
+    serial. A shell should show the menu on the ack, and may show the state it
+    already has if the ack is slow in coming (a program that is busy must not
+    make the menu bar dead), correcting it when the commit arrives. A menu the
+    shell stops showing is closed. about_to_open for the root asks for the
+    bar's own items (the titles along it) to be made current, and is not
+    required before showing the bar.
+
+    A client may commit changes at any time, with no menu open: a document's
+    new name, a check mark that moved. A shell showing the tree redraws.
+
+    Choosing an item is activate, with the modifiers held. The client does
+    what it does when the item is chosen in its own menu -- including
+    nothing, when the item turns out to be disabled: the client's own state
+    decides, not the shell's copy of it. activate needs no about_to_open
+    before it, so a shell may run an item from a shortcut it owns (it reads
+    the item's shortcut from the tree, or assigns its own). The shortcuts a
+    client describes stay the client's business while one of its surfaces
+    has the keyboard: the keys reach it as wl_keyboard events as they always
+    did and it acts on them itself. They are described so that a shell can
+    draw them beside the items, and so that it can offer them when the
+    client does not have the keyboard, if its conventions want that.
+
+    Neutrality
+
+    Nothing here belongs to one toolkit. Shortcuts are a key named as the
+    W3C UI Events "key" values name keys, with a mask of the four modifiers
+    every keymap has. Roles are optional hints from a fixed vocabulary of
+    lower-case words, there so a shell can find the items its conventions
+    place specially (an application menu, Quit, Preferences, a Window or
+    Help menu); a client that knows none sets none, and a shell ignores the
+    ones it does not know.
+  </description>
+
+  <interface name="gex_menu_manager_v1" version="1">
+    <description summary="publish menus to the shell">
+      The global. Advertised only by a compositor whose shell presents
+      menus; see the protocol's description.
+    </description>
+
+    <enum name="error">
+      <entry name="role_taken" value="0"
+             summary="the client already has an application menu of this kind"/>
+      <entry name="surface_taken" value="1"
+             summary="the surface already has a menu"/>
+      <entry name="bad_kind" value="2"
+             summary="not a kind of application menu this version knows"/>
+    </enum>
+
+    <enum name="kind">
+      <description summary="what an application menu is for">
+        Which of a client's menus a tree is.
+      </description>
+      <entry name="menu_bar" value="1">
+        <description summary="the application's menu bar">
+          The menus shown while any of the client's toplevels has the
+          keyboard, unless that toplevel has a menu of its own. Its root's
+          children are the bar's titles, each a submenu.
+        </description>
+      </entry>
+      <entry name="dock" value="2">
+        <description summary="the application's dock or taskbar menu">
+          Items a shell adds to the menu it shows for the application's icon
+          or task button. Its root's children are those items.
+        </description>
+      </entry>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Menus already made are unaffected.
+      </description>
+    </request>
+
+    <request name="get_application_menu">
+      <description summary="a menu that belongs to the whole client">
+        Makes the client's tree of the given kind. A client has at most one
+        of each kind at a time (role_taken otherwise); destroying it leaves
+        the client free to make another.
+      </description>
+      <arg name="id" type="new_id" interface="gex_menu_v1"/>
+      <arg name="kind" type="uint" enum="kind"/>
+    </request>
+
+    <request name="get_surface_menu">
+      <description summary="a menu that belongs to one toplevel">
+        Makes the menu bar of one surface, which should be or become an
+        xdg_toplevel. While that toplevel has the keyboard a shell shows
+        this tree and not the client's application menu bar. A surface has
+        at most one (surface_taken otherwise). The tree is gone from the
+        shell when the surface is destroyed; the object stays, inert, until
+        the client destroys it.
+      </description>
+      <arg name="id" type="new_id" interface="gex_menu_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="gex_menu_v1" version="1">
+    <description summary="one tree of menus">
+      See the protocol's description for the model. Requests other than
+      commit, ack_open and destroy change pending state, applied by commit.
+    </description>
+
+    <enum name="error">
+      <entry name="bad_item" value="0"
+             summary="item number zero, or a number never described"/>
+      <entry name="bad_tree" value="1"
+             summary="at commit, an item is in two menus, in itself, or a menu's child was never described"/>
+      <entry name="bad_image" value="2"
+             summary="an image larger than allowed, or whose file is too short"/>
+      <entry name="too_large" value="3"
+             summary="more than 4096 items"/>
+      <entry name="bad_serial" value="4"
+             summary="ack_open of a serial no about_to_open carried"/>
+    </enum>
+
+    <enum name="flags" bitfield="true">
+      <description summary="what kind of item, and how it is shown"/>
+      <entry name="disabled" value="1"
+             summary="cannot be chosen; a shell draws it dimmed"/>
+      <entry name="hidden" value="2"
+             summary="not shown at all, and takes no room"/>
+      <entry name="separator" value="4"
+             summary="a dividing line; its title and the rest mean nothing"/>
+      <entry name="submenu" value="8"
+             summary="opens a menu: its children, which may be none yet"/>
+      <entry name="alternate" value="16">
+        <description summary="stands in for the item before it">
+          The item replaces the nearest preceding item that is not an
+          alternate, while exactly its shortcut's modifiers are held with
+          the menu open (Close, and Close All with Alt held). A shell that
+          does not present alternates treats the item as hidden.
+        </description>
+      </entry>
+      <entry name="header" value="32"
+             summary="a label for the items after it; cannot be chosen"/>
+    </enum>
+
+    <enum name="state">
+      <description summary="an item's check mark"/>
+      <entry name="off" value="0"/>
+      <entry name="on" value="1" summary="checked"/>
+      <entry name="mixed" value="2" summary="true of part of what it applies to"/>
+    </enum>
+
+    <enum name="modifiers" bitfield="true">
+      <description summary="modifier keys">
+        Named as the compositor's keymap names them, which is how
+        wl_keyboard.modifiers reports them: Shift, Control, Mod1 and Mod4.
+        Mod4 is the key a Mac keyboard labels Command, a PC keyboard with
+        the Windows mark, and a shell usually calls Super or Meta; Mod1 is
+        Alt, a Mac's Option.
+      </description>
+      <entry name="shift" value="1"/>
+      <entry name="control" value="2"/>
+      <entry name="alt" value="4"/>
+      <entry name="logo" value="8"/>
+    </enum>
+
+    <enum name="image_flags" bitfield="true">
+      <entry name="template" value="1">
+        <description summary="a shape, not a picture">
+          Only the image's alpha means anything: a shell draws it in the
+          colour of the item's text, as it would a glyph.
+        </description>
+      </entry>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="take the tree away">
+        The shell stops showing it at once. Events already sent for it may
+        be ignored.
+      </description>
+    </request>
+
+    <request name="set_title">
+      <description summary="what the tree is called">
+        For an application menu, the application's name as it should be
+        shown to a person (a shell may title the application's own menu
+        with it); for a surface's, whatever names the window's menu, or
+        nothing. Pending state.
+      </description>
+      <arg name="title" type="string"/>
+    </request>
+
+    <request name="item">
+      <description summary="describe an item">
+        Makes the item `id` if the tree has none, and sets what every item
+        has: its flags, check mark, indentation (in levels, for an item
+        shown as subordinate to the one above; zero for none) and title.
+        The title is plain text, with no mnemonic marker. What the other
+        item_* requests set is left as it was.
+
+        A new item is in no menu until a set_items names it. Zero is not an
+        item (bad_item). Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="flags" type="uint" enum="flags"/>
+      <arg name="state" type="uint" enum="state"/>
+      <arg name="indent" type="uint"/>
+      <arg name="title" type="string"/>
+    </request>
+
+    <request name="item_shortcut">
+      <description summary="the keys that choose an item">
+        `key` names the key as the W3C UI Events specification's
+        KeyboardEvent "key" values do, for the unshifted key: one character
+        for a key that types one, in lower case if it has case ("s", ",",
+        "/", " " for the space bar), else the key's name ("Enter", "Tab",
+        "Backspace", "Delete", "Escape", "ArrowUp", "ArrowDown",
+        "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown",
+        "F1" and so on). `modifiers` is every modifier held with it, Shift
+        included: a shortcut a toolkit writes as a capital letter is the
+        lower-case key with shift.
+
+        An empty key means the item has no shortcut, which is how one is
+        taken away. Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="key" type="string"/>
+      <arg name="modifiers" type="uint" enum="modifiers"/>
+    </request>
+
+    <request name="item_role">
+      <description summary="what an item is, for a shell that treats some specially">
+        A hint, one lower-case word from this list, or empty for none (which
+        is what an item has until told otherwise). A shell may move, merge,
+        retitle or restyle items by role; a client must not depend on it.
+
+        On a child of the menu bar's root: "application" (the menu of the
+        application itself: About, Preferences, Quit; a Mac program's first
+        menu), "file", "edit", "view", "window", "help".
+
+        On an item anywhere: "about", "preferences", "services" (a submenu
+        of services other programs offer), "hide", "hide-others",
+        "show-all", "quit", "new", "open", "close", "save", "print",
+        "undo", "redo", "cut", "copy", "paste", "delete", "select-all",
+        "minimize", "zoom", "fullscreen", "bring-all-to-front".
+
+        Later versions may add words; a shell ignores one it does not know.
+        Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="role" type="string"/>
+    </request>
+
+    <request name="item_tooltip">
+      <description summary="help text for an item">
+        A sentence a shell may show when the pointer rests on the item.
+        Empty for none. Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="text" type="string"/>
+    </request>
+
+    <request name="item_image">
+      <description summary="a small picture shown with an item">
+        The file holds width * height pixels from its start, rows top to
+        bottom with no padding, each pixel 32 bits as wl_shm's argb8888
+        (alpha, red, green, blue from the most significant byte, in the
+        machine's byte order; colour premultiplied by alpha). The picture
+        is shown at width / scale by height / scale surface units, so a
+        client with a 16-unit icon for a scale-2 output sends 32 by 32 and
+        scale 2.
+
+        The compositor copies the pixels while it handles the request: the
+        client may close and reuse the file as soon as it has sent it. No
+        side may be longer than 128 pixels, and the file must hold them all
+        (bad_image). Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="fd" type="fd"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="scale" type="uint"/>
+      <arg name="flags" type="uint" enum="image_flags"/>
+    </request>
+
+    <request name="item_no_image">
+      <description summary="take an item's picture away">
+        Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="remove_item">
+      <description summary="forget an item">
+        The item is gone at the next commit, and from the menu it was in;
+        if it was a menu, its children are in no menu (and stay described:
+        the client removes those it is done with). The number may be given
+        to a new item afterwards. Pending state.
+      </description>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="set_items">
+      <description summary="a menu's children, in order">
+        `items` is an array of 32-bit item numbers in the machine's byte
+        order: the children of `menu` (an item with the submenu flag, or
+        zero for the root), first to last. It replaces the menu's children
+        whole; an item it leaves out is in no menu until named again.
+        Pending state, checked at commit: every number must be a described
+        item, and an item may be in one menu only and not inside itself
+        (bad_tree).
+      </description>
+      <arg name="menu" type="uint"/>
+      <arg name="items" type="array"/>
+    </request>
+
+    <request name="commit">
+      <description summary="apply the pending state">
+        Everything pending takes effect together, and the shell shows the
+        result. The first commit publishes the tree.
+      </description>
+    </request>
+
+    <request name="ack_open">
+      <description summary="a menu about to open is up to date">
+        Answers about_to_open: the menu's items are current as of the last
+        commit. Sent after that commit, or alone if nothing needed changing.
+        Acknowledging a serial acknowledges every earlier one.
+      </description>
+      <arg name="serial" type="uint"/>
+    </request>
+
+    <event name="about_to_open">
+      <description summary="the shell is about to show a menu">
+        The client makes the children of `menu` (zero: the root) current --
+        their titles, flags, check marks, and which there are -- commits if
+        any changed, and sends ack_open with this serial. It need not make
+        the menus below it current: each gets an event of its own when the
+        shell opens it. The event may name an item the client has since
+        removed, which the client acknowledges all the same.
+      </description>
+      <arg name="menu" type="uint"/>
+      <arg name="serial" type="uint"/>
+    </event>
+
+    <event name="closed">
+      <description summary="the shell no longer shows a menu">
+        Each about_to_open is paired with a closed, when the menu is put
+        away or was never shown after all. Menus below it that were open
+        are closed first.
+      </description>
+      <arg name="menu" type="uint"/>
+    </event>
+
+    <event name="activate">
+      <description summary="an item was chosen">
+        The client acts as it does when the item is chosen in a menu of its
+        own, having checked for itself that the item can be chosen now.
+        `modifiers` is what was held, for a program that looks. The client
+        acts on the item named: a shell that presents alternates names the
+        alternate when that is what it showed.
+      </description>
+      <arg name="item" type="uint"/>
+      <arg name="modifiers" type="uint" enum="modifiers"/>
+    </event>
+  </interface>
+</protocol>
