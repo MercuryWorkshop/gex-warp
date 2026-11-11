@@ -98,7 +98,7 @@ RTMAP="-ffile-prefix-map=$HERE=/gex/toolchain/gexcc"
 clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
 # -fgex-no-fork's object (rt/nofork.c): linked only into links that ask
 clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$HERE/rt/nofork.c" -o "$L/nofork.o"
-for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/nlcompat.c "$HERE"/rt/poll.s; do
+for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/nlcompat.c "$HERE"/rt/fts.c "$HERE"/rt/gnu_basename.c "$HERE"/rt/shadow_r.c "$HERE"/rt/poll.s; do
   clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
@@ -206,17 +206,17 @@ export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/wasm32-linux-musl/pkgconfig:$P
 unset PKG_CONFIG_PATH
 st=; case \${GEXCC_SHARED:-0} in 0) st=--static ;; esac
 # A variable naming a directory the sysroot does not have is where the
-# package installs to (udev's udevdir: /usr/lib/udev), not a place to read
-# from (wayland-protocols' pkgdatadir): the target's path, unprefixed. So is
-# every variable of a package whose .pc only says where others install
-# (bash-completion's completionsdir, which the sysroot has once a package
-# put a completion there; systemd's unit directories; udev's).
+# package installs to (a udevdir), not a place to read from (a pkgdatadir
+# of XML the build reads): the target's path, unprefixed. Which packages'
+# variables are always target paths, though the sysroot has the directory
+# (where others install to, or data a program finds at run time), only the
+# builder knows: GEXCC_PKG_CONFIG_RUNTIME names them (space-separated).
 case " \$* " in
 *" --variable"*)
     v=\$(pkg-config \$st "\$@") || exit
-    case " \$* " in
-    *" bash-completion "*|*" systemd "*|*" udev "*) v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
-    esac
+    for p in \${GEXCC_PKG_CONFIG_RUNTIME:-}; do
+        case " \$* " in *" \$p "*) v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;; esac
+    done
     case \$v in
     "\$PKG_CONFIG_SYSROOT_DIR"/*) [ -e "\$v" ] || v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
     esac
@@ -271,6 +271,13 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+# A Debian package's build: the build machine's tools' CMake packages too
+# (extra-cmake-modules, /usr/share/ECM, is one, not the target's), after the
+# sysroot's; the build machine's own libraries' are under its multiarch
+# directory, which is not searched
+if(DEFINED ENV{DEB_HOST_ARCH})
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+endif()
 set(CMAKE_CROSSCOMPILING_EMULATOR "$B/gexcc-run")
 set(PKG_CONFIG_EXECUTABLE "$B/$TRIPLE-pkg-config" CACHE FILEPATH "")
 # Static libraries unless GEXCC_SHARED (wasm side modules)

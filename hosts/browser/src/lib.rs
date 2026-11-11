@@ -3338,6 +3338,8 @@ static HEAP_BIGGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Bytes held by `Jit::registry`, for the arena report.
 static REGISTRY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A span of `len` bytes `who` took ([`ARENA_SPENT`]'s index): counted once
+/// taken, so that claims the arena refused do not add to what it spent.
 fn arena_note(who: usize, len: u64) {
     ARENA_SPENT[who].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
     ARENA_SPENT[3].fetch_max(len, std::sync::atomic::Ordering::Relaxed);
@@ -3346,8 +3348,19 @@ fn arena_note(who: usize, len: u64) {
 static ARENA_NEXT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The largest span of arena gex's own memory (this module's heap, a
+/// Worker's stack) asked for and did not get: the trap that follows is the
+/// process outgrowing its lowered memory ([`runtime_outgrow`]).
+static RUNTIME_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
+    arena_take_for(len, false)
+}
+
+/// Take `len` bytes of arena: for a guest mapping (`guest`, whose refusal
+/// the guest hears as ENOMEM), else for gex's own memory.
+fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
     let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
     // First claim starts above both the placement window (where shared objects
     // sit at a common address) and whatever the memory already reaches. The
@@ -3399,6 +3412,9 @@ fn arena_take(len: u64) -> Option<u64> {
     // No line from here: this is the allocator's refill path (see below).
     HEAP_REACH.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > winspace::arena_ceiling() || !grow_memory_to(end) {
+        if !guest {
+            RUNTIME_SHORT.fetch_max(len, std::sync::atomic::Ordering::Relaxed);
+        }
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
         // printed. This is the only place that knows the arena ran out -- and
@@ -3415,6 +3431,13 @@ fn arena_take(len: u64) -> Option<u64> {
                 self.1 += n;
                 Ok(())
             }
+        }
+        // Once a process: a program refused may ask again (the kernel ends
+        // one that asks for as much again: `note_short`), and each refusal
+        // after the first says nothing new.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return None;
         }
         // Sized generously: `write!` into a full buffer stops silently, so the
         // last field added is the first lost and reads as absent, not truncated.
@@ -3498,8 +3521,15 @@ fn arena_take(len: u64) -> Option<u64> {
             BIG_SIZE_N[7].load(std::sync::atomic::Ordering::Relaxed),
             BIG_SIZES[7].load(std::sync::atomic::Ordering::Relaxed),
         );
-        // SAFETY: `warn` reads the bytes and keeps none of them.
-        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        // Debug output for gex's own memory in a process that can move to
+        // a 64-bit memory: the trap that follows is its outgrowing the
+        // lowered one, which the kernel's line says (`runtime_outgrow`).
+        // SAFETY: `warn` and `debug` read the bytes and keep none of them.
+        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+            unsafe { debug(b.0.as_ptr() as u32, b.1 as u32) };
+        } else {
+            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        }
         return None;
     }
     // A compare-and-swap, not a bare store: two Workers that loaded the same
@@ -3515,7 +3545,7 @@ fn arena_take(len: u64) -> Option<u64> {
     if memmap::take_span(&ARENA_NEXT, cur, at, len) {
         Some(at)
     } else {
-        arena_take(len)
+        arena_take_for(len, guest)
     }
 }
 
@@ -3602,22 +3632,28 @@ fn wine32_note_reach(to: u64, why: &str, start: u64, end: u64) {
     // Unguarded units fold only constant KUSER_SHARED_DATA addresses (cgen):
     // a computed one into Windows' old page is caught by the engine's bounds
     // check only while the memory ends below it. Past it, such a read would
-    // succeed with whatever is there, so say so, once, by default. The
-    // heap's own reach (`HEAP_REACH`, recorded where nothing may allocate)
-    // is checked here too, at the next mapping.
-    static KUSER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // succeed with whatever is there. Translated code checks such accesses
+    // itself (`BRK_KUSER_UNFOLDED`) wherever the memory ends, so the reach
+    // matters only once a program's unguarded unit is published: said by
+    // default then, once, and as debug output otherwise. The heap's own
+    // reach (`HEAP_REACH`, recorded where nothing may allocate) is checked
+    // here too, at the next mapping.
+    static KUSER_SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let reach = to.max(HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed));
-    if winspace::wine32_compact()
-        && gex_abi::kuser_fold()
-        && reach > gex_abi::KUSER_WINDOWS
-        && !KUSER_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        warn_line(&format!(
-            "gex: CRITICAL: wine32 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}); unguarded units may read it\n",
-            my_pid(),
-            gex_abi::KUSER_WINDOWS,
-            reach,
-        ));
+    let said = KUSER_SAID.load(std::sync::atomic::Ordering::Relaxed);
+    if winspace::wine32_compact() && gex_abi::kuser_fold() && reach > gex_abi::KUSER_WINDOWS && said < 2 {
+        let exposed = crate::cgen::unguarded_image_unit();
+        if exposed || said == 0 {
+            KUSER_SAID.store(if exposed { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            let line = format!(
+                "gex: wine32 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}){}\n",
+                my_pid(),
+                gex_abi::KUSER_WINDOWS,
+                reach,
+                if exposed { "; an unguarded unit's computed read there would not fault" } else { "" },
+            );
+            if exposed { warn_line(&line) } else { trace_line(&line) }
+        }
     }
     if !winspace::wine32_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -3648,9 +3684,9 @@ static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// The same cursor this module's heap takes from, so the two can never hand
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
-    arena_note(0, len);
-    let at = arena_take(len).unwrap_or(0);
+    let at = arena_take_for(len, true).unwrap_or(0);
     if at != 0 {
+        arena_note(0, len);
         wine32_note_reach(at + len, "the kernel's arena", at, at + len);
     }
     if at != 0 {
@@ -3733,7 +3769,6 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
             );
             said = Some(b);
         }
-        arena_note(1, len);
         // Count of refills, plus the biggest single layout that forced one --
         // which separates one doubling buffer from many live objects.
         HEAP_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3790,6 +3825,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
             }
             return Err(());
         };
+        arena_note(1, len);
         let base = base as *mut u8;
         if let Some(b) = said {
             // SAFETY: as above.
@@ -4291,6 +4327,13 @@ struct Jit {
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
+    /// Pages (keys, either mode) retired since whose every translation was
+    /// made while the page was writable and executable, so each block of it
+    /// checks its bytes (`Block::guard`): made writable again while it
+    /// stays executable, such a page keeps its translations
+    /// (`MapLog::writable_code`, [`keep_guarded`]). Any other translation
+    /// on a page, or a stored module served there, takes it out.
+    guarded_pages: std::collections::HashSet<u64>,
     /// The page each directory entry this process published names (by the
     /// entry: table and first slot), so a module's blocks can be told which
     /// pages they are on.
@@ -5279,8 +5322,8 @@ fn slot_span_locked(i: usize) -> Option<u64> {
     if base != 0 {
         return Some(base);
     }
-    arena_note(2, (slots::STACK + slots::TLS) as u64);
     let base = arena_take((slots::STACK + slots::TLS) as u64)?;
+    arena_note(2, (slots::STACK + slots::TLS) as u64);
     SLOT_BASE[i].store(base, Ordering::Release);
     // SAFETY: as in `gex_worker_init`; the claims name the span once, when it
     // is taken.
@@ -11894,6 +11937,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         own_bases: Default::default(),
         stale_again: Default::default(),
         retired_pages: Default::default(),
+        guarded_pages: Default::default(),
         base_pages: Default::default(),
         dense_on_page: Default::default(),
         dense_live: Default::default(),
@@ -18113,6 +18157,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             page: u64,
             started: u64,
             epoch: (u32, u32),
+            volatile: Vec<(u64, u64)>,
         },
     }
     let pre = with_px(|px| with_jit_only(|j| {
@@ -18354,6 +18399,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
                         note_installed(j, *id, d.iter().map(|(p, _)| *p));
+                        // (built elsewhere: whether its blocks check their
+                        // bytes is not known here)
+                        for (p, _) in d.iter() {
+                            j.guarded_pages.remove(p);
+                        }
                         slots = slots.max(*s);
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
@@ -18508,13 +18558,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         let started = now_ns();
+        // The writable and executable ranges this translation guards.
+        let mut volatile: Vec<(u64, u64)> = Vec::new();
         // x86-64: what the page table's identity hooks answer from, as of now,
         // and which pages are a JIT's (writable and executable, or written
         // through another view), so their blocks carry a self-modifying-code
         // guard. See `Block::guard`, `MemoryMap::volatile_code`.
         if gex_abi::X86 {
         refresh_ident_snapshot(px);
-        gex_xlate::set_volatile_ranges(px.mm.lock().volatile_code());
+        volatile = px.mm.lock().volatile_code();
+        gex_xlate::set_volatile_ranges(volatile.clone());
         }
         phase(11);
         // The page table moves out and back: cloning it (a BTreeMap of every
@@ -18533,13 +18586,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             page,
             started,
             epoch,
+            volatile,
         };
         jitout::OUT.store(jit_me(), std::sync::atomic::Ordering::Release);
         go
     }));
     let translated = match pre {
         MissPre::Done(t) => t,
-        MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
+        MissPre::Go { exec, mut known, table, intr, page, started, epoch, volatile } => {
     // A provider's address counts as known: a miss there is bridged again
     // (`cgen::provider_serves`), its bytes may be a `ud2` stub; in the other
     // mode, a function of that mode bound there (`cgen::alt_serves`).
@@ -18742,6 +18796,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
         note_live(&unit.covered);
+        // A page this unit has code on that was not writable and executable
+        // as it was lifted: its blocks check nothing of their bytes.
+        for &(p, _) in &unit.covered {
+            let at = (p & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
+            if !volatile.iter().any(|&(s, e)| s <= at && at + gex_abi::DISPATCH_PAGE <= e) {
+                j.guarded_pages.remove(&p);
+            }
+        }
         // The entries the install publishes: the pages this unit numbered,
         // and every other page it covers whose directory entry this process
         // never wrote. A forked child is that case: its page table keeps the
@@ -19164,7 +19226,7 @@ fn retire_unmapped_code_in(h: &mut Host) {
     let mm = &h.kernel.mem;
     with_jit_only(|_| {
         let (retired, recheck, _) = take_logged(mm, false);
-        retire_noted(mm, &retired, &recheck);
+        retire_noted(mm, retired, &recheck);
     });
 }
 
@@ -19182,15 +19244,64 @@ fn retire_unmapped_code_in(h: &mut Host) {
 pub(crate) fn take_logged(
     mm: &gex_kernel::mem::Mm,
     mapped: bool,
-) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<gex_kernel::CodeMap>) {
+) -> (Logged, Vec<(u64, u64)>, Vec<gex_kernel::CodeMap>) {
     assert!(jit_holds(), "gex: the map's log drained without the JIT lock");
     let mut g = mm.lock();
     let log = &mut g.log;
     (
-        std::mem::take(&mut log.retired_code),
+        Logged { retired: std::mem::take(&mut log.retired_code), writable: std::mem::take(&mut log.writable_code) },
         std::mem::take(&mut log.recheck_code),
         if mapped { std::mem::take(&mut log.new_code) } else { Vec::new() },
     )
+}
+
+/// Code the map's log says was retired ([`take_logged`]): all of it, and
+/// of it what was only made writable while it stays executable.
+#[derive(Default)]
+pub(crate) struct Logged {
+    retired: Vec<(u64, u64)>,
+    writable: Vec<(u64, u64)>,
+}
+
+/// Of `retired`, what to retire: less the pages only made writable
+/// (`writable`) whose every translation checks its bytes
+/// (`Jit::guarded_pages`), and where no unit has code. A loader that makes
+/// its `.text` writable around each patch (MinGW's pseudo-relocations,
+/// one `VirtualProtect` of the whole section a patch) otherwise retires
+/// the section, the code doing the patching with it, once a patch.
+/// x86 only: AArch64's blocks carry no guard.
+fn keep_guarded(j: &Jit, retired: &[(u64, u64)], writable: &[(u64, u64)], units: &std::collections::HashSet<u64>) -> Vec<(u64, u64)> {
+    if writable.is_empty() || !gex_abi::X86 || crate::fjit::on() {
+        return retired.to_vec();
+    }
+    let kept = |page: u64| {
+        let at = page * gex_abi::DISPATCH_PAGE;
+        writable.iter().any(|&(s, e)| s <= at && at + gex_abi::DISPATCH_PAGE <= e)
+            && !units.contains(&page)
+            && !units.contains(&(page | gex_abi::ALT_PAGE))
+            && j.guarded_pages.contains(&page)
+            && j.guarded_pages.contains(&(page | gex_abi::ALT_PAGE))
+    };
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in retired {
+        if end <= start {
+            continue;
+        }
+        let mut lo = start;
+        for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+            let (ps, pe) = ((page * gex_abi::DISPATCH_PAGE).max(start), ((page + 1) * gex_abi::DISPATCH_PAGE).min(end));
+            if kept(page) {
+                if lo < ps {
+                    out.push((lo, ps));
+                }
+                lo = pe;
+            }
+        }
+        if lo < end {
+            out.push((lo, end));
+        }
+    }
+    out
 }
 
 /// What a mapping call made without the kernel lock (`free_syscall`) noted
@@ -19203,27 +19314,45 @@ fn map_drain() -> Vec<gex_kernel::CodeMap> {
     let mm = home.mm();
     with_jit_only(|_| {
         let (retired, recheck, mapped) = take_logged(mm, true);
-        retire_noted(mm, &retired, &recheck);
+        retire_noted(mm, retired, &recheck);
         mapped
     })
 }
 
 /// Retire `retired` (code unmapped or made writable) and compare `recheck`
 /// (made executable again), whoever noted them.
-fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u64, u64)]) {
+fn retire_noted(mm: &gex_kernel::mem::Mm, logged: Logged, recheck: &[(u64, u64)]) {
+    let retired = &logged.retired[..];
     if !retired.is_empty() {
         crate::cgen::on_retire(retired, &gone_code(mm, retired));
         crate::fjit::on_retire(retired);
         let why = gex_kernel::take_retire_why();
+        // The pages units have code on, asked before the JIT lock is taken.
+        let units = if logged.writable.is_empty() {
+            Default::default()
+        } else {
+            let pages: Vec<u64> = logged
+                .writable
+                .iter()
+                .flat_map(|&(s, e)| (s / gex_abi::DISPATCH_PAGE..e.div_ceil(gex_abi::DISPATCH_PAGE)).flat_map(|p| [p, p | gex_abi::ALT_PAGE]))
+                .collect();
+            crate::cgen::unit_pages_of(&pages)
+        };
         with_jit_only(|j| {
+            let retire = keep_guarded(j, retired, &logged.writable, &units);
+            let retiring = |page: u64| {
+                let at = page * gex_abi::DISPATCH_PAGE;
+                retire.iter().any(|&(s, e)| at < e && at + gex_abi::DISPATCH_PAGE > s)
+            };
             for w in &why {
                 for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
-                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() {
+                    // Pages kept (`keep_guarded`) are not counted.
+                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() && retiring(page) {
                         note_page_retired(Some(mm), page, w);
                     }
                 }
             }
-            retire_code(j, retired)
+            retire_code_keeping(j, retired, &retire)
         });
     }
     // Made executable again: the units' pages are compared, nothing is
@@ -19305,6 +19434,13 @@ pub(crate) fn gone_code(mm: &gex_kernel::mem::Mm, ranges: &[(u64, u64)]) -> Vec<
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
 /// old slots are left behind, unreachable.
 pub(crate) fn retire_code(j: &mut Jit, ranges: &[(u64, u64)]) {
+    retire_code_keeping(j, ranges, ranges)
+}
+
+/// [`retire_code`] of `retire`, the part of `ranges` that is retired here;
+/// a translation in flight retires all of `ranges` once its unit is queued
+/// (it may have lifted the code before the change, unguarded).
+fn retire_code_keeping(j: &mut Jit, ranges: &[(u64, u64)], retire: &[(u64, u64)]) {
     use std::sync::atomic::Ordering;
     // Under the JIT lock, so it waits for a translation in flight; and a
     // translation that may have read the old code retires these ranges again
@@ -19321,7 +19457,7 @@ pub(crate) fn retire_code(j: &mut Jit, ranges: &[(u64, u64)]) {
         }
         drop(log);
     }
-    retire_ranges(j, ranges);
+    retire_ranges(j, retire);
 }
 
 /// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
@@ -19371,6 +19507,9 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
+            // Nothing of it translated now: what is next is the next lift's.
+            j.guarded_pages.insert(page);
+            j.guarded_pages.insert(page | gex_abi::ALT_PAGE);
             forget_installed_on(j, page);
             let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
@@ -21009,6 +21148,7 @@ pub extern "C" fn gex_abandon(code: i32) {
     // no longer exists and the parent's `read` never returns: the run wedges
     // one process further along than the one that died, which is the shape
     // that made a lifter fault in a forked child look like a hang in `apt`.
+    let _ = runtime_outgrow(pid);
     outgrow_end(pid, code);
     hold_wakes();
     if let Some(fds) = fds_free() {
@@ -21054,6 +21194,32 @@ fn outgrow_end(pid: i32, status: i32) {
         let word = if status < 0 { (-status) & 0x7f } else { (status & 0xff) << 8 };
         gex_kernel::syscalls::outgrow_ending(pid, word, home.procs());
     }
+}
+
+/// Process `pid`, ending after a trap, ran out of gex's own memory in its
+/// lowered memory ([`RUNTIME_SHORT`]): it outgrew it, as a program whose
+/// reservation did not fit does, and is recorded for a 64-bit memory at
+/// its next start (`outgrow_ending`, which [`outgrow_end`] calls next).
+fn runtime_outgrow(pid: i32) -> bool {
+    let len = RUNTIME_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+        return false;
+    }
+    if let Some(home) = sigs::home() {
+        home.procs().set_crash_unless_said(pid, b"\0its memory ran out");
+    }
+    true
+}
+
+/// Whether this process's trap is its outgrowing its lowered memory
+/// ([`runtime_outgrow`]): gex's own memory could not grow, and the process
+/// can move to a 64-bit memory. Asked by the Worker before it says
+/// anything of the trap; a plain read of statics, and the record's lock
+/// tried.
+#[no_mangle]
+pub extern "C" fn gex_outgrew() -> i32 {
+    (RUNTIME_SHORT.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire))) as i32
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
@@ -21156,6 +21322,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
     set_exited(true);
     waitq::wake_process();
     let pid = my_pid();
+    let outgrew = runtime_outgrow(pid);
     outgrow_end(pid, status);
     let n = unsafe {
         if k_present() != 0 {
@@ -21170,9 +21337,10 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         home.procs().set_crash_unless_said(pid, b"\0gex could not run it on");
     }
     publish_exit(pid, status);
-    warn_line(&format!(
-        "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
-    ));
+    // (one that outgrew its memory: the kernel's line said so)
+    if !outgrew {
+        warn_line(&format!("[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"));
+    }
     n
 }
 

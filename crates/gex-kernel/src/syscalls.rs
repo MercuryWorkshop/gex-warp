@@ -1025,6 +1025,15 @@ struct Outgrow {
     clock: ClockFn,
     /// The largest reservation that did not fit, and when (ns).
     short: Option<(u64, u64)>,
+    /// The last one that did not fit (0: none yet).
+    last: u64,
+    /// gex is ending it for asking again ([`note_short`]); `end` until the
+    /// call that asked has taken it.
+    ended: bool,
+    end: bool,
+    /// gex's own memory for it ran out in the lowered memory
+    /// ([`note_runtime_short`]): it ends for that, whatever its status.
+    runtime: bool,
 }
 
 static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
@@ -1055,21 +1064,70 @@ pub fn wine_program(path: &str, argv: &[String], envp: &[String]) -> Option<Stri
 /// 32-bit guest (`compat`, `wasm32`), one already in a 64-bit memory or
 /// asked to stay out of one, an ask a 64-bit memory could not hold either,
 /// or a host that cannot run the 64-bit flavour.
-pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) {
+///
+/// The first refusal is the program's to handle: an allocator that can
+/// take a failure asks for less next (and one refused again may ask for
+/// less still). Asking again for at least what was last refused is a
+/// program that cannot go on without it, retrying as some allocators do
+/// for ever: true, and the caller ends the process (SIGKILL, raised now),
+/// which [`outgrow_ending`] records as ended for want of room.
+pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) -> bool {
     // (the host is asked when the process ends: a page Worker's first
     // calls can come before its host has set itself up)
     if len < OUTGROW_MIN || len > outgrow_max() || gex_abi::mem64() || compat || wasm32 {
-        return;
+        return false;
     }
     let mut all = OUTGROW.lock();
-    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return };
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return false };
     if o.short.is_none_or(|(had, _)| len > had) {
         o.short = Some((len, raw_ns(o.clock)));
     }
+    let again = o.last != 0 && len >= o.last;
+    o.last = len;
+    let end = again && !o.ended;
+    o.ended |= end;
     drop(all);
     if let Some(host) = OUTGROW_HOST.get() {
         (host.debug)(&format!("pid {pid}: a reservation of {len:#x} bytes did not fit its 32-bit memory\n"));
     }
+    end
+}
+
+/// Whether a [`crate::proc::PR_GEX_SHORT`] process `pid` just made says to
+/// end it ([`note_short`]), for its caller: `prctl` is answered where no
+/// signal can be raised.
+pub fn outgrow_take_end(pid: i32) -> bool {
+    OUTGROW.lock().iter_mut().find(|o| o.pid == pid).is_some_and(|o| std::mem::take(&mut o.end))
+}
+
+/// gex's own memory for process `pid` (the runtime's heap, a Worker's
+/// stack) could not grow by `len` bytes in its lowered memory, and the
+/// process cannot go on: recorded as a reservation that did not fit, which
+/// ends it whatever its status ([`outgrow_ending`]). Whether it was
+/// recorded: false for a process with no record (a 32-bit guest, one in a
+/// 64-bit memory or asked to stay out of one), or with the record's lock
+/// held where it ran out. Takes no other lock.
+pub fn note_runtime_short(pid: i32, len: u64, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 {
+        return false;
+    }
+    let Some(mut all) = OUTGROW.try_lock() else { return false };
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return false };
+    let len = len.clamp(OUTGROW_MIN, outgrow_max());
+    if o.short.is_none_or(|(had, _)| len > had) {
+        o.short = Some((len, raw_ns(o.clock)));
+    }
+    o.runtime = true;
+    true
+}
+
+/// Whether [`note_runtime_short`] would record process `pid`, and its host
+/// can move it to a 64-bit memory. No lock but the record's, tried.
+pub fn outgrow_armed(pid: i32, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 || !OUTGROW_HOST.get().is_some_and(|h| (h.reachable)()) {
+        return false;
+    }
+    OUTGROW.try_lock().is_some_and(|all| all.iter().any(|o| o.pid == pid && !o.stay32))
 }
 
 /// Process `pid` is ending with wait status `status`. One that fell short
@@ -1093,11 +1151,17 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
     };
     let Some((len, at)) = rec.short else { return };
     let sig = (status & 0x7f) as u32;
-    let abnormal = match sig {
-        0 => (status >> 8) & 0xff != 0,
-        0x7f => false,
-        s => matches!(s, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31),
-    };
+    let abnormal = rec.ended
+        || rec.runtime
+        || match sig {
+            0 => (status >> 8) & 0xff != 0,
+            0x7f => false,
+            s => matches!(s, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31),
+        };
+    if rec.ended {
+        let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
+        procs.set_crash_unless_said(pid, why.as_bytes());
+    }
     if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS || !(host.reachable)() {
         return;
     }
@@ -1107,11 +1171,12 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
     };
     let line = match set {
         Ok(()) => {
-            (host.say)(&format!(
-                "{} needs 64-bit memory (a reservation of {:#x} bytes did not fit); it gets it from its next start\n",
-                rec.image.as_deref().unwrap_or(""),
-                len
-            ));
+            let why = if rec.runtime {
+                format!("gex's own memory for it could not grow by {len:#x} bytes")
+            } else {
+                format!("a reservation of {len:#x} bytes did not fit")
+            };
+            (host.say)(&format!("{} needs 64-bit memory ({why}); it gets it from its next start\n", rec.image.as_deref().unwrap_or("")));
             "needs 64-bit memory; it will get it the next time it starts".to_string()
         }
         Err(e) => {
@@ -4711,6 +4776,12 @@ impl MapIo<'_> {
         // detour), which x86 needs no cache flush to see.
         if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
             self.retire_code_why(a[0], a[1], "mprotect", a[2] as u32);
+            if (a[2] as u32) & crate::mem::prot::EXEC != 0 {
+                let (start, end) = (crate::mem::page_align_down(a[0]), crate::mem::page_align_up(a[0].saturating_add(a[1])));
+                if end > start {
+                    self.mem.lock().log.writable_code.push((start, end));
+                }
+            }
         }
         let mut mm = self.mem.lock();
         let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
@@ -7583,7 +7654,11 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             // A reservation the lowered memory had no room for, as 64-bit
             // Wine says it (it never asks for a mapping it found no gap for).
             crate::proc::PR_GEX_SHORT => {
-                note_short(io.pid, a[1], io.compat, false);
+                if note_short(io.pid, a[1], io.compat, false) {
+                    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == io.pid) {
+                        o.end = true;
+                    }
+                }
                 Ok(0)
             }
             _ => Ok(0),
@@ -8227,8 +8302,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // A mapping the lowered memory had no room for.
         if r == Err(Errno::ENOMEM) && matches!(n, nr::MMAP | nr::MREMAP) {
             let len = f.map.mem.lock().take_short();
-            if len != 0 {
-                note_short(f.pid, len, compat, f.wasm32);
+            if len != 0 && note_short(f.pid, len, compat, f.wasm32) {
+                f.signals.raise(crate::signal::sig::SIGKILL);
             }
         }
         r
@@ -8250,7 +8325,11 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a)
+        let r = quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a);
+        if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(f.pid) {
+            f.signals.raise(crate::signal::sig::SIGKILL);
+        }
+        r
     } else if is_cred(n) {
         cred_call(f.creds, f.procs, f.pid, m, n, a)
     } else if is_mount(n) {
@@ -10588,7 +10667,9 @@ impl Kernel {
     /// A reservation of `len` bytes found no room in this process's
     /// lowered memory: [`note_short`].
     pub fn note_short(&mut self, len: u64) {
-        note_short(self.pid, len, self.compat, self.wasm32);
+        if note_short(self.pid, len, self.compat, self.wasm32) {
+            self.signals.raise(crate::signal::sig::SIGKILL);
+        }
     }
 
     /// Ready this process's record for [`note_short`] and
@@ -10616,13 +10697,13 @@ impl Kernel {
         let stay32 = self.exec_mem64 == Some(false);
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
-            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None },
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
             Some(o) => {
                 if o.image.is_none() {
                     o.image = image;
                 }
             }
-            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None }),
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false }),
         }
     }
 
@@ -11933,7 +12014,13 @@ impl Kernel {
             }
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
-            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a),
+            n if is_quiet(n, self.compat) => {
+                let r = quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a);
+                if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(self.pid) {
+                    self.signals.raise(crate::signal::sig::SIGKILL);
+                }
+                r
+            }
 
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest

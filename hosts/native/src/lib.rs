@@ -1658,6 +1658,9 @@ fn run_program_with(
         if wasmprog::flags(program) & wasmprog::FLAG_LINUX_SPACE == 0 {
             store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
         }
+        if wasmprog::flags(program) & wasmprog::FLAG_GUEST_X86_64 != 0 {
+            libprov::reserve_pe_data(store.data_mut());
+        }
         // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
         // constant addresses folded there, the old page and above a
         // named fault (`gex_abi::KUSER_GUARD`).
@@ -5099,7 +5102,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
             // would throw away the fresh translation.
             let retired: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
-                let r = std::mem::take(&mut k.mem.lock().log.retired_code);
+                let mut mm = k.mem.lock();
+                // (this host keeps no translation of writable code: those
+                // ranges are retired with the rest)
+                mm.log.writable_code.clear();
+                let r = std::mem::take(&mut mm.log.retired_code);
+                drop(mm);
                 if !r.is_empty() {
                     RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }

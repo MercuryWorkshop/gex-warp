@@ -105,6 +105,12 @@ if not CXX:
 # clang's default is an error.
 if CXX:
     BASE += ['-Wno-error=register']
+# A narrowing conversion of a non-constant in a braced initializer: GCC
+# warns, clang's default is an error, so code Debian builds for its 32-bit
+# ports (apt's fileutl.cc: a 64-bit offset into a size_t) stops here.
+# (Clang's one flag covers a constant too, which GCC rejects.)
+if CXX:
+    BASE += ['-Wno-error=c++11-narrowing']
 # An unused `static inline` function: GCC says nothing, clang warns, and a
 # -Werror build (keyutils) stops. Still a warning here.
 BASE += ['-Wno-error=unused-function']
@@ -498,6 +504,14 @@ while i < len(args):
                 elif want:
                     ld_opts[want].append(parts[k + 1])
                 k += 2; continue
+            # GNU ld's -R DIR: a run path directory (-R FILE, symbols from a
+            # file, is left to wasm-ld, which refuses it)
+            if p == '-R' and k + 1 < len(parts) and not os.path.isfile(parts[k + 1]):
+                ld_opts['rpath'].append(parts[k + 1]); k += 2; continue
+            if p == '-R' and k + 1 == len(parts):
+                ld_skip = 1; ld_want = 'rpath'; k += 1; continue
+            if p.startswith('-R') and len(p) > 2 and not os.path.isfile(p[2:]):
+                ld_opts['rpath'].append(p[2:]); k += 1; continue
             m = re.match(r'^(--?soname|--?rpath)=(.*)$', p)
             if m:
                 ld_opts['soname' if 'soname' in m.group(1) else 'rpath'].append(m.group(2))
@@ -627,7 +641,24 @@ def archive_deps(path):
     if a < 0:
         return []
     b = data.find(b'\nGEXCC-END', a)
-    return data[a + 11:b].decode().split('\n') if b > 0 else []
+    if b < 0:
+        return []
+    # (as the writer records them: `=` the sysroot, a relative path the
+    # archive's own directory; one moved with its package since, an
+    # archive found by name)
+    base, out = os.path.dirname(os.path.abspath(path)), []
+    for d in data[a + 11:b].decode().split('\n'):
+        flag = '-L' if d.startswith('-L') else ''
+        v = d[len(flag):]
+        if v.startswith('='):
+            v = SYSROOT + v[1:]
+        elif v and not v.startswith(('/', '-')):
+            v = os.path.normpath(os.path.join(base, v))
+            m = re.match(r'lib(.+)\.(a|so)$', os.path.basename(v))
+            if not flag and not os.path.exists(v) and m:
+                v = '-l' + m.group(1)
+        out.append(flag + v)
+    return out
 
 
 def ld_script_inputs(path):
@@ -670,9 +701,13 @@ def expand(items, seen):
             # libc and its parts are linked last, after libgex, whose
             # definitions (dlopen, dlsym) must win over musl's weak stubs:
             # an -lc mid-line would pull those first
-            if nm in LIBC_NAMES:
-                continue
             p = resolve(nm)
+            # (unless the name is a library of its own outside libc's
+            # directory: libxcrypt's libcrypt, with crypt_gensalt, which
+            # musl's crypt does not have, beside musl's empty libcrypt.a)
+            if nm in LIBC_NAMES and (p is None or os.path.dirname(p) == os.path.abspath(LIB)
+                                     or os.path.getsize(p) <= len(AR_MAGIC)):
+                continue
             if p is None:
                 if CXX and nm in ('stdc++', 'c++', 'c++abi', 'supc++'):
                     continue
@@ -1358,6 +1393,19 @@ if shared:
             members.append(it)
     # the -L directories, so the program's link finds the -l names
     deps = ['-L' + os.path.abspath(d) for d in libdirs] + deps
+    # and no path of the build machine: the sysroot's as `=`, the rest
+    # relative to this archive (archive_deps reads them back)
+    root, here = os.path.abspath(SYSROOT), os.path.dirname(os.path.abspath(out))
+
+    def portable(d):
+        flag = '-L' if d.startswith('-L') else ''
+        v = d[len(flag):]
+        if not v.startswith('/'):
+            return d
+        if v == root or v.startswith(root + '/'):
+            return flag + '=' + v[len(root):]
+        return flag + os.path.relpath(v, here)
+    deps = [portable(d) for d in deps]
     # the deps go in a custom section of an empty wasm object (wasm-ld
     # reads every member; it never pulls this one, which defines nothing)
     tmpd = os.path.join(tmp, 'deps')
