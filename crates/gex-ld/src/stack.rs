@@ -129,6 +129,20 @@ pub fn build_initial_stack(
     random: [u8; 16],
     id: Identity,
 ) -> StackLayout {
+    build_initial_stack_execfn(image, stack_top, args, env, random, id, None)
+}
+
+/// [`build_initial_stack`], with `AT_EXECFN` naming `execfn` -- the file
+/// that was exec'd, which `argv[0]` need not name -- rather than `argv[0]`.
+pub fn build_initial_stack_execfn(
+    image: &Image,
+    stack_top: u64,
+    args: &[String],
+    env: &[String],
+    random: [u8; 16],
+    id: Identity,
+    execfn: Option<&str>,
+) -> StackLayout {
     // Lay the variable-length data out first, from the top down, so that the
     // fixed-size vectors below can point at it.
     //
@@ -162,7 +176,15 @@ pub fn build_initial_stack(
         blob.extend_from_slice(e.as_bytes());
         blob.push(0);
     }
-    let execfn_off = offsets_argv.first().copied().unwrap_or(0);
+    let execfn_off = match execfn {
+        Some(f) => {
+            let at = blob.len();
+            blob.extend_from_slice(f.as_bytes());
+            blob.push(0);
+            at
+        }
+        None => offsets_argv.first().copied().unwrap_or(0),
+    };
     while !blob.len().is_multiple_of(8) {
         blob.push(0);
     }
@@ -265,7 +287,13 @@ pub fn build_program_stack(
             let apple = crate::macho::AppleStrings { exe_path: exe_path.to_string(), stack: (stack_top, stack_size), thread_port, random };
             crate::macho::build_stack(darwin, stack_top, args, env, &apple.strings(darwin))
         }
-        None => build_initial_stack(&program.exe, stack_top, args, env, random, id),
+        // (`AT_EXECFN` is the program's path, which `--argv0` or a shell's
+        // `exec -a` leaves apart from `argv[0]`; a program its interpreter
+        // maps was exec'd as the interpreter, its `argv[0]`)
+        None => {
+            let execfn = (program.direct.is_none() && !exe_path.is_empty()).then_some(exe_path);
+            build_initial_stack_execfn(&program.exe, stack_top, args, env, random, id, execfn)
+        }
     }
 }
 

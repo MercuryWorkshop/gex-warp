@@ -42,7 +42,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // page/public/gex of this tree; an ejected project's runtime/web).
 
-import { accessSync, appendFileSync, closeSync, constants as fsc, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { accessSync, appendFileSync, closeSync, constants as fsc, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
@@ -148,6 +148,9 @@ const dirEager = process.env.GEX_DIR_EAGER === '1';
 // Symbolic links, path -> target text (`--tar`).
 const symlinks = {};
 const rest = [];
+// What `--file` and `--dir` put where: [guest, host], for the program's
+// own guest path.
+const mounts = [];
 {
   const av = process.argv.slice(2);
   let i = 0;
@@ -157,6 +160,7 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--file wants <guest>=<host>'); process.exit(2); }
       files[spec.slice(0, eq)] = readFileSync(spec.slice(eq + 1));
+      mounts.push([spec.slice(0, eq), spec.slice(eq + 1)]);
       inputs.push(spec.slice(eq + 1));
       mtimes[spec.slice(0, eq)] = Math.trunc(statSync(spec.slice(eq + 1)).mtimeMs / 1000);
     } else if (av[i] === '--dir') {
@@ -166,6 +170,7 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
       const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
+      mounts.push([guestRoot, hostRoot]);
       const wholeRoot = guestRoot.replace(/\/$/, '') === '';
       const rootReal = resolve(hostRoot);
       const walk = (guest, host) => {
@@ -380,6 +385,31 @@ try {
 const guestWasm = readFileSync(guestPath);
 const elf = readFileSync(elfPath);
 const args = [argv0 ?? elfPath, ...guestArgs];
+// The program's own path (`/proc/self/exe`, a Mac's executable path): the
+// guest path of its file when a `--file` or `--dir` put it in the guest
+// (the closest), as gexc names a program inside its root or a bind --
+// whatever `--argv0` says.
+const exeGuest = (() => {
+  let real;
+  try {
+    real = realpathSync(elfPath);
+  } catch {
+    return undefined;
+  }
+  let best;
+  for (const [guest, host] of mounts) {
+    let h;
+    try {
+      h = realpathSync(host);
+    } catch {
+      continue;
+    }
+    const g = guest.replace(/\/+$/, '');
+    const path = real === h ? g || '/' : real.startsWith(`${h}/`) ? `${g}${real.slice(h.length)}` : null;
+    if (path && (!best || h.length > best.depth)) best = { depth: h.length, path };
+  }
+  return best?.path;
+})();
 
 /// Read a `.pins` manifest into `{ path: { base, span } }`.
 ///
@@ -972,6 +1002,7 @@ try {
       ...envOptions(process.env, 'opts'),
       mtimes,
       xattrs,
+      ...(exeGuest ? { exe: exeGuest } : {}),
       // The debugging switches, in the run's own options as well as the boot
       // message: `opts` is what a fork record carries to a child's Worker.
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,

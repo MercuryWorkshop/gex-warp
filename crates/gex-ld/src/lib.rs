@@ -19,4 +19,4 @@ pub mod stack;
 pub use dynamic::{load_program, plan_program, Program};
 pub use elf::{Image, LoadError, Segment, Symbol};
 pub use link::{link, Linked, Object};
-pub use stack::{build_initial_stack, build_program_stack, Identity, StackLayout};
+pub use stack::{build_initial_stack, build_initial_stack_execfn, build_program_stack, Identity, StackLayout};

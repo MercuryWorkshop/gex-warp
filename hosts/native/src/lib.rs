@@ -218,6 +218,64 @@ pub struct RunOptions {
     pub aot_only: bool,
 }
 
+/// The guest path of the host file `host` (an absolute, resolved path): by
+/// the bind whose host side holds it most closely, else by the sysroot (the
+/// guest's `/`). `None` when neither holds it, and the guest sees the host
+/// by its own paths or not at all.
+pub fn guest_path_of(
+    host: &std::path::Path,
+    sysroot: Option<&std::path::Path>,
+    binds: &[(std::path::PathBuf, String)],
+) -> Option<String> {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let root = sysroot.map(|r| (canon(r), "/".to_string()));
+    let mut best: Option<(usize, String)> = None;
+    for (h, g) in root.into_iter().chain(binds.iter().map(|(h, g)| (canon(h), g.clone()))) {
+        let Ok(rest) = host.strip_prefix(&h) else { continue };
+        let depth = h.components().count();
+        if best.as_ref().is_some_and(|(d, _)| *d >= depth) {
+            continue;
+        }
+        let rest = rest.to_string_lossy();
+        let path = match (g.trim_end_matches('/'), rest.is_empty()) {
+            ("", true) => "/".to_string(),
+            (g, true) => g.to_string(),
+            (g, false) => format!("{g}/{rest}"),
+        };
+        best = Some((depth, path));
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The host file at guest path `guest` (absolute): under the bind whose
+/// guest side holds it most closely, else under the sysroot; the path
+/// itself when there is neither. The reverse of [`guest_path_of`].
+pub fn host_path_of(
+    guest: &str,
+    sysroot: Option<&std::path::Path>,
+    binds: &[(std::path::PathBuf, String)],
+) -> std::path::PathBuf {
+    let guest = format!("/{}", guest.trim_start_matches('/'));
+    let mut best: Option<(usize, std::path::PathBuf)> = None;
+    for (h, g) in binds {
+        let g = g.trim_end_matches('/');
+        let rest = match guest.strip_prefix(g) {
+            Some("") => "",
+            Some(r) if r.starts_with('/') || g.is_empty() => r.trim_start_matches('/'),
+            _ => continue,
+        };
+        if best.as_ref().is_some_and(|(d, _)| *d >= g.len()) {
+            continue;
+        }
+        best = Some((g.len(), if rest.is_empty() { h.clone() } else { h.join(rest) }));
+    }
+    match (best, sysroot) {
+        (Some((_, p)), _) => p,
+        (None, Some(r)) => r.join(guest.trim_start_matches('/')),
+        (None, None) => guest.into(),
+    }
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
@@ -1212,20 +1270,11 @@ fn run_program_with(
         .and_then(|a| std::fs::canonicalize(a).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
-    // A program inside the sysroot is named by its guest path: the host path
-    // leads nowhere in the guest's namespace, and glibc's `$ORIGIN` handling
-    // asserts on what it reads back through /proc/self/exe.
-    let exe_path = match opts
-        .sysroot
-        .as_deref()
-        .and_then(|r| std::fs::canonicalize(r).ok())
-        .and_then(|r| exe_path.strip_prefix(r.to_string_lossy().as_ref()).map(str::to_string))
-    {
-        Some(rest) if !rest.is_empty() => {
-            if rest.starts_with('/') { rest } else { format!("/{rest}") }
-        }
-        _ => exe_path,
-    };
+    // A program inside the sysroot, or inside a bound directory, is named by
+    // its guest path: the host path leads nowhere in the guest's namespace
+    // (a Mac program's main bundle is found from it), and glibc's `$ORIGIN`
+    // handling asserts on what it reads back through /proc/self/exe.
+    let exe_path = guest_path_of(std::path::Path::new(&exe_path), opts.sysroot.as_deref(), &opts.binds).unwrap_or(exe_path);
     let fresh = inherited.is_none();
     // Taken before the kernel is moved out, because the setup below uses them
     // to decide whether to build a device or keep the one already bound.

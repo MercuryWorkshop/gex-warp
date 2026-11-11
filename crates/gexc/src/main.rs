@@ -356,9 +356,13 @@ run options:
                   objects loaded, files opened. GEX_PROFILE=1 does the same
                   into $GEX_PROFILE_OUT (default ./gex-profile).
   --cwd DIR       start in this guest directory
-  --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
-                  where the host path the program was loaded from is not a
-                  path the guest can resolve",
+  --argv0 NAME    what the guest sees as argv[0]. The program's own path
+                  (/proc/self/exe, AT_EXECFN, a Mac's executable path) is
+                  its file's guest path when the file is inside the sysroot
+                  or a bound directory, whatever argv[0] says
+  --guest         the program is named by its guest path, looked up through
+                  --bind and --sysroot as the guest would (and argv[0] is that
+                  path unless --argv0 says otherwise)",
         pe_info::USAGE,
         eject::USAGE
     );
@@ -369,6 +373,8 @@ struct RunArgs {
     path: String,
     /// What the guest should see as `argv[0]`, if not `path`.
     argv0: Option<String>,
+    /// `--guest`: `path` is a guest path.
+    guest: bool,
     guest_args: Vec<String>,
     opts: RunOptions,
     xlate: Options,
@@ -392,6 +398,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut fjit_image = false;
     let mut mem64 = None;
     let mut argv0: Option<String> = None;
+    let mut guest = false;
     let mut host_env = false;
     let mut i = 0;
     while i < args.len() {
@@ -510,6 +517,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.env.push(v.clone());
             }
             "--host-env" => host_env = true,
+            "--guest" => guest = true,
             // Which macOS a Mac program is told it is on, as a Wine
             // prefix's Windows version is chosen: the kernel's word for it
             // is the environment's (gex_kernel darwin::info::CHOSEN), which
@@ -561,6 +569,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     Ok(RunArgs {
         path,
         argv0,
+        guest,
         guest_args,
         opts,
         xlate: Options {
@@ -736,6 +745,13 @@ fn choose_mem(ra: &mut RunArgs, wide: bool) -> Result<()> {
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     prof::start();
     let mut ra = parse_run_args(args)?;
+    // `--guest`: the program's guest path, and the host file it is.
+    if ra.guest {
+        anyhow::ensure!(ra.path.starts_with('/'), "--guest {}: a guest path is absolute", ra.path);
+        let host = gex_native::host_path_of(&ra.path, ra.opts.sysroot.as_deref(), &ra.opts.binds);
+        ra.argv0.get_or_insert_with(|| ra.path.clone());
+        ra.path = host.to_string_lossy().into_owned();
+    }
     // `--busybox`: a program named as one of its applets (/bin/sh) is the
     // busybox the guest sees there, as the guest's own exec would find it.
     if let Some(bb) = &ra.opts.busybox {
@@ -783,13 +799,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     argv.append(&mut ra.guest_args);
     // (a program its interpreter maps: the interpreter's command line for
     // it, by the program's path in the guest)
-    let guest_path = match &sysroot {
-        Some(root) => std::path::Path::new(&ra.path)
-            .strip_prefix(root)
-            .map(|r| format!("/{}", r.display()))
-            .unwrap_or_else(|_| ra.path.clone()),
-        None => ra.path.clone(),
-    };
+    let guest_path = std::fs::canonicalize(&ra.path)
+        .ok()
+        .and_then(|p| gex_native::guest_path_of(&p, sysroot.as_deref(), &ra.opts.binds))
+        .unwrap_or_else(|| ra.path.clone());
     ra.opts.args = program.argv(argv, &guest_path);
     // (and `/proc/self/exe` is the program: not its interpreter, and not
     // the name it is told it was run by, `--argv0`'s, which names no file)
