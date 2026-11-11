@@ -1570,6 +1570,7 @@ impl Client {
                 self.surfaces.remove(&object);
                 self.delete_id(object);
                 self.dirty = true;
+                self.focus_next(object);
                 true
             }
             // attach(buffer, x, y). A NULL buffer is not "no change": it
@@ -1708,6 +1709,7 @@ impl Client {
                 s.shown_fd = None;
             }
             self.dirty = true;
+            self.focus_next(surface);
             return;
         }
         let buffer_id = state.pending_buffer.or(state.committed_buffer);
@@ -2231,8 +2233,42 @@ impl Client {
         }
         if self.focus_surface == Some(surface) {
             self.focus_surface = None;
+            self.focus_next(surface);
         }
         self.dirty = true;
+    }
+
+    /// The window that had the keyboard by default (`focus_surface`: no
+    /// host said which) is gone -- destroyed, unmapped, its role taken: the
+    /// keyboard goes to the newest window still shown, as a compositor gives
+    /// it to the window on top, and as a Mac gives it to the application's
+    /// next window. Not where a host says which window has it
+    /// (`keyboard_target`, the page's), nor to a placed window, whose client
+    /// says when it has the keyboard.
+    fn focus_next(&mut self, gone: u32) {
+        if self.focus_surface.is_some_and(|f| f != gone) || self.keyboard_target.is_some() {
+            return;
+        }
+        self.focus_surface = None;
+        if self.keyboard_on == Some(gone) {
+            if self.surfaces.contains_key(&gone) {
+                if let Some(kbd) = self.keyboard {
+                    let serial = self.serial();
+                    self.send(Writer::new(kbd, 2).uint(serial).object(gone)); // leave
+                }
+            }
+            self.keyboard_on = None;
+        }
+        let next = self
+            .surfaces
+            .iter()
+            .filter(|(id, s)| **id != gone && !s.placement.placed && s.committed_buffer.is_some() && (s.x11 || s.role == Role::Toplevel))
+            .map(|(id, _)| *id)
+            .max();
+        if let Some(id) = next {
+            self.focus_surface = Some(id);
+            self.ensure_keyboard_enter();
+        }
     }
 
     /// The `wl_surface` an `xdg_surface` gave a role to.
@@ -3093,8 +3129,9 @@ impl Client {
             .surfaces
             .iter()
             .filter(|(_, s)| !s.placement.placed && (s.x11 || matches!(s.role, Role::Toplevel)))
-            .map(|(id, _)| *id)
-            .max();
+            // (one that is shown, when there is one)
+            .max_by_key(|(id, s)| (s.committed_buffer.is_some(), **id))
+            .map(|(id, _)| *id);
         if let Some(id) = pick {
             self.focus_surface = Some(id);
             self.ensure_keyboard_enter();
@@ -4330,6 +4367,47 @@ mod tests {
         assert_eq!(popup.role, Role::Popup);
         assert_eq!(popup.parent, 6, "a popup is placed against its parent");
         assert_eq!((popup.rel_x, popup.rel_y), (20, 18));
+    }
+
+    #[test]
+    fn a_closed_window_gives_the_keyboard_to_the_one_left() {
+        let pool = Pool(vec![0u8; 16]);
+        let mut c = with_seat();
+        c.receive(&Writer::new(12, 1).new_id(14).finish(), &[], &pool); // get_keyboard
+        assert_eq!(c.focus_surface, Some(6));
+        // A second window (surface 20, xdg 21, toplevel 22) draws: it has the keyboard.
+        let second = |c: &mut Client| {
+            c.receive(&Writer::new(3, 0).new_id(20).finish(), &[], &pool);
+            c.receive(&Writer::new(5, 2).new_id(21).object(20).finish(), &[], &pool);
+            c.receive(&Writer::new(21, 1).new_id(22).finish(), &[], &pool);
+            c.receive(&Writer::new(20, 6).finish(), &[], &pool);
+            c.receive(&Writer::new(21, 4).uint(2).finish(), &[], &pool);
+            c.receive(&Writer::new(9, 0).new_id(23).int(0).int(2).int(2).int(8).uint(1).finish(), &[], &pool);
+            c.receive(&Writer::new(20, 1).object(23).int(0).int(0).finish(), &[], &pool);
+            c.receive(&Writer::new(20, 6).finish(), &[], &pool);
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            assert_eq!(c.focus_surface, Some(20), "the new window did not take the keyboard");
+            c.take_outgoing();
+        };
+        let entered = |bytes: &[u8]| {
+            messages(bytes).into_iter().find(|(o, p, _)| *o == 14 && *p == 1).map(|(_, _, b)| u32::from_le_bytes(b[4..8].try_into().unwrap()))
+        };
+        second(&mut c);
+        // Destroyed: the first window has the keyboard again, and is told so.
+        c.receive(&Writer::new(22, 0).finish(), &[], &pool); // xdg_toplevel.destroy
+        c.receive(&Writer::new(21, 0).finish(), &[], &pool); // xdg_surface.destroy
+        c.receive(&Writer::new(20, 0).finish(), &[], &pool); // wl_surface.destroy
+        assert_eq!(c.focus_surface, Some(6), "the keyboard went nowhere");
+        assert_eq!(entered(&c.take_outgoing()), Some(6), "no keyboard enter for the window left");
+        // Hidden (a null attach) rather than destroyed: the same.
+        c.receive(&Writer::new(23, 0).finish(), &[], &pool);
+        second(&mut c);
+        c.receive(&Writer::new(20, 1).object(0).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 6).finish(), &[], &pool);
+        assert_eq!(c.focus_surface, Some(6));
+        let out = c.take_outgoing();
+        assert!(messages(&out).iter().any(|(o, p, _)| *o == 14 && *p == 2), "no keyboard leave for the hidden window");
+        assert_eq!(entered(&out), Some(6));
     }
 
     /// The events for object `id` with opcode `op` in `bytes`.
