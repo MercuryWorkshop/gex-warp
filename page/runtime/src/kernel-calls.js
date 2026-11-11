@@ -11,12 +11,27 @@ function ensure(mem, n) {
   if (n > have) mem.grow(Math.ceil((n - have) / 65536));
 }
 
+// Where a process's memory names its page write map (gex_abi's
+// WRITE_MAP_SLOT, RESERVED_END - 32): the kernel reads eight bytes there
+// after every copy into its caller's memory (gex-kmem `written`) and, when
+// they are not zero, takes them for the map's address and marks the pages it
+// wrote with a 1 each. The scratch memory is no process's and has no map, so
+// nothing is laid over the slot and it is kept zero: what a batch had left
+// there (a megabyte of a file's bytes, an argument) was taken for one, and a
+// 1 was written wherever it pointed (a program's output, read by the page
+// with its second byte made 1, is what was seen).
+const WRITE_MAP_SLOT = 0x100000 - 32;
+const WRITE_MAP_SLOT_END = WRITE_MAP_SLOT + 16;
+
 /** A batch's arguments laid out in `mem` and its results read back. */
 function batch(k, mem) {
   let top = 0;
+  if (mem.buffer.byteLength >= WRITE_MAP_SLOT_END) new Uint8Array(mem.buffer).fill(0, WRITE_MAP_SLOT, WRITE_MAP_SLOT_END);
   const place = (n) => {
-    const at = top;
-    top = (top + n + 15) & ~15;
+    let at = top;
+    // (Past the slot, when it would lie in what is placed.)
+    if (at < WRITE_MAP_SLOT_END && at + n > WRITE_MAP_SLOT) at = WRITE_MAP_SLOT_END;
+    top = (at + n + 15) & ~15;
     ensure(mem, top + 16);
     return at;
   };
