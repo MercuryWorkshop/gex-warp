@@ -657,6 +657,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         mapped_by: None,
         #[cfg(not(feature = "shared-memory"))]
         mapped_by: Some(&by_kernel),
+        shares: None,
         tid: crate::my_tid() as u32,
         clock: home.clock,
     };
