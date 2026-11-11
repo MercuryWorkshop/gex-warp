@@ -17,7 +17,7 @@ if [ ! -f "$ARCHIVE" ]; then
         "https://github.com/google/dawn/releases/download/$VERSION/emdawnwebgpu_pkg-$VERSION.zip" \
         --output "$ARCHIVE"
 fi
-printf '%s  %s\n' "$SHA512" "$ARCHIVE" | sha512sum --check --status || {
+printf '%s  %s\n' "$SHA512" "$ARCHIVE" | shasum -a 512 --check --status || {
     echo "emdawnwebgpu archive checksum mismatch: $ARCHIVE" >&2
     exit 1
 }
