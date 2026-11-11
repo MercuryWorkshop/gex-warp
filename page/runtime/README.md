@@ -83,8 +83,15 @@ as a `window` event carrying a `GuestWindow`. Its `canvas` goes into one of
 the desktop's frames:
 - `decorations: 'host'`: the desktop draws the title bar (`title`, and the
   `title` event).
-- `'client'`: the window draws its own (a Win32 window under Wine). Place it
-  bare, where its `x` and `y` say when it is `placed`.
+- `'client'`: the window draws its own (a Win32 window under Wine with no
+  caption: a menu, a tooltip, a borderless window). Place it bare, where its
+  `x` and `y` say when it is `placed`.
+- A Win32 window with a caption is `'host'` and `placed`: Wine leaves its
+  caption and border to the page (`env` has `WINEGEX_FRAMES=1`), and the
+  canvas is its client area. Put the frame so that the canvas is at `x`, `y`
+  when it first comes, then `place` it wherever the frame takes it: Wine
+  moves the window there. A `position` event that is not one of the page's
+  own moves is the program moving its window.
 - Popups and subsurfaces are never framed: put them at `x`, `y` over their
   `parent`.
 
@@ -141,8 +148,9 @@ sys.hostCalls.register('open-url', ({ url }) => { openBrowserWindow(url); return
 and a prefix, laid beside the Linux tree. A Windows program is then
 `wine 'C:\path\prog.exe'`, with `WINEPREFIX` naming the prefix. The
 first Wine program starts Wine's server and the services Wine runs; the
-next ones reuse them while they last. Its windows come as any other, framed by the program
-itself (`decorations: 'client'`) and `placed`. The filesystem's store keeps
+next ones reuse them while they last. Its windows come as any other, `placed`: one with a
+caption framed by the page (`decorations: 'host'`), the rest by the program itself
+(`'client'`). The filesystem's store keeps
 the prefix's changes with the rest of the root. Each 64-bit Wine process takes a
 memory of about 2 GiB (most of it reserved, not touched), so a desktop
 running several Windows programs at once should expect the tab's address
@@ -714,7 +722,7 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `kind` | `'toplevel'`, `'popup'` (a menu, a tooltip: never framed, drawn above its parent and outside its frame) or `'subsurface'`. |
 | `parent`, `title`, `width`, `height` | `title` whole (up to 256 bytes of UTF-8). |
 | `pid` | The program's pid: an X window's as the program says (`_NET_WM_PID`, which Qt, GTK and most toolkits set), else its X server's. `process.windows()` uses it. |
-| `decorations` | `'host'` (frame it), `'client'` (it draws its own: a Win32 window under Wine) or `'none'`. |
+| `decorations` | `'host'` (frame it: a Win32 window with a caption too), `'client'` (it draws its own: a Win32 window without one) or `'none'`. |
 | `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
 | `place(x, y)` | Where the page put it on the output; call after each move (X windows' menus read it). |
 | `resize(w, h)`, `setStates({ maximized, fullscreen, resizing }, w, h)` | Ask for a size, with states. |

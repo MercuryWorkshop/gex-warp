@@ -98,7 +98,8 @@ J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
 pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine.pins")
-[ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine.pins' $(printf %.12s "$pin")" >&2
+# (or at it with wine/patches, wine/patches.sh's commit over it)
+"$here/patches.sh" --check "$W" "$pin" || echo "wine64-dist: $W is at $K, not wine.pins' $(printf %.12s "$pin") (with wine/patches)" >&2
 log() { echo "wine64-dist: $*" >&2; }
 # The 32-bit prerequisites first, so a missing one fails now, not after the
 # Wine builds: the sysroot and the libraries (no 32-bit Wine tree, and
@@ -416,6 +417,26 @@ b64_build() {
 	mkdir -p out
 	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_MEDIA=$MEDIA WINE64_PADS=$PADS WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-unix64.sh" "$PWD" "$PWD/out/wine"
 }
+# Built incrementally too, as the PE tree is: a new commit of the same
+# checkout (a pin bump, a change to wine/patches) takes over the tree an
+# earlier commit's build left with the same S, and make rebuilds what the
+# commit changed -- the native PE side's make of every module in it (pen64)
+# was most of a rebuild. The tree is renamed, not copied: the earlier
+# commit's is gone. WINE64_B64_FRESH=1 starts over.
+B64=$C/b64-$K-$S
+if [ ! -e "$B64/.done" ] && [ ! -e "$B64/.taken" ] && [ "${WINE64_B64_FRESH:-0}" = 0 ]; then
+	for o in "$C"/b64-*-"$S"; do
+		[ "$o" != "$B64" ] && [ -e "$o/.done" ] && grep -qxF "srcdir = $W" "$o/Makefile" 2>/dev/null || continue
+		log "wasm64 Unix side: $(basename "$o")'s tree, taken over for $K"
+		rm -rf "$B64"; rm -f "$o/.done"; mv "$o" "$B64"; touch "$B64/.taken"
+		break
+	done
+fi
+if [ -e "$B64/.taken" ]; then
+	log "wasm64 Unix side ($K, $S), in place"
+	( cd "$B64" && b64_build ) > "$B64.log" 2>&1 || { log "b64-$K-$S failed: $B64.log"; tail -5 "$B64.log" >&2; exit 1; }
+	rm -f "$B64/.taken"; touch "$B64/.done"
+fi
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
 srv_conf() {

@@ -86,16 +86,21 @@ export class GuestWindow extends EventTarget {
   }
 
   /** Who draws its frame: 'host' (the page), 'client' (the program: a
-   *  Win32 window under Wine, a GTK 4 window), or 'none' (a popup, a
-   *  subsurface: never framed). */
+   *  Win32 window under Wine that has no caption or was not given the
+   *  page's frame, an X menu, a GTK 4 window), or 'none' (a popup, a
+   *  subsurface: never framed). A placed window can be the host's: a Win32
+   *  window with a caption under a Wine that asks for server-side
+   *  decoration, whose client area this is. */
   get decorations() {
     if (this.kind !== 'toplevel') return 'none';
-    return this.#w.placed ? 'client' : 'host';
+    return this.#w.decorations === 'server' ? 'host' : 'client';
   }
 
   /** Placed by its client (a Win32 window under Wine, an X menu): `x`, `y`
    *  are where it goes on the output, and its client moves, sizes and
-   *  stacks it (`restack`); the page never does. */
+   *  stacks it (`restack`). The page does not, except for one it frames
+   *  (`decorations` 'host'): that one is where the page shows it, and
+   *  `place` moves it there, the client following. */
   get placed() {
     return !!this.#w.placed;
   }
@@ -224,9 +229,11 @@ export class HostWindows extends EventTarget {
   }
 
   /** The environment a program needs to reach this compositor and the X
-   *  display: add it to `spawn`'s `env`. */
+   *  display: add it to `spawn`'s `env`. WINEGEX_FRAMES=1 tells Wine the
+   *  page frames a placed window with a caption (`decorations` 'host'), so
+   *  Win32 draws neither caption nor border. */
   get env() {
-    return { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0' };
+    return { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0', WINEGEX_FRAMES: '1' };
   }
 
   /** The output's new size (CSS pixels) and scale, when the page's desktop

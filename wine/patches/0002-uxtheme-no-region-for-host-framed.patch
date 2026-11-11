@@ -1,0 +1,57 @@
+From f3575ce9554a517deaf58fe0f881aa477b1a6bbe Mon Sep 17 00:00:00 2001
+From: gex <gex@localhost>
+Date: Wed, 11 Nov 2026 12:27:27 -0500
+Subject: [PATCH] uxtheme: No window region for a window the host frames (gex,
+ WINEGEX_FRAMES=1).
+
+The visual style's rounded caption corners are a window region, and a
+shaped window is one win32u leaves no frame to the driver for
+(get_visible_rect): under a host that frames captioned windows the theme
+kept every themed window drawing its own caption. Such a window shows no
+caption of the style's, so it gets no region.
+---
+ dlls/uxtheme/window.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/uxtheme/window.c b/dlls/uxtheme/window.c
+index f326532ea96..4c04143e38a 100644
+--- a/dlls/uxtheme/window.c
++++ b/dlls/uxtheme/window.c
+@@ -292,15 +292,32 @@ static void draw_frame(HTHEME theme, HWND hwnd, HDC hdc, const RECT *window, BOO
+     }
+ }
+ 
++/* (gex) Whether the host frames this window instead of Win32: WINEGEX_FRAMES=1 says it frames
++ * a top-level window with a caption (winewayland.drv's wayland_frames_windows, is_window_decorated). */
++static BOOL host_frames(DWORD style, DWORD ex_style)
++{
++    static int frames = -1;
++
++    if (frames < 0)
++    {
++        WCHAR value[2];
++        frames = GetEnvironmentVariableW(L"WINEGEX_FRAMES", value, ARRAY_SIZE(value)) == 1 && value[0] == '1';
++    }
++    if (!frames || (style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return FALSE;
++    if (ex_style & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) return FALSE;
++    return (style & WS_CAPTION) == WS_CAPTION;
++}
++
+ /* The window's shape in the visual style: the caption's transparent corners cut away, as XP's
+  * rounded top corners. Set once per window size; a region the program set itself is kept, and a
+- * maximized window has none. */
++ * maximized window has none, nor has one the host frames (its caption is not shown, and a shaped
++ * window is one win32u leaves no frame to the host for). */
+ static void update_window_region(HTHEME theme, HWND hwnd, DWORD style, DWORD ex_style, const RECT *window,
+                                  int cap_state)
+ {
+     static const WCHAR prop[] = L"__wine_uxtheme_region";
+     int cx = window->right - window->left, cy = window->bottom - window->top;
+-    ULONG_PTR want = (style & WS_MAXIMIZE) ? 0 : MAKELONG(cx, cy);
++    ULONG_PTR want = (style & WS_MAXIMIZE) || host_frames(style, ex_style) ? 0 : MAKELONG(cx, cy);
+     ULONG_PTR have = (ULONG_PTR)GetPropW(hwnd, prop);
+     RECT caption, inside;
+     HRGN region, rest;
+-- 
+2.54.0 (Apple Git-157)
+
