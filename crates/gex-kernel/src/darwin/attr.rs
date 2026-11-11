@@ -595,6 +595,15 @@ impl Kernel {
         }
         if let Some(mode) = mode {
             let mode = mode as u64 & 0o7777;
+            // A link's own mode, asked for with no link followed (`lchmod`
+            // is this call): kept where a link's is, and nothing where it
+            // is not; never the mode of what the link names.
+            if path != 0 && nofollow != 0 && self.vfs.metadata_nofollow(&full).is_ok_and(|md| md.file_type == FileType::Symlink) {
+                return match self.vfs.chmod_link(&full, mode as u32) {
+                    Ok(()) | Err(Errno::EOPNOTSUPP) => Ok(0),
+                    Err(e) => Err(e),
+                };
+            }
             if path == 0 { self.dispatch(m, nr::FCHMOD, [dirfd, mode, 0, 0, 0, 0]) } else { self.dispatch(m, nr::FCHMODAT, [dirfd, path, mode, 0, 0, 0]) }.unwrap_or(Err(Errno::EINVAL))?;
         }
         Ok(0)

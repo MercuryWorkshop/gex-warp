@@ -148,6 +148,18 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_printf("  the link's is %o\n", st.st_mode & 07777);
     SYS(SYS_stat64, "f", &st);
     t_printf("  its file's stays %o\n", st.st_mode & 07777);
+    // `lchmod` is no call of its own: the mode among attributes given,
+    // with no link followed (ATTR_CMN_ACCESSMASK, FSOPT_NOFOLLOW).
+    struct {
+        unsigned short count, reserved;
+        u32 common, volume, dir, file, fork;
+    } al = {5, 0, 0x00020000, 0, 0, 0, 0};
+    u32 mode = 0640;
+    t_show("and as lchmod does", SYS(221 /* setattrlist */, "l", &al, &mode, sizeof mode, 1));
+    SYS(SYS_lstat64, "l", &st);
+    t_printf("  the link's is %o\n", st.st_mode & 07777);
+    SYS(SYS_stat64, "f", &st);
+    t_printf("  its file's stays %o\n", st.st_mode & 07777);
     // (What a mode is changed to is `files`' to say: the page's files keep
     // none.)
     t_show("change what the link names", SYS(SYS_fchmodat, AT_FDCWD, "l", 0644, 0));
