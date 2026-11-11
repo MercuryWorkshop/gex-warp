@@ -794,10 +794,13 @@ fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
     let mut hs = hasher.clone();
     (off + (addr - start)).hash(&mut hs);
-    // A page key of the other mode is `key_identity`'s, whole.
+    // A page key of the other mode is `key_identity`'s, whole; one of this
+    // mode is apart by processor too (`arch_salt`, as `key_identity`'s).
     if alt {
         flavour_salt(&mut hs);
         mode_salt(&mut hs, true);
+    } else {
+        arch_salt(&mut hs);
     }
     Some((hs.finish(), id.clone()))
 }
@@ -13491,6 +13494,19 @@ fn flavour_salt(h: &mut impl std::hash::Hasher) {
     if let Some(map) = gex_abi::write_map() {
         h.write_u8(4);
         h.write_u64(map);
+    }
+    arch_salt(h);
+}
+
+/// The processor in a code identity: a process of the other processor's
+/// runtime on a page that runs both (`vfork::other_arch_worker`) keys its
+/// translations apart, the same name being another file's code there (a
+/// Mac root's libraries, by the names the other processor's root gives its
+/// own). The page's own processor's processes add nothing, so their keys,
+/// and the units and caches kept by them, stay as they were.
+fn arch_salt(h: &mut impl std::hash::Hasher) {
+    if vfork::other_arch_worker() {
+        h.write_u8(if gex_abi::X86 { 0x86 } else { 0xa6 });
     }
 }
 

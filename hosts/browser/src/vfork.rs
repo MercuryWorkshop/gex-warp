@@ -443,11 +443,24 @@ pub(crate) fn page_runs_mem64() -> bool {
 
 /// Bit 0: the page's memory is a 64-bit one; bit 1: it runs the other
 /// flavour as well ([`exec_target`]); bit 2: it runs the other processor's
-/// programs ([`exec_other_arch`]). Set in every Worker before the guest
-/// runs.
+/// programs ([`exec_other_arch`]); bit 3: this Worker's runtime is that
+/// other processor's ([`other_arch_worker`]). Set in every Worker before the
+/// guest runs.
 #[no_mangle]
 pub extern "C" fn gex_set_page_flavours(bits: i32) {
-    PAGE_FLAVOURS.store(bits & 7, std::sync::atomic::Ordering::Relaxed);
+    PAGE_FLAVOURS.store(bits & 15, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this Worker's runtime is the other processor's on a page that
+/// runs both (host.mjs `#otherArch`): its translations are keyed apart from
+/// the page's own processor's (lib.rs `arch_salt`). A code identity is a
+/// file's name as the process has it, and a Mac program's root names its
+/// libraries as the other processor's root names its own
+/// (`/usr/lib/libobjc.A.dylib` in each): the two processors' processes took
+/// each other's slot numbering and units for them, and the second Cocoa
+/// program of the other processor never showed its window.
+pub(crate) fn other_arch_worker() -> bool {
+    page_flavours() & 8 != 0
 }
 
 /// The processor the program at `path` is for, true x86 (x86-64 or i386),

@@ -749,7 +749,9 @@ export class ProcessHost {
   /** The page's flavours, for the shim (vfork.rs
    *  `gex_set_page_flavours`): bit 0 its own is a 64-bit memory, bit 1 it
    *  runs the other too (`#other`), so that an exec may ask for that one;
-   *  bit 2 it runs the other processor's programs (`#otherArch`). */
+   *  bit 2 it runs the other processor's programs (`#otherArch`). Bit 3,
+   *  added per Worker where it starts: the Worker's runtime is that other
+   *  processor's. */
   #pageFlavours() {
     return (this.#extra?.mem64 ? 1 : 0) | (this.#other && this.#kernel ? 2 : 0) | (this.#otherArch && this.#kernel ? 4 : 0);
   }
@@ -1734,7 +1736,9 @@ export class ProcessHost {
             guest: rt.guest,
             kernel: rt.kernel,
             mem64: rt.mem64,
-            pageFlavours: this.#pageFlavours(),
+            // (Bit 3: this Worker's runtime is the other processor's, whose
+            // translations are keyed apart: vfork.rs `other_arch_worker`.)
+            pageFlavours: this.#pageFlavours() | (this.#otherArchPid(pid) ? 8 : 0),
             otherGate: this.#otherGate?.buffer,
             otherLoad: this.#otherLoadFn(),
             saveGate: this.#saveGate,
