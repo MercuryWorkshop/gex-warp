@@ -1,0 +1,8 @@
+a store to an unmapped page: SIGSEGV, code 1, si_addr the address
+a store to a PROT_NONE page: SIGSEGV, code 2, si_addr the address
+a store to a read-only page: SIGSEGV, code 2, si_addr the address
+a load from a PROT_NONE page: SIGSEGV, code 2, si_addr the address
+a store at 0x10: SIGSEGV, code 1, si_addr the address
+a store at 0x1010: SIGSEGV, code 1, si_addr the address
+write barrier: 2 faults for 3 stores, the stores made
+stack overflow: caught on the alternate stack (SIGSEGV)
