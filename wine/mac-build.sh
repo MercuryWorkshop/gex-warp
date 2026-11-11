@@ -10,7 +10,7 @@
 #
 # The printed WINE64_* paths are the container's (/root/.cache/gex/...).
 # wine/mac-export.sh copies a finished dist and prefix to the host.
-# Env: JOBS (default 6), VOLUME, GEX_WINE_IMAGE, SEEDS: a directory of bare
+# Env: JOBS (default 3), CPUS (default 3), VOLUME, GEX_WINE_IMAGE, SEEDS: a directory of bare
 # clones wine-wasm.git, musl-wasm.git and musl-wasm64.git, for the pinned
 # sources when the forks are private (the container has no credentials):
 # git clone --bare URL SEEDS/NAME.git, with gh's or your credentials.
@@ -27,5 +27,5 @@ seed=
 if [ -n "${SEEDS:-}" ]; then
   seed="-v $SEEDS:/seed -e WINE64_SEED=/seed/wine-wasm.git -e WINE32_SEED=/seed/wine-wasm.git -e MUSL_SEED=/seed/musl-wasm.git -e MUSL64_SEED=/seed/musl-wasm64.git"
 fi
-exec docker run --rm --platform linux/amd64 -v "$root":/gex -v "$common":"$common" -v "$VOLUME":/root/.cache/gex $seed \
-  -w /gex -e JOBS="${JOBS:-6}" -e HOME=/root "$IMAGE" nice -n 10 make "$T" JOBS="${JOBS:-6}" OUT=/root/.cache/gex/out "$@"
+exec docker run --rm --cpus "${CPUS:-3}" --platform linux/amd64 -v "$root":/gex -v "$common":"$common" -v "$VOLUME":/root/.cache/gex $seed \
+  -w /gex -e JOBS="${JOBS:-3}" -e HOME=/root "$IMAGE" nice -n 10 make "$T" JOBS="${JOBS:-3}" OUT=/root/.cache/gex/out "$@"

@@ -28,3 +28,5 @@ RUN git clone --depth 1 https://github.com/emscripten-core/emsdk /opt/emsdk && c
     && rm -rf /opt/emsdk /root/.emscripten*
 ENV GEX_CRT_SRC=/opt/crt/builtins HOME=/root
 RUN git config --global --add safe.directory '*'
+# the EGL and KHR headers wine/deps32.sh and deps64.sh copy
+RUN apt-get update && apt-get install -y --no-install-recommends libegl-dev && rm -rf /var/lib/apt/lists/*
