@@ -844,6 +844,14 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 }
 
 /// The run may start again with a 64-bit memory ([`restart_mem64`]).
+/// The pid of the run's first program: 1, or a Mac's, which is the first
+/// child of a pid 1 that runs nothing (`ProcTable::set_virtual_init`).
+static FIRST_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(gex_kernel::INIT_PID);
+
+fn first_pid() -> i32 {
+    FIRST_PID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static RESTART_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The run ended to start again with a 64-bit memory.
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1244,6 +1252,18 @@ fn run_program_with(
             {
                 let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
                 k.pins = std::sync::Arc::new(opts.pins.clone());
+                // A Mac's program is never the first process: that is
+                // launchd, which runs nothing here, and the program is a
+                // child of it. A shell that finds itself pid 1, or its
+                // parent's pid 1, takes itself for what it must not stop
+                // or leave (ksh would not stop a job it had started, and
+                // lost one after a command substitution).
+                if gex_kernel::darwin::on() {
+                    k.procs.set_virtual_init(true);
+                    let pid = k.procs.spawn(gex_kernel::INIT_PID);
+                    (k.pid, k.tid) = (pid, pid);
+                    FIRST_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+                }
                 k
             },
             // Filled when the process is first published (`publish_proc`).
@@ -1670,7 +1690,7 @@ fn run_program_with(
         // process has one memory flavour, so the run starts again with one.
         let to_m64 = {
             let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
-            k.pid == gex_kernel::INIT_PID && k.exec_mem64 == Some(true) && !gex_abi::mem64()
+            k.pid == first_pid() && k.exec_mem64 == Some(true) && !gex_abi::mem64()
         };
         if to_m64 && RESTART_OK.load(std::sync::atomic::Ordering::Relaxed) {
             RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3220,7 +3240,7 @@ fn report_first_end(spawn: &SpawnContext, pid: i32, exit: &Exit) {
     // Any program's end (an exec'd child's too, whose table entry its
     // thread then ends): whether it outgrew its memory.
     gex_kernel::syscalls::outgrow_ending(pid, exit.wait_status(), &procs);
-    if pid != gex_kernel::INIT_PID {
+    if pid != first_pid() {
         return;
     }
     if let Some(note) = crash_note(exit) {
