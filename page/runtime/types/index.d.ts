@@ -26,6 +26,11 @@ export interface SystemOptions {
   /** Keep translated code across loads (the origin's private file system). */
   /** Keep translated code across loads; a string names the cache, apart from other names'. */
   xcache?: boolean | string;
+  /** Which macOS a Mac program is told it is on: a release its root's
+   *  /usr/share/gex/macos-releases has ('14', '14.8.9', 'sonoma'), given each
+   *  program the page starts as GEX_MACOS_VERSION unless its environment
+   *  names one. By default the root's own. */
+  macos?: string;
   /** The translated architecture the tree's programs are built for. Default:
    *  read from the tree at boot. Given, the kernel and runtime load while the
    *  page lays out its files. */

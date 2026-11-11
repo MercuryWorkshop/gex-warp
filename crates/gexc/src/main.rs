@@ -288,6 +288,10 @@ run options:
   --env K=V       add an environment variable (repeatable)
   --host-env      start from gexc's own environment (default: PATH, HOME)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --macos VERSION a Mac program (and what it runs) is told it is on that
+                  macOS: 14, 14.8.9 or sonoma, any release the Mac root's
+                  /usr/share/gex/macos-releases has; its root says which
+                  otherwise. The same as --env GEX_MACOS_VERSION=VERSION
   --bind H=G      mount host file or directory H at guest path G (repeatable)
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
                   coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
@@ -506,6 +510,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.env.push(v.clone());
             }
             "--host-env" => host_env = true,
+            // Which macOS a Mac program is told it is on, as a Wine
+            // prefix's Windows version is chosen: the kernel's word for it
+            // is the environment's (gex_kernel darwin::info::CHOSEN), which
+            // what the program runs inherits.
+            "--macos" => {
+                i += 1;
+                let v = args.get(i).context("--macos needs a version (14, 14.8.9, sonoma)")?;
+                opts.env.push(format!("GEX_MACOS_VERSION={v}"));
+            }
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             other => path = Some(other.to_string()),
         }

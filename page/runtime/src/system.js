@@ -200,15 +200,21 @@ export class System extends EventTarget {
    * given. `bothArches`: programs of the other architecture run too, each
    * in a process of its own runtime under the one kernel (an x86-64 system
    * with an arm64 program in it, or the other way round); the other's shim
-   * is loaded with the system's own. `debug`: the runtime's switches,
+   * is loaded with the system's own. `macos`: which macOS a Mac program is
+   * told it is on, as a Wine prefix's Windows version is chosen: a release
+   * its root's table has (/usr/share/gex/macos-releases: '14', '14.8.9',
+   * 'sonoma'), given each program the page starts as GEX_MACOS_VERSION,
+   * unless its own environment names one; the root's own when not given.
+   * (What a program runs inherits it, as its environment.) `debug`: the runtime's switches,
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
-  constructor({ baseUrl, units, xcache = false, arch, bothArches = false, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, bothArches = false, macos, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'arch', 'bothArches', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'bothArches', 'macos', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
+    if (macos !== undefined && (typeof macos !== 'string' || !macos || /[\s=]/.test(macos))) throw new TypeError('System: macos is a release, as \'14\', \'14.8.9\' or \'sonoma\'');
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
@@ -222,6 +228,7 @@ export class System extends EventTarget {
       xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
       bothArches: !!bothArches,
+      macos,
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the
@@ -917,6 +924,13 @@ export class System extends EventTarget {
     return this.#connection((h) => this.#programs.connectUnix(h, p));
   }
 
+  /** A program's environment with the system's `macos` in it, unless it
+   *  chooses a release of its own. */
+  #withMacos(env) {
+    const m = this.#opts.macos;
+    return m && !env.some((e) => e.startsWith('GEX_MACOS_VERSION=')) ? [...env, `GEX_MACOS_VERSION=${m}`] : env;
+  }
+
   #running(what) {
     if (this.#state.phase !== 'running') throw new Error(`${what}: the system is ${this.#state.phase}, not running`);
   }
@@ -925,7 +939,8 @@ export class System extends EventTarget {
    * Start a program: `argv[0]` a path, or a name looked up in the PATH of
    * `env`. Options:
    *   pty: {cols, rows, encoding}  a terminal (else pipes)
-   *   env: {K: V} or ['K=V']       the whole environment (nothing is added)
+   *   env: {K: V} or ['K=V']       the whole environment (nothing is added,
+   *                                but the system's `macos` where it names none)
    *   cwd, uid, gid
    *   detached: true               no terminal and no pipes: /dev/null
    * Returns a Process at once; `p.started` resolves with its pid.
@@ -974,7 +989,7 @@ export class System extends EventTarget {
     pr.spawn({
       h,
       argv,
-      env: envList(opts.env),
+      env: this.#withMacos(envList(opts.env)),
       cwd: opts.cwd ?? '',
       stdio,
       cols: opts.pty?.cols ?? 80,
