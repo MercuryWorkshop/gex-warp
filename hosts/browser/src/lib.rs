@@ -19976,12 +19976,12 @@ fn note_intrinsics(addr: u64) {
     }
     // The map first, the JIT state after it and not under it (ExecLock, JIT,
     // mm), neither under the kernel lock.
-    let Some((path, start)) = ({
+    let Some((path, start, offset)) = ({
         let mm = sigs::proc_home().mm().lock();
         mm.vmas()
             .iter()
             .find(|v| addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)
-            .and_then(|v| v.origin.as_ref().map(|(p, _)| (p.clone(), v.start)))
+            .and_then(|v| v.origin.as_ref().map(|(p, o)| (p.clone(), v.start, *o)))
     }) else {
         return;
     };
@@ -19992,7 +19992,10 @@ fn note_intrinsics(addr: u64) {
     if with_jit_only(|j| j.intrinsics_scanned.get(&path).copied().unwrap_or(0) >= 8) {
         return;
     }
-    let (found, pending) = scan_intrinsics(&path, start);
+    let (found, pending) = match scan_macho_intrinsics(&path, start, offset) {
+        Some(found) => (found, false),
+        None => scan_intrinsics(&path, start),
+    };
     with_jit_only(|j| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
@@ -20010,7 +20013,7 @@ fn add_intrinsics(j: &mut Jit, found: impl IntoIterator<Item = (u64, gex_xlate::
     for (a, k) in found {
         let bit = match k {
             gex_xlate::Intrinsic::MemCpy => 1,
-            gex_xlate::Intrinsic::MemSet => 2,
+            gex_xlate::Intrinsic::MemSet | gex_xlate::Intrinsic::BZero => 2,
             gex_xlate::Intrinsic::MemCmp => 4,
             gex_xlate::Intrinsic::MemPCpy => 8,
             gex_xlate::Intrinsic::MemMove => 16,
@@ -20355,6 +20358,31 @@ fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>,
         }
     }
     (out, pending)
+}
+
+/// A Mac library's functions the host's builtins serve
+/// (`gex_xlate::intrinsic::recognise_macho`: libplatform's memset, memmove,
+/// memcpy and bzero), where the mapping of file offset `offset` at `start`
+/// put them, as the native host finds them. `None` for a file that is not
+/// Mach-O.
+fn scan_macho_intrinsics(path: &str, start: u64, offset: u64) -> Option<Vec<(u64, gex_xlate::Intrinsic)>> {
+    if !(path.ends_with(".dylib") || path.contains(".framework/")) {
+        return None;
+    }
+    let bytes = sigs::proc_home().read_file(path)?;
+    if !gex_ld::macho::is_macho(&bytes) {
+        return None;
+    }
+    let Some((m, syms, slice)) = gex_ld::macho::file_functions(&bytes) else { return Some(Vec::new()) };
+    let Some(seg) = m.segments.iter().find(|s| s.filesize > 0 && s.fileoff + slice == offset) else { return Some(Vec::new()) };
+    let bias = start.wrapping_sub(seg.vmaddr);
+    let (lo, hi) = (seg.vmaddr, seg.vmaddr + seg.vmsize);
+    Some(
+        syms.iter()
+            .filter(|s| s.value >= lo && s.value < hi)
+            .filter_map(|s| gex_xlate::intrinsic::recognise_macho(&s.name).map(|k| (s.value.wrapping_add(bias), k)))
+            .collect(),
+    )
 }
 
 fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {

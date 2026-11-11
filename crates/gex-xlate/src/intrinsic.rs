@@ -31,6 +31,10 @@ pub enum Intrinsic {
     /// `void *mempcpy(void *dst, const void *src, size_t n)`, which differs
     /// from `memcpy` only in returning the *end* of the copy.
     MemPCpy,
+    /// `void bzero(void *dst, size_t n)`: a Mac's (libplatform's
+    /// `_platform_bzero`), a fill of zeros whose length is the second
+    /// argument.
+    BZero,
     /// `void *memset(void *dst, int c, size_t n)`.
     MemSet,
     /// `int memcmp(const void *a, const void *b, size_t n)`.
@@ -136,6 +140,23 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
     }
 }
 
+/// The intrinsic a Mach-O symbol names (its C name with the leading `_`):
+/// libplatform's string routines, which every Mac program's `memset`,
+/// `memmove`, `memcpy` and `bzero` reach (libsystem_c and the rest call
+/// them through stubs, libplatform itself directly), and the public names
+/// it defines them under. Its open-source `memset` is a 4-byte
+/// `memset_pattern4` loop of `memmove` calls -- some hundreds of times a
+/// Mac's cost per byte when translated -- and `memmove` a byte-and-word loop.
+pub fn recognise_macho(name: &str) -> Option<Intrinsic> {
+    match name {
+        "_memset" | "__platform_memset" => Some(Intrinsic::MemSet),
+        "_memmove" | "__platform_memmove" => Some(Intrinsic::MemMove),
+        "_memcpy" | "__platform_memcpy" => Some(Intrinsic::MemCpy),
+        "_bzero" | "___bzero" | "__platform_bzero" => Some(Intrinsic::BZero),
+        _ => None,
+    }
+}
+
 /// The whole function as one block: read the AAPCS64 arguments (`x0`-`x2`),
 /// do it, and return through `x30`. Registers a real implementation would
 /// clobber are left alone, which the procedure call standard permits.
@@ -158,6 +179,13 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
         // `val` is an `int` whose low byte is the fill; `memory.fill` takes
         // the same and ignores the rest, so no masking is needed here.
         Intrinsic::MemSet => b.stmt(Stmt::MemFill { dst, val: src, len }),
+        // (dst, n): the length is the second argument, the value zero
+        Intrinsic::BZero => {
+            // (a register's width, as memset's `c` is read: the fill is
+            // its low byte)
+            let zero = b.const_i64(0);
+            b.stmt(Stmt::MemFill { dst, val: zero, len: src });
+        }
         Intrinsic::MemCmp => {
             // `dst`/`src` here are just this builder's names for x0 and x1,
             // the two buffers.

@@ -406,6 +406,17 @@ fn parse_head(data: &[u8], len: u64) -> Result<MachO, LoadError> {
     Ok(m)
 }
 
+/// A Mach-O file's (or its guest slice's) segments and function symbols,
+/// unslid, and where in the file the slice starts: what a host needs to
+/// find a library's functions where the guest's dynamic linker mapped it.
+pub fn file_functions(bytes: &[u8]) -> Option<(MachO, Vec<Symbol>, u64)> {
+    let (off, len) = guest_slice(bytes).ok()?;
+    let data = bytes.get(off..off.checked_add(len)?)?;
+    let m = parse(data).ok()?;
+    let syms = functions(&m, data);
+    Some((m, syms, off as u64))
+}
+
 /// The function symbols of `m` (unslid): the symbol table's definitions in
 /// code sections, and every `LC_FUNCTION_STARTS` address no symbol names
 /// (a stripped image has only those). Each is as long as the gap to the

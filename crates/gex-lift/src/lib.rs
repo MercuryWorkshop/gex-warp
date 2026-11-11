@@ -1009,6 +1009,17 @@ impl<'a> Lifter<'a> {
                     return Flow::Next;
                 }
                 let addr = self.rd_addr(rt);
+                // `dc zva`: the block holding the address, zeroed in place
+                // (a memset's inner loop: a host call per 64 bytes was most
+                // of what it cost).
+                if op == SysMaintOp::DcZva {
+                    let mask = self.b.const_i64(!(gex_abi::DCZID_BLOCK_BYTES - 1));
+                    let dst = self.b.bin(BinOp::And, Ty::I64, addr, mask);
+                    let val = self.b.const_i64(0);
+                    let len = self.b.const_i64(gex_abi::DCZID_BLOCK_BYTES);
+                    self.b.stmt(Stmt::MemFill { dst, val, len });
+                    return Flow::Next;
+                }
                 let code = match op {
                     SysMaintOp::DcZva => gex_abi::cache_op::DC_ZVA,
                     SysMaintOp::IcInvalidate => gex_abi::cache_op::IC_INVALIDATE,

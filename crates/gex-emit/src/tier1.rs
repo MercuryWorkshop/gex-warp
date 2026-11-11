@@ -2002,6 +2002,7 @@ impl<'a> Emitter<'a> {
                 self.emit_address_flat(*src);
                 self.f.local_set(s);
                 self.clamp_len(*len, &[d, s]);
+                self.null_if_empty(&[d, s]);
                 self.f.local_get(d);
                 self.f.local_get(s);
                 self.f.local_get(self.scratch_i64);
@@ -2017,6 +2018,7 @@ impl<'a> Emitter<'a> {
                 self.emit_address_flat(*dst);
                 self.f.local_set(d);
                 self.clamp_len(*len, &[d]);
+                self.null_if_empty(&[d]);
                 self.f.local_get(d);
                 self.push(*val);
                 self.f.byte(code::I32_WRAP_I64);
@@ -2416,6 +2418,27 @@ impl<'a> Emitter<'a> {
     /// which would take the whole process rather than fault the guest. Each
     /// base is already below `GUEST_LIMIT` (address-guarded), so clamping the
     /// length to the smallest room above them makes the bulk op unable to trap.
+    /// After [`Self::clamp_len`]: a bulk operation of no bytes at address 0.
+    /// The engine bounds-checks a bulk operand even when it moves nothing,
+    /// and a `memmove(dst, junk, 0)` -- which touches nothing, and which a
+    /// Mac's libmalloc makes -- trapped on the junk.
+    fn null_if_empty(&mut self, bases: &[u32]) {
+        let n = self.scratch_i64;
+        for &b in bases {
+            self.f.local_get(b);
+            if gex_abi::mem64() {
+                self.f.i64_const(0);
+            } else {
+                self.f.i32_const(0);
+            }
+            self.f.local_get(n);
+            self.f.i64_const(0);
+            self.f.byte(code::I64_NE);
+            self.f.select();
+            self.f.local_set(b);
+        }
+    }
+
     fn clamp_len(&mut self, len: Value, bases: &[u32]) {
         let n = self.scratch_i64;
         let room = self.scratch_page;

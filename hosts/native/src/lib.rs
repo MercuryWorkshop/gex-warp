@@ -621,6 +621,11 @@ struct JitShared {
     /// space: a fork shares them (its table has their units), an exec starts
     /// empty, so every program that maps an object gets its unit.
     elf_units: Vec<pe_units::ElfPlaced>,
+    /// Library functions the runtime translator serves with the host's
+    /// builtins (`gex_xlate::intrinsic`), by address: a Mac library's
+    /// `memset` and kin where its dynamic linker mapped it
+    /// ([`note_macho_intrinsics`]). A fork shares them, an exec starts empty.
+    lib_intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -658,6 +663,7 @@ impl JitShared {
             relocated: Arc::new(Mutex::new(self.relocated.lock().unwrap_or_else(|e| e.into_inner()).clone())),
             trampolines: self.trampolines,
             elf_units: self.elf_units.clone(),
+            lib_intrinsics: self.lib_intrinsics.clone(),
             blocks: 0,
             calls: 0,
         }
@@ -1541,6 +1547,7 @@ fn run_program_with(
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),
+                lib_intrinsics: Default::default(),
                 processes: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             })),
             engine.clone(),
@@ -5052,6 +5059,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             elfprov::on_elf_maps(&mut caller, &mapped)?;
             // Function-tier units for listed shared objects (GEX_ELF_UNITS).
             pe_units::on_elf_maps(&mut caller, &mapped)?;
+            // A Mac library's memset and kin, served by the host's builtins.
+            note_macho_intrinsics(&mut caller, &mapped);
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
@@ -6132,6 +6141,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| k.mem.lock().volatile_code());
     gex_xlate::set_volatile_ranges(volatile);
     }
+    let lib_intrinsics = shared.lock().unwrap_or_else(|e| e.into_inner()).lib_intrinsics.clone();
     let (translated_module, stats) = gex_emit::with_module_id_global(|| {
         let data = memory.bytes();
         // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
@@ -6148,7 +6158,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             // synchronously; the next miss picks up where this stopped.
             4096,
             true,
-            &Default::default(),
+            &lib_intrinsics,
         )
     });
     jit_stats::note(pc);
@@ -7707,6 +7717,44 @@ fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)], alt_
         data[off..off + 4].copy_from_slice(&base.to_le_bytes());
     }
     Ok(())
+}
+
+/// The functions of Mac libraries just mapped that the host's builtins serve
+/// (`gex_xlate::intrinsic::recognise_macho`: libplatform's memset, memmove,
+/// memcpy and bzero), where the mapping put them, for the runtime
+/// translator. Read before the dynamic linker has run any of the library.
+/// `GEX_MACHO_INTRINSICS=0` leaves them translated (A/B runs).
+fn note_macho_intrinsics(caller: &mut Caller<'_, HostState>, mapped: &[gex_kernel::CodeMap]) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("GEX_MACHO_INTRINSICS").is_ok_and(|v| v == "0"));
+    if mapped.is_empty() || *OFF {
+        return;
+    }
+    let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) else { return };
+    for m in mapped {
+        if !m.path.starts_with('/') || !(m.path.ends_with(".dylib") || m.path.contains(".framework/")) {
+            continue;
+        }
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)) else { continue };
+        if !gex_ld::macho::is_macho(&bytes) {
+            continue;
+        }
+        let Some((macho, syms, slice)) = gex_ld::macho::file_functions(&bytes) else { continue };
+        let Some(seg) = macho.segments.iter().find(|s| s.filesize > 0 && s.fileoff + slice == m.offset) else { continue };
+        let bias = m.start.wrapping_sub(seg.vmaddr);
+        let (lo, hi) = (seg.vmaddr, seg.vmaddr + seg.vmsize);
+        let found: Vec<(u64, gex_xlate::Intrinsic)> = syms
+            .iter()
+            .filter(|s| s.value >= lo && s.value < hi)
+            .filter_map(|s| gex_xlate::intrinsic::recognise_macho(&s.name).map(|k| (s.value.wrapping_add(bias), k)))
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        if std::env::var_os("GEX_PROVIDER_TRACE").is_some() {
+            eprintln!("gex: {} builtins for {} at {bias:#x}", found.len(), m.path);
+        }
+        shared.lock().unwrap_or_else(|e| e.into_inner()).lib_intrinsics.extend(found);
+    }
 }
 
 /// The exported entry points of the object mapped at `map`, biased to where
