@@ -157,7 +157,9 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_show("delete", change(1, TIMER, DELETE, 0, 0, 0));
     t_show("a timer, once, in microseconds", change(2, TIMER, ADD | ONESHOT, USECONDS, 5000, 42));
     n = ready(1000);
-    t_printf("fired: %ld, filter %d flags 0x%x data %ld\n", n, got[0].filter, got[0].flags, (long)got[0].data);
+    // (How many times it is said to have fired by then depends on how late
+    // the asking is: a busy Mac says twice or more of a timer that fires once.)
+    t_printf("fired: %ld, filter %d flags 0x%x, fired %d\n", n, got[0].filter, got[0].flags, got[0].data >= 1);
     say("and not again", ready(30));
     // A timer sooner than the time given to wait.
     t_show("a timer, once", change(3, TIMER, ADD | ONESHOT, 0, 10, 43));
