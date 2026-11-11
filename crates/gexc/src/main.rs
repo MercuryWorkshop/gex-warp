@@ -778,8 +778,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         None => ra.path.clone(),
     };
     ra.opts.args = program.argv(argv, &guest_path);
-    // (and `/proc/self/exe` is the program, not its interpreter)
-    if program.direct.is_some() && ra.opts.exe.is_none() {
+    // (and `/proc/self/exe` is the program: not its interpreter, and not
+    // the name it is told it was run by, `--argv0`'s, which names no file)
+    if (program.direct.is_some() || ra.argv0.is_some()) && ra.opts.exe.is_none() {
         ra.opts.exe = Some(ra.path.clone());
     }
     // A client finds the display by joining these two, so default them when a
