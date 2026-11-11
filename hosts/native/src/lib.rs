@@ -248,6 +248,53 @@ pub fn guest_path_of(
     best.map(|(_, p)| p)
 }
 
+/// `guest` (absolute) with the root's symbolic links in it followed, as far
+/// as the root has its components: where a bind of that path has to be
+/// mounted for the program to find it by every name (a Mac root's `/tmp` is
+/// `private/tmp`; a bind at `/tmp/x` mounted as given was at no name the
+/// program's lookups, which follow the link, reached). A Linux bind mount
+/// resolves its target in the same way when it is made. Unchanged with no
+/// root, and from the first component the root has not.
+pub fn resolve_in_root(sysroot: Option<&std::path::Path>, guest: &str) -> String {
+    let Some(root) = sysroot else { return guest.to_string() };
+    let mut todo: std::collections::VecDeque<String> = guest.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
+    let mut done: Vec<String> = Vec::new();
+    let mut hops = 0;
+    while let Some(c) = todo.pop_front() {
+        match c.as_str() {
+            "." => continue,
+            ".." => {
+                done.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let here = root.join(done.iter().chain(std::iter::once(&c)).collect::<std::path::PathBuf>());
+        match std::fs::symlink_metadata(&here) {
+            Ok(md) if md.file_type().is_symlink() && hops < 40 => {
+                hops += 1;
+                let Ok(target) = std::fs::read_link(&here) else {
+                    done.push(c);
+                    continue;
+                };
+                let t = target.to_string_lossy().into_owned();
+                if t.starts_with('/') {
+                    done.clear();
+                }
+                for (i, part) in t.split('/').filter(|p| !p.is_empty()).enumerate() {
+                    todo.insert(i, part.to_string());
+                }
+            }
+            Ok(_) => done.push(c),
+            Err(_) => {
+                done.push(c);
+                done.extend(todo.drain(..).filter(|c| c != "."));
+            }
+        }
+    }
+    format!("/{}", done.join("/"))
+}
+
 /// The host file at guest path `guest` (absolute): under the bind whose
 /// guest side holds it most closely, else under the sysroot; the path
 /// itself when there is neither. The reverse of [`guest_path_of`].
@@ -257,9 +304,14 @@ pub fn host_path_of(
     binds: &[(std::path::PathBuf, String)],
 ) -> std::path::PathBuf {
     let guest = format!("/{}", guest.trim_start_matches('/'));
+    // By the name a bind was mounted at, and by the name the root's links
+    // make of it (`resolve_in_root`).
+    let resolved = if binds.is_empty() { guest.clone() } else { resolve_in_root(sysroot, &guest) };
     let mut best: Option<(usize, std::path::PathBuf)> = None;
     for (h, g) in binds {
         let g = g.trim_end_matches('/');
+        let rg = resolve_in_root(sysroot, g);
+        let (g, guest) = if guest.strip_prefix(g).is_some_and(|r| r.is_empty() || r.starts_with('/')) { (g, guest.as_str()) } else { (rg.as_str(), resolved.as_str()) };
         let rest = match guest.strip_prefix(g) {
             Some("") => "",
             Some(r) if r.starts_with('/') || g.is_empty() => r.trim_start_matches('/'),
@@ -3884,7 +3936,7 @@ fn mount_filesystems(
         }
     }
     for (host, guest) in &opts.binds {
-        kernel.vfs.mount(guest, Arc::new(HostFs::new(host)));
+        kernel.vfs.mount(&resolve_in_root(opts.sysroot.as_deref(), guest), Arc::new(HostFs::new(host)));
     }
     let mut devfs = DevFs::new();
     if opts.gl {
@@ -8148,4 +8200,27 @@ pub(crate) fn note_wine32_image(base: u64, size: u64, path: &str) {
 fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
     let g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
+}
+
+#[cfg(test)]
+mod resolve_in_root_tests {
+    #[test]
+    fn a_bind_under_a_linked_directory_goes_where_the_link_leads() {
+        let root = std::env::temp_dir().join(format!("gex-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("private/tmp")).unwrap();
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("private/tmp", root.join("tmp")).unwrap();
+        std::os::unix::fs::symlink("/usr/lib", root.join("lib")).unwrap();
+        let r = Some(root.as_path());
+        assert_eq!(super::resolve_in_root(r, "/tmp/bound"), "/private/tmp/bound");
+        assert_eq!(super::resolve_in_root(r, "/tmp/a/b/../c"), "/private/tmp/a/b/../c");
+        assert_eq!(super::resolve_in_root(r, "/lib/x"), "/usr/lib/x");
+        assert_eq!(super::resolve_in_root(r, "/private/tmp/./x"), "/private/tmp/x");
+        assert_eq!(super::resolve_in_root(None, "/tmp/bound"), "/tmp/bound");
+        let binds = vec![(std::path::PathBuf::from("/host/dir"), "/tmp/bound".to_string())];
+        assert_eq!(super::host_path_of("/private/tmp/bound/f", r, &binds), std::path::PathBuf::from("/host/dir/f"));
+        assert_eq!(super::host_path_of("/tmp/bound/f", r, &binds), std::path::PathBuf::from("/host/dir/f"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
