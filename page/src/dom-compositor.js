@@ -86,6 +86,8 @@ function winNote(win, what) {
 }
 
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
+/** `DomWindow.decorations` for a surface record. */
+const decorationsOf = (s) => (s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none');
 
 /** One window, as the page sees it. */
 class DomWindow {
@@ -107,7 +109,7 @@ class DomWindow {
      * `zxdg_decoration_manager_v1` that way, so Qt and KDE draw nothing and
      * the page's HTML is the frame. GTK draws its own inside that anyway --
      * there is no signal for it, and no compositor gets one. */
-    this.decorations = s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none';
+    this.decorations = decorationsOf(s);
     /** Placed by its client (`gex_window_placement_v1`: a Win32 window, an X
      * menu): `relX`/`relY` are where it goes in the desktop's pixels, and
      * `layer` (0 normal, 1 topmost, 2 menus) and `onrestack` how it stacks.
@@ -692,6 +694,14 @@ export class DomDesktop {
       const k = key(s);
       live.add(k);
       let win = this.#windows.get(k);
+      // A surface id its client reused for another window between two
+      // reconciles (Wine destroys a menu's surface and makes a message box's
+      // at once): a window of another role or frame is a new one, the old one
+      // gone, not the old one changed.
+      if (win && win.role && s.role && (win.role !== s.role || win.decorations !== decorationsOf(s))) {
+        this.#gone(k, win);
+        win = null;
+      }
       if (!win) {
         win = new DomWindow(this, k, s);
         this.#windows.set(k, win);
@@ -709,34 +719,38 @@ export class DomDesktop {
       this.#update(win, s);
     }
     for (const [k, win] of [...this.#windows]) {
-      if (live.has(k)) continue;
-      this.#windows.delete(k);
-      this.#focusPrev = this.#focusPrev.filter((w) => w !== win);
-      if (this.#pressed === win) this.#pressed = null;
-      if (this.#focus === win) {
-        // Back to the window that had it before, or the client's next key goes
-        // nowhere: Win32 does not activate anything when a menu, a tooltip or
-        // the Start menu's user picture goes, and winewayland takes the enter
-        // of a placed window as where keys go, not as an activation.
-        this.#focus = null;
-        const prev = [...this.#focusPrev].reverse().find((w) => this.#windows.get(w.key) === w);
-        if (prev) this.focus(prev);
-      }
-      if (this.#cursor === win) {
-        // The client took its cursor away: back to the page's own pointer,
-        // which is what the scene compositor's fallback arrow amounts to.
-        this.#cursor = null;
-        this.#cursorShown = -1;
-        this.#setCursor('default');
-      }
-      if (win.glFrame) this.#gl?.surfaceCanvas?.(win.glFrame, false);
-      win.dropGl();
-      win.onclosed?.();
-      this.onwindowgone?.(win);
+      if (!live.has(k)) this.#gone(k, win);
     }
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     sceneMark(this.#marks, blocks);
     this.#markedTouch = touched;
+  }
+
+  /** A window that went away. */
+  #gone(k, win) {
+    this.#windows.delete(k);
+    this.#focusPrev = this.#focusPrev.filter((w) => w !== win);
+    if (this.#pressed === win) this.#pressed = null;
+    if (this.#focus === win) {
+      // Back to the window that had it before, or the client's next key goes
+      // nowhere: Win32 does not activate anything when a menu, a tooltip or
+      // the Start menu's user picture goes, and winewayland takes the enter
+      // of a placed window as where keys go, not as an activation.
+      this.#focus = null;
+      const prev = [...this.#focusPrev].reverse().find((w) => this.#windows.get(w.key) === w);
+      if (prev) this.focus(prev);
+    }
+    if (this.#cursor === win) {
+      // The client took its cursor away: back to the page's own pointer,
+      // which is what the scene compositor's fallback arrow amounts to.
+      this.#cursor = null;
+      this.#cursorShown = -1;
+      this.#setCursor('default');
+    }
+    if (win.glFrame) this.#gl?.surfaceCanvas?.(win.glFrame, false);
+    win.dropGl();
+    win.onclosed?.();
+    this.onwindowgone?.(win);
   }
 
   #update(win, s) {
