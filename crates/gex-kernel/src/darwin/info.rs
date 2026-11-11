@@ -18,22 +18,122 @@ pub const XNU: &str = "xnu-12377.1.9";
 /// setting of the root a program runs in, as a Windows version is of a Wine
 /// prefix.
 pub const SYSTEM_VERSION: &str = "/System/Library/CoreServices/SystemVersion.plist";
+/// Beside it: the iOS a Mac runs Mac Catalyst programs as, and (11 to 15)
+/// the version a program built for 10.15 or before is shown instead.
+pub const IOS_VERSION: &str = "/System/Library/CoreServices/iOSSystemVersion.plist";
+pub const COMPAT_VERSION: &str = "/System/Library/CoreServices/SystemVersionCompat.plist";
+
+/// The releases a root's userland knows, and what each says of itself
+/// (pyrus's oss/macos-releases, which its build.sh puts here): one row a
+/// release, its fields apart by tabs, `-` for what is not known.
+pub const RELEASES: &str = "/usr/share/gex/macos-releases";
+
+/// The environment's word for which release a process is to be told it is
+/// on, whatever its root's files say: `GEX_MACOS_VERSION=14`, `=14.8.9`,
+/// `=sonoma`. Inherited, as the environment is, by what it runs: a process
+/// tree is "on" that release, as a program is under a Wine prefix's
+/// Windows version, without the root's being built again. The kernel then
+/// gives that process the files that say so, too ([`Os::files`]).
+pub const CHOSEN: &str = "GEX_MACOS_VERSION";
 
 /// The system a process is told it is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Os {
-    /// `kern.osproductversion`: the macOS version, "26.0".
+    /// `kern.osproductversion`: the macOS version, "27.0".
     pub product: String,
-    /// `kern.osversion`: its build, "25A354".
+    /// `kern.osversion`: its build, "26A425".
     pub build: String,
-    /// `kern.osrelease`: Darwin's own version, "25.0.0".
+    /// `kern.osrelease`: Darwin's own version, "27.0.0".
     pub release: String,
+    /// What else the release's row knows ([`Release`]), if there is one.
+    pub row: Option<Release>,
+    /// Told so by the environment ([`CHOSEN`]), and not by the root's
+    /// files: what the files say is given from here.
+    pub chosen: bool,
 }
 
 impl Default for Os {
-    /// The macOS that shipped [`XNU`].
+    /// The macOS that shipped [`XNU`], for a root that says nothing.
     fn default() -> Os {
-        Os { product: "26.0".into(), build: "25A354".into(), release: "25.0.0".into() }
+        Os { product: "26.0".into(), build: "25A354".into(), release: "25.0.0".into(), row: None, chosen: false }
+    }
+}
+
+/// One of the files that say which system this is, as a process told it is
+/// another release than its root's is given it ([`Os::files`]): a file of
+/// the system's, read-only.
+#[derive(Debug)]
+pub struct VersionFile(pub Vec<u8>);
+
+impl crate::vfs::FileHandle for VersionFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        let start = (offset as usize).min(self.0.len());
+        let n = buf.len().min(self.0.len() - start);
+        buf[..n].copy_from_slice(&self.0[start..start + n]);
+        Ok(n as u64)
+    }
+    fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Regular, size: self.0.len() as u64, mode: 0o644, ino: 0x5653, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+    }
+}
+
+/// A row of [`RELEASES`]: what a release is known to say of itself, where
+/// it is known.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Release {
+    pub product: String,
+    pub build: String,
+    pub darwin: Option<String>,
+    /// As `kern.version` names the kernel: `xnu-13432.1.9~1`, or as much of
+    /// it as is known (`xnu-13432`).
+    pub xnu: Option<String>,
+    /// When that kernel was built, as `kern.version` says it.
+    pub kdate: Option<String>,
+    /// `kern.osproductversioncompat`: SystemVersionCompat.plist's version.
+    pub compat: Option<String>,
+    /// `iOSSupportVersion`.
+    pub ios: Option<String>,
+    /// `ProductCopyright`'s last year.
+    pub year: Option<String>,
+    pub build_id: Option<String>,
+}
+
+impl Release {
+    /// The rows of the table's `text`.
+    pub fn parse(text: &str) -> Vec<Release> {
+        let known = |f: Option<&str>| f.map(str::trim).filter(|f| !f.is_empty() && *f != "-" && *f != "none").map(String::from);
+        text.lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                let (product, build) = (known(f.first().copied())?, known(f.get(1).copied())?);
+                Some(Release {
+                    product,
+                    build,
+                    darwin: known(f.get(2).copied()),
+                    xnu: known(f.get(3).copied()),
+                    kdate: known(f.get(4).copied()),
+                    compat: known(f.get(5).copied()),
+                    ios: known(f.get(6).copied()),
+                    year: known(f.get(7).copied()),
+                    build_id: known(f.get(8).copied()),
+                })
+            })
+            .collect()
+    }
+
+    /// The row a setting names: a release exactly ("14.8.9"), or the
+    /// latest of a release's updates ("14", "14.8": the first row whose
+    /// version begins so, the table's order being latest first), or of a
+    /// release by its name ("sonoma").
+    pub fn find<'a>(rows: &'a [Release], spec: &str) -> Option<&'a Release> {
+        let spec = spec.trim().to_ascii_lowercase();
+        // Their names, as Apple has called them, for the releases there
+        // are rows of.
+        const NAMES: [(&str, &str); 7] = [("bigsur", "11"), ("big sur", "11"), ("monterey", "12"), ("ventura", "13"), ("sonoma", "14"), ("sequoia", "15"), ("tahoe", "26")];
+        let spec = NAMES.iter().find(|(n, _)| *n == spec).map_or(spec.as_str(), |(_, v)| v);
+        let spec = spec.strip_prefix("macos").unwrap_or(spec).trim();
+        rows.iter().find(|r| r.product == spec).or_else(|| rows.iter().find(|r| r.product.starts_with(&format!("{spec}."))))
     }
 }
 
@@ -48,19 +148,87 @@ impl Os {
             Some(rest[..rest.find("</string>")?].trim().to_string())
         };
         let product = value("ProductVersion")?;
+        let release = Os::darwin(&product)?;
+        let darwin = release.split('.').next().unwrap_or("").to_string();
+        let build = value("ProductBuildVersion").unwrap_or_else(|| format!("{darwin}A1"));
+        Some(Os { product, build, release, ..Os::default() })
+    }
+
+    /// The system a row of the table says, as the environment chose it or
+    /// as the root's files name it.
+    pub fn from_release(r: &Release, chosen: bool) -> Os {
+        let release = r.darwin.clone().or_else(|| Os::darwin(&r.product)).unwrap_or_default();
+        Os { product: r.product.clone(), build: r.build.clone(), release, row: Some(r.clone()), chosen }
+    }
+
+    /// The Darwin release a macOS version was. Mac OS X 10.x was Darwin
+    /// x + 4, its updates Darwin's minor versions; macOS 11 to 13 were
+    /// Darwin 20 to 22, each update one past its own number (11.0.1 was
+    /// 20.1.0, 12.5 21.6.0, 13.5 22.6.0: xnu's config/MasterVersion at
+    /// those releases' tags), and 14 and 15 Darwin 23 and 24, an update its
+    /// own number (recalled: xnu publishes no MasterVersion from 14); none
+    /// past .6 (recalled, of 11.7, 12.7, 13.7 and 14.7). macOS 26 was Darwin
+    /// 25. From 27 the two agree, an update's patch level apart (27.0.1 is
+    /// 27.0.0: this Mac).
+    pub fn darwin(product: &str) -> Option<String> {
         let mut parts = product.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
         let (major, minor, patch) = (parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0));
-        // Mac OS X 10.x was Darwin x + 4, its updates Darwin's minor
-        // versions; macOS 11 to 15 were Darwin 20 to 24; macOS 26 was
-        // Darwin 25; from 27 the two agree.
         let (darwin, sub) = match major {
             10 => (minor + 4, patch),
-            11..=15 => (major + 9, minor),
+            11..=13 => (major + 9, (minor + 1).min(6)),
+            14..=15 => (major + 9, minor.min(6)),
             16..=26 => (major - 1, minor),
             _ => (major, minor),
         };
-        let build = value("ProductBuildVersion").unwrap_or_else(|| format!("{darwin}A1"));
-        Some(Os { product, build, release: format!("{darwin}.{sub}.0") })
+        Some(format!("{darwin}.{sub}.0"))
+    }
+
+    /// `kern.osproductversioncompat`: what the release shows a program
+    /// built for 10.15 or before, or nothing (as 27 has).
+    pub fn compat(&self) -> &str {
+        self.row.as_ref().and_then(|r| r.compat.as_deref()).unwrap_or("")
+    }
+
+    /// `kern.iossupportversion`, where the release's row knows it.
+    pub fn ios(&self) -> Option<&str> {
+        self.row.as_ref().and_then(|r| r.ios.as_deref())
+    }
+
+    /// The files that say which system this is, as a Mac has them, for a
+    /// process told it is on another release than its root's files say:
+    /// (path, contents). SystemVersion.plist with each key the row knows,
+    /// in the order a Mac writes them; iOSSystemVersion.plist where the
+    /// iOS is known; SystemVersionCompat.plist for a release that had one.
+    /// (As pyrus's build.sh writes them into a root, byte for byte.)
+    pub fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
+        let r = self.row.clone().unwrap_or_default();
+        let plist = |name: &str, version: &str| {
+            let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n");
+            let mut key = |k: &str, v: &str| s.push_str(&format!("\t<key>{k}</key>\n\t<string>{v}</string>\n"));
+            if let Some(id) = &r.build_id {
+                key("BuildID", id);
+            }
+            key("ProductBuildVersion", &self.build);
+            if let Some(y) = &r.year {
+                key("ProductCopyright", &format!("1983-{y} Apple Inc."));
+            }
+            key("ProductName", name);
+            key("ProductUserVisibleVersion", version);
+            key("ProductVersion", version);
+            if let Some(ios) = &r.ios {
+                key("iOSSupportVersion", ios);
+            }
+            s.push_str("</dict>\n</plist>\n");
+            s.into_bytes()
+        };
+        let mut out = vec![(SYSTEM_VERSION, plist("macOS", &self.product))];
+        if let Some(ios) = &r.ios {
+            out.push((IOS_VERSION, plist("iPhone OS", ios)));
+        }
+        if let Some(c) = &r.compat {
+            out.push((COMPAT_VERSION, plist("macOS", c)));
+        }
+        out
     }
 }
 
@@ -139,6 +307,8 @@ const NAMES: &[(&str, &[i32])] = &[
     ("kern.safeboot", &[CTL_KERN, 66]),
     ("kern.osproductversion", &[]),
     ("kern.osproductversioncompat", &[]),
+    ("kern.iossupportversion", &[]),
+    ("kern.system_version_compat", &[]),
     ("kern.osreleasetype", &[]),
     ("kern.secure_kernel", &[]),
     ("kern.hv_vmm_present", &[]),
@@ -161,6 +331,7 @@ const NAMES: &[(&str, &[i32])] = &[
     ("hw.availcpu", &[CTL_HW, 25]),
     ("hw.target", &[CTL_HW, 26]),
     ("hw.product", &[CTL_HW, 27]),
+    ("hw.targettype", &[]),
     ("hw.activecpu", &[]),
     ("hw.physicalcpu", &[]),
     ("hw.physicalcpu_max", &[]),
@@ -355,10 +526,50 @@ fn name_of(oid: &[i32]) -> Option<&'static str> {
 }
 
 impl Kernel {
-    /// The system this process is told it is on: what its root's
-    /// [`SYSTEM_VERSION`] says, read once, or with none the default.
+    /// The system this process is told it is on, worked out once for each
+    /// program it runs: the release its environment chooses ([`CHOSEN`]),
+    /// from the table its root has ([`RELEASES`]); else what its root's
+    /// [`SYSTEM_VERSION`] says, with what the table knows of that release;
+    /// else, with no file, the macOS of the XNU this kernel is.
     pub fn darwin_os(&self) -> &Os {
-        self.darwin_os.get_or_init(|| self.read_file(SYSTEM_VERSION).and_then(|p| Os::from_plist(&p)).unwrap_or_default())
+        self.darwin_os.get_or_init(|| {
+            let rows = self.read_file(RELEASES).map(|t| Release::parse(&String::from_utf8_lossy(&t))).unwrap_or_default();
+            if let Some(spec) = self.envp.iter().find_map(|e| e.strip_prefix(CHOSEN).and_then(|v| v.strip_prefix('='))).filter(|v| !v.is_empty()) {
+                match Release::find(&rows, spec) {
+                    Some(r) => return Os::from_release(r, true),
+                    None => eprintln!(
+                        "[gex:{}] {CHOSEN}={spec}: no such release in {RELEASES}{}; this process is told its root's",
+                        self.pid,
+                        if rows.is_empty() { " (the root has none: a pyrus root built since it had the table has)".to_string() } else { format!(" (it has {})", rows.iter().map(|r| r.product.as_str()).collect::<Vec<_>>().join(" ")) }
+                    ),
+                }
+            }
+            let Some(os) = self.read_file(SYSTEM_VERSION).and_then(|p| Os::from_plist(&p)) else { return Os::default() };
+            match rows.iter().find(|r| r.product == os.product && r.build == os.build) {
+                Some(r) => Os::from_release(r, false),
+                None => os,
+            }
+        })
+    }
+
+    /// What this process is given for the file at `path` in place of the
+    /// root's, if it is one of the files that say which system this is and
+    /// the process was told it is another ([`Os::files`]): its contents, or
+    /// `Some(None)` for one that release has not (none of the root's is
+    /// seen through).
+    pub fn darwin_version_file(&self, path: &str) -> Option<Option<Vec<u8>>> {
+        if !path.ends_with("Version.plist") && !path.ends_with("VersionCompat.plist") {
+            return None;
+        }
+        let path = crate::vfs::normalize(path, &self.caller_cwd());
+        if ![SYSTEM_VERSION, IOS_VERSION, COMPAT_VERSION].contains(&path.as_str()) {
+            return None;
+        }
+        let os = self.darwin_os();
+        if !os.chosen {
+            return None;
+        }
+        Some(os.files().into_iter().find(|(p, _)| *p == path).map(|(_, b)| b))
     }
 
     /// The value of the name `name`, if this kernel has one.
@@ -366,16 +577,27 @@ impl Kernel {
         use Val::*;
         let x86 = gex_abi::X86;
         let Machine { cpus, mem, cputype, cpusubtype } = Machine::this();
+        // The Mac an x86-64 program is on: an Intel one, unless the
+        // release ran on none.
+        let intel = x86 && !rosetta(&self.darwin_os().product);
         let page = abi::PAGE_SIZE as i64;
         let nofile = self.rlimits.get()[RLIMIT_NOFILE];
         Some(match name {
             "kern.ostype" => Str("Darwin".into()),
             "kern.osrelease" => Str(self.darwin_os().release.clone()),
             "kern.osrevision" => Int(199506),
-            "kern.version" => Str(darwin_version(&self.darwin_os().release)),
+            "kern.version" => Str(darwin_version(self.darwin_os())),
             "kern.osversion" => Str(self.darwin_os().build.clone()),
+            // (The version a program built for 10.15 or before is shown,
+            // to a task that has asked for it, where the release has one:
+            // xnu's sysctl_osproductversion.)
+            "kern.osproductversion" if self.darwin_compat.load(std::sync::atomic::Ordering::Relaxed) && !self.darwin_os().compat().is_empty() => Str(self.darwin_os().compat().into()),
             "kern.osproductversion" => Str(self.darwin_os().product.clone()),
-            "kern.osproductversioncompat" => Str("16.0".into()),
+            // (As xnu reads it: the task's flag as it is kept,
+            // TF_SYS_VERSION_COMPAT, 0x8000, which is what a Mac says.)
+            "kern.system_version_compat" => Int(if self.darwin_compat.load(std::sync::atomic::Ordering::Relaxed) { 0x8000 } else { 0 }),
+            "kern.osproductversioncompat" => Str(self.darwin_os().compat().into()),
+            "kern.iossupportversion" => Str(self.darwin_os().ios()?.into()),
             "kern.osreleasetype" => Str("User".into()),
             "kern.hostname" => Str("gex".into()),
             "kern.nisdomainname" | "kern.bootargs" => Str(String::new()),
@@ -410,8 +632,10 @@ impl Kernel {
             }
             "vm.pagesize" | "hw.pagesize" | "hw.pagesize32" => Quad(page),
             "hw.machine" => Str(if x86 { "x86_64" } else { "arm64" }.into()),
-            "hw.model" | "hw.product" => Str(if x86 { "MacBookPro16,1" } else { "MacBookAir10,1" }.into()),
-            "hw.target" => Str(if x86 { "Mac-E1008331FDC96864" } else { "J313AP" }.into()),
+            "hw.model" | "hw.product" => Str(if intel { "MacBookPro16,1" } else { "MacBookAir10,1" }.into()),
+            "hw.target" => Str(if intel { "Mac-E1008331FDC96864" } else { "J313AP" }.into()),
+            // The board without the "AP" (as a Mac's J616sAP is J616s).
+            "hw.targettype" if !intel => Str("J313".into()),
             "hw.ncpu" | "hw.availcpu" | "hw.activecpu" | "hw.physicalcpu" | "hw.physicalcpu_max" | "hw.logicalcpu" | "hw.logicalcpu_max" => Int(cpus),
             "hw.perflevel0.physicalcpu" | "hw.perflevel0.physicalcpu_max" | "hw.perflevel0.logicalcpu" | "hw.perflevel0.logicalcpu_max" => Int(cpus),
             "hw.perflevel0.name" => Str("Performance".into()),
@@ -436,8 +660,9 @@ impl Kernel {
             "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.arm64" | "hw.optional.armv8_1_atomics" | "hw.optional.armv8_crc32" if !x86 => Int(1),
             "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_CRC32" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.AdvSIMD" | "hw.optional.arm.FP_SyncExceptions" if !x86 => Int(1),
             "user.cs_path" => Str("/usr/bin:/bin:/usr/sbin:/sbin".into()),
-            // Not under Rosetta.
-            "sysctl.proc_translated" if !x86 => Int(0),
+            // Under Rosetta, or not: an x86-64 program on a macOS that
+            // runs on no Intel Mac is translated ([`rosetta`]).
+            "sysctl.proc_translated" if !intel => Int((x86 && !intel) as i64),
             "security.mac.proc_enforce" | "security.mac.vnode_enforce" => Int(1),
             n if ABSENT.contains(&n) && !x86 => Int(0),
             _ => return None,
@@ -552,6 +777,16 @@ impl Kernel {
     }
 
     fn darwin_sysctl_named(&mut self, m: &mut GuestMem<'_>, name: &str, old: u64, oldlenp: u64, new: u64) -> SysResult {
+        // The one name a task sets: whether it is shown the compatibility
+        // version (by anybody: CTLFLAG_ANYBODY), the old value answered.
+        if name == "kern.system_version_compat" && new != 0 {
+            let was = self.darwin_sysctl_value(name);
+            if old != 0 || oldlenp != 0 {
+                self.darwin_sysctl_out(m, old, oldlenp, was.unwrap_or(Val::Int(0)))?;
+            }
+            self.darwin_compat.store(m.read_u32(new)? != 0, std::sync::atomic::Ordering::Relaxed);
+            return Ok(0);
+        }
         let Some(v) = self.darwin_sysctl_value(name) else {
             if self.trace || std::env::var_os("GEX_DARWIN_UNIMPLEMENTED").is_some() {
                 eprintln!("[gex:{}] sysctl {name}: no such name", self.pid);
@@ -872,10 +1107,24 @@ impl Kernel {
     }
 }
 
-/// `kern.version`, as `uname -v` prints it.
-pub fn darwin_version(release: &str) -> String {
-    let soc = if gex_abi::X86 { "X86_64" } else { "ARM64_T8103" };
-    format!("Darwin Kernel Version {release}: gex; root:{XNU}/RELEASE_{soc}")
+/// Whether macOS `product` ran on no Intel Mac, so that an x86-64 program
+/// on it is one Rosetta translates: 27 and later (the last for Intel was
+/// 26; recalled).
+pub fn rosetta(product: &str) -> bool {
+    product.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| m >= 27)
+}
+
+/// `kern.version`, as `uname -v` prints it: the release's kernel by its
+/// name and the date it was built, where the table knows them (else this
+/// one's, [`XNU`], and the word "gex" where the date is), and the machine
+/// it was built for: the M1's, or an Intel Mac's (or, under Rosetta, the
+/// M1's still).
+pub fn darwin_version(os: &Os) -> String {
+    let row = os.row.as_ref();
+    let soc = if gex_abi::X86 && !rosetta(&os.product) { "X86_64" } else { "ARM64_T8103" };
+    let date = row.and_then(|r| r.kdate.as_deref()).unwrap_or("gex");
+    let xnu = row.and_then(|r| r.xnu.as_deref()).unwrap_or(XNU);
+    format!("Darwin Kernel Version {}: {date}; root:{xnu}/RELEASE_{soc}", os.release)
 }
 
 #[cfg(test)]
@@ -889,13 +1138,76 @@ mod tests {
     #[test]
     fn the_system_is_the_one_its_version_file_names() {
         let os = |p: &str, b: &str| Os::from_plist(&plist(p, b)).unwrap();
-        assert_eq!(os("10.6.8", "10K549"), Os { product: "10.6.8".into(), build: "10K549".into(), release: "10.8.0".into() });
+        assert_eq!(os("10.6.8", "10K549"), Os { product: "10.6.8".into(), build: "10K549".into(), release: "10.8.0".into(), ..Os::default() });
         assert_eq!(os("10.14.6", "18G103").release, "18.6.0");
+        // (xnu's config/MasterVersion at 7195.50.7.100.1, 7195.141.2,
+        // 8020.140.41, 8792.41.9.)
+        assert_eq!(os("11.0.1", "20B29").release, "20.1.0");
+        assert_eq!(os("11.5", "20G71").release, "20.6.0");
         assert_eq!(os("11.6", "20G165").release, "20.6.0");
+        assert_eq!(os("12.5", "21G72").release, "21.6.0");
+        assert_eq!(os("13.0", "22A380").release, "22.1.0");
         assert_eq!(os("15.1", "24B83").release, "24.1.0");
-        assert_eq!(os("26.0", "25A354"), Os::default());
+        assert_eq!(os("26.0", "25A354").release, "25.0.0");
         assert_eq!(os("27.0.1", "26A434").release, "27.0.0");
         assert_eq!(Os::from_plist(b"not a plist"), None);
+    }
+
+    const TABLE: &str = "# a comment\n#product\tbuild\tdarwin\txnu\tkdate\tcompat\tios\tyear\tbuildid\tcf\tfoundation\tappkit\tsource\n\
+        27.0.1\t26A434\t27.0.0\txnu-13432.1.9~1\tTue Aug 11 21:05:48 PDT 2026\tnone\t27.0\t2026\t0B27979E-B7E7-11F1-B3D2-24EC53F49301\t5027.0\t5027.0\t2775.1\tthis Mac\n\
+        27.0\t26A425\t-\txnu-13432\t-\tnone\t27.0\t2026\tF8088D3E-A1DA-11F1-AAD4-A82B6E44CE4F\t5027.0\t5027.0\t2775.1\tthe SDK\n\
+        14.8.9\t23J631\t-\t-\t-\t10.16\t-\t-\t-\t-\t-\t-\tthe catalog\n\
+        14.6\t23G80\t-\t-\t-\t10.16\t-\t-\t-\t-\t-\t-\tan older one\n";
+
+    #[test]
+    fn a_release_is_chosen_by_its_number_or_its_name() {
+        let rows = Release::parse(TABLE);
+        assert_eq!(rows.len(), 4);
+        let find = |s: &str| Release::find(&rows, s).map(|r| r.product.as_str());
+        assert_eq!(find("27.0"), Some("27.0"));
+        assert_eq!(find("27"), Some("27.0.1"));
+        assert_eq!(find("14"), Some("14.8.9"));
+        assert_eq!(find("14.6"), Some("14.6"));
+        assert_eq!(find("Sonoma"), Some("14.8.9"));
+        assert_eq!(find("macos14"), Some("14.8.9"));
+        assert_eq!(find("13"), None);
+        assert_eq!(find("2"), None);
+        let os = Os::from_release(Release::find(&rows, "14").unwrap(), true);
+        assert_eq!((os.product.as_str(), os.build.as_str(), os.release.as_str(), os.compat(), os.ios()), ("14.8.9", "23J631", "23.6.0", "10.16", None));
+        let os = Os::from_release(Release::find(&rows, "27.0.1").unwrap(), false);
+        assert_eq!(os.compat(), "");
+        assert_eq!(os.ios(), Some("27.0"));
+    }
+
+    #[test]
+    fn the_kernel_is_named_as_the_release_says() {
+        let rows = Release::parse(TABLE);
+        let v = |s: &str| darwin_version(&Os::from_release(Release::find(&rows, s).unwrap(), true));
+        // (27 on either processor: an x86-64 program on it is under Rosetta.)
+        assert_eq!(v("27.0.1"), "Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T8103");
+        assert_eq!(v("27.0"), "Darwin Kernel Version 27.0.0: gex; root:xnu-13432/RELEASE_ARM64_T8103");
+        let intel = if gex_abi::X86 { "X86_64" } else { "ARM64_T8103" };
+        assert_eq!(v("14"), format!("Darwin Kernel Version 23.6.0: gex; root:{XNU}/RELEASE_{intel}"));
+    }
+
+    #[test]
+    fn a_chosen_release_has_the_files_a_mac_of_it_has() {
+        let rows = Release::parse(TABLE);
+        let os = Os::from_release(Release::find(&rows, "27.0").unwrap(), true);
+        let files = os.files();
+        assert_eq!(files.iter().map(|f| f.0).collect::<Vec<_>>(), [SYSTEM_VERSION, IOS_VERSION]);
+        // As the SDK's own SystemVersion.plist is, byte for byte.
+        let want = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\
+            \t<key>BuildID</key>\n\t<string>F8088D3E-A1DA-11F1-AAD4-A82B6E44CE4F</string>\n\t<key>ProductBuildVersion</key>\n\t<string>26A425</string>\n\
+            \t<key>ProductCopyright</key>\n\t<string>1983-2026 Apple Inc.</string>\n\t<key>ProductName</key>\n\t<string>macOS</string>\n\
+            \t<key>ProductUserVisibleVersion</key>\n\t<string>27.0</string>\n\t<key>ProductVersion</key>\n\t<string>27.0</string>\n\
+            \t<key>iOSSupportVersion</key>\n\t<string>27.0</string>\n</dict>\n</plist>\n";
+        assert_eq!(String::from_utf8_lossy(&files[0].1), want);
+        assert_eq!(Os::from_plist(&files[0].1).map(|o| (o.product, o.build)), Some(("27.0".into(), "26A425".into())));
+        let os = Os::from_release(Release::find(&rows, "14").unwrap(), true);
+        let files = os.files();
+        assert_eq!(files.iter().map(|f| f.0).collect::<Vec<_>>(), [SYSTEM_VERSION, COMPAT_VERSION]);
+        assert!(String::from_utf8_lossy(&files[1].1).contains("<key>ProductVersion</key>\n\t<string>10.16</string>"));
     }
 }
 

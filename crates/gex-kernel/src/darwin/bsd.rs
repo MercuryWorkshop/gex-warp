@@ -134,8 +134,10 @@ impl Kernel {
             // (`oflags::from_guest`).
             // (A descriptor opened by its number, or a file locked as it
             // is opened, is more than the kernel's `openat`.)
-            d::OPEN | d::OPEN_NOCANCEL if darwin_open_is_more(m, x[0], x[1]) => NATIVE + code,
-            d::OPENAT | d::OPENAT_NOCANCEL if darwin_open_is_more(m, x[1], x[2]) => NATIVE + code,
+            // (And so is one of the files that say which system this is,
+            // for a process told it is another: [`Kernel::darwin_served`].)
+            d::OPEN | d::OPEN_NOCANCEL if darwin_open_is_more(m, x[0], x[1]) || self.darwin_served(m, CWD, x[0]).is_some() => NATIVE + code,
+            d::OPENAT | d::OPENAT_NOCANCEL if darwin_open_is_more(m, x[1], x[2]) || self.darwin_served(m, dirfd(x[0]), x[1]).is_some() => NATIVE + code,
             d::OPEN | d::OPEN_NOCANCEL => set(nr::OPENAT, &[CWD, x[0], x[1], x[2]]),
             d::OPENAT | d::OPENAT_NOCANCEL => set(nr::OPENAT, &[dirfd(x[0]), x[1], x[2], x[3]]),
             // (path, flags, protection class, protection flags, mode):
@@ -301,6 +303,10 @@ impl Kernel {
             // not a file of `/dev`'s.)
             d::STAT64 | d::LSTAT64 if fd_named(m, x[0], code == d::STAT64).is_some() => set(nr::FSTAT, &[fd_named(m, x[0], true).unwrap_or(0), x[1]]),
             d::FSTATAT64 if fd_named(m, x[1], x[3] & 0x20 == 0).is_some() => set(nr::FSTAT, &[fd_named(m, x[1], true).unwrap_or(0), x[2]]),
+            // (One of the files that say which system this is, as it is
+            // given a process told it is another: as it opens.)
+            d::STAT64 | d::LSTAT64 if self.darwin_served(m, CWD, x[0]).is_some() => NATIVE + code,
+            d::FSTATAT64 if self.darwin_served(m, dirfd(x[0]), x[1]).is_some() => NATIVE + code,
             d::STAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], 0]),
             d::LSTAT64 => set(nr::NEWFSTATAT, &[CWD, x[0], x[1], K_NOFOLLOW]),
             // (Shared memory is no kind of file.)
@@ -630,6 +636,13 @@ impl Kernel {
                 }
                 self.dispatch(m, nr::FACCESSAT, [dir, path, mode, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))
             }
+            d::STAT64 | d::LSTAT64 | d::FSTATAT64 => {
+                let (dir, path, stat) = if code == d::FSTATAT64 { (dirfd(x[0]), x[1], x[2]) } else { (CWD, x[0], x[1]) };
+                let fd = self.darwin_open(m, dir, path, 0, 0)?;
+                let r = self.dispatch(m, nr::FSTAT, [fd, stat, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF));
+                let _ = self.dispatch(m, nr::CLOSE, [fd, 0, 0, 0, 0, 0]);
+                r
+            }
             d::OPEN | d::OPEN_NOCANCEL => self.darwin_open(m, CWD, x[0], x[1], x[2]),
             d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
             d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),
@@ -895,6 +908,16 @@ impl Kernel {
     /// the file is opened, as `flock` takes one; a lock that cannot be had
     /// at once is `EAGAIN`, whether the caller would have waited or not.
     fn darwin_open(&mut self, m: &mut GuestMem<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
+        if let Some(data) = self.darwin_served(m, dirfd, path) {
+            let data = data.ok_or(Errno::ENOENT)?;
+            // The system's, which nobody but its owner writes.
+            if flags & 3 != 0 {
+                return Err(Errno::EACCES);
+            }
+            let name = String::from_utf8_lossy(&m.read_cstr(path, 1024)?).into_owned();
+            let file = crate::file::OpenFile::new(Arc::new(super::info::VersionFile(data)), name, 0, true, false);
+            return self.fds.insert(file, flags & abi::o::CLOEXEC != 0);
+        }
         if let Some(fd) = dev_fd(&m.read_cstr(path, 64).unwrap_or_default()) {
             // (What the open file can do, not what its flags say: the
             // streams a process is born with keep no access mode there.)
@@ -950,6 +973,18 @@ impl Kernel {
             }
         }
         Ok(fd)
+    }
+
+    /// What a process told it is another release than its root's is given
+    /// for the file `path` names (from the working directory, or absolute),
+    /// if it is one of the files that say which system this is
+    /// ([`Kernel::darwin_version_file`]).
+    pub(super) fn darwin_served(&self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> Option<Option<Vec<u8>>> {
+        let p = m.read_cstr(path, 1024).ok()?;
+        if !p.ends_with(b".plist") || (p.first() != Some(&b'/') && dirfd != CWD) {
+            return None;
+        }
+        self.darwin_version_file(std::str::from_utf8(&p).ok()?)
     }
 
     /// The open file at `fd`, if it is POSIX shared memory: a file of the

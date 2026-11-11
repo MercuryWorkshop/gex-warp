@@ -769,6 +769,11 @@ pub struct Kernel {
     /// The system a Darwin process is told it is on, once asked
     /// ([`darwin::info::Os`]).
     pub darwin_os: Arc<std::sync::OnceLock<darwin::info::Os>>,
+    /// Whether the task has asked to be shown the version a program built
+    /// for 10.15 or before is (`kern.system_version_compat`, which
+    /// Libsystem's initializer sets): its threads', a fork's too, not the
+    /// next program's.
+    pub darwin_compat: Arc<std::sync::atomic::AtomicBool>,
     /// What the process registered of its threads ([`darwin::thread`]).
     pub darwin_threads: Arc<std::sync::Mutex<darwin::thread::Registration>>,
     /// Set by a syscall that may have made a descriptor readable or
@@ -10397,6 +10402,7 @@ impl Kernel {
             darwin_restart: Arc::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
+            darwin_compat: Default::default(),
             darwin_threads: Default::default(),
             fd_activity: false,
             wasm32: false,
@@ -10569,6 +10575,10 @@ impl Kernel {
         self.darwin_reclaim = None;
         self.darwin_restart.clear();
         self.darwin_spawn_at = None;
+        // Which system the new program is told it is on is its own to work
+        // out: its environment may choose another release.
+        self.darwin_os = Default::default();
+        self.darwin_compat = Default::default();
     }
 
     /// Everything `execve` can fail at before the point of no return.
@@ -10918,6 +10928,7 @@ impl Kernel {
             darwin_restart: Arc::new(self.darwin_restart.copy()),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
+            darwin_compat: Arc::new(std::sync::atomic::AtomicBool::new(self.darwin_compat.load(std::sync::atomic::Ordering::Relaxed))),
             // The child's libpthread is the parent's, registered already.
             darwin_threads: Arc::new(std::sync::Mutex::new(*self.darwin_threads.lock().unwrap_or_else(|e| e.into_inner()))),
             fd_activity: false,
