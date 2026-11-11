@@ -97,6 +97,11 @@ pub enum Role {
     /// The surface a client handed to `wl_pointer.set_cursor`. Drawn at the
     /// pointer, offset by its hotspot -- never a window, never hit-tested.
     Cursor,
+    /// The icon of a drag the client started (`wl_data_device.start_drag`'s
+    /// icon), while the host carries the drag: drawn at the pointer as a
+    /// cursor is, `rel_x`/`rel_y` its hotspot (the negative of the offset
+    /// its attaches moved it by) -- never a window, never hit-tested.
+    DragIcon,
 }
 
 impl Role {
@@ -108,6 +113,7 @@ impl Role {
             Role::Popup => 2,
             Role::Subsurface => 3,
             Role::Cursor => 4,
+            Role::DragIcon => 5,
         }
     }
 }
@@ -903,6 +909,9 @@ pub struct Client {
     /// implicit grab, which keeps the pointer until the last is up.
     held: Vec<u32>,
     grab_surface: Option<u32>,
+    /// The window a host with no hit test of its own put the pointer over
+    /// ([`Client::point_window`]), for [`Client::pointer_in_window`].
+    window_choice: Option<u32>,
     /// A keyboard was created and owes a `keymap` event whose fd the host must
     /// attach: this is the payload, taken once by [`Client::take_keymap`].
     pending_keymap: Option<Vec<u8>>,
@@ -968,6 +977,7 @@ impl Client {
             held_releases: Vec::new(),
             held: Vec::new(),
             grab_surface: None,
+            window_choice: None,
             pending_keymap: None,
             data: data::DataState::default(),
             relative_pointers: Vec::new(),
@@ -1581,10 +1591,17 @@ impl Client {
                 let Some(buffer) = r.object() else {
                     return false;
                 };
-                let (_x, _y) = (r.int(), r.int());
+                let (x, y) = (r.int(), r.int());
                 if let Some(s) = self.surfaces.get_mut(&object) {
                     s.pending_buffer = if buffer == 0 { None } else { Some(buffer) };
                     s.pending_null = buffer == 0;
+                    // A drag icon's attach moves it by (x, y) from where it
+                    // was under the pointer: its hotspot the other way.
+                    if s.role == Role::DragIcon {
+                        s.rel_x -= x.unwrap_or(0);
+                        s.rel_y -= y.unwrap_or(0);
+                        self.dirty = true;
+                    }
                 }
                 true
             }
@@ -3226,7 +3243,7 @@ impl Client {
 
     /// The toplevel a surface belongs to: itself, or the toplevel at the end
     /// of its chain of parents (a popup's, a subsurface's).
-    fn toplevel_of(&self, mut surface: u32) -> Option<u32> {
+    pub fn toplevel_of(&self, mut surface: u32) -> Option<u32> {
         for _ in 0..64 {
             let s = self.surfaces.get(&surface)?;
             match s.role {
@@ -3294,6 +3311,50 @@ impl Client {
         })
     }
 
+    /// The window [`Client::pointer_in_window`]'s points are in: the one the
+    /// host chose ([`Client::point_window`]), else the one the pointer is on
+    /// or was sent to, else the one with the keyboard, else the newest shown
+    /// (a host that places pixels names no focus).
+    fn pointer_window(&self) -> Option<u32> {
+        let newest = || {
+            self.surfaces
+                .iter()
+                .filter(|(_, s)| s.role == Role::Toplevel && s.committed_buffer.is_some())
+                .map(|(id, _)| *id)
+                .max()
+        };
+        self.window_choice
+            .filter(|t| self.surfaces.get(t).is_some_and(|s| s.role == Role::Toplevel))
+            .or_else(|| self.pointer_on.or(self.pointer_target).or(self.focus_surface).and_then(|s| self.toplevel_of(s)))
+            .or_else(newest)
+    }
+
+    /// For a host with no hit test of its own (the native host's scripted
+    /// input): from now on [`Client::pointer_in_window`]'s points are in
+    /// window `top` (a toplevel), or, with `None`, in whichever it would
+    /// pick. A window that is not this client's toplevel is no choice.
+    pub fn point_window(&mut self, top: Option<u32>) {
+        self.window_choice = top;
+    }
+
+    /// This client's toplevel titled `title`, the newest if there are more.
+    pub fn toplevel_titled(&self, title: &str) -> Option<u32> {
+        self.surfaces
+            .iter()
+            .filter(|(_, s)| s.role == Role::Toplevel && s.title == title)
+            .map(|(id, _)| *id)
+            .max()
+    }
+
+    /// The surface of [`Client::pointer_in_window`]'s window at its point
+    /// `(x, y)` -- a popup over it, a subsurface, the toplevel -- and the
+    /// point in that surface: where a drag the host carries is over, for a
+    /// host with no hit test of its own. `None` over none of them.
+    pub fn window_point(&self, x: i32, y: i32) -> Option<(u32, i32, i32)> {
+        let top = self.pointer_window()?;
+        self.window_hit(top, x, y)
+    }
+
     /// The pointer moved to `(x, y)` of the focused window -- its toplevel's
     /// pixels -- for a host that composites one window and has no hit test
     /// of its own (the native host's scripted input). It goes to whichever
@@ -3308,16 +3369,7 @@ impl Client {
         if self.is_dragging() {
             return;
         }
-        // (a host that places pixels names no focus: its newest window)
-        let newest = || {
-            self.surfaces
-                .iter()
-                .filter(|(_, s)| s.role == Role::Toplevel && s.committed_buffer.is_some())
-                .map(|(id, _)| *id)
-                .max()
-        };
-        let top = self.pointer_on.or(self.pointer_target).or(self.focus_surface).and_then(|s| self.toplevel_of(s)).or_else(newest);
-        let Some(top) = top else {
+        let Some(top) = self.pointer_window() else {
             self.pointer_motion(x, y, time);
             return;
         };
@@ -5314,6 +5366,60 @@ mod tests {
         // Pointer events reach it again.
         src.pointer_motion(11, 11, 7);
         assert!(src.failed.is_none() && dst.failed.is_none());
+    }
+
+    #[test]
+    fn a_taken_drag_leaves_the_pointer_and_shows_its_icon_until_it_ends() {
+        let mut src = with_data_device(3);
+        // get_pointer(13), on the window with a button down: the press.
+        src.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
+        src.pointer_to(6, 5, 5, 1);
+        src.pointer_button(0x110, true, 2);
+        // An icon surface (40) with the window's buffer on it.
+        src.receive(&Writer::new(3, 0).new_id(40).finish(), &[], &no_pool());
+        src.receive(&Writer::new(40, 1).object(10).int(0).int(0).finish(), &[], &no_pool());
+        src.receive(&Writer::new(40, 6).finish(), &[], &no_pool());
+        src.receive(&Writer::new(20, 0).new_id(30).finish(), &[], &no_pool());
+        src.receive(&Writer::new(30, 0).string("text/plain").finish(), &[], &no_pool());
+        src.receive(&Writer::new(21, 0).object(30).object(6).object(40).uint(1).finish(), &[], &no_pool());
+        let _ = src.take_outgoing();
+        assert_eq!(src.take_drag_start().and_then(|d| d.icon), Some(40));
+        assert!(messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 13 && *op == 1), "the pointer leaves for the drag");
+        assert_eq!(src.surfaces[&40].role, Role::DragIcon);
+        assert_eq!(src.drag_icon(), Some((40, 0, 0)));
+        // An attach of (-4, -6) moves the icon up and left: its hotspot (4, 6).
+        src.receive(&Writer::new(40, 1).object(10).int(-4).int(-6).finish(), &[], &no_pool());
+        assert_eq!((src.surfaces[&40].rel_x, src.surfaces[&40].rel_y), (4, 6));
+        src.drag_source_cancel(Some(30));
+        assert_eq!(src.surfaces[&40].role, Role::None, "not drawn once the drag is over");
+        assert_eq!(src.drag_icon(), None);
+        // No implicit grab left from the press: the pointer is anyone's again.
+        src.pointer_to(6, 1, 1, 3);
+        let msgs = messages(&src.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 0), "entered again");
+        assert!(src.grab_surface.is_none() && src.held.is_empty());
+        assert!(src.failed.is_none(), "{:?}", src.failed);
+    }
+
+    #[test]
+    fn a_host_with_no_hit_test_names_the_window_its_points_are_in() {
+        let mut c = with_seat();
+        // A second toplevel (41), titled, with the same buffer.
+        c.receive(&Writer::new(3, 0).new_id(41).finish(), &[], &no_pool());
+        c.receive(&Writer::new(5, 2).new_id(42).object(41).finish(), &[], &no_pool());
+        c.receive(&Writer::new(42, 1).new_id(43).finish(), &[], &no_pool());
+        c.receive(&Writer::new(43, 2).string("the other").finish(), &[], &no_pool());
+        c.receive(&Writer::new(42, 4).uint(3).finish(), &[], &no_pool());
+        c.receive(&Writer::new(41, 1).object(10).int(0).int(0).finish(), &[], &no_pool());
+        c.receive(&Writer::new(41, 6).finish(), &[], &no_pool());
+        assert_eq!(c.toplevel_titled("the other"), Some(41));
+        assert_eq!(c.toplevel_titled("a window"), Some(6));
+        assert_eq!(c.toplevel_titled("none"), None);
+        c.point_window(Some(6));
+        assert_eq!(c.window_point(1, 1), Some((6, 1, 1)));
+        assert_eq!(c.window_point(5, 5), None, "outside its 2x2");
+        c.point_window(Some(41));
+        assert_eq!(c.window_point(0, 1), Some((41, 0, 1)));
     }
 
     #[test]

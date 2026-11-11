@@ -29,7 +29,7 @@
 //!   the client is sent no pointer motion or buttons.
 
 use crate::wire::{Fixed, Reader, Writer};
-use crate::{Client, Object};
+use crate::{Client, Object, Role};
 use std::collections::HashMap;
 
 /// `wl_data_device_manager.dnd_action` bits.
@@ -155,6 +155,8 @@ pub(crate) struct DataState {
     /// The client's own drag is under way, taken by the host: its source,
     /// 0 for none.
     dragging: Option<u32>,
+    /// That drag's icon surface, drawn by the host while it lasts.
+    icon: Option<u32>,
 }
 
 /// The action for a drop: the client's preferred one when the source has
@@ -247,7 +249,7 @@ impl Client {
                 self.objects.remove(&object);
                 self.data.sources.remove(&object);
                 if self.data.dragging == Some(object) {
-                    self.data.dragging = None;
+                    self.drag_over();
                 }
                 if self.data.selection == Some(object) {
                     self.data.selection = None;
@@ -466,8 +468,42 @@ impl Client {
     /// pointer as it was, and its drags do nothing, as before.
     pub fn take_drag_start(&mut self) -> Option<DragStart> {
         let d = self.data.drag_start.take()?;
+        // The pointer leaves the client's surfaces for the drag (as wlroots'
+        // grab clears the pointer's focus), and the press that started it is
+        // the drag's: no implicit grab is left behind for after it.
+        self.pointer_clear();
+        self.held.clear();
+        self.grab_surface = None;
         self.data.dragging = Some(d.source.unwrap_or(0));
+        // The icon: drawn at the pointer, its hotspot its top left until an
+        // attach moves it.
+        if let Some(s) = d.icon.and_then(|i| self.surfaces.get_mut(&i)) {
+            s.role = Role::DragIcon;
+            s.rel_x = 0;
+            s.rel_y = 0;
+            self.data.icon = d.icon;
+            self.dirty = true;
+        }
         Some(d)
+    }
+
+    /// The drag is over for the pointer: its icon is not drawn any more.
+    fn drag_over(&mut self) {
+        self.data.dragging = None;
+        if let Some(i) = self.data.icon.take() {
+            if let Some(s) = self.surfaces.get_mut(&i).filter(|s| s.role == Role::DragIcon) {
+                s.role = Role::None;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The icon surface of the client's drag under way, if it has one, and
+    /// its hotspot: drawn with that point at the pointer.
+    pub fn drag_icon(&self) -> Option<(u32, i32, i32)> {
+        let i = self.data.icon.filter(|_| self.data.dragging.is_some())?;
+        let s = self.surfaces.get(&i)?;
+        Some((i, s.rel_x, s.rel_y))
     }
 
     /// Whether the client's own drag is under way: the pointer is the
@@ -505,7 +541,7 @@ impl Client {
     /// The drag is over for the pointer; the source waits for the target's
     /// finish ([`Client::drag_source_finished`]).
     pub fn drag_source_drop(&mut self, source: Option<u32>) {
-        self.data.dragging = None;
+        self.drag_over();
         if let Some(s) = source.filter(|s| self.data.sources.contains_key(s)) {
             self.send(Writer::new(s, 3));
         }
@@ -521,7 +557,7 @@ impl Client {
     /// The drag ended with nothing taking it (released over nothing that
     /// accepts, or the host gave up on it): `cancelled`.
     pub fn drag_source_cancel(&mut self, source: Option<u32>) {
-        self.data.dragging = None;
+        self.drag_over();
         if let Some(s) = source.filter(|s| self.data.sources.contains_key(s)) {
             self.send(Writer::new(s, 2));
         }
