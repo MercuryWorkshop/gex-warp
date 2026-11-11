@@ -1408,10 +1408,12 @@ impl TmpFs {
             }),
             Node::Dir => {
                 let d = Metadata::dir();
+                let (nlink, entries) = TmpFs::dir_counts(inner, path);
                 Ok(Metadata {
                     ino,
                     mtime: mtime(),
-                    nlink: TmpFs::dir_nlink(inner, path),
+                    nlink,
+                    size: TmpFs::dir_size(entries),
                     mode: inner.modes.get(path).copied().unwrap_or(d.mode),
                     ..d
                 })
@@ -1458,6 +1460,12 @@ impl TmpFs {
     /// directory is 2, which is what programs test to decide it has no
     /// subdirectories without reading it.
     fn dir_nlink(inner: &Inner, path: &str) -> u32 {
+        TmpFs::dir_counts(inner, path).0
+    }
+
+    /// A directory's link count (two and one for each directory in it) and
+    /// how many entries it has, `.` and `..` aside.
+    fn dir_counts(inner: &Inner, path: &str) -> (u32, u64) {
         let prefix = if path.is_empty() {
             String::new()
         } else {
@@ -1471,6 +1479,7 @@ impl TmpFs {
         // `fdopendir` makes one per case-insensitive lookup).
         use std::ops::Bound::{Included, Unbounded};
         let mut subdirs = 0u32;
+        let mut entries = 0u64;
         let mut names = inner.nodes.range::<String, _>((Included(prefix.clone()), Unbounded));
         while let Some((k, v)) = names.next() {
             let Some(rest) = k.strip_prefix(&prefix) else {
@@ -1481,13 +1490,28 @@ impl TmpFs {
                     names = inner.nodes.range::<String, _>((Included(format!("{prefix}{}0", &rest[..i])), Unbounded));
                 }
                 None => {
-                    if !rest.is_empty() && matches!(v, Node::Dir) {
-                        subdirs += 1;
+                    if !rest.is_empty() {
+                        entries += 1;
+                        if matches!(v, Node::Dir) {
+                            subdirs += 1;
+                        }
                     }
                 }
             }
         }
-        2 + subdirs
+        (2 + subdirs, entries)
+    }
+
+    /// A directory's size: Linux's 4096, or for a Mac program what APFS
+    /// says of one, 64 and 32 more for each entry (measured on a Mac: 64
+    /// empty, 96, 128, 384 with ten, 3264 with a hundred, and down again
+    /// as entries go, whatever their names' lengths).
+    fn dir_size(entries: u64) -> u64 {
+        if crate::darwin::on() {
+            64 + 32 * entries
+        } else {
+            Metadata::dir().size
+        }
     }
 }
 
