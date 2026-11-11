@@ -454,8 +454,15 @@ pub extern "C" fn gex_set_page_flavours(bits: i32) {
 /// false AArch64: by its ELF header's machine, or a Mach-O's (of a
 /// universal one's, this Worker's own when it is among them). `None`: for
 /// neither, or no program this can tell of (a script's interpreter is what
-/// an exec names by now; a gex wasm container runs no translated code).
+/// an exec names by now). A native wasm program's container is an i386 (or
+/// x86-64) ELF around a wasm module: none of its code is a processor's
+/// unless its header says it runs translated x86 code (Wine's loader, the
+/// header's flags 1 or 2), so it runs on whichever runtime it is exec'd
+/// from, and is not sent to the x86-64 one for its ELF's machine.
 fn exec_arch(path: &str) -> Option<bool> {
+    if let Some((_, _, flags)) = wasm_program_image(path) {
+        return (flags & 3 != 0).then_some(true);
+    }
     let home = crate::sigs::proc_home();
     let mut head = [0u8; 4096];
     let n = home.read_file_at(path, 0, &mut head)?;

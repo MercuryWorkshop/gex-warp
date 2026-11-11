@@ -31,9 +31,17 @@ static void waited(const char *what, long pid) {
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)apple;
     if (argc > 1 && !t_strcmp(argv[1], "say")) {
+        // And what the system says this process's processor is: its own,
+        // whichever the system's is (Rosetta's x86-64 process is told
+        // x86_64 on an arm64 Mac).
+        char machine[32];
+        unsigned long len = sizeof machine - 1;
+        if (SYS(SYS_sysctlbyname, "hw.machine", 10, machine, &len, 0, 0) != 0) len = 0;
+        machine[len < sizeof machine ? len : sizeof machine - 1] = 0;
+        if (!machine[0]) machine[0] = '?', machine[1] = 0;
         t_printf("%s:", ME);
         for (int i = 2; i < argc; i++) t_printf(" %s", argv[i]);
-        t_printf(" (T_VAR %s)\n", t_getenv(envp, "T_VAR"));
+        t_printf(" (T_VAR %s, hw.machine %s)\n", t_getenv(envp, "T_VAR"), machine);
         return 3;
     }
     if (argc > 2 && !t_strcmp(argv[1], "hop")) {

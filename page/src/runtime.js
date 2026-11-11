@@ -595,7 +595,9 @@ export async function makeProcessHost({
   // both. With the global kernel, which serves either; not on a 64-bit
   // memory's page (`?mem64=1`), whose runtime is built for x86-64 alone.
   const otherInfix = guestArch() === 'x86' ? '' : '.x86';
-  const otherArch = globalThis.GEX_BOTH_ARCHES && kernel && !globalThis.GEX_MEM64 ? {
+  // Nor in the single-thread build, whose fibers share one realm and one
+  // shim's glue.
+  const otherArch = globalThis.GEX_BOTH_ARCHES && kernel && !globalThis.GEX_MEM64 && !(SP_CODE && single.on) ? {
     arch: guestArch() === 'x86' ? 'aarch64' : 'x86',
     shim: await otherBytes(assetUrl(`/gex/gex_browser${otherInfix}.shared.wasm`)),
     guest: await otherBytes(assetUrl(`/gex/seed${otherInfix}.shared.wasm`)),

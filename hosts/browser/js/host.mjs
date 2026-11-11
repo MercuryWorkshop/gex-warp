@@ -1032,6 +1032,7 @@ export class ProcessHost {
       maxPages,
       flavourOf: [...this.#flavourOf],
       archOf: [...this.#archOf],
+      otherArch: this.#otherArch?.arch ?? null,
       at,
       // what the references are to (`restore` takes only the same)
       bundle: kernel.refs.length ? sources.id ?? null : null,
@@ -1063,6 +1064,12 @@ export class ProcessHost {
     this.#restored = true;
     watchLibraries();
     if (!this.#kernel?.memory) throw new Error('restore: no global kernel');
+    // A process of the other processor goes on in a Worker of that one's
+    // runtime: a session without it, or with the two the other way round,
+    // would start it on a shim that cannot run its program's code.
+    if (meta.archOf?.length && (!this.#otherArch || (meta.otherArch && meta.otherArch !== this.#otherArch.arch))) {
+      throw new Error(`restore: the snapshot has processes of ${meta.otherArch ?? 'another'} processor, which this session does not run (bothArches)`);
+    }
     if (kernel.refs?.length && (!sources || (sources.id ?? null) !== meta.bundle)) {
       throw new Error(`restore: the snapshot's pages are by reference to bundle ${meta.bundle}, and this session's is ${sources?.id ?? 'none'}`);
     }
@@ -1075,7 +1082,7 @@ export class ProcessHost {
     Atomics.store(words, word, 1);
     this.#stacks = meta.stacks;
     for (const [p, f] of meta.flavourOf ?? []) this.#flavourOf.set(p, f);
-    for (const p of meta.archOf ?? []) if (this.#otherArch) this.#archOf.add(p);
+    for (const p of meta.archOf ?? []) this.#archOf.add(p);
     inform(`[gex] restore: ${meta.threads.length} threads of ${memories.size} processes`);
     const byPid = new Map();
     for (const t of meta.threads) {

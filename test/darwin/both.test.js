@@ -12,6 +12,8 @@ import { bytesOf } from '../../page/runtime/src/internal.js';
 export const meta = { hosts: ['browser', 'node'], arches: ['a64', 'x86'], images: ['darwin-root'], timeout: 300 };
 
 const NAME = { x86: 'x86-64', aarch64: 'arm64' };
+// What `sysctl hw.machine` tells a process of each (a Mac's names).
+const MACHINE = { x86: 'x86_64', aarch64: 'arm64' };
 
 export default async function (t) {
   const { eq, timeout } = t;
@@ -31,22 +33,24 @@ export default async function (t) {
   await timeout(sys.boot(), 60000, 'boot');
   const env = { T_VAR: 'yes' };
   const [me, it] = [NAME[arch], NAME[other]];
-  const through = `${it}: through a pipe (T_VAR yes)\n`;
+  // Each process is told its own processor, whichever the system's is.
+  const said = (who, words) => `${NAME[who]}: ${words} (T_VAR yes, hw.machine ${MACHINE[who]})`;
+  const through = `${said(other, 'through a pipe')}\n`;
   const r = await timeout(sys.run(['/tmp/arches', '/tmp/arches-other', '/tmp/arches'], { env, cwd: '/tmp' }), 120000, 'the two');
   eq('the system\'s own, the other its child', [r.stdout, r.code], [[
     `${me}: the first`,
-    `${it}: a child (T_VAR yes)`,
+    said(other, 'a child'),
     'the other as a child: waited for, status 300',
     `read ${through.length} bytes: ${through.trimEnd()}`,
     'the writer: waited for, status 300',
     `${it}: becoming another`,
-    `${me}: back again (T_VAR yes)`,
+    said(arch, 'back again'),
     'there and back: waited for, status 300',
     `${me}: the first, still`,
     '',
   ].join('\n'), 0]);
   // The other processor's program, started by the page itself.
   const s = await timeout(sys.run(['/tmp/arches-other', 'say', 'from', 'the', 'page'], { env, cwd: '/tmp' }), 120000, 'the other alone');
-  eq('the other, started by the page', [s.stdout, s.code], [`${it}: from the page (T_VAR yes)\n`, 3]);
+  eq('the other, started by the page', [s.stdout, s.code], [`${said(other, 'from the page')}\n`, 3]);
   await sys.shutdown();
 }
