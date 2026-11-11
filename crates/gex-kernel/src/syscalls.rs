@@ -4886,7 +4886,10 @@ impl MapIo<'_> {
     }
 
     pub fn mmap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let shared = a[3] & crate::mem::flags::SHARED != 0;
+        // A second mapping of a file mapped shared already is handed the
+        // first one's pages (`mmap_placed`), which are a share already:
+        // neither placed anew nor a share of its own.
+        let shared = a[3] & crate::mem::flags::SHARED != 0 && !self.aliases(a);
         let (a, end) = if shared { self.place_shared(a)? } else { (a, 0) };
         let r = self.mmap_placed(m, a);
         // What a fork shares with the child ([`crate::mem::Share`]): from
@@ -4901,6 +4904,29 @@ impl MapIo<'_> {
             }
         }
         r
+    }
+
+    /// Whether `mmap(a)`, a shared mapping of a file, is one
+    /// [`Self::mmap_placed`] answers with the pages of a shared mapping of
+    /// the same file this process has already: the same test.
+    fn aliases(&self, a: [u64; 6]) -> bool {
+        let (addr, len, flags, fd, offset) = (a[0], a[1], a[3], a[4] as i32, a[5]);
+        if flags & mflags::ANONYMOUS != 0 || fd < 0 {
+            return false;
+        }
+        let Ok(file) = self.fds.get(fd) else { return false };
+        if file.handle.maps_own_memory() {
+            return false;
+        }
+        let len_aligned = crate::mem::page_align_up(len);
+        let _ = file.ino(); // asked outside the lock (file I/O), as there
+        let mm = self.mem.lock();
+        mm.log.shared_maps.iter().any(|s| {
+            s.file.same_file(&file)
+                && s.offset <= offset
+                && offset + len_aligned <= s.offset + s.len
+                && (flags & mflags::FIXED == 0 || addr == s.start + (offset - s.offset))
+        })
     }
 
     /// A `MAP_SHARED` mapping with no address of the caller's (or a hint
