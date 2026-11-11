@@ -779,6 +779,7 @@ fn refresh_ident_snapshot(p: &Px<'_>) {
         let Some((id, off)) = v.code.as_ref() else { continue };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut hasher);
+        root_salt(&mut hasher, p.ns, id);
         snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
@@ -13451,6 +13452,7 @@ fn object_identity_mode(p: &Px<'_>, addr: u64, alt: bool) -> Option<u64> {
     let (id, _) = v.code.as_ref()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
+    root_salt(&mut hasher, p.ns, id);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);
     let key = hasher.finish();
@@ -13496,6 +13498,29 @@ fn flavour_salt(h: &mut impl std::hash::Hasher) {
         h.write_u64(map);
     }
     arch_salt(h);
+}
+
+/// The root in a code identity: a code identity is the file's name as the
+/// process has it, and a process in a root of its own (a Mac program's
+/// tree, entered; a `chroot`) names its files as another root names other
+/// files (`/usr/lib/...` in a Mac root, in the Linux tree, in another
+/// version's Mac root beside it). Its identities take the root's name in
+/// the namespace the process started with ([`gex_kernel::vfs::Namespace::root`]),
+/// which with the name makes the file's own name there. A process at the
+/// system's own root adds nothing, so its keys -- the common case, every
+/// process of a one-tree system -- and the units and caches kept by them
+/// stay as they were. One named by its bytes ([`gex_kernel::mem::CONTENT_ID`])
+/// is the same code whatever the root. (Taken when the key is made, not
+/// when the file was mapped: code a process mapped before a `chroot` of its
+/// own is keyed by the new root after it, as a file of that root by the
+/// same name would be. Rare -- a root is entered at an exec, before
+/// anything is mapped -- and not covered.)
+fn root_salt(h: &mut impl std::hash::Hasher, ns: &gex_kernel::vfs::Namespace, id: &str) {
+    let root = ns.root();
+    if root != "/" && !id.starts_with(gex_kernel::mem::CONTENT_ID) {
+        h.write_u8(0x2f);
+        h.write(root.as_bytes());
+    }
 }
 
 /// The processor in a code identity: a process of the other processor's
@@ -13920,6 +13945,7 @@ fn page_identity_mode(p: &Px<'_>, page: u64, alt: bool) -> Option<u64> {
     // the `(page, identity)` key.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
+    root_salt(&mut hasher, p.ns, id);
     (off + (page - v.start)).hash(&mut hasher);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);
