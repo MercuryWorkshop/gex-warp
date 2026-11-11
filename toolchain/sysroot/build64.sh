@@ -61,7 +61,9 @@ make -s -j"$JOBS" install-headers install-libs >/dev/null
 SR="$OUT/sysroot/include"
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
 cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+# (Debian keeps asm/ under the multiarch directory)
+ASMDIR=/usr/include/asm; [ -d "$ASMDIR" ] || ASMDIR=/usr/include/$(gcc -print-multiarch)/asm
+cp -rL "$ASMDIR" "$SR/asm"
 
 # libgex: the wasm32 runtime's setjmp and dlopen (data-model neutral C) and
 # the x86-64 signal-frame runner.

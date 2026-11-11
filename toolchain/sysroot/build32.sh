@@ -94,7 +94,9 @@ fi
 SR="$OUT/sysroot/include"
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
 cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+# (Debian keeps asm/ under the multiarch directory)
+ASMDIR=/usr/include/asm; [ -d "$ASMDIR" ] || ASMDIR=/usr/include/$(gcc -print-multiarch)/asm
+cp -rL "$ASMDIR" "$SR/asm"
 for h in $(grep -l __i386__ "$SR"/asm/*.h); do
   case $h in */swab.h) continue ;; esac
   sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \
