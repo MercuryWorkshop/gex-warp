@@ -11,6 +11,10 @@ LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config || command -v llvm-config-22
 inc=${CLANG_DEV_INCLUDE:-}
 if [ -z "$inc" ]; then
   major=$($LLVM_CONFIG --version | cut -d. -f1)
+  # (libclang-NN-dev installed: its headers are where llvm-config's are)
+  [ ! -f "/usr/lib/llvm-$major/include/clang/Basic/TargetInfo.h" ] || inc=/usr/lib/llvm-$major/include
+fi
+if [ -z "$inc" ]; then
   ver=$(dpkg-query -W -f '${Version}' "libclang-cpp$major" 2>/dev/null || echo unknown)
   cache=$HOME/.cache/gex/libclang-dev/$ver
   inc=$cache/usr/lib/llvm-$major/include
