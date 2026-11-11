@@ -851,6 +851,10 @@ pub enum Inst {
     },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
+    /// AES's four: `aese` and `aesd` (`vd ^ vn` through a round's byte
+    /// substitution and row shift, or their inverses) and `aesmc` and
+    /// `aesimc` (`vn`'s columns mixed, or unmixed).
+    VAes { op: VAesOp, vd: VReg, vn: VReg },
     /// FEAT_SHA3's four on whole registers: `eor3` (`vn ^ vm ^ va`), `bcax`
     /// (`vn ^ (vm & !va)`), `rax1` (`vn ^ rol(vm, 1)` in each doubleword) and
     /// `xar` (`ror(vn ^ vm, rot)` in each doubleword). `va` is only the first
@@ -1436,6 +1440,15 @@ pub enum VSelKind {
 }
 
 /// Fixed byte permutations expressible as a single shuffle.
+/// Which of AES's instructions an [`Inst::VAes`] is.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VAesOp {
+    Encrypt,
+    Decrypt,
+    MixColumns,
+    InvMixColumns,
+}
+
 /// What an [`Inst::Flags`] does to NZCV.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FlagOp {

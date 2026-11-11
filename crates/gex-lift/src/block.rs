@@ -476,6 +476,11 @@ mod tests {
                             VBinOp::AndNot => g(a) & !g(b),
                         },
                         Expr::VBitSelect { mask, a, b } => (g(a) & g(mask)) | (g(b) & !g(mask)),
+                        // wasm's swizzle: a byte of `a` for each index below 16, zero for the rest.
+                        Expr::VSwizzle { a, idx } => {
+                            let (t, i) = (g(a).to_le_bytes(), g(idx).to_le_bytes());
+                            u128::from_le_bytes(core::array::from_fn(|k| if i[k] < 16 { t[i[k] as usize] } else { 0 }))
+                        }
                         e => panic!("not evaluated here: {e:?}"),
                     };
                     val.insert(dst.0, r);
@@ -764,6 +769,48 @@ mod tests {
                 !block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })),
                 "{raw:08x} still goes to the host"
             );
+        }
+    }
+
+    /// `aese`, `aesd`, `aesmc` and `aesimc` are lowered, and to what the reference says of
+    /// them: on every byte value in every place, and on pseudo-random states.
+    #[test]
+    fn aes_words_match_the_reference() {
+        let mut seed = 0x1319_8a2e_0370_7344u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for raw in [0x4e284820u32, 0x4e285820, 0x4e286820, 0x4e287820, 0x4e284800, 0x4e286800] {
+            let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+            assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+            assert!(!block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })), "{raw:08x} goes to the host");
+            let mut states: Vec<(u128, u128)> = Vec::new();
+            for b in 0..=255u128 {
+                // The byte in every place at once, and alone in one that moves with it.
+                states.push((b * 0x0101_0101_0101_0101_0101_0101_0101_0101, 0));
+                states.push((b << (8 * (b % 16)), 0));
+            }
+            for _ in 0..200 {
+                states.push(((rnd() as u128) << 64 | rnd() as u128, (rnd() as u128) << 64 | rnd() as u128));
+            }
+            for (d, n) in states {
+                let mut v = [0u128; 32];
+                (v[0], v[1]) = (d, n);
+                if raw & 0x3e0 == 0 {
+                    v[0] = n; // the one register is both
+                }
+                let mut bytes = [0u8; 512];
+                for (i, r) in v.iter().enumerate() {
+                    bytes[i * 16..i * 16 + 16].copy_from_slice(&r.to_le_bytes());
+                }
+                let mut fpsr = 0;
+                assert!(gex_isa::slow::execute(raw, &mut gex_isa::slow::VRegs(&mut bytes), &mut fpsr), "{raw:08x}");
+                let want = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+                assert_eq!(eval_vectors(&block, &v)[&0], want, "{raw:08x} on {:032x} {:032x}", v[0], v[1]);
+            }
         }
     }
 

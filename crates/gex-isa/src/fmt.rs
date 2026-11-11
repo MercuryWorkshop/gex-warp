@@ -1054,6 +1054,15 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::VAes { op, vd, vn } => {
+            let m = match op {
+                VAesOp::Encrypt => "aese",
+                VAesOp::Decrypt => "aesd",
+                VAesOp::MixColumns => "aesmc",
+                VAesOp::InvMixColumns => "aesimc",
+            };
+            format!("{m} v{}.16b, v{}.16b", vd.0, vn.0)
+        }
         Inst::Flags(op) => match op {
             FlagOp::Cfinv => "cfinv".into(),
             FlagOp::Axflag => "axflag".into(),

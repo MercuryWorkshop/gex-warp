@@ -1495,6 +1495,15 @@ fn decode_simd_fp(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let u = bit(raw, 29);
 
+    // AES: `0100 1110 0010 1000 01 op 10 Rn Rd`.
+    if raw & 0xffff_cc00 == 0x4e28_4800 {
+        return Inst::VAes {
+            op: [VAesOp::Encrypt, VAesOp::Decrypt, VAesOp::MixColumns, VAesOp::InvMixColumns][bits(raw, 13, 12) as usize],
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+        };
+    }
+
     // FEAT_SHA3, under `1100 1110`: eor3 and bcax `00 op Rm 0 Ra Rn Rd`, xar
     // `100 Rm imm6 Rn Rd`, rax1 `011 Rm 1000 11 Rn Rd`. Its neighbours there
     // are SHA-512's (the slow path's, `gex_isa::slow`) and SM3 and SM4, which
@@ -3349,6 +3358,15 @@ mod tests {
                 shift: 0
             }
         );
+    }
+
+    #[test]
+    fn aes_decodes() {
+        let v = |n: u8| VReg(n);
+        assert_eq!(d(0x4e284820), Inst::VAes { op: VAesOp::Encrypt, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e285820), Inst::VAes { op: VAesOp::Decrypt, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e286820), Inst::VAes { op: VAesOp::MixColumns, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e287820), Inst::VAes { op: VAesOp::InvMixColumns, vd: v(0), vn: v(1) });
     }
 
     #[test]

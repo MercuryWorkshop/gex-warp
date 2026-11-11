@@ -2414,6 +2414,45 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // AES, in the vector: Go's runtime hashes every map key with these, and a host
+            // call each (the slow path, where they were) is most of such a program's time.
+            Inst::VAes { op, vd, vn } => {
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let r = match op {
+                    gex_isa::VAesOp::Encrypt | gex_isa::VAesOp::Decrypt => {
+                        let inverse = op == gex_isa::VAesOp::Decrypt;
+                        let d = self.b.read(GuestReg::V128(vd.0));
+                        let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: d, b: n });
+                        // The rows shift first -- bytes only move, so the order is free --
+                        // and then each byte goes through the box. The state is by
+                        // column: byte `r + 4c` is row `r` of column `c`.
+                        let mut lanes = [0u8; 16];
+                        for c in 0..4 {
+                            for r in 0..4 {
+                                let (to, from) = if inverse { (r + (c + r) % 4 * 4, r + c * 4) } else { (r + c * 4, r + (c + r) % 4 * 4) };
+                                lanes[to] = from as u8;
+                            }
+                        }
+                        let moved = self.b.def(Expr::VShuffle { a: x, b: x, lanes: Box::new(lanes) });
+                        self.aes_sub_bytes(moved, inverse)
+                    }
+                    gex_isa::VAesOp::MixColumns => self.aes_mix_columns(n),
+                    gex_isa::VAesOp::InvMixColumns => {
+                        // The inverse is the mix itself of each byte plus four times its
+                        // sum with the one two rows on: 5a + 4c through 2, 3, 1, 1 is
+                        // 14, 11, 13, 9.
+                        let two_on = self.aes_rows_up(n, 2);
+                        let sum = self.b.def(Expr::VBin { op: VBinOp::Xor, a: n, b: two_on });
+                        let twice = self.aes_double(sum);
+                        let four = self.aes_double(twice);
+                        let pre = self.b.def(Expr::VBin { op: VBinOp::Xor, a: n, b: four });
+                        self.aes_mix_columns(pre)
+                    }
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
             // FEAT_SHA3's, each a few whole-register operations: the two rotates are a
             // pair of doubleword shifts, joined.
             Inst::VSha3 { op, vd, vn, vm, va, rot } => {
@@ -2857,6 +2896,64 @@ impl<'a> Lifter<'a> {
     // -- scalar floating point ---------------------------------------------
 
     /// The lane type GIR should use for an arrangement.
+    /// Every byte of `x` through AES's box (or its inverse): the box is sixteen rows of
+    /// sixteen, and a swizzle is a lookup in one row that gives zero for an index past it,
+    /// so each row is asked with the byte's high nibble cancelled by the row's own -- the
+    /// one row a byte belongs to answers, the others give nothing -- and the answers joined.
+    /// No table in memory, and no time that depends on the bytes.
+    fn aes_sub_bytes(&mut self, x: Value, inverse: bool) -> Value {
+        let table = gex_isa::slow::aes_box(inverse);
+        let mut acc: Option<Value> = None;
+        for row in 0..16usize {
+            let entries: [u8; 16] = table[row * 16..row * 16 + 16].try_into().unwrap();
+            let entries = self.b.def(Expr::VConst(Box::new(entries)));
+            let idx = if row == 0 {
+                x
+            } else {
+                let high = self.b.def(Expr::VConst(Box::new([(row as u8) << 4; 16])));
+                self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: high })
+            };
+            let part = self.b.def(Expr::VSwizzle { a: entries, idx });
+            acc = Some(match acc {
+                None => part,
+                Some(prev) => self.b.def(Expr::VBin { op: VBinOp::Or, a: prev, b: part }),
+            });
+        }
+        acc.expect("sixteen rows")
+    }
+
+    /// Each byte of an AES state replaced by the one `by` rows on in its column.
+    fn aes_rows_up(&mut self, a: Value, by: usize) -> Value {
+        let mut lanes = [0u8; 16];
+        for (i, l) in lanes.iter_mut().enumerate() {
+            *l = (i / 4 * 4 + (i % 4 + by) % 4) as u8;
+        }
+        self.b.def(Expr::VShuffle { a, b: a, lanes: Box::new(lanes) })
+    }
+
+    /// Each byte doubled in AES's field: shifted left, less the field's polynomial where
+    /// the top bit went.
+    fn aes_double(&mut self, a: Value) -> Value {
+        let one = self.b.const_i32(1);
+        let shifted = self.b.def(Expr::VShift { op: VShiftOp::Shl, lane: VLane::I8, a, amount: one });
+        let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+        let top = self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtS, lane: VLane::I8, a, b: zero });
+        let poly = self.b.def(Expr::VConst(Box::new([0x1b; 16])));
+        let reduce = self.b.def(Expr::VBin { op: VBinOp::And, a: top, b: poly });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: shifted, b: reduce })
+    }
+
+    /// AES's MixColumns: each byte twice itself, three times the next in its column, and
+    /// the other two -- with a, b, c, d down a column from the byte, `2(a + b) + b + c + d`.
+    fn aes_mix_columns(&mut self, a: Value) -> Value {
+        let (r1, r2, r3) = (self.aes_rows_up(a, 1), self.aes_rows_up(a, 2), self.aes_rows_up(a, 3));
+        let pair = self.b.def(Expr::VBin { op: VBinOp::Xor, a, b: r1 });
+        let doubled = self.aes_double(pair);
+        let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: doubled, b: r1 });
+        let y = self.b.def(Expr::VBin { op: VBinOp::Xor, a: r2, b: r3 });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: y })
+    }
+
     fn lane_of(arr: VArr) -> VLane {
         match (arr.lane_bytes, arr.float) {
             (1, _) => VLane::I8,

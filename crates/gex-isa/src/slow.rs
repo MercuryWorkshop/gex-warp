@@ -154,6 +154,12 @@ const fn aes_sboxes() -> ([u8; 256], [u8; 256]) {
 }
 const AES: ([u8; 256], [u8; 256]) = aes_sboxes();
 
+/// AES's substitution box, or its inverse: for the lifter, which lowers the four AES
+/// instructions itself.
+pub fn aes_box(inverse: bool) -> &'static [u8; 256] {
+    if inverse { &AES.1 } else { &AES.0 }
+}
+
 fn xt(a: u8) -> u8 {
     (a << 1) ^ if a & 0x80 != 0 { 0x1b } else { 0 }
 }
