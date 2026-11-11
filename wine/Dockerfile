@@ -34,3 +34,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends libegl-dev && r
 RUN apt-get update && apt-get install -y --no-install-recommends libexpat1-dev libgmp-dev libxml2-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
 # the tools build's configure (--enable-archs=) checks gcc -m32
 RUN apt-get update && apt-get install -y --no-install-recommends gcc-multilib && rm -rf /var/lib/apt/lists/*
+# wasm-objdump (wine/pelink.py)
+RUN apt-get update && apt-get install -y --no-install-recommends wabt && rm -rf /var/lib/apt/lists/*
