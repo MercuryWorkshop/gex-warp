@@ -3951,6 +3951,17 @@ pub extern "C" fn k_fs_noblock() -> i32 {
     0
 }
 
+/// This instance's process memory is a page helper's own, with no page
+/// write map ([`gex_kmem::no_write_map`]): what a copy into it leaves is not
+/// marked through whatever its bytes at the map's slot say. Every helper
+/// instance calls it once it has its thread-local block (lazy-fetch.mjs
+/// `kernelThread`); a guest process's Worker never does.
+#[no_mangle]
+pub extern "C" fn k_no_write_map() -> i32 {
+    gex_kmem::no_write_map();
+    0
+}
+
 /// Bytes at `offset` of a file of the bundle being laid: into the file its
 /// index named (`TmpFs::fill_pending`), else seeded at `path` as
 /// [`k_fs_add`] (offset 0) and [`k_fs_add_part`] do.

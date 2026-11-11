@@ -38,5 +38,8 @@ export async function helperKernel(spec, stackTop, pages = 16, { suspending = fa
   const k = inst.exports;
   const top = typeof stackTop === 'function' ? stackTop(k) : stackTop;
   if (top && k.__stack_pointer) kernelThread(k, top);
+  // Its scratch is no process's: nothing at the write map's place in it is
+  // a map to mark (gex-kmem `no_write_map`).
+  k.k_no_write_map?.();
   return { k, mem };
 }

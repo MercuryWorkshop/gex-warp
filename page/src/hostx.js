@@ -280,6 +280,10 @@ export class HostX {
       const top = msg.kernel.stackTop ?? (inst.exports.k_stack_area ? helperStackTop(inst.exports, 'hostx') : 0);
       // And thread-locals of its own at the top of it (`kernelThread`).
       if (top) kernelThread(inst.exports, top);
+      // The server's memory is no guest process's: its own bytes at the
+      // write map's place are not a map for the kernel to mark through on
+      // each socket read (gex-kmem `no_write_map`).
+      inst.exports.k_no_write_map?.();
       this.#k = inst.exports;
       this.#kmem = msg.kernel.memory;
     }

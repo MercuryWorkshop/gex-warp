@@ -13,6 +13,7 @@
 
 #![no_std]
 #![feature(asm_experimental_arch)]
+#![feature(thread_local)]
 
 /// Which memories the process's address space is imported as. The kernel's
 /// own is 0; a process's is appended to the import section after it, as two
@@ -134,15 +135,33 @@ pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
     written(dst, len);
 }
 
+/// This instance's "process" memory is no guest process's ([`no_write_map`]).
+/// A thread-local, which is the instance's own: every Worker's instance has
+/// its own block (`kernelThread` in lazy-fetch.mjs), while a static is in the
+/// one kernel memory every instance shares.
+#[thread_local]
+static NO_WRITE_MAP: core::cell::Cell<bool> = core::cell::Cell::new(false);
+
+/// The memory this instance was given as its process's is a page helper's
+/// own (a terminal's or an open-files ask's scratch, the X server's wasm
+/// memory, the page kernel Worker's): it has no page write map, and what is
+/// at `gex_abi::WRITE_MAP_SLOT` in it is the helper's bytes, which a copy
+/// here must not take for a map's address and mark through. Called once,
+/// after the instance has its thread-local block.
+pub fn no_write_map() {
+    NO_WRITE_MAP.set(true);
+}
+
 /// Page write tracking (`gex_abi::set_write_map`): when the calling process
 /// has it on, its map's address is at `gex_abi::WRITE_MAP_SLOT` in its
 /// memory, and a write here marks the pages it wrote there, after the bytes,
 /// as the process's own stores mark theirs.
 fn written(dst: PAddr, len: u32) {
-    // (A memory too small to hold the slot is no guest process's: a page
-    // helper's scratch, a page of it or none. Reading the slot there would
-    // be out of bounds, and trap with whatever its caller holds held.)
-    if len == 0 || !in_process(gex_abi::WRITE_MAP_SLOT, 8) {
+    // (A memory too small to hold the slot is no guest process's either: a
+    // helper that did not say, with a page of scratch or none. Reading the
+    // slot there would be out of bounds, and trap with whatever its caller
+    // holds held.)
+    if len == 0 || NO_WRITE_MAP.get() || !in_process(gex_abi::WRITE_MAP_SLOT, 8) {
         return;
     }
     let mut buf = [0u8; 8];

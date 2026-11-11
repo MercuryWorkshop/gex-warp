@@ -30,6 +30,9 @@ self.onmessage = async (e) => {
       // Its own slot (`HELPER_STACKS`), thread-locals at the top of it.
       kernelThread(k, helperStackTop(k, 'fsOpened'));
     }
+    // The paths it writes here may lie over the write map's place, which is
+    // no map in a scratch memory (gex-kmem `no_write_map`).
+    k.k_no_write_map?.();
     for (let cap = 1 << 20; ; cap *= 4) {
       const need = Math.ceil((SCRATCH + cap) / 65536) - mem.buffer.byteLength / 65536;
       if (need > 0) mem.grow(need);

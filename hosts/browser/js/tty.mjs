@@ -113,6 +113,8 @@ export class PageTty {
       // Its own slot (`HELPER_STACKS`), thread-locals at the top of it.
       kernelThread(inst.exports, helperStackTop(k, 'tty'));
     }
+    // Its scratch has no write map (gex-kmem `no_write_map`).
+    k.k_no_write_map?.();
     return new PageTty(k, scratch);
   }
 
