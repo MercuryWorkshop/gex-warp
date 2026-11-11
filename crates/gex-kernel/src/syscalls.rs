@@ -5277,15 +5277,17 @@ impl NetIo<'_> {
             nr::GETSOCKNAME => match socket_family_type(io, fd) {
                 // A bound datagram socket has its name.
                 Ok((1, 2)) if io.dgram_of(fd)?.name().is_some() => {
-                    Kernel::write_sockaddr_un(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap()).map(|_| 0)
+                    Kernel::write_sockaddr_un(m, a[1], a[2], &io.dgram_of(fd)?.shown_name().unwrap()).map(|_| 0)
                 }
                 // A unix stream socket: its name (bound, listening, or its
                 // listener's when accepted), else unnamed. A listener in the
-                // global kernel has the name it was bound to.
+                // global kernel has the name it was bound to, and an end it
+                // accepted the same. Each as the process that bound it named
+                // it, not as the table every process shares has it.
                 Ok((1, _)) => {
                     let name = match io.unix_of(fd) {
                         Ok(sock) => sock.local_name(),
-                        Err(_) => io.remote_unix_of(fd).ok().filter(|r| r.listening).and_then(|r| r.peer.clone()),
+                        Err(_) => io.remote_unix_of(fd).ok().and_then(|r| if r.listening { r.peer.clone() } else { r.local.clone() }),
                     };
                     match name {
                         Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
@@ -5548,6 +5550,8 @@ impl NetIo<'_> {
             // process started with names it (a `chroot`'s root in front).
             let name = io.ns.socket_name(&path).into_owned();
             d.bind(&name)?;
+            // (`getsockname` gives it by the name the process has for it.)
+            d.set_shown(false, &path);
             if !path.starts_with('\0') {
                 let _ = io.ns.mksocket(&path);
             }
@@ -5592,6 +5596,10 @@ impl NetIo<'_> {
             sock.unbind_failed(&name);
             return Err(e);
         }
+        // Named to `getsockname` as the process named it, which in a root
+        // of its own is not the table's name (the global kernel's sockets
+        // keep the process's name the same way: `RemoteUnix::peer`).
+        sock.set_shown(false, &path);
         // And a node in the filesystem, so the name can be seen as well as
         // connected to. Xvfb binds /tmp/.X11-unix/X0 and every X client waits
         // for that path to appear before trying it; without the node the
@@ -5613,7 +5621,9 @@ impl NetIo<'_> {
             // Named in the table every process shares as the namespace the
             // process started with names it (a `chroot`'s root in front).
             let name = io.ns.socket_name(&path).into_owned();
-            return d.connect(&name);
+            d.connect(&name)?;
+            d.set_shown(true, &path);
+            return Ok(0);
         }
         let sock = io.unix_of(fd)?;
         let path = Kernel::sockaddr_un(m, addr, len)?;
@@ -5640,14 +5650,21 @@ impl NetIo<'_> {
         // then the system-wide table, which is where a guest server (an X
         // server's socket) lives.
         sock.set_cred(io.cred());
+        // (`getpeername` gives the name as the process named it.)
         if let Ok(r) = self.host_names.connect(&sock, &name) {
+            sock.set_shown(true, &path);
             return Ok(r);
         }
         match self.socket_names.connect(&sock, &name) {
             // Nobody listening on a name is a refusal; no such name at all
             // is no such file.
             Err(Errno::ECONNREFUSED) if !path.starts_with('\0') && matches!(io.ns.metadata(&path), Err(Errno::ENOENT)) => Err(Errno::ENOENT),
-            r => r,
+            r => {
+                if r.is_ok() {
+                    sock.set_shown(true, &path);
+                }
+                r
+            }
         }
     }
 }
@@ -15261,6 +15278,67 @@ mod tests {
     /// `mlock` and its kin succeed and change nothing: KSharedDataCache
     /// checks a file-backed cache's mapping with `mlock` and gives the file
     /// up when it fails.
+    /// A process in a root of its own (`chroot`) has its sockets by its own
+    /// names: `getsockname` and `getpeername` give the path as it bound or
+    /// connected by it, an accepted end its listener's, while the table every
+    /// process shares has the name from outside the root (where a process
+    /// outside connects to it). A datagram socket the same.
+    #[test]
+    fn a_socket_in_a_root_of_its_own_is_named_as_its_process_named_it() {
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        const AF_UNIX: u64 = 1;
+        put_str(&mut m, 0x20000, "/jail");
+        set_args(&mut m, at, nr::MKDIRAT, &[AT_FDCWD as i64 as u64, 0x20000, 0o755]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 0);
+        // (As the call makes it, without the capability it asks for.)
+        k.vfs.chroot("/jail").unwrap();
+        let mut call = |m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        // `sockaddr_un` for NAME at 0x20100, and its length.
+        let sa = |m: &mut GuestMem<'_>, name: &str| {
+            let mut b = vec![1u8, 0];
+            b.extend_from_slice(name.as_bytes());
+            b.push(0);
+            m.write(0x20100, &b).unwrap();
+            b.len() as u64
+        };
+        // What a name call gives: the path after the family.
+        let named = |m: &mut GuestMem<'_>, call: &mut dyn FnMut(&mut GuestMem<'_>, u64, &[u64]) -> i64, n: u64, fd: u64| {
+            m.write(0x20200, &[0u8; 112]).unwrap();
+            m.write_u32(0x20300, 110).unwrap();
+            let r = call(m, n, &[fd, 0x20200, 0x20300]);
+            let len = m.read_u32(0x20300).unwrap() as usize;
+            let bytes = m.read(0x20202, len.saturating_sub(2)).unwrap().to_vec();
+            (r, String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string())
+        };
+        for (ty, name) in [(1u64, "/s"), (2, "/d")] {
+            let l = call(&mut m, nr::SOCKET, &[AF_UNIX, ty, 0]) as u64;
+            let len = sa(&mut m, name);
+            assert_eq!(call(&mut m, nr::BIND, &[l, 0x20100, len]), 0, "bind {name}");
+            assert_eq!(named(&mut m, &mut call, nr::GETSOCKNAME, l), (0, name.to_string()), "getsockname of {name}");
+            let c = call(&mut m, nr::SOCKET, &[AF_UNIX, ty, 0]) as u64;
+            if ty == 1 {
+                assert_eq!(call(&mut m, nr::LISTEN, &[l, 4]), 0);
+            }
+            let len = sa(&mut m, name);
+            assert_eq!(call(&mut m, nr::CONNECT, &[c, 0x20100, len]), 0, "connect {name}");
+            assert_eq!(named(&mut m, &mut call, nr::GETPEERNAME, c), (0, name.to_string()), "getpeername of a client of {name}");
+            if ty == 1 {
+                let s = call(&mut m, nr::ACCEPT4, &[l, 0, 0, 0]) as u64;
+                assert_eq!(named(&mut m, &mut call, nr::GETSOCKNAME, s), (0, name.to_string()), "getsockname of an end {name} accepted");
+            }
+        }
+        // The shared table's name is the one from outside the root.
+        drop(call);
+        assert!(k.socket_names.exists("/jail/s"), "the table has /jail/s");
+    }
+
     #[test]
     fn locking_memory_succeeds() {
         for n in [nr::MLOCK, nr::MUNLOCK, nr::MLOCKALL, nr::MUNLOCKALL, nr::MLOCK2] {

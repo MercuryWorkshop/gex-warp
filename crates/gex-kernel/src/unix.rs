@@ -246,6 +246,20 @@ pub struct UnixSocket {
     gone: AtomicBool,
     /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
     passcred: AtomicBool,
+    /// The names `getsockname` and `getpeername` give, as the process that
+    /// bound or connected this end named them ([`Self::set_shown`]): the
+    /// role's are the table's, which every process shares, and a process in
+    /// a root of its own (a `chroot`, a Mac's tree) has them by another
+    /// name. An accepted end has its listener's own.
+    shown: Mutex<Shown>,
+}
+
+/// [`UnixSocket::shown`]: this end's own name and its peer's, each as the
+/// process that gave it named it; None where the table's name is all there is.
+#[derive(Debug, Default, Clone)]
+struct Shown {
+    own: Option<String>,
+    peer: Option<String>,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -271,7 +285,16 @@ impl UnixSocket {
             peer_addr: Mutex::new(None),
             gone: AtomicBool::new(false),
             passcred: AtomicBool::new(false),
+            shown: Mutex::new(Shown::default()),
         }
+    }
+
+    /// The name this end was bound by (`peer` false) or connected by (true),
+    /// as the process that did it named it: what `getsockname` or
+    /// `getpeername` gives in place of the table's name.
+    pub fn set_shown(&self, peer: bool, name: &str) {
+        let mut s = self.shown.lock().unwrap();
+        *if peer { &mut s.peer } else { &mut s.own } = Some(name.to_string());
     }
 
     /// `SO_PASSCRED`, set and read.
@@ -413,21 +436,24 @@ impl UnixSocket {
 
     /// The name this end connected to, for `getpeername`: None for an
     /// accepted end (its peer is unnamed); ENOTCONN when not connected.
+    /// Each as the process that connected named it ([`Self::set_shown`]).
     pub fn peer_name(&self) -> Result<Option<String>, Errno> {
         match &*self.role.lock().unwrap() {
-            Role::Connected { peer, .. } => Ok(peer.clone()),
+            Role::Connected { peer, .. } => Ok(peer.as_ref().map(|p| self.shown.lock().unwrap().peer.clone().unwrap_or_else(|| p.clone()))),
             _ => Err(Errno::ENOTCONN),
         }
     }
 
     /// This end's own name, for `getsockname`: the one it is bound to or
     /// listening on, or (an accepted end) its listener's. None when unnamed.
+    /// As the process that bound it named it ([`Self::set_shown`]).
     pub fn local_name(&self) -> Option<String> {
-        match &*self.role.lock().unwrap() {
+        let name = match &*self.role.lock().unwrap() {
             Role::Bound(p) | Role::Listening { path: p, .. } => Some(p.clone()),
             Role::Connected { local, .. } => local.clone(),
             Role::Fresh => None,
-        }
+        };
+        name.map(|p| self.shown.lock().unwrap().own.clone().unwrap_or(p))
     }
 
     pub fn listen(&self) -> SysResult {
@@ -477,6 +503,8 @@ impl UnixSocket {
             if let Role::Connected { local, .. } = &mut *theirs.role.lock().unwrap() {
                 *local = Some(path.to_string());
             }
+            // And by the name its listener's process gave it.
+            theirs.shown.lock().unwrap().own = listener.shown.lock().unwrap().own.clone();
             // Each end has the other's credentials as they were now: the
             // connecting process's for the end `accept` gives out, the
             // listener's (from its `listen`) for this one.
@@ -924,6 +952,9 @@ pub struct UnixDgram {
     nonblocking: AtomicBool,
     /// Who waits on it (`crate::wait`): readers.
     queue: crate::wait::Queue,
+    /// Its own name and its peer's as the process that bound or connected
+    /// it named them ([`UnixSocket::set_shown`]'s).
+    shown: Mutex<Shown>,
 }
 
 impl UnixDgram {
@@ -936,7 +967,19 @@ impl UnixDgram {
             inbox: Mutex::new(VecDeque::new()),
             nonblocking: AtomicBool::new(false),
             queue: crate::wait::Queue::new(),
+            shown: Mutex::new(Shown::default()),
         })
+    }
+
+    /// As [`UnixSocket::set_shown`].
+    pub fn set_shown(&self, peer: bool, name: &str) {
+        let mut s = self.shown.lock().unwrap();
+        *if peer { &mut s.peer } else { &mut s.own } = Some(name.to_string());
+    }
+
+    /// Its name for `getsockname`: [`Self::name`], as its process named it.
+    pub fn shown_name(&self) -> Option<String> {
+        self.name().map(|n| self.shown.lock().unwrap().own.clone().unwrap_or(n))
     }
 
     /// `socketpair(AF_UNIX, SOCK_DGRAM)`: two sockets connected to each other.
@@ -957,9 +1000,10 @@ impl UnixDgram {
 
     /// The name `connect` gave, for `getpeername`; `ENOTCONN` when it was
     /// not connected (a socketpair's end has an unnamed peer: `Ok(None)`).
+    /// As its process named it ([`Self::set_shown`]).
     pub fn peer_name(&self) -> Result<Option<String>, Errno> {
         match &*self.peer.lock().unwrap() {
-            Some((_, name)) => Ok(name.clone()),
+            Some((_, name)) => Ok(name.as_ref().map(|n| self.shown.lock().unwrap().peer.clone().unwrap_or_else(|| n.clone()))),
             None => Err(Errno::ENOTCONN),
         }
     }
@@ -2080,7 +2124,12 @@ pub struct RemoteUnix {
     pub id: i32,
     /// Set for a listener, so `accept` and `poll` know which question to ask.
     pub listening: bool,
+    /// A listener's name, or the name a connected end connected by: as the
+    /// process that bound or connected it named it (`getsockname`,
+    /// `getpeername`), not as the global kernel's table has it.
     pub peer: Option<String>,
+    /// An accepted end's own name, its listener's (`getsockname`).
+    pub local: Option<String>,
     pub remote: Remote,
     nonblocking: AtomicBool,
     /// `SO_PASSCRED` (this process's, as the option is the descriptor's).
@@ -2114,6 +2163,7 @@ impl RemoteUnix {
             id,
             listening,
             peer,
+            local: None,
             remote,
             nonblocking: AtomicBool::new(false),
             passcred: AtomicBool::new(false),
@@ -2142,7 +2192,12 @@ impl RemoteUnix {
             return Err(Errno::EINVAL);
         }
         match (self.remote.accept)(self.id) {
-            n if n >= 0 => Ok(Arc::new(RemoteUnix::new(n, false, None, self.remote))),
+            n if n >= 0 => {
+                // Named as its listener is (`getsockname`); its peer unnamed.
+                let mut s = RemoteUnix::new(n, false, None, self.remote);
+                s.local = self.peer.clone();
+                Ok(Arc::new(s))
+            }
             n => Err(Errno(-n)),
         }
     }

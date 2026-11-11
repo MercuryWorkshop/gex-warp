@@ -10461,7 +10461,11 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
     if let Some(sock) = gex_kernel::syscalls::Kernel::remote_unix_of_file(file) {
         // A socket in the global kernel: another id on the same end.
         let dup = sock.dup_id()?;
-        return Some(format!("sock:{dup}:{}", sock.listening as i32));
+        // With its names, as its process named them (`getsockname`,
+        // `getpeername` in the process that has it next), in hex: a name
+        // may hold anything, the line's separators among them.
+        let hex = |s: &Option<String>| s.as_deref().map_or(String::from("-"), |s| s.bytes().map(|b| format!("{b:02x}")).collect());
+        return Some(format!("sock:{dup}:{}:{}:{}", sock.listening as i32, hex(&sock.peer), hex(&sock.local)));
     }
     // A process descriptor, by its pid; a fork's child does not get the one
     // its parent made for it in the same `clone` (`forget_own_pidfds`).
@@ -10731,9 +10735,19 @@ fn rebuild_carried(
         f
     } else if let Some(rest) = path.strip_prefix("sock:") {
         let r = global_sockets().ok_or("no global kernel")?;
-        let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
-        let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
-        let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        // `sock:ID:LISTENING:PEER:LOCAL`, the names in hex or `-` for none.
+        let mut parts = rest.split(':');
+        let id = parts.next().and_then(|id| id.parse::<i32>().ok()).ok_or("bad socket id")?;
+        let listening = parts.next().ok_or("bad socket name")? == "1";
+        let unhex = |s: Option<&str>| -> Option<String> {
+            let s = s.filter(|s| *s != "-" && s.len() % 2 == 0)?;
+            let bytes: Option<Vec<u8>> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect();
+            String::from_utf8(bytes?).ok()
+        };
+        let (peer, local) = (unhex(parts.next()), unhex(parts.next()));
+        let mut sock = gex_kernel::unix::RemoteUnix::new(id, listening, peer, r);
+        sock.local = local;
+        let sock = Arc::new(sock);
         sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
         let handle: Arc<dyn FileHandle> = sock;
         OpenFile::new(handle, "socket".to_string(), flags, true, true)
