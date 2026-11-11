@@ -740,6 +740,9 @@ struct SurfaceState {
     /// because the accumulator started at the value that means all of it.
     pending_damage: Option<Damage>,
     damage: Option<Damage>,
+    /// The size of the buffer last committed, whether the host places its
+    /// pixels or is handed a copy.
+    buffer_size: (i32, i32),
     /// The window geometry a client set with `xdg_surface.set_window_geometry`:
     /// the part of the surface that is the window, excluding the invisible
     /// margins GTK leaves for its shadows. What the compositor decorates and
@@ -884,6 +887,13 @@ pub struct Client {
     /// currently over/focused), so motion and keys only follow an enter.
     pointer_on: Option<u32>,
     keyboard_on: Option<u32>,
+    /// [`Client::pointer_in_window`]'s pointer is over none of the window's
+    /// surfaces.
+    pointer_out: bool,
+    /// The buttons held, and the surface that took the first press: the
+    /// implicit grab, which keeps the pointer until the last is up.
+    held: Vec<u32>,
+    grab_surface: Option<u32>,
     /// A keyboard was created and owes a `keymap` event whose fd the host must
     /// attach: this is the payload, taken once by [`Client::take_keymap`].
     pending_keymap: Option<Vec<u8>>,
@@ -942,6 +952,9 @@ impl Client {
             pointer_at: (0, 0),
             pointer_on: None,
             keyboard_on: None,
+            pointer_out: false,
+            held: Vec::new(),
+            grab_surface: None,
             pending_keymap: None,
             data: data::DataState::default(),
             relative_pointers: Vec::new(),
@@ -1740,6 +1753,11 @@ impl Client {
                         "[wl] buffer {buffer_id}: fd {} pool {} -> addr {:?}, {}x{} stride {}",
                         spec.fd, spec.pool_size, placed, spec.width, spec.height, spec.stride
                     ));
+                }
+                // (its size, which a host compositing from copies keeps nowhere
+                // else: what the pointer's hit test needs)
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.buffer_size = (spec.width, spec.height);
                 }
                 match placed {
                     Some(addr) => {
@@ -3077,6 +3095,158 @@ impl Client {
         self.pointer_motion(x, y, time);
     }
 
+    /// The toplevel a surface belongs to: itself, or the toplevel at the end
+    /// of its chain of parents (a popup's, a subsurface's).
+    fn toplevel_of(&self, mut surface: u32) -> Option<u32> {
+        for _ in 0..64 {
+            let s = self.surfaces.get(&surface)?;
+            match s.role {
+                Role::Toplevel => return Some(surface),
+                Role::Popup | Role::Subsurface if s.parent != 0 => surface = s.parent,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The surfaces of the window `top` that are shown, bottom to top, each
+    /// with where it is in the window's coordinates and its size: the
+    /// toplevel at (0, 0), and a popup or subsurface at its parent's place
+    /// plus its offset, as the page's desktop places them. A subsurface is
+    /// over its parent; popups are over the whole window, a later one over
+    /// an earlier.
+    fn window_stack(&self, top: u32) -> Vec<(u32, i32, i32, i32, i32)> {
+        let mut out = Vec::new();
+        let mut popups = Vec::new();
+        self.stack_into(top, 0, 0, &mut out, &mut popups);
+        let mut i = 0;
+        while i < popups.len() {
+            let (p, x, y) = popups[i];
+            self.stack_into(p, x, y, &mut out, &mut popups);
+            i += 1;
+        }
+        out
+    }
+
+    fn stack_into(&self, id: u32, x: i32, y: i32, out: &mut Vec<(u32, i32, i32, i32, i32)>, popups: &mut Vec<(u32, i32, i32)>) {
+        let Some(s) = self.surfaces.get(&id) else { return };
+        if out.len() > 256 || out.iter().any(|o| o.0 == id) {
+            return;
+        }
+        let (w, h) = s.external.unwrap_or(s.buffer_size);
+        let shown = (s.committed_buffer.is_some() || s.external.is_some()) && w > 0 && h > 0;
+        if shown {
+            out.push((id, x, y, w, h));
+        }
+        let mut kids: Vec<(u32, &SurfaceState)> = self
+            .surfaces
+            .iter()
+            .filter(|(_, c)| c.parent == id && matches!(c.role, Role::Popup | Role::Subsurface))
+            .map(|(k, c)| (*k, c))
+            .collect();
+        kids.sort_by_key(|k| k.0);
+        for (k, c) in kids {
+            match c.role {
+                Role::Subsurface if shown => self.stack_into(k, x + c.rel_x, y + c.rel_y, out, popups),
+                Role::Popup => popups.push((k, x + c.rel_x, y + c.rel_y)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The topmost surface of window `top` that takes the pointer at `(x, y)`
+    /// of the window, and the point in that surface.
+    fn window_hit(&self, top: u32, x: i32, y: i32) -> Option<(u32, i32, i32)> {
+        self.window_stack(top).into_iter().rev().find_map(|(id, sx, sy, w, h)| {
+            let (lx, ly) = (x - sx, y - sy);
+            let inside = lx >= 0 && ly >= 0 && lx < w && ly < h;
+            let takes = self.surfaces.get(&id).is_none_or(|s| s.input.as_ref().is_none_or(|r| r.contains(lx, ly)));
+            (inside && takes).then_some((id, lx, ly))
+        })
+    }
+
+    /// The pointer moved to `(x, y)` of the focused window -- its toplevel's
+    /// pixels -- for a host that composites one window and has no hit test
+    /// of its own (the native host's scripted input). It goes to whichever
+    /// of the window's surfaces is there, popups first, in that surface's
+    /// own coordinates, with a leave and an enter when that changes, as a
+    /// compositor sends them; over none of them, the pointer leaves. While
+    /// a button is held it stays with the surface that took the press (the
+    /// implicit grab), at the point clamped to it, as the page's desktop
+    /// keeps it. A client with no toplevel takes the point as it is.
+    pub fn pointer_in_window(&mut self, x: i32, y: i32, time: u32) {
+        // (a host that places pixels names no focus: its newest window)
+        let newest = || {
+            self.surfaces
+                .iter()
+                .filter(|(_, s)| s.role == Role::Toplevel && s.committed_buffer.is_some())
+                .map(|(id, _)| *id)
+                .max()
+        };
+        let top = self.pointer_on.or(self.pointer_target).or(self.focus_surface).and_then(|s| self.toplevel_of(s)).or_else(newest);
+        let Some(top) = top else {
+            self.pointer_motion(x, y, time);
+            return;
+        };
+        if let Some(grab) = self.grab_surface.filter(|g| self.surfaces.contains_key(g)) {
+            if let Some(&(_, sx, sy, w, h)) = self.window_stack(top).iter().find(|o| o.0 == grab) {
+                self.pointer_to(grab, (x - sx).clamp(0, (w - 1).max(0)), (y - sy).clamp(0, (h - 1).max(0)), time);
+                return;
+            }
+        }
+        match self.window_hit(top, x, y) {
+            Some((surface, lx, ly)) => {
+                self.pointer_out = false;
+                self.pointer_to(surface, lx, ly, time);
+            }
+            None => {
+                self.pointer_clear();
+                // (and no falling back on the focus until the next motion:
+                // a button now is over no surface of this client)
+                self.pointer_out = true;
+            }
+        }
+    }
+
+    /// A button for [`Client::pointer_in_window`]'s pointer: to the surface
+    /// under it. A press anywhere but on an open popup (or a popup over it)
+    /// dismisses that popup first -- what the popup's grab asked for, and
+    /// what the page's desktop does -- and a press over no surface goes
+    /// nowhere.
+    pub fn pointer_button_in_window(&mut self, button: u32, pressed: bool, time: u32) {
+        if pressed && self.grab_surface.is_none() {
+            let on = self.pointer_on;
+            let open: Vec<u32> = self
+                .surfaces
+                .iter()
+                .filter(|(_, s)| s.role == Role::Popup && s.committed_buffer.is_some())
+                .map(|(id, _)| *id)
+                .filter(|p| !on.is_some_and(|o| self.descends_from(o, *p)))
+                .collect();
+            for p in open {
+                self.dismiss_popup(p);
+            }
+        }
+        if self.pointer_out {
+            return;
+        }
+        self.pointer_button(button, pressed, time);
+    }
+
+    /// Whether `surface` is `ancestor` or one of its popups' or subsurfaces'.
+    fn descends_from(&self, mut surface: u32, ancestor: u32) -> bool {
+        for _ in 0..64 {
+            if surface == ancestor {
+                return true;
+            }
+            match self.surfaces.get(&surface) {
+                Some(s) if s.parent != 0 && matches!(s.role, Role::Popup | Role::Subsurface) => surface = s.parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The pointer left every surface of this client (it is over another
     /// client's window, or over the compositor's own decorations).
     pub fn pointer_clear(&mut self) {
@@ -3189,6 +3359,19 @@ impl Client {
         let Some(ptr) = self.pointer else { return };
         if !self.ensure_pointer_enter() {
             return;
+        }
+        if pressed {
+            if self.held.is_empty() {
+                self.grab_surface = self.pointer_on;
+            }
+            if !self.held.contains(&button) {
+                self.held.push(button);
+            }
+        } else {
+            self.held.retain(|b| *b != button);
+            if self.held.is_empty() {
+                self.grab_surface = None;
+            }
         }
         let serial = self.serial();
         // button(serial, time, button, state): 1 pressed, 0 released.
@@ -4059,6 +4242,99 @@ mod tests {
         assert_eq!(popup.role, Role::Popup);
         assert_eq!(popup.parent, 6, "a popup is placed against its parent");
         assert_eq!((popup.rel_x, popup.rel_y), (20, 18));
+    }
+
+    /// `placed_window` with a pointer (object 51) and a drawn popup of
+    /// 120x60 at (60, 50) of the 300x200 window (surface 21, xdg_popup 23).
+    fn window_with_popup() -> Client {
+        let pool = Placed(0x5000, 64 * 1024);
+        let (mut c, _) = placed_window(300, 200, 1200);
+        c.receive(&Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 0).new_id(51).finish(), &[], &pool); // get_pointer
+        // A positioner: 120x60, its top-left corner on the anchor rectangle's
+        // top-left (anchor top_left 5, gravity bottom_right 8) at (60, 50).
+        c.receive(&Writer::new(5, 1).new_id(20).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 1).int(120).int(60).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 2).int(60).int(50).int(1).int(1).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 3).uint(5).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 4).uint(8).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(21).finish(), &[], &pool);
+        c.receive(&Writer::new(5, 2).new_id(22).object(21).finish(), &[], &pool);
+        c.receive(&Writer::new(22, 2).new_id(23).object(7).object(20).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(24).int(0).int(120).int(60).int(480).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(21, 1).object(24).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(21, 6).finish(), &[], &pool);
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+        let popup = c.scene().into_iter().find(|s| s.surface == 21).expect("no popup");
+        assert_eq!((popup.rel_x, popup.rel_y), (60, 50));
+        c.take_outgoing();
+        c
+    }
+
+    /// The pointer's events in `bytes`: (opcode, surface or time, x, y) for
+    /// enter (0), leave (1), motion (2), and button (3: serial, time,
+    /// button, state).
+    fn pointer_events(bytes: &[u8]) -> Vec<(u16, Vec<i32>)> {
+        messages(bytes)
+            .into_iter()
+            .filter(|(id, op, _)| *id == 51 && *op <= 3)
+            .map(|(_, op, body)| (op, body.chunks(4).map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn the_window_pointer_reaches_a_popup_in_its_own_coordinates() {
+        let mut c = window_with_popup();
+        // Over the popup: entered at the point less the popup's place.
+        c.pointer_in_window(100, 80, 1);
+        let ev = pointer_events(&c.take_outgoing());
+        let enter = ev.iter().find(|e| e.0 == 0).expect("no enter");
+        assert_eq!(&enter.1[1..], &[21, 40 * 256, 30 * 256], "entered the popup somewhere else");
+        assert_eq!(ev.iter().find(|e| e.0 == 2).map(|e| &e.1[1..]), Some(&[40 * 256, 30 * 256][..]));
+        // Within it: motion only.
+        c.pointer_in_window(150, 100, 2);
+        let ev = pointer_events(&c.take_outgoing());
+        assert!(ev.iter().all(|e| e.0 == 2), "{ev:?}");
+        assert_eq!(&ev[0].1[1..], &[90 * 256, 50 * 256]);
+        // Out of it, onto the window: a leave, then the window entered.
+        c.pointer_in_window(10, 20, 3);
+        let ev = pointer_events(&c.take_outgoing());
+        assert_eq!(ev.iter().map(|e| e.0).collect::<Vec<_>>(), vec![1, 0, 2], "{ev:?}");
+        assert_eq!(ev[0].1[1], 21, "left something else");
+        assert_eq!(&ev[1].1[1..], &[6, 10 * 256, 20 * 256]);
+        // Off the window altogether: it leaves, and a button goes nowhere.
+        c.pointer_in_window(400, 20, 4);
+        let ev = pointer_events(&c.take_outgoing());
+        assert_eq!(ev.iter().map(|e| (e.0, e.1[1])).collect::<Vec<_>>(), vec![(1, 6)]);
+        c.pointer_button_in_window(0x110, true, 5);
+        c.pointer_button_in_window(0x110, false, 6);
+        assert!(pointer_events(&c.take_outgoing()).iter().all(|e| e.0 != 3), "a button over nothing reached a surface");
+    }
+
+    #[test]
+    fn a_press_outside_a_popup_dismisses_it_and_inside_keeps_it() {
+        let mut c = window_with_popup();
+        let done = |bytes: &[u8]| messages(bytes).iter().any(|(id, op, _)| *id == 23 && *op == 1);
+        // A press on the popup: the popup has it, and stays.
+        c.pointer_in_window(100, 80, 1);
+        c.pointer_button_in_window(0x110, true, 2);
+        // Held, the pointer stays with the popup past its edge (clamped).
+        c.pointer_in_window(10, 10, 3);
+        c.pointer_button_in_window(0x110, false, 4);
+        let out = c.take_outgoing();
+        assert!(!done(&out), "a press on the popup dismissed it");
+        let ev = pointer_events(&out);
+        assert!(ev.iter().all(|e| e.0 != 1), "the grab let the pointer go: {ev:?}");
+        assert_eq!(ev.iter().filter(|e| e.0 == 3).count(), 2, "the popup did not get both halves of the click");
+        assert_eq!(ev.iter().rev().find(|e| e.0 == 2).map(|e| &e.1[1..]), Some(&[0, 0][..]));
+        // Released over the window, then a press on the window: popup_done.
+        c.pointer_in_window(10, 10, 5);
+        c.pointer_button_in_window(0x110, true, 6);
+        let out = c.take_outgoing();
+        assert!(done(&out), "a press outside the popup left it open");
+        let ev = pointer_events(&out);
+        assert_eq!(ev.iter().find(|e| e.0 == 0).map(|e| e.1[1]), Some(6));
+        assert!(ev.iter().any(|e| e.0 == 3), "the window did not get its press");
     }
 
     #[test]

@@ -133,7 +133,12 @@ enum Ev {
 /// (one that only listens to its outputs), where `frames 0` would count the
 /// time its program takes to load.
 ///
-/// Coordinates are the focused surface's pixels.
+/// Coordinates are the focused window's pixels, its toplevel's: a point
+/// over one of the window's popups (or subsurfaces) reaches that surface in
+/// its own coordinates, with the pointer's enter and leave as it moves
+/// between them; a point over none of them reaches nothing, and a press
+/// there or on the window outside an open popup dismisses the popup. With
+/// placed windows (`gex_window_placement_v1`), the screen's pixels.
 struct Input {
     events: Vec<(f64, Ev, String)>,
     /// Each `drag` line's files, as the text/uri-list the host offers.
@@ -604,8 +609,10 @@ impl Wayland {
             let take = s.client.input_ready() && !placing;
             for &(ev, ms) in due.iter().filter(|_| take) {
                 match ev {
-                    Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
-                    Ev::Button(b, down) => s.client.pointer_button(b, down, ms),
+                    // (the window's own hit test: a popup's point in the
+                    // popup's coordinates, as the page's desktop sends it)
+                    Ev::Motion(x, y) => s.client.pointer_in_window(x, y, ms),
+                    Ev::Button(b, down) => s.client.pointer_button_in_window(b, down, ms),
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
                     Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
                     Ev::Drag(..) | Ev::DragMove(..) | Ev::Drop | Ev::DragLeave => {
