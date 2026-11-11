@@ -373,7 +373,7 @@ struct SpawnContext {
     /// Inherited the same way, so a client that a shell forked reaches the
     /// same compositor its parent could.
     wayland: Option<wayland::Wayland>,
-    jit_shared: Option<Arc<Mutex<JitShared>>>,
+    jit_shared: JitHold,
     limits: gex_xlate::BlockLimits,
     /// Where this process's objects are, for naming profile counts.
     prof_proc: Option<Arc<profile::ProcProf>>,
@@ -446,6 +446,38 @@ struct Jit {
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
+    /// `shared`'s `JitShared::processes`.
+    processes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Jit {
+    /// A store's half of `shared`, before anything is replayed into it.
+    fn new(shared: Arc<Mutex<JitShared>>, engine: Engine, linker: Linker<HostState>, tables: Vec<Table>, cache: Option<(std::path::PathBuf, String)>, limits: gex_xlate::BlockLimits) -> Jit {
+        let processes = Arc::clone(&shared.lock().unwrap_or_else(|e| e.into_inner()).processes);
+        Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, limits, ftab: None, processes }
+    }
+}
+
+/// The translation state a process runs on, counted in its
+/// `JitShared::processes` for as long as the process holds it: from its
+/// start or the fork that shared it, to its end, its `execve` or the state
+/// of its own it takes instead (`own_translations`, which counts the swap
+/// itself).
+struct JitHold(Mutex<Option<Arc<Mutex<JitShared>>>>);
+
+impl JitHold {
+    fn get(&self) -> Option<Arc<Mutex<JitShared>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for JitHold {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            let sh = s.lock().unwrap_or_else(|e| e.into_inner());
+            sh.processes.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 /// At least as long as every process's `JitShared::registry` (raised after
@@ -534,13 +566,22 @@ struct JitShared {
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
+    /// How many processes run on this state ([`JitHold`]): more than one
+    /// while a fork's child shares its parent's, which holds only while
+    /// both have the same code at the same addresses. Each store keeps it
+    /// too (`Jit::processes`), to ask without the lock. Changed only under
+    /// the lock; above one, every process counted has a single thread
+    /// (`fork_process`, `own_translations`).
+    processes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl JitShared {
     /// A forked child's own copy (`fork_process`): what the child's memory,
     /// a copy of this address space's, was installed and relocated with.
+    /// Also a process's own copy when it stops sharing (`own_translations`).
     fn fork_copy(&self) -> JitShared {
         JitShared {
+            processes: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             page_table: self.page_table.clone(),
             translated: self.translated.clone(),
             alt_dir: self.alt_dir,
@@ -1409,8 +1450,8 @@ fn run_program_with(
     // miss handler is one user; static object recompilation is another.
     // `--no-jit` turns off the miss handler, not this.
     if opts.jit || opts.recompile_objects || !aot_shared.is_empty() || pe_units::elf_units_on() {
-        store.data_mut().jit = Some(Jit {
-            shared: Arc::new(Mutex::new(JitShared {
+        store.data_mut().jit = Some(Jit::new(
+            Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),
                 translated: Default::default(),
                 alt_dir: 0,
@@ -1431,16 +1472,14 @@ fn run_program_with(
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),
+                processes: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             })),
-            engine: engine.clone(),
-            linker: linker.clone(),
+            engine.clone(),
+            linker.clone(),
             tables,
-            cache: jit_cache.clone(),
-            instances: Vec::new(),
-            replayed: 0,
-            limits: xlate.limits,
-            ftab: None,
-        });
+            jit_cache.clone(),
+            xlate.limits,
+        ));
         if let Some(t) = gex_kernel::ftab::translator() {
             let process = store.data().jit.as_ref().map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.process.0);
             if let Some(process) = process {
@@ -1539,7 +1578,7 @@ fn run_program_with(
         xlate: xlate.clone(),
         kernel: Arc::clone(&store.data().kernel),
         proc_state: Arc::clone(&store.data().proc_state),
-        jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
+        jit_shared: JitHold(Mutex::new(store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)))),
         limits: xlate.limits,
         prof_proc: prof_proc.clone(),
         fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
@@ -2390,12 +2429,7 @@ fn run_thread_loop(
             fork_process(&*store, req, false)?;
         }
         if let Some(child) = store.data_mut().pending_spawn.take() {
-            let cx = store
-                .data()
-                .spawn
-                .clone()
-                .ok_or_else(|| anyhow!("clone with no spawn context"))?;
-            start_guest_thread(cx, child)?;
+            start_guest_thread(store.data_mut(), child)?;
         }
         if let Some(req) = store.data_mut().pending_exec.take() {
             return Ok(Stopped::Exec(req));
@@ -2622,7 +2656,12 @@ fn give_runner() {
 /// Start a host thread for a guest thread a `clone` (or an NT thread
 /// creation) asked for: the one its `clone` was promised, else a new one.
 /// Called between guest calls, where nothing is borrowed.
-fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
+fn start_guest_thread(state: &mut HostState, child: ThreadState) -> Result<()> {
+    // Translations shared with another process are first the process's own:
+    // a process swaps those for a copy when it changes its code, which only
+    // one of a single thread can do (`own_translations`).
+    own_translations(state)?;
+    let cx = state.spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
     // Detached: a guest thread is joined through its own futex, not
     // through the host's handle, and `exit_group` ends the process
     // whatever its threads are doing.
@@ -2765,6 +2804,67 @@ fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
 }
 
+/// Whether this store's process runs on translations another process runs
+/// on too (`JitShared::processes`). Without the lock: only a process
+/// counted can raise the count, so one that reads 1 is alone.
+fn shares_translations(state: &HostState) -> bool {
+    state.jit.as_ref().is_some_and(|j| j.processes.load(std::sync::atomic::Ordering::Acquire) > 1)
+}
+
+/// Give this store's process translations of its own when it shares them
+/// with another (a fork's parent and child, `fork_process`): a copy of the
+/// shared state, which it then changes for itself, while the others go on
+/// with theirs. Called before the process acts on a change to its code
+/// (its maps, `retire_translations`, a page check), and before it starts a
+/// second thread. What the shared state holds was made from code all its
+/// processes have at the same addresses: code from before their fork, or
+/// mapped by one that was alone in it then, and changed by none of them
+/// since, for one that changes it leaves first.
+///
+/// A process that shares has one thread, whose store is the only one to
+/// swap; the caller is on it, outside anything that keeps the old state
+/// (each user takes `Jit::shared` afresh). Every other process's own is
+/// untouched, and background translations queued on the shared state are
+/// dropped (`ftab::Shared::drop_queued`): they may have read this one's
+/// changed memory.
+fn own_translations(state: &mut HostState) -> Result<()> {
+    if !shares_translations(state) {
+        return Ok(());
+    }
+    let cx = state.spawn.clone().ok_or_else(|| anyhow!("shared translations with no spawn context"))?;
+    if cx.running.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        bail!("gex: BUG: a process with threads shares its translations with another process");
+    }
+    let Some(jit) = state.jit.as_mut() else { return Ok(()) };
+    let old = Arc::clone(&jit.shared);
+    let own = {
+        let mut sh = old.lock().unwrap_or_else(|e| e.into_inner());
+        // The others may all have gone since the look above.
+        if sh.processes.load(std::sync::atomic::Ordering::Acquire) <= 1 {
+            return Ok(());
+        }
+        let own = sh.fork_copy();
+        sh.processes.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        sh.ftab.drop_queued();
+        own
+    };
+    let processes = Arc::clone(&own.processes);
+    let own = Arc::new(Mutex::new(own));
+    copy_keyed(&old, &own);
+    // Counted already: the hold now has the copy, its one process.
+    *cx.jit_shared.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&own));
+    jit.shared = own;
+    jit.processes = processes;
+    Ok(())
+}
+
+/// What is kept of `from` by its address (`elfprov`'s bindings, deferred
+/// Windows images), kept for its copy `to` too.
+fn copy_keyed(from: &Arc<Mutex<JitShared>>, to: &Arc<Mutex<JitShared>>) {
+    elfprov::copy_bound(from, to);
+    pe_units::copy_deferred(from, to);
+}
+
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
@@ -2804,7 +2904,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // What the parent has mapped, less what it is known to hold only
         // zeros (its reservations): the child's memory is zero already.
         let regions: Vec<(u64, u64)> = {
-            let mm = k.mem.lock();
+            let mut mm = k.mem.lock();
+            // What the parent's code was until now is the child's too: only
+            // a change after this one stops the two sharing translations
+            // (`own_translations`).
+            mm.log.code_changed = false;
             mm.vmas().iter().flat_map(|v| mm.dirty_parts(v.start, v.end)).collect()
         };
         if std::env::var_os("GEX_FORK_VMAS").is_some() {
@@ -2824,24 +2928,30 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // child's memory only, so the parent and its later children must not
     // find it loaded. Taken before the memory is copied: a dlopen in between
     // leaves the child with the data and no link-map entry, and the child
-    // loads it again if it asks. Every other process shares the parent's
-    // (the modules are the same code at the same addresses).
+    // loads it again if it asks.
     //
-    // A Mac's process has its own too. Its loader is the guest's (dyld),
-    // which maps a library where the address space has room: a child that
-    // loads one and its parent that later loads another have different
-    // code at one address, and with what was translated shared, the parent
-    // ran the child's translation of that address over its own library's
-    // data (a zsh that loaded a module in a subshell, then another itself,
-    // branched into the first one's stubs).
-    let jit_shared = cx.jit_shared.as_ref().map(|s| {
+    // Every other process shares the parent's, the same code at the same
+    // addresses, until one of the two changes its code: a guest's loader
+    // puts a library where the address space has room, the same place in
+    // a child and in its parent, so a translation one makes of the code it
+    // mapped there runs over the other's different code. The one that
+    // changes first takes a copy then (`own_translations`). That swaps the
+    // state of one store, so only a process of one thread shares: a fork
+    // from one with more gives the child a copy now, and a process that
+    // shares takes its own before it starts a second thread.
+    let jit_shared = JitHold(Mutex::new(cx.jit_shared.get().map(|s| {
         let s0 = s.lock().unwrap_or_else(|e| e.into_inner());
-        if s0.ftab.dyproc.is_some() || gex_kernel::darwin::on() {
-            Arc::new(Mutex::new(s0.fork_copy()))
+        if s0.ftab.dyproc.is_some() || cx.running.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            let own = Arc::new(Mutex::new(s0.fork_copy()));
+            drop(s0);
+            copy_keyed(&s, &own);
+            own
         } else {
-            Arc::clone(s)
+            s0.processes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(s0);
+            s
         }
-    });
+    })));
 
     let shared = wasmtime::SharedMemory::new(
         &cx.engine,
@@ -3173,18 +3283,8 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     profile::attach(&mut store, &instance)?;
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
-    if let Some(shared) = &cx.jit_shared {
-        store.data_mut().jit = Some(Jit {
-            shared: Arc::clone(shared),
-            engine: cx.engine.clone(),
-            linker: cx.linker.clone(),
-            tables,
-            cache: cx.jit_cache.clone(),
-            instances: Vec::new(),
-            replayed: 0,
-            limits: cx.limits,
-            ftab: None,
-        });
+    if let Some(shared) = cx.jit_shared.get() {
+        store.data_mut().jit = Some(Jit::new(shared, cx.engine.clone(), cx.linker.clone(), tables, cx.jit_cache.clone(), cx.limits));
     }
     catch_up_table(&mut store)?;
     if cx.opts.aot_only {
@@ -3555,18 +3655,8 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     profile::attach(&mut store, &instance)?;
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
-    if let Some(shared) = &cx.jit_shared {
-        store.data_mut().jit = Some(Jit {
-            shared: Arc::clone(shared),
-            engine: cx.engine.clone(),
-            linker: cx.linker.clone(),
-            tables,
-            cache: cx.jit_cache.clone(),
-            instances: Vec::new(),
-            replayed: 0,
-            limits: cx.limits,
-            ftab: None,
-        });
+    if let Some(shared) = cx.jit_shared.get() {
+        store.data_mut().jit = Some(Jit::new(shared, cx.engine.clone(), cx.linker.clone(), tables, cx.jit_cache.clone(), cx.limits));
     }
 
     // This thread's table starts with only what the image module installed,
@@ -4845,6 +4935,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let gm = GuestMem::new(memory.bytes());
                 w.pump(&k, &gm);
             }
+            // A process that shares its translations with another (a fork's
+            // parent or child) and has changed its code takes its own first,
+            // before anything below retires or adds to them for that change.
+            if shares_translations(caller.data())
+                && caller.data_mut().with_kernel(|k| {
+                    let log = &mut k.mem.lock().log;
+                    std::mem::take(&mut log.code_changed) || !log.retired_code.is_empty() || !log.new_code.is_empty() || !log.recheck_code.is_empty()
+                })
+            {
+                own_translations(caller.data_mut())?;
+            }
             // Code that has gone away, retired before the newly mapped code
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
             // would throw away the fresh translation.
@@ -4962,8 +5063,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // borrowed). Leaving for the run loop would unwind every
                     // wasm frame, which under the function table means every
                     // caller resumes at an interior address.
-                    let cx = state.spawn.clone().ok_or_else(|| anyhow!("clone with no spawn context"))?;
-                    start_guest_thread(cx, ThreadState { ctx_addr, tid })?;
+                    start_guest_thread(state, ThreadState { ctx_addr, tid })?;
                     Ok(())
                 }
                 SyscallOutcome::Blocking(_) => {
@@ -5549,6 +5649,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // only if its module still provides it; a newer translation
                 // otherwise already sits in the slot dispatch reaches.
                 let start = pc as u64;
+                // Its bytes are not the ones it was made from: this process's
+                // code changed, and what it translates now is its own.
+                own_translations(caller.data_mut())?;
                 // In the mode the block ran in: the thread's.
                 let key = gex_abi::addr_key(start, thread_alt(&caller));
                 let again = match caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
@@ -7216,8 +7319,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             },
         };
         if let Some(child) = caller.data_mut().pending_spawn.take() {
-            let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
-            start_guest_thread(cx, child)?;
+            start_guest_thread(caller.data_mut(), child)?;
         }
         // A fork from the guest code a call-out runs (a function-tier
         // unit's libc calling `fork`): made here, as the run loop makes it,
@@ -7455,6 +7557,9 @@ fn retire_translations(
     caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
     ranges: &[(u64, u64)],
 ) -> Result<()> {
+    // What another process sharing them still runs is not retired: the
+    // change is this process's alone (`own_translations`).
+    own_translations(caller.as_context_mut().data_mut())?;
     let Some(shared) = caller
         .as_context()
         .data()

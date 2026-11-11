@@ -88,6 +88,15 @@ impl Shared {
             process: Process::default(),
         }
     }
+
+    /// Drop the background translations in flight, as a retirement does: a
+    /// process that shared this state has taken a copy to change its code
+    /// in (`own_translations`), and what they read of its memory may be the
+    /// changed code.
+    pub(crate) fn drop_queued(&mut self) {
+        self.epoch += 1;
+        self.queued.clear();
+    }
 }
 
 /// A guest process's identity for the run-time translator, unique for the

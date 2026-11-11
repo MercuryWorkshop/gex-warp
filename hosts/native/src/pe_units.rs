@@ -1981,6 +1981,15 @@ fn wine32_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe
 /// `JitShared`) that mapped them.
 static WINE32_DEFERRED: Mutex<Vec<(usize, Pending)>> = Mutex::new(Vec::new());
 
+/// `to`, a copy of `from` (`JitShared::fork_copy`), has `from`'s deferred
+/// images too: its memory has them where `from`'s has.
+pub(crate) fn copy_deferred(from: &Arc<Mutex<crate::JitShared>>, to: &Arc<Mutex<crate::JitShared>>) {
+    let (from, to) = (Arc::as_ptr(from) as usize, Arc::as_ptr(to) as usize);
+    let mut d = WINE32_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+    let copies: Vec<(usize, Pending)> = d.iter().filter(|(o, _)| *o == from).map(|(_, p)| (to, p.clone())).collect();
+    d.extend(copies);
+}
+
 /// A tier-1 miss at `pc`: if it is inside an image [`wine32_image`] deferred,
 /// place that image's unit now.
 pub(crate) fn wine32_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {

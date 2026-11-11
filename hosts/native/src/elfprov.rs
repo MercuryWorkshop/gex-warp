@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::Caller;
 
 /// One library's bindings: its path, its executable mapping, the addresses.
+#[derive(Clone)]
 struct Bound {
     path: String,
     start: u64,
@@ -48,6 +49,16 @@ static BOUND: Mutex<Option<HashMap<usize, Vec<Bound>>>> = Mutex::new(None);
 
 fn key(sh: &Arc<Mutex<crate::JitShared>>) -> usize {
     Arc::as_ptr(sh) as usize
+}
+
+/// `to`, a copy of `from` (`JitShared::fork_copy`), has `from`'s bindings.
+pub(crate) fn copy_bound(from: &Arc<Mutex<crate::JitShared>>, to: &Arc<Mutex<crate::JitShared>>) {
+    let mut g = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.as_mut() {
+        if let Some(v) = m.get(&key(from)).cloned() {
+            m.insert(key(to), v);
+        }
+    }
 }
 
 /// The addresses ELF providers hold in this process, for a translation job.

@@ -32,6 +32,10 @@ export default async function (t) {
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
   for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue', 'vnode', 'calls', 'shm', 'fifo', 'jobs']) await d.compare(name, await d.build(name), [], { page: true });
+  // Processes that a fork parted making code at one address, in turns:
+  // under gexc only, as the page's runtime refuses a fixed mapping in one
+  // process (ENOMEM) where another, alive, has mapped since their fork.
+  await d.compare('forkcode', await d.build('forkcode'));
   // posix_spawn. A file without permission to be run is refused under
   // gexc; the page's files have no modes, and it is run (and fails as the
   // child).

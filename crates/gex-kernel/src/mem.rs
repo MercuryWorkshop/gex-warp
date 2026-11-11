@@ -500,6 +500,13 @@ pub struct MapLog {
     /// units and native modules on them for good (a native Wine DLL's `ud2`
     /// stub would then run as code: SIGILL).
     pub recheck_code: Vec<(u64, u64)>,
+    /// Whether a mapping that is or was executable has been made, changed
+    /// or removed since the host cleared this: what the logs above do not
+    /// all say (anonymous memory made executable, or mapped so from the
+    /// start). A process that shares its translations with another (a fork's
+    /// parent and child, until one of them changes its code) stops sharing
+    /// them on this.
+    pub code_changed: bool,
 }
 
 impl Clone for MapLog {
@@ -793,6 +800,21 @@ impl MemoryMap {
     /// holds.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Before `[start, end)` is mapped, unmapped or given `prot`: note in
+    /// the log when code is involved, executable before or after
+    /// ([`MapLog::code_changed`]).
+    fn note_code(&mut self, start: u64, end: u64, prot: u32) {
+        if self.log.code_changed {
+            return;
+        }
+        // Sorted and disjoint: the first mapping ending past `start` on.
+        let first = self.vmas.partition_point(|v| v.end <= start);
+        let was = self.vmas[first..].iter().take_while(|v| v.start < end).any(|v| v.prot & prot::EXEC != 0);
+        if was || prot & prot::EXEC != 0 {
+            self.log.code_changed = true;
+        }
     }
 
     /// The mapping holding `addr`, if any.
@@ -1273,6 +1295,7 @@ impl MemoryMap {
         origin: Option<(String, u64)>,
     ) {
         self.generation += 1;
+        self.note_code(start, end, prot);
         let aligned = page_align_down(start);
         // Whatever it will hold is the caller's to write; an anonymous
         // mapping the kernel zeroed is marked clean again after.
@@ -1718,6 +1741,7 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        self.note_code(addr, end, 0);
         let mut out = Vec::with_capacity(self.vmas.len() + 1);
         for v in std::mem::take(&mut self.vmas) {
             if v.end <= addr || v.start >= end {
@@ -1820,6 +1844,7 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        self.note_code(addr, end, new_prot);
         if new_prot & prot::WRITE != 0 {
             self.mark_dirty(addr, end);
         }
