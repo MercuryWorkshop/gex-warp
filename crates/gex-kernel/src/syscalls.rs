@@ -2394,15 +2394,20 @@ impl FdIo<'_> {
 
     /// Install received descriptors and describe them in the control buffer.
     ///
-    /// Returns the bytes of control data written. A buffer too small for all
-    /// of them gets what fits; Linux sets `MSG_CTRUNC` and closes the rest,
-    /// and the socket layer here simply never handed over more than fit.
+    /// Returns the bytes of control data written: the message with its
+    /// padding where the buffer has room for it, as Linux counts it
+    /// (`msg_controllen` 24 for one descriptor, not 20). A buffer too small
+    /// for all of them gets what fits; Linux sets `MSG_CTRUNC` and closes
+    /// the rest, and the socket layer here simply never handed over more
+    /// than fit. `cloexec`: the call asked for them close-on-exec
+    /// (`MSG_CMSG_CLOEXEC`).
     fn write_scm_rights(
         &self,
         m: &mut GuestMem<'_>,
         control: u64,
         len: u64,
         files: Vec<Arc<OpenFile>>,
+        cloexec: bool,
     ) -> Result<u64, Errno> {
         const SCM_RIGHTS: u32 = 1;
         if files.is_empty() || control == 0 {
@@ -2418,10 +2423,10 @@ impl FdIo<'_> {
         m.write_u32(control + w, self.cmsg_sol_socket())?;
         m.write_u32(control + w + 4, SCM_RIGHTS)?;
         for (i, f) in files.into_iter().enumerate() {
-            let fd = self.fds.insert(f, false)?;
+            let fd = self.fds.insert(f, cloexec)?;
             m.write_u32(control + hdr + i as u64 * 4, fd as u32)?;
         }
-        Ok(cmsg_len)
+        Ok(self.cmsg_align(cmsg_len).min(len))
     }
 
     /// The `SCM_CREDENTIALS` message a socket with `SO_PASSCRED` gets with
@@ -2588,6 +2593,7 @@ impl FdIo<'_> {
         controllen: u64,
         room: usize,
         peek: bool,
+        cloexec: bool,
     ) -> SysResult {
         let mut parts = Vec::new();
         let mut want = 0usize;
@@ -2623,9 +2629,9 @@ impl FdIo<'_> {
             m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
         }
         let creds = if sock.passcred() { self.write_scm_creds(m, control, controllen, sock.peer_cred())? } else { 0 };
-        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files)?;
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files, cloexec)?;
         self.msg_len_wr(m, msg, 5, written)?;
-        m.write_u32(self.msg_flags_at(msg), 0)?;
+        m.write_u32(self.msg_flags_at(msg), if cloexec { Kernel::MSG_CMSG_CLOEXEC as u32 } else { 0 })?;
         Ok(n)
     }
 
@@ -2645,6 +2651,10 @@ impl FdIo<'_> {
 
     pub fn recvmsg(&self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Kernel::MSG_PEEK != 0;
+        // Linux's `MSG_CMSG_CLOEXEC`: the descriptors received are made
+        // close-on-exec, and the flag is said back in `msg_flags`. (A Mac
+        // has no such flag.)
+        let cloexec = !darwin::on() && flags & Kernel::MSG_CMSG_CLOEXEC != 0;
         let iov = self.msg_rd(m, msg, 2)?;
         let iovlen = self.msg_len_rd(m, msg, 3)?;
         let control = self.msg_rd(m, msg, 4)?;
@@ -2662,7 +2672,7 @@ impl FdIo<'_> {
         let unix_sock = self.unix_of(fd).ok();
         if unix_sock.is_none() {
             if let Ok(sock) = self.remote_unix_of(fd) {
-                return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
+                return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek, cloexec);
             }
         }
         // The read and the sender address it set, as one (`recv_turn`).
@@ -2738,12 +2748,12 @@ impl FdIo<'_> {
             Some(s) if s.passcred() => self.write_scm_creds(m, control, controllen, s.peer_cred())?,
             _ => 0,
         };
-        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, received)?;
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, received, cloexec)?;
         self.msg_len_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
-        // of room.
+        // of room; MSG_CMSG_CLOEXEC said back.
         let msg_ctrunc: u32 = if darwin::on() { 0x20 } else { 0x8 };
-        let flags = if cut || (given && written == 0) { msg_ctrunc } else { 0 };
+        let flags = if cut || (given && written == 0) { msg_ctrunc } else { 0 } | if cloexec { Kernel::MSG_CMSG_CLOEXEC as u32 } else { 0 };
         m.write_u32(self.msg_flags_at(msg), flags)?;
         Ok(total)
     }
@@ -5257,6 +5267,28 @@ impl MapIo<'_> {
         Ok(start)
     }
 
+
+    /// Before a `sendmsg` that passes descriptors over a unix socket (one
+    /// with control data): what this process's shared mappings hold is
+    /// written to their files first. A memfd filled through its mapping and
+    /// handed over -- an image loader's frame -- is read by the receiver as
+    /// its sender left it, where Linux's one set of pages needs no such
+    /// step. Nothing when nothing is mapped shared. (What the sender stores
+    /// through its mapping after the send is the receiver's only at the
+    /// next write-back: `msync`, `munmap`, another send, its exit.)
+    pub fn flush_before_passing(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, msg: u64) {
+        if self.mem.lock().log.shared_maps.is_empty() {
+            return;
+        }
+        let passes = (|| -> Result<bool, Errno> {
+            let control = io.msg_rd(m, msg, 4)?;
+            let controllen = io.msg_len_rd(m, msg, 5)?;
+            Ok(control != 0 && controllen >= io.cmsg_hdr() && (io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok()))
+        })();
+        if passes == Ok(true) {
+            self.flush_all_shared(m);
+        }
+    }
 
     /// Write every shared mapping back (the changed pages): at `exit` and
     /// `execve`, where Linux's page cache keeps a mapping's stores for the
@@ -8461,6 +8493,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let cwd = if matches!(n, nr::BIND | nr::CONNECT) { f.path.fs.get() } else { String::new() };
         f.net.call(&f.io, m, n, a, &cwd)
     } else if n == nr::SENDMSG {
+        f.map.flush_before_passing(&f.io, m, a[0] as i32, a[1]);
         f.io.sendmsg(m, a[0] as i32, a[1])
     } else if n == nr::RECVMSG {
         // As the full call: a blocking socket parks until it is readable,
@@ -12100,7 +12133,10 @@ impl Kernel {
             // -- sockets -----------------------------------------------------
             // The socket calls ([`NetIo`]), against the calling thread's
             // working directory (entered into the namespace for the call).
-            nr::SENDMSG => self.fd_io().sendmsg(m, a[0] as i32, a[1]),
+            nr::SENDMSG => {
+                self.map_io().flush_before_passing(&self.fd_io(), m, a[0] as i32, a[1]);
+                self.fd_io().sendmsg(m, a[0] as i32, a[1])
+            }
             nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1], a[2]),
             n if is_socket_call(n) => {
                 let cwd = self.vfs.cwd.clone();
@@ -13713,6 +13749,7 @@ impl Kernel {
     /// already does. `MSG_PEEK` leaves the bytes queued.
     const MSG_PEEK: u64 = 0x2;
     const MSG_DONTWAIT: u64 = 0x40;
+    const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
 
 

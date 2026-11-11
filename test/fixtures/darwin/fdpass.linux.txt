@@ -1,0 +1,22 @@
+== one send of 20 bytes with two fds, read 16 then 4
+first 16: 16 bytes '0123456789abcdef', 2 fds (first holds 'alpha'), 1 control messages, controllen 24, flags
+last 4: 4 bytes 'WXYZ', 0 fds (first holds ''), 0 control messages, controllen 0, flags
+== peeked, then read
+peek 4: 4 bytes 'peek', 1 fds (first holds 'gamma'), 1 control messages, controllen 24, flags
+read 4: 4 bytes 'peek', 1 fds (first holds 'gamma'), 1 control messages, controllen 24, flags
+read 4 more: 4 bytes 'peek', 0 fds (first holds ''), 0 control messages, controllen 0, flags
+== two sends, each with an fd, one read asking for both
+read 8: 4 bytes 'AAAA', 1 fds (first holds 'alpha'), 1 control messages, controllen 24, flags
+read 8 again: 4 bytes 'BBBB', 1 fds (first holds 'beta'), 1 control messages, controllen 24, flags
+== a send with an fd after plain bytes, one read asking for all
+read 11: 11 bytes 'plainwithfd', 1 fds (first holds 'gamma'), 1 control messages, controllen 24, flags
+read 11 again: -1 bytes '', 0 fds (first holds ''), 1 control messages, controllen 256, flags
+== no room for the control message
+read with no control buffer: 6 bytes 'noroom', 0 fds (first holds ''), 0 control messages, controllen 0, flags CTRUNC
+read with room for one fd: 5 bytes 'small', 2 fds (first holds 'alpha'), 1 control messages, controllen 24, flags
+== read by read(2), then recvmsg
+read: 3 'rea'
+then recvmsg: 3 bytes 'dme', 0 fds (first holds ''), 0 control messages, controllen 0, flags
+== seals over the socket
+add seals: 0, get: 0
+received: seals 0x7, size 4096, cloexec 1

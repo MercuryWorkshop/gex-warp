@@ -1777,10 +1777,12 @@ extern "C" fn rs_read_fds(
     unsafe { k_sock_read_fds(id, at, len, max_fds, peek, pid, out, out_cap) }
 }
 
-/// Descriptors for `SCM_RIGHTS` that cannot leave this process -- an epoll
-/// set, a memfd, a local socket -- parked by number for a receiver that turns
-/// out to be this same process (a wineserver thread hearing from its own
-/// process's client). Another process finds no entry and gets nothing.
+/// Descriptors for `SCM_RIGHTS` that cannot leave this process -- a local
+/// socket, whatever has no name to travel by -- parked by number for a
+/// receiver that turns out to be this same process (a wineserver thread
+/// hearing from its own process's client). Another process finds no entry
+/// and gets nothing. (A memfd is not among them: it moves into the global
+/// kernel and goes by id, `carry_name`.)
 static LOCAL_FDS: std::sync::Mutex<(u32, Vec<(u32, Arc<gex_kernel::file::OpenFile>)>)> =
     std::sync::Mutex::new((0, Vec::new()));
 
@@ -10482,16 +10484,19 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         pty_note("hands on", id, master as i32, holder);
         return Some(file.path.clone());
     }
-    // A memfd going to a fork's child: its bytes move into the global
-    // kernel first, so the two processes share one file (and their shared
-    // mappings of it meet as any file's do); then it goes by id, below.
-    if holder >= 0 {
-        if let Some(memfd) = Arc::clone(&file.handle).as_memfd() {
-            if memfd.backing().is_none() {
-                if let Err(e) = share_memfd(&memfd) {
-                    warn_line(&format!("gex: could not share {} with a child: {e}\n", file.path));
-                    return None;
-                }
+    // A memfd going to another process -- a fork's child, or whoever reads
+    // the socket it is passed over (an image loader hands its frame to the
+    // program that asked: by its name alone it arrived as nothing, the
+    // receiver having no such file to open): its bytes move into the
+    // global kernel first, so the two processes share one file (and their
+    // shared mappings of it meet as any file's do); then it goes by id,
+    // below, with the seals it has now.
+    let memfd = Arc::clone(&file.handle).as_memfd();
+    if let Some(memfd) = &memfd {
+        if memfd.backing().is_none() {
+            if let Err(e) = share_memfd(memfd) {
+                warn_line(&format!("gex: could not share {} with another process: {e}\n", file.path));
+                return None;
             }
         }
     }
@@ -10502,7 +10507,11 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
             return None;
         }
         // With its path after a colon, for what reads it back (`/proc`,
-        // 32-bit Wine's image hook finding the module beside a DLL).
+        // 32-bit Wine's image hook finding the module beside a DLL); a
+        // memfd's as `/memfd+SEALS:NAME` (`rebuild_carried`).
+        if let (Some(memfd), Some(name)) = (&memfd, file.path.strip_prefix("/memfd:")) {
+            return Some(format!("#{dup}:/memfd+{}:{name}", memfd.seals()));
+        }
         return Some(format!("#{dup}:{}", file.path));
     }
     if let Some(sock) = gex_kernel::syscalls::Kernel::remote_unix_of_file(file) {
@@ -10745,13 +10754,18 @@ fn rebuild_carried(
     }) {
         let root = global_root().ok_or("no global kernel")?;
         let mut handle = gex_kernel::vfs::remote::adopt(root.remote(), id);
-        // a memfd its sender shared (`share_memfd`): a memfd here too
-        if let Some(n) = name.strip_prefix("/memfd:") {
+        // a memfd its sender shared (`share_memfd`): a memfd here too,
+        // sealed as its sender's was (`/memfd+SEALS:NAME`, `carry_name`)
+        let mut name = name.to_string();
+        if let Some((seals, n)) = name.strip_prefix("/memfd+").and_then(|v| v.split_once(':')).map(|(s, n)| (s.parse::<u32>().unwrap_or(0), n.to_string())) {
+            handle = Arc::new(gex_kernel::unix::MemFd::backed_sealed(&n, handle, seals));
+            name = format!("/memfd:{n}");
+        } else if let Some(n) = name.strip_prefix("/memfd:") {
             handle = Arc::new(gex_kernel::unix::MemFd::backed(n, handle));
         }
         let f = OpenFile::new(
             handle,
-            name.to_string(),
+            name,
             flags,
             acc != oflags::O_WRONLY,
             acc != oflags::O_RDONLY,

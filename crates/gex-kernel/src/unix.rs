@@ -1465,6 +1465,17 @@ impl MemFd {
         m
     }
 
+    /// [`Self::backed`], with the seals its sender's had when it was passed
+    /// (`SCM_RIGHTS` across processes: a frame's receiver asks for them
+    /// before it maps what it was handed). A copy as of then: a seal added
+    /// on one side afterwards is not seen on the other, where Linux's one
+    /// file would show it.
+    pub fn backed_sealed(name: &str, file: Arc<dyn FileHandle>, seals: u32) -> MemFd {
+        let m = MemFd::backed(name, file);
+        *m.seals.lock().unwrap() = seals & seal::ALL;
+        m
+    }
+
     /// The file holding the bytes, once they are shared.
     pub fn backing(&self) -> Option<&Arc<dyn FileHandle>> {
         self.backing.get()

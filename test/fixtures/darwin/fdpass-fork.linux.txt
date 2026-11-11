@@ -1,0 +1,7 @@
+written: 1 byte 'A', fd there, flags 0x40000000, size 20, read 20 'written by the child', seals 0
+mapped: 1 byte 'B', fd there, size 65536, read 19 'mapped by the child', seals 0x6, mapped yes 'mapped by the child' ... 'END!'
+live: fd there, mapped 'before the send'
+live, after the child wrote again: mapped 'after the send', read 'after the send'
+pipe: fd there, read 14 'through a pipe'
+file: fd there, read 4, ELF 1
+child: 0
