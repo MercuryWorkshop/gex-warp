@@ -3846,7 +3846,7 @@ impl PathIo<'_> {
 
     pub fn getdents(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
         let file = self.map.fds.get(fd)?;
-        let bytes = file.read_dirents(len as usize)?;
+        let bytes = file.read_dirents(len as usize, &|dir| self.ns.mounts_in(dir))?;
         m.write(buf, &bytes)?;
         Ok(bytes.len() as u64)
     }

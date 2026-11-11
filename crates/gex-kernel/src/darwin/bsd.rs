@@ -1103,7 +1103,7 @@ impl Kernel {
         let before = file.seek(0, 1).unwrap_or(0);
         // What is no directory is an invalid argument to this call (as is
         // a buffer with no room for one record, which the read says).
-        let linux = file.read_dirents(abi::dirents_room(len) as usize).map_err(|e| if e == Errno::ENOTDIR { Errno::EINVAL } else { e })?;
+        let linux = file.read_dirents(abi::dirents_room(len) as usize, &|dir| self.vfs.mounts_in(dir)).map_err(|e| if e == Errno::ENOTDIR { Errno::EINVAL } else { e })?;
         // `old`: the records of before 64-bit inodes (`getdirentries`).
         let out = if old { abi::dirents_old(&linux) } else { abi::dirents(&linux) };
         m.write(buf, &out)?;

@@ -411,7 +411,7 @@ impl Kernel {
         }
         let dir = file.path.trim_end_matches('/').to_string();
         let (mut out, mut count, mut full_up) = (Vec::new(), 0u64, false);
-        file.take_dir_entries(|e| {
+        file.take_dir_entries(&|dir| self.vfs.mounts_in(dir), |e| {
             if e.name == "." || e.name == ".." {
                 return true;
             }

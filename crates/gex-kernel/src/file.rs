@@ -355,10 +355,10 @@ impl OpenFile {
     /// The directory's entries from the cursor on, each handed to `take`
     /// until it has no room for one (`false`); the cursor moves past the
     /// ones taken, however many those are.
-    pub fn take_dir_entries(&self, mut take: impl FnMut(&DirEntry) -> bool) -> Result<usize, Errno> {
+    pub fn take_dir_entries(&self, mounted: &dyn Fn(&str) -> Vec<DirEntry>, mut take: impl FnMut(&DirEntry) -> bool) -> Result<usize, Errno> {
         let mut cache = self.dir_cache.lock().unwrap();
         if cache.is_none() {
-            *cache = Some(self.handle.read_dir()?);
+            *cache = Some(self.list(mounted)?);
         }
         let entries = cache.as_ref().unwrap();
         let start = self.dir_pos.load(Ordering::Relaxed).min(entries.len());
@@ -367,11 +367,26 @@ impl OpenFile {
         Ok(taken)
     }
 
+    /// The directory's entries, and with them what is mounted in it that
+    /// its own filesystem has no entry for (`mounted`, asked by the
+    /// directory's name: [`crate::vfs::Namespace::mounts_in`]).
+    fn list(&self, mounted: &dyn Fn(&str) -> Vec<DirEntry>) -> Result<Vec<DirEntry>, Errno> {
+        let mut entries = self.handle.read_dir()?;
+        if self.path.starts_with('/') {
+            for m in mounted(&self.path) {
+                if !entries.iter().any(|e| e.name == m.name) {
+                    entries.push(m);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Fill `buf` with `getdents64` records, advancing the cursor.
-    pub fn read_dirents(&self, buf_len: usize) -> Result<Vec<u8>, Errno> {
+    pub fn read_dirents(&self, buf_len: usize, mounted: &dyn Fn(&str) -> Vec<DirEntry>) -> Result<Vec<u8>, Errno> {
         let mut cache = self.dir_cache.lock().unwrap();
         if cache.is_none() {
-            *cache = Some(self.handle.read_dir()?);
+            *cache = Some(self.list(mounted)?);
         }
         let entries = cache.as_ref().unwrap();
         let start = self.dir_pos.load(Ordering::Relaxed);

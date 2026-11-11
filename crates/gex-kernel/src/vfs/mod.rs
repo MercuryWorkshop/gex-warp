@@ -1473,6 +1473,25 @@ impl Namespace {
         self.others = others.join("\0");
     }
 
+    /// What is mounted in the directory `dir`, as entries of it: a
+    /// filesystem mounted where its parent's has no directory (`/dev` in a
+    /// Mac's root, a host directory bound at a name of its own) is there to
+    /// be listed all the same. A program that finds where it is by looking
+    /// for its directory among its parent's entries (ksh, with no `PWD`)
+    /// found nothing, and went on as one that does not know.
+    pub fn mounts_in(&self, dir: &str) -> Vec<DirEntry> {
+        let dir = normalize(dir, "/");
+        self.mounts
+            .iter()
+            .filter(|(at, _)| at.as_str() != "/" && parent_of(at) == dir)
+            .map(|(at, fs)| DirEntry {
+                name: at.rsplit('/').next().unwrap_or("").to_string(),
+                file_type: FileType::Directory,
+                ino: fs.metadata("").map_or(mount_id(at), |m| m.ino),
+            })
+            .collect()
+    }
+
     /// Every mount, parents before what is mounted under them: where, and
     /// its [`FileSystem::fs_type`].
     pub fn mount_table(&self) -> Vec<(String, &'static str)> {
@@ -2280,6 +2299,22 @@ mod tests {
         assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
         assert!(vfs.metadata("/bin/sh").is_ok());
         assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
+    }
+
+    #[test]
+    fn what_is_mounted_in_a_directory_is_listed_there() {
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("usr/x", b"x".to_vec());
+        vfs.mount("/", root);
+        vfs.mount("/dev", Arc::new(TmpFs::new()));
+        vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+        vfs.mount("/work", Arc::new(TmpFs::new()));
+        let names = |d: &str| vfs.mounts_in(d).into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names("/"), ["dev", "work"]);
+        assert_eq!(names("/dev"), ["shm"]);
+        assert_eq!(names("/dev/"), ["shm"]);
+        assert!(names("/usr").is_empty());
     }
 
     #[test]
