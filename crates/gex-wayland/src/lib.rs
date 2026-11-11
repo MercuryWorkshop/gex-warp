@@ -646,7 +646,8 @@ impl Positioner {
     /// The anchor picks a point on the anchor rectangle; the gravity says which
     /// way the popup grows from it. Both are the same nine-value enum, so both
     /// are read the same way: 0 none (the centre), 1 top, 2 bottom, 3 left,
-    /// 4 right, and 5..8 the corners.
+    /// 4 right, and the corners: 5 top-left, 6 bottom-left, 7 top-right,
+    /// 8 bottom-right.
     fn place(&self) -> (i32, i32) {
         let (ax, ay, aw, ah) = self.anchor_rect;
         let (mut x, mut y) = (ax + aw / 2, ay + ah / 2);
@@ -656,8 +657,8 @@ impl Positioner {
             3 => x = ax,
             4 => x = ax + aw,
             5 => { x = ax; y = ay }
-            6 => { x = ax + aw; y = ay }
-            7 => { x = ax; y = ay + ah }
+            6 => { x = ax; y = ay + ah }
+            7 => { x = ax + aw; y = ay }
             8 => { x = ax + aw; y = ay + ah }
             _ => {}
         }
@@ -670,8 +671,8 @@ impl Positioner {
             3 => x -= w,
             4 => {}
             5 => { x -= w; y -= h }
-            6 => { y -= h }
-            7 => { x -= w }
+            6 => { x -= w }
+            7 => { y -= h }
             8 => {}
             // "none": centred on the anchor point.
             _ => { x -= w / 2; y -= h / 2 }
@@ -4427,6 +4428,20 @@ mod tests {
             offset: (0, 0),
         };
         assert_eq!(p.place(), (10 - 30, 20 - 10));
+        // A menu under a button: hung from the rectangle's bottom-left
+        // corner (6), growing down and to the right (8), its top-left
+        // corner is on that corner. And one that opens upward from the
+        // top-right corner (7), growing up and to the left (5).
+        let menu = Positioner { anchor: 6, gravity: 8, ..p.clone() };
+        assert_eq!(menu.place(), (10, 20 + 50));
+        let up = Positioner { anchor: 7, gravity: 5, ..p.clone() };
+        assert_eq!(up.place(), (10 + 100 - 30, 20 - 10));
+        // The gravities of the other two corners: bottom-left (6) grows
+        // down and to the left, top-right (7) up and to the right.
+        let p6 = Positioner { anchor: 0, gravity: 6, ..p.clone() };
+        assert_eq!(p6.place(), (10 + 50 - 30, 20 + 25));
+        let p7 = Positioner { anchor: 0, gravity: 7, ..p.clone() };
+        assert_eq!(p7.place(), (10 + 50, 20 + 25 - 10));
         // No anchor and no gravity: centred on the middle of the rectangle.
         let p = Positioner {
             anchor: 0,
