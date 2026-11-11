@@ -14,7 +14,8 @@
 //            for each architecture there is one of (GEX_TEST_DARWIN_ROOT,
 //            GEX_TEST_DARWIN_ROOT_X86; by default pyrus's out/root and
 //            out/root-x86_64 beside this repository); and beside each,
-//            darwin-window.ARCH, fixtures/darwin/page's programs built
+//            darwin-window.ARCH, darwin-dnd.ARCH (and darwin-dnd-linux.ARCH,
+//            its Linux build), fixtures/darwin/page's programs built
 //            for a Mac where there is a compiler for one,
 //            darwin-arches.ARCH (fixtures/darwin/arches.c, static), and
 //            darwin-beside.ARCH, its Linux program (zig, or a musl
@@ -220,7 +221,7 @@ export const images = {
       made++;
       // And the Mac programs a page's tests run in it, where there is a
       // compiler for them (a Mac's).
-      for (const name of ['window']) {
+      for (const name of ['window', 'dnd']) {
         const prog = join(work, `darwin-${name}.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin/page', `${name}.c`)], { stdio: 'ignore' });
@@ -242,10 +243,14 @@ export const images = {
       rmSync(beside, { force: true });
       const triple = `${arch === 'x86' ? 'x86_64' : 'aarch64'}-linux-musl`;
       const src = join(HERE, 'darwin/page', 'beside.c');
-      spawnSync('zig', ['cc', '-target', triple, '-O2', '-static', '-Wl,--image-base=0x1000000', '-o', beside, src], { stdio: 'ignore' });
-      if (!existsSync(beside)) {
-        const tc = process.env[arch === 'x86' ? 'GEX_TOOLCHAIN_X86' : 'GEX_TOOLCHAIN'] || join(homedir(), 'toolchains', `${triple}-cross`);
-        spawnSync(join(tc, 'bin', `${triple}-gcc`), ['-O2', '-static', '-Wl,-Ttext-segment=0x1000000', '-o', beside, src], { stdio: 'ignore' });
+      // (and darwin/dnd's Linux half, the same way: darwin-dnd-linux.ARCH)
+      for (const [out, from] of [[beside, src], [join(work, `darwin-dnd-linux.${arch}`), join(HERE, 'darwin/page', 'dnd.c')]]) {
+        rmSync(out, { force: true });
+        spawnSync('zig', ['cc', '-target', triple, '-O2', '-static', '-Wl,--image-base=0x1000000', '-o', out, from], { stdio: 'ignore' });
+        if (!existsSync(out)) {
+          const tc = process.env[arch === 'x86' ? 'GEX_TOOLCHAIN_X86' : 'GEX_TOOLCHAIN'] || join(homedir(), 'toolchains', `${triple}-cross`);
+          spawnSync(join(tc, 'bin', `${triple}-gcc`), ['-O2', '-static', '-Wl,-Ttext-segment=0x1000000', '-o', out, from], { stdio: 'ignore' });
+        }
       }
     }
     return made ? null : 'no Mac root (GEX_TEST_DARWIN_ROOT, GEX_TEST_DARWIN_ROOT_X86: pyrus builds one)';
