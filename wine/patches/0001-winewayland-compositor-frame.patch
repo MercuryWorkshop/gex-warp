@@ -1,0 +1,517 @@
+From fe46d6c9b1e345f8560cd7feeb806ad588bb23e1 Mon Sep 17 00:00:00 2001
+From: gex <gex@localhost>
+Date: Wed, 11 Nov 2026 10:16:25 -0500
+Subject: [PATCH] winewayland.drv: Have the compositor frame a window with a
+ caption (xdg-decoration).
+
+With zxdg_decoration_manager_v1, a top-level window with a caption asks
+for server-side decoration, and Win32 leaves its caption and border to
+the compositor (GetWindowStyleMasks): the surface is the window's
+visible rect, inside them, and a configure's size is the client area's.
+A compositor that places windows (gex_window_placement_v1) frames them
+only when its host says it frames placed windows, WINEGEX_FRAMES=1 (gex's
+HostWindows); such a window is placed but not unmanaged, and an origin
+other than where Win32 put it is its frame having moved it: Win32 moves
+it there. Windows without a caption, and every window when the
+compositor says client_side or win32u's Decorated option is off, are
+drawn by Win32 as before.
+---
+ dlls/winewayland.drv/Makefile.in              |   1 +
+ dlls/winewayland.drv/wayland.c                |   5 +
+ dlls/winewayland.drv/wayland_surface.c        |  63 +++++++-
+ dlls/winewayland.drv/waylanddrv.h             |  20 ++-
+ dlls/winewayland.drv/waylanddrv_main.c        |   1 +
+ dlls/winewayland.drv/window.c                 | 134 +++++++++++++++++-
+ .../xdg-decoration-unstable-v1.xml            |  53 +++++++
+ 7 files changed, 266 insertions(+), 11 deletions(-)
+ create mode 100644 dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index 1220d367878..374df0e6378 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -31,6 +31,7 @@ SOURCES = \
+ 	window.c \
+ 	window_surface.c \
+ 	wlr-data-control-unstable-v1.xml \
++	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+ 	xdg-shell.xml \
+ 	xdg-toplevel-icon-v1.xml
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 7ff67641e64..585d87bd161 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -159,6 +159,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+             wl_registry_bind(registry, id, &gex_window_placement_manager_v1_interface,
+                              version < 2 ? version : 2);
+     }
++    else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
++    {
++        process_wayland.zxdg_decoration_manager_v1 =
++            wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
++    }
+     else if (strcmp(interface, "wp_viewporter") == 0)
+     {
+         process_wayland.wp_viewporter =
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 1adb6ae4ee4..2ae47593644 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -335,10 +335,39 @@ static void gex_placement_handle_origin(void *data, struct gex_window_placement_
+     {
+         surface->placed_origin.x = x;
+         surface->placed_origin.y = y;
++        /* A framed window is where its frame is: one shown elsewhere than
++         * Win32 put it was moved by its frame, and Win32 follows. */
++        if (surface->decorated && (x != surface->placed_at.x || y != surface->placed_at.y))
++            NtUserPostMessage(hwnd, WM_WAYLAND_MOVE, 0, 0);
+     }
+     wayland_win_data_release(win_data);
+ }
+ 
++static void decoration_handle_configure(void *data, struct zxdg_toplevel_decoration_v1 *decoration,
++                                        uint32_t mode)
++{
++    HWND hwnd = data;
++    struct wayland_win_data *win_data;
++    BOOL refused = FALSE;
++
++    TRACE("hwnd=%p mode=%u\n", hwnd, mode);
++
++    if (mode != ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) return;
++    if (!(win_data = wayland_win_data_get(hwnd))) return;
++    if (!win_data->decoration_refused && win_data->wayland_surface &&
++        win_data->wayland_surface->zxdg_toplevel_decoration_v1 == decoration)
++        win_data->decoration_refused = refused = TRUE;
++    wayland_win_data_release(win_data);
++
++    /* Win32 draws the frame after all: the window's rects again. */
++    if (refused) NtUserPostMessage(hwnd, WM_WAYLAND_FRAME, 0, 0);
++}
++
++static const struct zxdg_toplevel_decoration_v1_listener decoration_listener =
++{
++    decoration_handle_configure,
++};
++
+ /* A window Win32 activated before it had a placement: WAYLAND_ActivateWindow
+  * found nothing to tell then (ShowWindow activates a window before the
+  * WindowPosChanged that makes its surface), and the compositor, which gives
+@@ -360,9 +389,10 @@ static const struct gex_window_placement_v1_listener gex_placement_listener =
+ /**********************************************************************
+  *          wayland_surface_make_toplevel
+  *
+- * Gives the toplevel role to a plain wayland surface.
++ * Gives the toplevel role to a plain wayland surface; decorated, one the
++ * compositor frames.
+  */
+-void wayland_surface_make_toplevel(struct wayland_surface *surface)
++void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL decorated)
+ {
+     WCHAR text[1024];
+ 
+@@ -394,15 +424,31 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+ 
+     wayland_surface_init_fractional_scale(surface, 1.0);
+ 
++    surface->decorated = decorated && wayland_frames_windows();
++    if (surface->decorated)
++    {
++        surface->zxdg_toplevel_decoration_v1 = zxdg_decoration_manager_v1_get_toplevel_decoration(
++            process_wayland.zxdg_decoration_manager_v1, surface->xdg_toplevel);
++        if (surface->zxdg_toplevel_decoration_v1)
++        {
++            zxdg_toplevel_decoration_v1_add_listener(surface->zxdg_toplevel_decoration_v1,
++                                                     &decoration_listener, surface->hwnd);
++            zxdg_toplevel_decoration_v1_set_mode(surface->zxdg_toplevel_decoration_v1,
++                                                 ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++        }
++        else surface->decorated = FALSE;
++    }
++
+     if (process_wayland.gex_window_placement_manager_v1)
+     {
+         surface->gex_placement = gex_window_placement_manager_v1_get_placement(
+             process_wayland.gex_window_placement_manager_v1, surface->wl_surface);
+         if (surface->gex_placement)
+         {
+-            /* Win32 draws the frame, and other windows name this one by its
+-             * handle when they stack above or below it. */
+-            gex_window_placement_v1_set_unmanaged(surface->gex_placement);
++            /* Win32 draws the frame, unless the compositor does, and other
++             * windows name this one by its handle when they stack above or
++             * below it. */
++            if (!surface->decorated) gex_window_placement_v1_set_unmanaged(surface->gex_placement);
+             gex_window_placement_v1_set_stack_id(surface->gex_placement,
+                                                  (UINT)(ULONG_PTR)surface->hwnd);
+             surface->placed_at.x = surface->placed_at.y = INT_MIN;
+@@ -549,6 +595,13 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+             gex_window_placement_v1_destroy(surface->gex_placement);
+             surface->gex_placement = NULL;
+         }
++        /* (before its toplevel, which it would otherwise outlive) */
++        if (surface->zxdg_toplevel_decoration_v1)
++        {
++            zxdg_toplevel_decoration_v1_destroy(surface->zxdg_toplevel_decoration_v1);
++            surface->zxdg_toplevel_decoration_v1 = NULL;
++        }
++        surface->decorated = FALSE;
+         if (surface->xdg_toplevel_icon)
+         {
+             xdg_toplevel_icon_manager_v1_set_icon(
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index f5608677284..50f3aa905d1 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -36,6 +36,7 @@
+ #include "viewporter-client-protocol.h"
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
++#include "xdg-decoration-unstable-v1-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+ #include "xdg-toplevel-icon-v1-client-protocol.h"
+ #include "pointer-warp-v1-client-protocol.h"
+@@ -73,6 +74,8 @@ enum wayland_window_message
+     WM_WAYLAND_SET_FOREGROUND,
+     WM_WAYLAND_KEY,
+     WM_WAYLAND_DND,
++    WM_WAYLAND_MOVE,
++    WM_WAYLAND_FRAME,
+ };
+ 
+ /* WM_WAYLAND_DND's wparam: what the data device heard of a drag. */
+@@ -198,6 +201,11 @@ struct wayland
+      * placed by position and z-order, and Win32 -- not the compositor --
+      * moves, sizes, maximizes, activates and raises. */
+     struct gex_window_placement_manager_v1 *gex_window_placement_manager_v1;
++    /* With it, a window with a caption is framed by the compositor
++     * (wayland_frames_windows): Win32 draws neither its caption nor its
++     * border (WAYLAND_GetWindowStyleMasks), and its surface is what is
++     * inside them. */
++    struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1;
+     struct wl_subcompositor *wl_subcompositor;
+     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
+     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
+@@ -339,6 +347,10 @@ struct wayland_surface
+     UINT placed_layer;
+     HWND placed_below;
+     BOOL placed_stacked;
++    /* The compositor frames the toplevel (server-side decoration asked
++     * for): its surface is the window less the caption and border. */
++    struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
++    BOOL decorated;
+ 
+     struct wayland_surface_config pending, requested, processing, current;
+     BOOL resizing;
+@@ -375,7 +387,7 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
+ struct wayland_surface *wayland_surface_create(HWND hwnd);
+ void wayland_surface_place(struct wayland_surface *surface, BOOL restack);
+ void wayland_surface_destroy(struct wayland_surface *surface);
+-void wayland_surface_make_toplevel(struct wayland_surface *surface);
++void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL decorated);
+ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                      struct wayland_surface *parent);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
+@@ -435,6 +447,10 @@ struct wayland_win_data
+     BOOL resizeable;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    /* Win32 left the caption and border to the compositor (the visible rect
++     * is inside the window rect), and whether the compositor refused. */
++    BOOL decorated;
++    BOOL decoration_refused;
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+@@ -443,6 +459,7 @@ void wayland_win_data_release(struct wayland_win_data *data);
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ UINT32 wayland_gex_client_surface(HWND hwnd);
++BOOL wayland_frames_windows(void);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void wayland_window_init(void);
+@@ -508,6 +525,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
+ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
+ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+ void WAYLAND_DestroyWindow(HWND hwnd);
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
+ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect);
+ void WAYLAND_SetCursor(HWND hwnd, HCURSOR hcursor);
+ BOOL WAYLAND_SetCursorPos(INT x, INT y);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 79e553c34d1..7ca4abc4593 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -39,6 +39,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+     .pDestroyWindow = WAYLAND_DestroyWindow,
++    .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
+     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
+     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 61c95bf5a00..6566a429445 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <stdlib.h>
+ 
+ #include "ntstatus.h"
+@@ -207,8 +208,13 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
+-    /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
+-    if ((surface = data->wayland_surface) && role && surface->role && surface->role != role)
++    /* we can temporarily clear the role of a surface but cannot assign a different one after it's set.
++     * Framed by the compositor or by Win32 is a toplevel's for its life too (a placement made
++     * unmanaged stays so): a change makes a new one. */
++    if ((surface = data->wayland_surface) && role && surface->role &&
++        (surface->role != role ||
++         (wayland_surface_is_toplevel(surface) &&
++          !surface->decorated != !(data->decorated && wayland_frames_windows()))))
+     {
+         /* Make sure any attached client surface is detached before we destroy the surface.
+          * They will be reattached when win32u updates them again after WindowPosChanged.
+@@ -237,7 +243,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         wayland_surface_clear_role(surface);
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+-        wayland_surface_make_toplevel(surface);
++        wayland_surface_make_toplevel(surface, data->decorated);
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         wayland_surface_make_subsurface(surface, owner_surface);
+@@ -424,6 +430,76 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+     return FALSE;
+ }
+ 
++/***********************************************************************
++ *		wayland_frames_windows
++ *
++ * Whether the compositor frames top-level windows with a caption: one that
++ * offers xdg-decoration does, but one that places windows (gex) only when
++ * its host draws a frame around a placed window, as gex's HostWindows does,
++ * and says so to its programs: WINEGEX_FRAMES=1. Otherwise Win32 draws every
++ * frame, as on Windows.
++ */
++BOOL wayland_frames_windows(void)
++{
++    static int frames = -1;
++
++    if (!process_wayland.zxdg_decoration_manager_v1) return FALSE;
++    if (!process_wayland.gex_window_placement_manager_v1) return TRUE;
++    if (frames < 0)
++    {
++        const char *e = getenv("WINEGEX_FRAMES");
++        frames = e && e[0] == '1';
++    }
++    return frames;
++}
++
++/***********************************************************************
++ *		is_window_decorated
++ *
++ * Whether the compositor frames a top-level window of this style, given a
++ * compositor that frames windows: one with a caption, as the X11 driver has
++ * its window manager decorate. The rest (popups, menus, tooltips, tool and
++ * layered windows, borderless and fullscreen ones) Win32 draws as it is.
++ */
++static BOOL is_window_decorated(DWORD style, DWORD ex_style)
++{
++    if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
++    if (ex_style & (WS_EX_TOOLWINDOW|WS_EX_LAYERED)) return FALSE;
++    return (style & WS_CAPTION) == WS_CAPTION;
++}
++
++/***********************************************************************
++ *           WAYLAND_GetWindowStyleMasks
++ *
++ * The non-client parts the compositor draws, which Win32 then neither draws
++ * nor counts in the window's surface (its visible rect): the caption and the
++ * border of a decorated window. The "Decorated" value under
++ * HKCU\Software\Wine\X11 Driver (win32u's, for every driver) set to N
++ * leaves them to Win32 again.
++ */
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask)
++{
++    struct wayland_win_data *data;
++    BOOL decorated;
++
++    if (!wayland_frames_windows()) return FALSE;
++
++    decorated = is_window_decorated(style, ex_style);
++    if (decorated && (data = wayland_win_data_get(hwnd)))
++    {
++        if (data->decoration_refused) decorated = FALSE;
++        wayland_win_data_release(data);
++    }
++
++    *style_mask = *ex_style_mask = 0;
++    if (decorated)
++    {
++        *style_mask = WS_CAPTION | WS_THICKFRAME;
++        *ex_style_mask = WS_EX_DLGMODALFRAME;
++    }
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           WAYLAND_DestroyWindow
+  */
+@@ -481,6 +557,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     data->is_fullscreen = fullscreen;
+     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
+     data->managed = managed;
++    data->decorated = !EqualRect(&new_rects->window, &new_rects->visible) &&
++                      is_window_decorated(NtUserGetWindowLongW(hwnd, GWL_STYLE),
++                                          NtUserGetWindowLongW(hwnd, GWL_EXSTYLE));
+ 
+     if (!surface)
+     {
+@@ -543,8 +622,9 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     state = surface->processing.state;
+     /* Ignore size hints if we don't have a state that requires strict
+-     * size adherence, in order to avoid spurious resizes. */
+-    if (state)
++     * size adherence, in order to avoid spurious resizes. A window the
++     * compositor frames is sized by its frame, though. */
++    if (state || surface->decorated)
+     {
+         width = surface->processing.rect.right - surface->processing.rect.left;
+         height = surface->processing.rect.bottom - surface->processing.rect.top;
+@@ -611,6 +691,15 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     SetRect(&rect, 0, 0, width, height);
+     rect = map_rect_from_surface(surface, rect);
++    /* A framed window's surface is inside its caption and border, which the
++     * window keeps around the size asked for. */
++    if (surface->decorated && width && height)
++    {
++        rect.right += (data->rects.window.right - data->rects.window.left) -
++                      (data->rects.visible.right - data->rects.visible.left);
++        rect.bottom += (data->rects.window.bottom - data->rects.window.top) -
++                       (data->rects.visible.bottom - data->rects.visible.top);
++    }
+     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
+ 
+     wayland_win_data_release(data);
+@@ -642,6 +731,33 @@ static void wayland_configure_window(HWND hwnd)
+     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+ }
+ 
++/* A framed, placed window that its frame moved (the compositor shows it at
++ * an origin other than where Win32 put it): Win32 moves it there, its
++ * client area at the origin. Only the latest origin; a stale message does
++ * nothing. */
++static void wayland_move_window(HWND hwnd)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    RECT rect;
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (!(surface = data->wayland_surface) || !surface->gex_placement || !surface->decorated ||
++        surface->placed_origin.x == INT_MIN ||
++        (surface->placed_origin.x == surface->placed_at.x && surface->placed_origin.y == surface->placed_at.y))
++    {
++        wayland_win_data_release(data);
++        return;
++    }
++    rect = data->rects.window;
++    OffsetRect(&rect, surface->placed_origin.x - data->rects.visible.left,
++               surface->placed_origin.y - data->rects.visible.top);
++    wayland_win_data_release(data);
++
++    TRACE("hwnd=%p to %s\n", hwnd, wine_dbgstr_rect(&rect));
++    NtUserSetRawWindowPos(hwnd, rect, SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE, FALSE);
++}
++
+ /**********************************************************************
+  *           WAYLAND_WindowMessage
+  */
+@@ -673,6 +789,14 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_DND:
+         wayland_dnd_message(hwnd, wp, lp);
+         return 0;
++    case WM_WAYLAND_MOVE:
++        wayland_move_window(hwnd);
++        return 0;
++    case WM_WAYLAND_FRAME:
++        /* The compositor will not frame it: its rects with Win32's frame. */
++        NtUserSetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOSIZE | SWP_NOMOVE |
++                           SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
++        return 0;
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;
+diff --git a/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+new file mode 100644
+index 00000000000..834f6568ac1
+--- /dev/null
++++ b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+@@ -0,0 +1,53 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="xdg_decoration_unstable_v1">
++  <description summary="who draws a toplevel's frame">
++    The interfaces of wayland-protocols' unstable/xdg-decoration (version
++    1): a client asks for each xdg_toplevel to be decorated by the
++    compositor (server-side) or by itself (client-side), and the compositor
++    says which it is to be.
++  </description>
++
++  <interface name="zxdg_decoration_manager_v1" version="1">
++    <request name="destroy" type="destructor"/>
++
++    <request name="get_toplevel_decoration">
++      <arg name="id" type="new_id" interface="zxdg_toplevel_decoration_v1"/>
++      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
++    </request>
++  </interface>
++
++  <interface name="zxdg_toplevel_decoration_v1" version="1">
++    <enum name="error">
++      <entry name="unconfigured_buffer" value="0"/>
++      <entry name="already_constructed" value="1"/>
++      <entry name="orphaned" value="2"/>
++      <entry name="invalid_mode" value="3"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the decoration object">
++        Destroyed before its xdg_toplevel. The compositor goes back to its
++        default decoration mode for the toplevel.
++      </description>
++    </request>
++
++    <enum name="mode">
++      <entry name="client_side" value="1" summary="the client draws its frame"/>
++      <entry name="server_side" value="2" summary="the compositor draws the frame"/>
++    </enum>
++
++    <request name="set_mode">
++      <arg name="mode" type="uint" enum="mode"/>
++    </request>
++
++    <request name="unset_mode"/>
++
++    <event name="configure">
++      <description summary="the mode to use">
++        The decoration mode the toplevel is to have, applied at the next
++        xdg_surface.configure.
++      </description>
++      <arg name="mode" type="uint" enum="mode"/>
++    </event>
++  </interface>
++</protocol>
+-- 
+2.54.0 (Apple Git-157)
+
