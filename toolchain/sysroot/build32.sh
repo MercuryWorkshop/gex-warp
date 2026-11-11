@@ -94,7 +94,9 @@ fi
 SR="$OUT/sysroot/include"
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
 cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+# (Debian keeps asm/ under the multiarch directory)
+ASMDIR=/usr/include/asm; [ -d "$ASMDIR" ] || ASMDIR=/usr/include/$(gcc -print-multiarch)/asm
+cp -rL "$ASMDIR" "$SR/asm"
 for h in $(grep -l __i386__ "$SR"/asm/*.h); do
   case $h in */swab.h) continue ;; esac
   sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \
@@ -117,7 +119,7 @@ for f in "$CRT"/*.c; do
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS -nostdinc -isystem "$SR" -isystem "$(clang -print-resource-dir)/include" -Wno-everything -c "$f" -o "$b.o" &
   objs="$objs $b.o"
   [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done
