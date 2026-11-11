@@ -18,5 +18,5 @@ read with room for one fd: 5 bytes 'small', 2 fds (first holds 'alpha'), 1 contr
 read: 3 'rea'
 then recvmsg: 3 bytes 'dme', 0 fds (first holds ''), 0 control messages, controllen 0, flags
 == seals over the socket
-add seals: 0, get: 0
+add seals: 0, get: 0x7
 received: seals 0x7, size 4096, cloexec 1

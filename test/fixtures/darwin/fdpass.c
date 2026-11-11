@@ -78,7 +78,8 @@ int main(void) {
   recv_show("then recvmsg", sv[1], 3, 0, 256);
   printf("== seals over the socket\n");
   int m = memfd_create("s", MFD_CLOEXEC | MFD_ALLOW_SEALING); ftruncate(m, 4096);
-  printf("add seals: %d, get: %#x\n", fcntl(m, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL), fcntl(m, F_GET_SEALS));
+  int added = fcntl(m, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
+  printf("add seals: %d, get: %#x\n", added, fcntl(m, F_GET_SEALS));
   send_with(sv[0], "x", 1, &m, 1);
   { char buf[4], cbuf[64]; struct iovec iov = { buf, 1 }; struct msghdr mh = { 0 }; mh.msg_iov = &iov; mh.msg_iovlen = 1; mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
     recvmsg(sv[1], &mh, MSG_CMSG_CLOEXEC); struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
