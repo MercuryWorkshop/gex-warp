@@ -28,4 +28,4 @@ if [ -n "${SEEDS:-}" ]; then
   seed="-v $SEEDS:/seed -e WINE64_SEED=/seed/wine-wasm.git -e WINE32_SEED=/seed/wine-wasm.git -e MUSL_SEED=/seed/musl-wasm.git -e MUSL64_SEED=/seed/musl-wasm64.git"
 fi
 exec docker run --rm --cpus "${CPUS:-3}" --platform linux/amd64 -v "$root":/gex -v "$common":"$common" -v "$VOLUME":/root/.cache/gex $seed \
-  -w /gex -e JOBS="${JOBS:-3}" -e HOME=/root "$IMAGE" nice -n 10 make "$T" JOBS="${JOBS:-3}" OUT=/root/.cache/gex/out "$@"
+  -w /gex -e JOBS="${JOBS:-3}" -e WINE32_JOBS="${JOBS:-3}" -e HOME=/root "$IMAGE" nice -n 10 make "$T" JOBS="${JOBS:-3}" OUT=/root/.cache/gex/out "$@"
