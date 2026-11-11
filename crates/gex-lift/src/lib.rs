@@ -1534,8 +1534,8 @@ impl<'a> Lifter<'a> {
                 vm,
                 index,
             } => {
-                // Scalar `fmla`/`fmls` are fused, as `fmadd` is. (The vector forms round the
-                // product first: wasm has no vector FMA.)
+                // Scalar `fmla`/`fmls` are fused, as `fmadd` is; the vector forms are too, a lane
+                // at a time, below.
                 if arr.scalar && matches!(op, VOp3::FMla | VOp3::FMls) {
                     let sz = if arr.lane_bytes == 8 { FpSz::D } else { FpSz::S };
                     let a = self.rd_fp(vn, sz);
@@ -3015,12 +3015,41 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             // Multiply-accumulate reads the destination as a third operand.
+            // The floating-point forms are fused, one rounding a lane. wasm has no vector FMA
+            // (and its relaxed one may or may not fuse), so each lane goes through the scalar
+            // one: a product rounded first is a different answer, and code that leans on the
+            // difference -- an exact product's error term, `a*b - round(a*b)` -- gets zero.
+            VOp3::FMla | VOp3::FMls if matches!(arr.lane_bytes, 4 | 8) => {
+                let acc = self.b.read(GuestReg::V128(vd.0));
+                let sz = if arr.lane_bytes == 8 { FpSz::D } else { FpSz::S };
+                let ty = if sz.is_double() { Ty::I64 } else { Ty::I32 };
+                let mut r = acc;
+                for i in 0..arr.lanes() {
+                    let mut lane_of = |this: &mut Self, v| {
+                        this.b.def(Expr::VExtract {
+                            a: v,
+                            lane: i,
+                            lane_bytes: arr.lane_bytes,
+                            signed: false,
+                            ty,
+                        })
+                    };
+                    let (x, y, z) = (lane_of(self, a), lane_of(self, b), lane_of(self, acc));
+                    let val = self.fused_bits(sz, x, y, z, op == VOp3::FMls, false);
+                    r = self.b.def(Expr::VReplace {
+                        a: r,
+                        lane: i,
+                        lane_bytes: arr.lane_bytes,
+                        val,
+                    });
+                }
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             VOp3::Mla | VOp3::Mls | VOp3::FMla | VOp3::FMls => {
                 let acc = self.b.read(GuestReg::V128(vd.0));
                 let prod = self.vmul(lane, a, b);
                 let add = matches!(op, VOp3::Mla | VOp3::FMla);
-                // The floating-point forms are fused on hardware; wasm has no
-                // vector FMA, so the product is rounded first.
                 let r = self.b.def(Expr::VLaneBin {
                     op: if add {
                         VLaneBinOp::Add
@@ -4542,6 +4571,13 @@ impl<'a> Lifter<'a> {
     /// host's FMA is called.
     #[allow(clippy::too_many_arguments)]
     fn fused(&mut self, vd: gex_isa::VReg, sz: FpSz, a: Value, b: Value, c: Value, neg_product: bool, neg_addend: bool) -> Flow {
+        let v = self.fused_bits(sz, a, b, c, neg_product, neg_addend);
+        self.wr_fp(vd, sz, v);
+        Flow::Next
+    }
+
+    /// [`Self::fused`]'s value, as the bit pattern its operands are given in.
+    fn fused_bits(&mut self, sz: FpSz, a: Value, b: Value, c: Value, neg_product: bool, neg_addend: bool) -> Value {
         let double = sz.is_double();
         let a = if neg_product {
             self.b.def(Expr::FpUn {
@@ -4577,8 +4613,7 @@ impl<'a> Lifter<'a> {
                 a: prod,
                 b: c,
             });
-            self.wr_fp(vd, sz, v);
-            return Flow::Next;
+            return v;
         }
         let (a64, b64, c64) = if double {
             (a, b, c)
@@ -4603,9 +4638,7 @@ impl<'a> Lifter<'a> {
             args: vec![a64, b64, c64, is_double],
             ty: Ty::I64,
         });
-        let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
-        self.wr_fp(vd, sz, v);
-        Flow::Next
+        if double { r } else { self.b.def(Expr::Wrap(r)) }
     }
 
     fn rd_fp(&mut self, v: gex_isa::VReg, sz: FpSz) -> Value {

@@ -3,6 +3,7 @@
  * differs from an unfused product in the last place and `%f` would hide it.
  * Inputs cover the extremes (huge, tiny, non-finite, zeros), where the inline
  * implementation's exponent guard would show a mistake. */
+#include <arm_neon.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -36,6 +37,16 @@ static float fmsub_f(float a, float b, float c) {
     __asm__("fmsub %s0, %s1, %s2, %s3" : "=w"(r) : "w"(a), "w"(b), "w"(c));
     return r;
 }
+
+/* One three-operand vector instruction, `acc` both read and written, its
+ * result stored to `out`. Written out as the instruction, since which of
+ * `n` and `m` a compiler puts first is its own affair and shows in a NaN. */
+#define V3(out, store, type, acc, n, m, insn) \
+    do { \
+        type v3_ = (acc); \
+        __asm__(insn : "+w"(v3_) : "w"(n), "w"(m)); \
+        store(out, v3_); \
+    } while (0)
 
 static uint64_t dbits(double x) {
     union { double d; uint64_t u; } v = {.d = x};
@@ -140,6 +151,74 @@ int main(void) {
         facc = facc * 31 + fbits(fmsub_f(a, fv, c));
     }
     printf("float, ordinary: %08x\n", facc);
+
+    /* The vector forms, `fmla` and `fmls`, round once a lane as well: whole
+     * registers, the two-lane single form, and the forms that take one operand
+     * from a chosen lane. A compiler contracts `a*x + c*y` over two coordinates
+     * into one `fmla.2d`, so this is what any affine transform is made of. */
+    acc = 0;
+    for (int i = 0; i < 20000; i++) {
+        double a[2], b[2], c[2], r[2];
+        for (int k = 0; k < 2; k++) {
+            double *into[3] = {&a[k], &b[k], &c[k]};
+            for (int o = 0; o < 3; o++) {
+                uint64_t bits = rnd(&s);
+                /* One NaN a lane at most: which of two is the answer is not this test's
+                 * business. */
+                if ((i + k) % 3 != o && (bits >> 52 & 0x7ff) == 0x7ff) bits &= ~(1ULL << 62);
+                *into[o] = i & 1 ? dfrom(bits) : (double)(int64_t)bits / (double)(1ULL << 40);
+            }
+        }
+        dv = a[0];
+        a[0] = dv;
+        float64x2_t va = vld1q_f64(a), vb = vld1q_f64(b), vc = vld1q_f64(c);
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmla %0.2d, %1.2d, %2.2d");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmls %0.2d, %1.2d, %2.2d");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmla %0.2d, %1.2d, %2.d[1]");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmls %0.2d, %1.2d, %2.d[1]");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+        /* One lane alone, which leaves nothing above it. */
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmla %d0, %d1, %2.d[1]");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+        V3(r, vst1q_f64, float64x2_t, vc, va, vb, "fmls %d0, %d1, %2.d[1]");
+        acc = acc * 31 + (dbits(r[0]) ^ dbits(r[1]) * 3);
+    }
+    printf("double, vectors: %016llx\n", (unsigned long long)acc);
+
+    facc = 0;
+    for (int i = 0; i < 20000; i++) {
+        float a[4], b[4], c[4], r[4];
+        for (int k = 0; k < 4; k++) {
+            float *into[3] = {&a[k], &b[k], &c[k]};
+            for (int o = 0; o < 3; o++) {
+                uint32_t bits = (uint32_t)rnd(&s);
+                /* The lane the chosen-lane forms multiply by holds no NaN, so that those
+                 * have one a lane at most as well. */
+                if (((i + k) % 3 != o || (o == 1 && k >= 2)) && (bits >> 23 & 0xff) == 0xff) bits &= ~(1u << 30);
+                *into[o] = i & 1 ? ffrom(bits) : (float)(int32_t)bits / 65536.0f;
+            }
+        }
+        fv = a[0];
+        a[0] = fv;
+        float32x4_t va = vld1q_f32(a), vb = vld1q_f32(b), vc = vld1q_f32(c);
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmla %0.4s, %1.4s, %2.4s");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmls %0.4s, %1.4s, %2.4s");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmla %0.4s, %1.4s, %2.s[3]");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+        /* Two lanes: the upper half of the register comes back zero. */
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmla %0.2s, %1.2s, %2.2s");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmls %0.2s, %1.2s, %2.2s");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+        V3(r, vst1q_f32, float32x4_t, vc, va, vb, "fmla %s0, %s1, %2.s[2]");
+        for (int k = 0; k < 4; k++) facc = facc * 31 + fbits(r[k]);
+    }
+    printf("float, vectors: %08x\n", facc);
 
     /* Bullet advances its fixed-step clock with exactly this cancellation.
      * Keep it separate from the checksums: the result must be positive zero,
