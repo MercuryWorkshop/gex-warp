@@ -32,3 +32,5 @@ RUN git config --global --add safe.directory '*'
 RUN apt-get update && apt-get install -y --no-install-recommends libegl-dev && rm -rf /var/lib/apt/lists/*
 # wayland-scanner, built natively by wine/deps32.sh and deps64.sh, needs expat
 RUN apt-get update && apt-get install -y --no-install-recommends libexpat1-dev libgmp-dev libxml2-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
+# the tools build's configure (--enable-archs=) checks gcc -m32
+RUN apt-get update && apt-get install -y --no-install-recommends gcc-multilib && rm -rf /var/lib/apt/lists/*
