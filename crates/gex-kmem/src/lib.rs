@@ -139,7 +139,10 @@ pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
 /// memory, and a write here marks the pages it wrote there, after the bytes,
 /// as the process's own stores mark theirs.
 fn written(dst: PAddr, len: u32) {
-    if len == 0 {
+    // (A memory too small to hold the slot is no guest process's: a page
+    // helper's scratch, a page of it or none. Reading the slot there would
+    // be out of bounds, and trap with whatever its caller holds held.)
+    if len == 0 || !in_process(gex_abi::WRITE_MAP_SLOT, 8) {
         return;
     }
     let mut buf = [0u8; 8];

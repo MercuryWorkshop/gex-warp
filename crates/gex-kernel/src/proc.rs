@@ -1699,8 +1699,14 @@ impl ProcTable {
                 Some(true) => return false,
                 Some(false) => {}
                 None => {
+                    // Whoever holds the status is waited for with the table
+                    // let go (the order everyone takes the two in), and
+                    // then asked again: a turn of this loop for each holder,
+                    // not as many as fit while one of them waits for the
+                    // table (yielding does nothing in a page's Worker).
+                    let status = Arc::clone(&p.child.status);
                     drop(t);
-                    std::thread::yield_now();
+                    drop(status.lock());
                     continue;
                 }
             }

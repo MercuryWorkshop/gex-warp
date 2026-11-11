@@ -1452,6 +1452,15 @@ impl Namespace {
         };
         let dir = self.canonical(dir);
         let inside = if dir == "/" { format!("/{base}") } else { format!("{dir}/{base}") };
+        // The tree's own name for it: a `chroot` since the tree was entered
+        // has moved this namespace's root below the tree's, and what is
+        // shared is by the tree's names, not the jail's (whose
+        // `/private/tmp` is a directory of its own).
+        let tree = outer.ns.outer_path(&outer.dir);
+        let inside = match self.root.strip_prefix(tree.as_ref()) {
+            Some(below) if !below.is_empty() => format!("{below}{inside}"),
+            _ => inside,
+        };
         let named = self.outer_name(&inside).unwrap_or(inside);
         std::borrow::Cow::Owned(outer.ns.socket_name(&named).into_owned())
     }
@@ -2213,6 +2222,12 @@ mod tests {
         // One of the root's own is under the root's directory.
         assert_eq!(v.socket_name("/var/run/s"), "/opt/mac/var/run/s");
         assert_eq!(v.socket_name("\0abstract"), "\0abstract");
+        // A `chroot` inside the root: the jail's names are the jail's, its
+        // /private/tmp a directory of its own and not what is shared.
+        let mut jailed = v.clone();
+        jailed.chroot("/var").unwrap();
+        assert_eq!(jailed.socket_name("/run/s"), "/opt/mac/var/run/s");
+        assert_eq!(jailed.socket_name("/private/tmp/x"), "/opt/mac/var/private/tmp/x");
     }
 
     #[test]

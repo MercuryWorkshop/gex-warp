@@ -2388,7 +2388,7 @@ impl FdIo<'_> {
             let namelen = m.read_u32(msg + if self.compat { 4 } else { 8 })? as u64;
             let to = if name != 0 {
                 let p = Kernel::sockaddr_un(m, name, namelen)?;
-                Some(if p.starts_with('\0') { p } else { crate::vfs::normalize(&p, "/") })
+                Some(if p.starts_with('\0') { p } else { self.ns.socket_name(&crate::vfs::normalize(&p, "/")).into_owned() })
             } else {
                 None
             };
@@ -4218,7 +4218,7 @@ impl PathIo<'_> {
             let sock = self.is_socket_file(&p);
             self.ns.unlink(&p)?;
             if sock {
-                self.socket_renamed(&p, None);
+                self.socket_renamed(&self.ns.socket_name(&p), None);
             }
             Ok(0)
         }
@@ -4230,7 +4230,9 @@ impl PathIo<'_> {
 
     /// The socket file at `from` unlinked (`to` none) or renamed: its bound
     /// name goes with it ([`unix::SocketNames::rename_name`]), here and in
-    /// the global kernel, so the path can be bound again.
+    /// the global kernel, so the path can be bound again. Each by the name
+    /// it was bound under ([`crate::vfs::Namespace::socket_name`]), which is
+    /// not the path a process in a root of its own has for it.
     fn socket_renamed(&self, from: &str, to: Option<&str>) {
         self.socket_names.rename_name(from, to);
         if let Some(r) = self.unix_remote {
@@ -4308,9 +4310,9 @@ impl PathIo<'_> {
         let to_sock = self.is_socket_file(&to);
         self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0)?;
         if from_moves && from != to {
-            self.socket_renamed(&from, Some(&to));
+            self.socket_renamed(&self.ns.socket_name(&from), Some(&self.ns.socket_name(&to)));
         } else if to_sock && from != to {
-            self.socket_renamed(&to, None);
+            self.socket_renamed(&self.ns.socket_name(&to), None);
         }
         Ok(0)
     }
@@ -5740,7 +5742,7 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
         let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
         let to = if dest != 0 {
             let path = Kernel::sockaddr_un(m, dest, dest_len)?;
-            Some(if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) })
+            Some(if path.starts_with('\0') { path } else { io.ns.socket_name(&crate::vfs::normalize(&path, cwd)).into_owned() })
         } else {
             None
         };
