@@ -2033,6 +2033,15 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
 /// `Q` selects which half of the narrow sources is read (the `2` suffix), not
 /// the register width; the destination is always 128 bits.
 fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
+    // pmull and pmull2 of doublewords: opcode 1110, U clear, size 11.
+    if bits(raw, 15, 12) == 0b1110 && u == 0 && bits(raw, 23, 22) == 0b11 {
+        return Some(Inst::VPmull {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg(bits(raw, 20, 16) as u8),
+            upper: q,
+        });
+    }
     let op = match bits(raw, 15, 12) {
         0b0000 => VWidenOp::AddL,
         0b0001 => VWidenOp::AddW,
@@ -3358,6 +3367,16 @@ mod tests {
                 shift: 0
             }
         );
+    }
+
+    #[test]
+    fn pmull_of_doublewords_decodes() {
+        let v = |n: u8| VReg(n);
+        assert_eq!(d(0x0ee2e020), Inst::VPmull { vd: v(0), vn: v(1), vm: v(2), upper: false });
+        assert_eq!(d(0x4ee2e020), Inst::VPmull { vd: v(0), vn: v(1), vm: v(2), upper: true });
+        // Of bytes it is the slow path's, and there is none of halfwords or words.
+        assert!(matches!(d(0x0e22e020), Inst::Unknown { .. }));
+        assert!(matches!(d(0x0e62e020), Inst::Unknown { .. }));
     }
 
     #[test]

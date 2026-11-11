@@ -851,6 +851,10 @@ pub enum Inst {
     },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
+    /// `pmull` and `pmull2` of doublewords: the 128-bit product, as polynomials
+    /// over GF(2), of the low (or, `upper`, the high) doublewords of `vn` and
+    /// `vm`. (The byte form is the slow path's.)
+    VPmull { vd: VReg, vn: VReg, vm: VReg, upper: bool },
     /// AES's four: `aese` and `aesd` (`vd ^ vn` through a round's byte
     /// substitution and row shift, or their inverses) and `aesmc` and
     /// `aesimc` (`vn`'s columns mixed, or unmixed).

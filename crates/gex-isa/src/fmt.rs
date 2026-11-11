@@ -1054,6 +1054,10 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::VPmull { vd, vn, vm, upper } => {
+            let (m, half) = if upper { ("pmull2", "2d") } else { ("pmull", "1d") };
+            format!("{m} v{}.1q, v{}.{half}, v{}.{half}", vd.0, vn.0, vm.0)
+        }
         Inst::VAes { op, vd, vn } => {
             let m = match op {
                 VAesOp::Encrypt => "aese",

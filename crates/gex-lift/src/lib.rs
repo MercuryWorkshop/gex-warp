@@ -2414,6 +2414,39 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // The carry-less multiply AES-GCM and the folded checksums are made of: three
+            // multiplies of 32-bit halves (Karatsuba's: the two ends, and the sums' product
+            // for the middle), each by `clmul32`.
+            Inst::VPmull { vd, vn, vm, upper } => {
+                let lane = upper as u32;
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let m = self.b.read(GuestReg::V128(vm.0));
+                let a = self.b.def(Expr::VExtract { a: n, lane, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let b = self.b.def(Expr::VExtract { a: m, lane, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let low32 = self.b.const_i64(0xffff_ffff);
+                let k32 = self.b.const_i64(32);
+                let a0 = self.b.bin(BinOp::And, Ty::I64, a, low32);
+                let a1 = self.b.bin(BinOp::ShrU, Ty::I64, a, k32);
+                let b0 = self.b.bin(BinOp::And, Ty::I64, b, low32);
+                let b1 = self.b.bin(BinOp::ShrU, Ty::I64, b, k32);
+                let lo = self.clmul32(a0, b0);
+                let hi = self.clmul32(a1, b1);
+                let asum = self.b.bin(BinOp::Xor, Ty::I64, a0, a1);
+                let bsum = self.b.bin(BinOp::Xor, Ty::I64, b0, b1);
+                let both = self.clmul32(asum, bsum);
+                let ends = self.b.bin(BinOp::Xor, Ty::I64, lo, hi);
+                let mid = self.b.bin(BinOp::Xor, Ty::I64, both, ends);
+                let mid_up = self.b.bin(BinOp::Shl, Ty::I64, mid, k32);
+                let mid_down = self.b.bin(BinOp::ShrU, Ty::I64, mid, k32);
+                let low = self.b.bin(BinOp::Xor, Ty::I64, lo, mid_up);
+                let high = self.b.bin(BinOp::Xor, Ty::I64, hi, mid_down);
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let r = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: 8, val: low });
+                let r = self.b.def(Expr::VReplace { a: r, lane: 1, lane_bytes: 8, val: high });
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
             // AES, in the vector: Go's runtime hashes every map key with these, and a host
             // call each (the slow path, where they were) is most of such a program's time.
             Inst::VAes { op, vd, vn } => {
@@ -2896,6 +2929,36 @@ impl<'a> Lifter<'a> {
     // -- scalar floating point ---------------------------------------------
 
     /// The lane type GIR should use for an arrangement.
+    /// The product of two 32-bit polynomials over GF(2), all 63 bits of it, out of
+    /// ordinary multiplies: each operand is split into four with only every fourth bit,
+    /// so that a column of a product sums at most eight ones, which the three empty bits
+    /// above it hold, and its lowest bit is the sum without carries; the sixteen
+    /// products are gathered by where their bits fall, and the other bits dropped.
+    fn clmul32(&mut self, x: Value, y: Value) -> Value {
+        const EVERY_FOURTH: [u64; 4] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 0x4444_4444_4444_4444, 0x8888_8888_8888_8888];
+        let masks = EVERY_FOURTH.map(|m| self.b.const_i64(m));
+        let xs = masks.map(|m| self.b.bin(BinOp::And, Ty::I64, x, m));
+        let ys = masks.map(|m| self.b.bin(BinOp::And, Ty::I64, y, m));
+        let mut out: Option<Value> = None;
+        for k in 0..4 {
+            // The products whose bits land on bits `k` mod 4.
+            let mut z: Option<Value> = None;
+            for i in 0..4 {
+                let p = self.b.bin(BinOp::Mul, Ty::I64, xs[i], ys[(k + 4 - i) % 4]);
+                z = Some(match z {
+                    None => p,
+                    Some(prev) => self.b.bin(BinOp::Xor, Ty::I64, prev, p),
+                });
+            }
+            let kept = self.b.bin(BinOp::And, Ty::I64, z.expect("four products"), masks[k]);
+            out = Some(match out {
+                None => kept,
+                Some(prev) => self.b.bin(BinOp::Or, Ty::I64, prev, kept),
+            });
+        }
+        out.expect("four residues")
+    }
+
     /// Every byte of `x` through AES's box (or its inverse): the box is sixteen rows of
     /// sixteen, and a swizzle is a lookup in one row that gives zero for an index past it,
     /// so each row is asked with the byte's high nibble cancelled by the row's own -- the

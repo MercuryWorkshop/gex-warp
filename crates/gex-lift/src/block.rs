@@ -391,6 +391,25 @@ mod tests {
                     let r = match expr {
                         Expr::ReadReg(GuestReg::V128(n)) => v[*n as usize],
                         Expr::VConst(c) => u128::from_le_bytes(**c),
+                        // The few scalar expressions a vector lowering goes through
+                        // (doublewords, kept in the low half).
+                        Expr::ConstI64(c) => *c as u128,
+                        Expr::Bin { op, ty: gex_ir::Ty::I64, a, b } => {
+                            let (x, y) = (g(a) as u64, g(b) as u64);
+                            (match op {
+                                gex_ir::BinOp::And => x & y,
+                                gex_ir::BinOp::Or => x | y,
+                                gex_ir::BinOp::Xor => x ^ y,
+                                gex_ir::BinOp::Mul => x.wrapping_mul(y),
+                                gex_ir::BinOp::Shl => x << (y & 63),
+                                gex_ir::BinOp::ShrU => x >> (y & 63),
+                                o => panic!("not evaluated here: {o:?}"),
+                            }) as u128
+                        }
+                        Expr::VExtract { a, lane, lane_bytes: 8, signed: false, .. } => (g(a) >> (64 * lane)) as u64 as u128,
+                        Expr::VReplace { a, lane, lane_bytes: 8, val } => {
+                            (g(a) & !((u64::MAX as u128) << (64 * lane))) | (g(val) as u64 as u128) << (64 * lane)
+                        }
                         Expr::ConstI32(c) => *c as u128,
                         Expr::VShift { op, lane, a, amount } => {
                             let bits = w(*lane);
@@ -769,6 +788,51 @@ mod tests {
                 !block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })),
                 "{raw:08x} still goes to the host"
             );
+        }
+    }
+
+    /// `pmull` and `pmull2` of doublewords are lowered, and to what the reference says:
+    /// on single bits, on all ones and on pseudo-random doublewords.
+    #[test]
+    fn pmull_words_match_the_reference() {
+        let mut seed = 0xa409_3822_299f_31d0u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut pairs: Vec<(u64, u64)> = vec![(0, 0), (u64::MAX, u64::MAX), (u64::MAX, 1), (1, u64::MAX), (0xffff_ffff, 0xffff_ffff), (u64::MAX, 0x8000_0000_0000_0000)];
+        for i in 0..64 {
+            pairs.push((1 << i, 1 << (63 - i)));
+            pairs.push((1 << i, u64::MAX));
+            pairs.push((rnd(), 1 << i));
+        }
+        for _ in 0..2000 {
+            pairs.push((rnd(), rnd()));
+        }
+        for raw in [0x0ee2e020u32, 0x4ee2e020, 0x0ee0e000] {
+            let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
+            assert!(!matches!(block.term, Term::Illegal { .. }), "{raw:08x} lifted as illegal");
+            assert!(!block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })), "{raw:08x} goes to the host");
+            for &(a, b) in &pairs {
+                let mut v = [0u128; 32];
+                // The operands in the half the word reads, noise in the other.
+                let upper = raw >> 30 & 1 == 1;
+                let place = |x: u64, other: u64| if upper { (x as u128) << 64 | other as u128 } else { (other as u128) << 64 | x as u128 };
+                (v[1], v[2]) = (place(a, rnd()), place(b, rnd()));
+                if raw & 0x1f_03e0 == 0 {
+                    v[0] = place(a, 0); // the one register is both operands
+                }
+                let mut bytes = [0u8; 512];
+                for (i, r) in v.iter().enumerate() {
+                    bytes[i * 16..i * 16 + 16].copy_from_slice(&r.to_le_bytes());
+                }
+                let mut fpsr = 0;
+                assert!(gex_isa::slow::execute(raw, &mut gex_isa::slow::VRegs(&mut bytes), &mut fpsr), "{raw:08x}");
+                let want = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+                assert_eq!(eval_vectors(&block, &v)[&0], want, "{raw:08x} on {a:016x} {b:016x}");
+            }
         }
     }
 
