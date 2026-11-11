@@ -40,6 +40,7 @@ use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
+pub mod metal;
 pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
@@ -2196,6 +2197,11 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         if crate::gl::have_d3d() {
             devfs.add("gex-d3d", crate::gl::GlDevice::new());
         }
+    }
+    // `/dev/gex-metal`: a stream to the page's Metal replayer, each open its
+    // own (metal.rs). With a global kernel only: a reader waits in it.
+    if crate::metal::have_metal() && unsafe { k_present() } != 0 {
+        devfs.add_per_open("gex-metal", Arc::new(|| Arc::new(crate::metal::MetalDevice::new())));
     }
     // `/dev/gex-host`: calls to the page, where it answers them. Each open is
     // a handle in the global kernel, so the call crosses fork and exec.

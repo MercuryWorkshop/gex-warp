@@ -214,6 +214,7 @@ const runs = (carry?.runs ?? 0) + 1;
 /// fork child's start on the demo page.
 const bridgeImports = {
   gl: () => import('./gl-bridge.mjs'),
+  metal: () => import('./metal-bridge.mjs'),
   wl: () => import('./wl-bridge.mjs'),
   net: () => import('./net-bridge.mjs'),
 };
@@ -941,6 +942,12 @@ async function handle(msg) {
   }
   // The GL device runs D3D too: /dev/gex-d3d beside /dev/gex-gl.
   if (msg.glChannel?.d3d) gex.useD3d(true);
+  // The page's Metal replayer: /dev/gex-metal, each open a connection of
+  // the channel's (metal-bridge.mjs). Before `load`, as GL.
+  if (msg.metalChannel) {
+    const { MetalProxy } = await bridge('metal');
+    gex.useMetal(new MetalProxy(msg.metalChannel));
+  }
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
   // load, so it must run before `load` -- which binds `wayland-0` only when it

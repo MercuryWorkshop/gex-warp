@@ -369,7 +369,8 @@ async function startBrowser() {
     '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
     // The machine's GPU (--gpu), else SwiftShader. ANGLE and WebGPU on one
     // backend either way: a canvas both read needs that.
-    ...(gpu ? ['--use-angle=vulkan', '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader']),
+    // (A Mac's GPU is reached through Metal: its Chromium has no Vulkan.)
+    ...(gpu ? (process.platform === 'darwin' ? ['--use-angle=metal', '--ignore-gpu-blocklist'] : ['--use-angle=vulkan', '--ignore-gpu-blocklist']) : ['--use-angle=swiftshader']),
     '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
   ], { stdio: ['ignore', 'ignore', o.verbose ? 'inherit' : 'ignore'] });
   let ws = null;

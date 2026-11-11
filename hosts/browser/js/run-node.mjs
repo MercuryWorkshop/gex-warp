@@ -52,6 +52,7 @@ import { spareMemories } from './lazy-fetch.mjs';
 import { pageHosts } from './page-host.mjs';
 import { envOptions } from './options.mjs';
 import { makeGlChannel } from './gl-bridge.mjs';
+import { makeMetalChannel, setMetalHost } from './metal-bridge.mjs';
 
 /** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
  *  a directory against this one. */
@@ -79,6 +80,12 @@ function providerSources(dirs) {
 // GEX_SINGLE=1: the single-thread build -- every
 // process and thread a fiber on this thread, no SharedArrayBuffer, the shared
 // build's binaries on plain memories. Before anything is compiled.
+function metalChannelUnserved() {
+  const channel = makeMetalChannel();
+  setMetalHost(channel, 1);
+  return channel;
+}
+
 const SINGLE = !!process.env.GEX_SINGLE;
 if (SINGLE) {
   enableSingle();
@@ -665,6 +672,10 @@ const host = new ProcessHost({
     // `gl: 'compositor'` gives them before its compositor starts Mesa: the
     // guest has /dev/gex-gl, and nothing answers a batch sent into it.
     glChannel: process.env.GEX_GL_CHANNEL === '1' ? makeGlChannel() : undefined,
+    // GEX_METAL_CHANNEL=1: every process gets the Metal channel, with a
+    // replayer said to serve it and none that does: the guest has
+    // /dev/gex-metal (where there is a global kernel), and nothing answers.
+    metalChannel: process.env.GEX_METAL_CHANNEL === '1' ? metalChannelUnserved() : undefined,
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
     // its start (a test-only switch).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,

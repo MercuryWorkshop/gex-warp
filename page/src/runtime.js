@@ -586,7 +586,7 @@ export async function makeProcessHost({
   kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
   restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
   closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
-  netChannel = null, network = null, winsize,
+  netChannel = null, network = null, winsize, metalChannel = null,
 }, on) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const makeGuestWorker = await guestWorkerFactory();
@@ -666,6 +666,9 @@ export async function makeProcessHost({
     // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
     // reach the page's GlDevice.
     glChannel: glChannel ?? undefined,
+    // The Metal channel's shared buffers (metal-bridge.mjs), so a Worker
+    // whose program opens /dev/gex-metal reaches the page's replayer.
+    metalChannel: metalChannel ?? undefined,
     // The Wayland ring's shared buffers, so a Worker that binds the
     // compositor can carry its frames to the page's canvas. Like glChannel.
     wlChannel: wlChannel ?? undefined,
@@ -815,6 +818,27 @@ export async function openGlChannel(d3d = false) {
   const channel = makeGlChannel();
   channel.d3d = !!d3d;
   return channel;
+}
+
+/** The channel /dev/gex-metal's opens are connections of (metal-bridge.mjs):
+ *  shared memory, so a cross-origin isolated page. */
+export async function openMetalChannel(opts) {
+  // (Under Node there is shared memory and no `crossOriginIsolated` at all.)
+  if (typeof SharedArrayBuffer !== 'function' || globalThis.crossOriginIsolated === false) {
+    throw new Error('the guest Metal needs a cross-origin isolated page (SharedArrayBuffer rings).');
+  }
+  const { makeMetalChannel } = await import('../../hosts/browser/js/metal-bridge.mjs');
+  return makeMetalChannel(opts);
+}
+
+/** Serve the channel: `replayer(connection)` for each open, the readers of
+ *  `kernel()`'s memory woken when it says it wrote (metal-bridge.mjs
+ *  `serveMetal`). Answers `{ stop(), drop(pid) }`; `stop` fails the channel. */
+export async function serveMetalChannel(channel, opts) {
+  const { serveMetal, setMetalHost } = await import('../../hosts/browser/js/metal-bridge.mjs');
+  const served = serveMetal(channel, opts);
+  setMetalHost(channel, 1);
+  return { drop: served.drop, stop() { setMetalHost(channel, -1); served.stop(); } };
 }
 
 /** `start()` once the guest first opens its GL (gl-bridge.mjs STATE): a GL
