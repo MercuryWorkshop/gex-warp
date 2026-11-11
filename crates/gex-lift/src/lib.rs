@@ -1065,14 +1065,24 @@ impl<'a> Lifter<'a> {
             } => {
                 let a = self.address(addr);
                 let ty = ty_of(dest);
-                let v = self.b.def(Expr::Load {
+                // An ordered load that sign-extends (LDAPURSB/SH/SW): the
+                // atomic load has no signed form, so the bytes are loaded
+                // unsigned and extended after.
+                let ordered = order_of(order) != Order::Relaxed;
+                let loaded = self.b.def(Expr::Load {
                     addr: a.base,
                     offset: a.offset,
                     sz: mem_sz(sz),
-                    signed,
+                    signed: signed && !ordered,
                     ty,
                     order: order_of(order),
                 });
+                let bits = mem_sz(sz).bytes() as u32 * 8;
+                let v = if signed && ordered && bits < ty.bits() {
+                    self.b.def(Expr::ExtendBits { a: loaded, ty, bits, signed: true })
+                } else {
+                    loaded
+                };
                 self.wr_gp(rt, dest, v);
                 self.finish_address(&a);
                 Flow::Next
