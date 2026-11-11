@@ -3041,7 +3041,10 @@ impl Client {
     /// The newest toplevel -- an `xdg_toplevel`, or an X11 window -- takes
     /// focus then.
     pub fn focus_fallback(&mut self) {
-        if self.pointer_target.or(self.focus_surface).is_some() {
+        // (the keyboard's: where the pointer is says nothing of it -- a
+        // pop-up that had the keyboard and closed leaves the pointer on its
+        // window, and the keys went nowhere)
+        if self.focus_surface.or(self.keyboard_target).is_some() {
             return;
         }
         let pick = self
@@ -3069,7 +3072,8 @@ impl Client {
             .iter()
             .map(|id| {
                 let s = &self.surfaces[id];
-                format!("{id}:{:?}{}{}{}", s.role, if s.x11 { " x11" } else { "" },
+                format!("{id}:{:?}{}{}{}{}", s.role, if s.x11 { " x11" } else { "" },
+                    if matches!(s.role, Role::Popup | Role::Subsurface) { format!(" at {},{} of {}", s.rel_x, s.rel_y, s.parent) } else { String::new() },
                     if s.committed_buffer.is_some() { " drawn" } else { "" },
                     s.external.map(|(w, h)| format!(" ext {w}x{h}")).unwrap_or_default())
             })
