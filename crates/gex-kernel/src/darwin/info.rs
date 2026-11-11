@@ -365,6 +365,7 @@ const NAMES: &[(&str, &[i32])] = &[
     ("hw.optional.arm.FEAT_LSE", &[]),
     ("hw.optional.arm.FEAT_CRC32", &[]),
     ("hw.optional.arm.FEAT_LRCPC", &[]),
+    ("hw.optional.arm.FEAT_LRCPC2", &[]),
     ("hw.optional.arm.AdvSIMD", &[]),
     ("hw.optional.arm.FP_SyncExceptions", &[]),
     ("user.cs_path", &[CTL_USER, 1]),
@@ -397,7 +398,6 @@ const ABSENT: &[&str] = &[
     "hw.optional.arm.FEAT_FCMA",
     "hw.optional.arm.FEAT_JSCVT",
     "hw.optional.arm.FEAT_LSE2",
-    "hw.optional.arm.FEAT_LRCPC2",
     "hw.optional.arm.FEAT_FlagM",
     "hw.optional.arm.FEAT_FlagM2",
     "hw.optional.arm.FEAT_FRINTTS",
@@ -658,7 +658,7 @@ impl Kernel {
             "hw.tbfrequency" => Quad(1_000_000_000),
             "hw.optional.floatingpoint" => Int(1),
             "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.arm64" | "hw.optional.armv8_1_atomics" | "hw.optional.armv8_crc32" if !x86 => Int(1),
-            "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_CRC32" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.AdvSIMD" | "hw.optional.arm.FP_SyncExceptions" if !x86 => Int(1),
+            "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_CRC32" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" | "hw.optional.arm.AdvSIMD" | "hw.optional.arm.FP_SyncExceptions" if !x86 => Int(1),
             "user.cs_path" => Str("/usr/bin:/bin:/usr/sbin:/sbin".into()),
             // Under Rosetta, or not: an x86-64 program on a macOS that
             // runs on no Intel Mac is translated ([`rosetta`]).

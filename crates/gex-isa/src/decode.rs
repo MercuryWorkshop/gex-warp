@@ -781,6 +781,30 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
             order: Ordering::Acquire,
         };
     }
+    // LDAPUR*/STLUR* (FEAT_LRCPC2): a load-acquire RCpc and a store-release
+    // at [Rn + simm9], unscaled: size 011001 opc 0 imm9 00 Rn Rt. opc 00 is
+    // the store, 01 the zero-extending load, 10 the load sign-extended to 64
+    // bits (LDAPURSB/SH/SW), 11 to 32 (LDAPURSB/SH). Acquire and Release are
+    // stronger than RCpc, hence safe. A compiler that targets Apple silicon
+    // loads and stores atomics through these (Rust's `Ordering::Acquire` and
+    // `Release` on a field of a struct): ripgrep stopped at its first search.
+    if (raw & 0x3F20_0C00) == 0x1900_0000 {
+        let size = bits(raw, 31, 30);
+        let rt = RegSel::gp(bits(raw, 4, 0));
+        let addr = AddrMode::Offset {
+            rn: RegSel::sp(bits(raw, 9, 5)),
+            off: sext(bits(raw, 20, 12), 9),
+        };
+        let sz = MemSz::from_log2(size);
+        let load = |dest, signed| Inst::Load { sz, dest, signed, rt, addr, order: Ordering::Acquire };
+        return match bits(raw, 23, 22) {
+            0b00 => Inst::Store { sz, rt, addr, order: Ordering::Release },
+            0b01 => load(if size == 0b11 { Sz::X } else { Sz::W }, false),
+            0b10 if size != 0b11 => load(Sz::X, true),
+            0b11 if size < 0b10 => load(Sz::W, true),
+            _ => Inst::Unknown { raw },
+        };
+    }
     // FEAT_MTE's allocation-tag stores, STG/STZG/ST2G/STZ2G: opc picks the
     // form, bits[11:10] the addressing (01 post-index, 10 offset, 11
     // pre-index), imm9 counts 16-byte granules. The tag itself lives beside
@@ -3286,6 +3310,48 @@ mod tests {
                 shift: 0
             }
         );
+    }
+
+    #[test]
+    fn ldapur_and_stlur_are_ordered_accesses_at_an_offset() {
+        // ldapur x8, [x19, #248] (ripgrep's, on Apple silicon).
+        assert_eq!(
+            d(0xd94f8268),
+            Inst::Load {
+                sz: MemSz::D,
+                dest: Sz::X,
+                signed: false,
+                rt: RegSel::Gp(8),
+                addr: AddrMode::Offset { rn: RegSel::Gp(19), off: 248 },
+                order: Ordering::Acquire,
+            }
+        );
+        // stlur w1, [x2, #-4].
+        assert_eq!(
+            d(0x991fc041),
+            Inst::Store {
+                sz: MemSz::W,
+                rt: RegSel::Gp(1),
+                addr: AddrMode::Offset { rn: RegSel::Gp(2), off: -4 },
+                order: Ordering::Release,
+            }
+        );
+        // ldapursb x3, [sp, #1] / ldapursh w4, [x5, #-2] / ldapursw x6, [x7].
+        assert_eq!(
+            d(0x198013e3),
+            Inst::Load { sz: MemSz::B, dest: Sz::X, signed: true, rt: RegSel::Gp(3), addr: AddrMode::Offset { rn: RegSel::Sp, off: 1 }, order: Ordering::Acquire }
+        );
+        assert_eq!(
+            d(0x59dfe0a4),
+            Inst::Load { sz: MemSz::H, dest: Sz::W, signed: true, rt: RegSel::Gp(4), addr: AddrMode::Offset { rn: RegSel::Gp(5), off: -2 }, order: Ordering::Acquire }
+        );
+        assert_eq!(
+            d(0x998000e6),
+            Inst::Load { sz: MemSz::W, dest: Sz::X, signed: true, rt: RegSel::Gp(6), addr: AddrMode::Offset { rn: RegSel::Gp(7), off: 0 }, order: Ordering::Acquire }
+        );
+        // There is no 64-bit load sign-extended to 64, nor a word to 32.
+        assert!(matches!(d(0xd9800000), Inst::Unknown { .. }));
+        assert!(matches!(d(0x99c00000), Inst::Unknown { .. }));
     }
 
     #[test]
