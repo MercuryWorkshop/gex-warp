@@ -890,6 +890,15 @@ pub struct Client {
     /// [`Client::pointer_in_window`]'s pointer is over none of the window's
     /// surfaces.
     pointer_out: bool,
+    /// A host that shows a frame some time after the commit (`set_held`):
+    /// frame callbacks wait for it to say so, and so does the release of a
+    /// buffer whose pixels it reads where they are. Each commit is numbered
+    /// (`commit_seq`); what waits is kept with its commit's number until
+    /// [`Client::present_upto`] reaches it.
+    hold: bool,
+    commit_seq: u64,
+    held_frames: Vec<(u64, u32)>,
+    held_releases: Vec<(u64, u32)>,
     /// The buttons held, and the surface that took the first press: the
     /// implicit grab, which keeps the pointer until the last is up.
     held: Vec<u32>,
@@ -953,6 +962,10 @@ impl Client {
             pointer_on: None,
             keyboard_on: None,
             pointer_out: false,
+            hold: false,
+            commit_seq: 0,
+            held_frames: Vec::new(),
+            held_releases: Vec::new(),
             held: Vec::new(),
             grab_surface: None,
             pending_keymap: None,
@@ -1156,6 +1169,8 @@ impl Client {
                     // Every one of these has `destroy` at opcode 0 and
                     // requests that change nothing observable here.
                     if opcode == 0 {
+                        // (its id may be a new buffer's next: no release for it)
+                        self.held_releases.retain(|r| r.1 != object);
                         self.objects.remove(&object);
                         self.delete_id(object);
                     }
@@ -1660,6 +1675,9 @@ impl Client {
 
     /// Apply a surface's pending state, the only moment anything becomes visible.
     fn commit(&mut self, surface: u32, buffers: &dyn Buffers) {
+        self.commit_seq += 1;
+        // (whether the host reads this commit's buffer where it is)
+        let mut located = false;
         // The buffer scale is double-buffered state like the rest.
         if let Some(s) = self.surfaces.get_mut(&surface) {
             if let Some(k) = s.pending_scale.take() {
@@ -1754,6 +1772,7 @@ impl Client {
                         spec.fd, spec.pool_size, placed, spec.width, spec.height, spec.stride
                     ));
                 }
+                located = placed.is_some();
                 // (its size, which a host compositing from copies keeps nowhere
                 // else: what the pointer's hit test needs)
                 if let Some(s) = self.surfaces.get_mut(&surface) {
@@ -1846,8 +1865,22 @@ impl Client {
             // second time (two games on 32-bit Wine: libwayland's
             // `proxy->refcount > 0` assertion at the first swap-chain resize).
             if state.pending_buffer.is_some() {
-                let w = Writer::new(buffer_id, 0);
-                self.send(w);
+                // A buffer the host reads where it is (`placed`) is busy
+                // until the host has read it: released when it says it has
+                // shown this commit, not now, or a client drawing into it
+                // again draws into pixels not yet copied. One release for
+                // attaches that overlap (a buffer attached again before the
+                // first was read). A copy was read just now.
+                if self.hold && located {
+                    let seq = self.commit_seq;
+                    match self.held_releases.iter_mut().find(|r| r.1 == buffer_id) {
+                        Some(r) => r.0 = seq,
+                        None => self.held_releases.push((seq, buffer_id)),
+                    }
+                } else {
+                    let w = Writer::new(buffer_id, 0);
+                    self.send(w);
+                }
             }
         }
         if let Some(frame) = produced {
@@ -1875,13 +1908,22 @@ impl Client {
         // Frame callbacks belong to the commit that carried them. The argument
         // is meant to be a monotonic millisecond timestamp, used only for
         // deltas; a serial counts up the same way.
-        let serial = self.serial();
-        for cb in &state.pending_callbacks {
-            let w = Writer::new(*cb, 0).uint(serial);
-            self.send(w);
-            let id = *cb;
-            self.objects.remove(&id);
-            self.delete_id(id);
+        // Held: answered when the host shows this commit (a page's
+        // animation frame, a paced tick natively), so a client that waits
+        // for them draws at the rate frames are shown, not as fast as it
+        // can commit. A client that commits without waiting is unaffected.
+        if self.hold {
+            let seq = self.commit_seq;
+            self.held_frames.extend(state.pending_callbacks.iter().map(|cb| (seq, *cb)));
+        } else {
+            let serial = self.serial();
+            for cb in &state.pending_callbacks {
+                let w = Writer::new(*cb, 0).uint(serial);
+                self.send(w);
+                let id = *cb;
+                self.objects.remove(&id);
+                self.delete_id(id);
+            }
         }
         if let Some(s) = self.surfaces.get_mut(&surface) {
             s.committed_buffer = buffer_id;
@@ -3056,6 +3098,48 @@ impl Client {
         if let Some(id) = pick {
             self.focus_surface = Some(id);
             self.ensure_keyboard_enter();
+        }
+    }
+
+    /// Hold frame callbacks, and the release of buffers the host reads where
+    /// they are, until the host says a commit has been shown
+    /// ([`Client::present_upto`]). Off, everything waiting goes now.
+    pub fn set_held(&mut self, on: bool) {
+        self.hold = on;
+        if !on {
+            self.present_upto(u64::MAX, 0);
+        }
+    }
+
+    /// The number of the last commit (any surface's): what a host keeps with
+    /// what it is about to show, to say later that it has shown it.
+    pub fn commit_seq(&self) -> u64 {
+        self.commit_seq
+    }
+
+    /// Whether anything waits for [`Client::present_upto`].
+    pub fn has_held(&self) -> bool {
+        !self.held_frames.is_empty() || !self.held_releases.is_empty()
+    }
+
+    /// The host has shown every commit up to `seq` (and read the pixels of
+    /// the buffers they attached): their buffers are released and their
+    /// frame callbacks answered, with `time` (milliseconds) as the frame's.
+    pub fn present_upto(&mut self, seq: u64, time: u32) {
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_releases).into_iter().partition(|r| r.0 <= seq);
+        self.held_releases = later;
+        for (_, buffer) in now {
+            // (one the client destroyed meanwhile is gone from both)
+            if matches!(self.objects.get(&buffer), Some(Object::Buffer(_))) {
+                self.send(Writer::new(buffer, 0));
+            }
+        }
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_frames).into_iter().partition(|f| f.0 <= seq);
+        self.held_frames = later;
+        for (_, cb) in now {
+            self.send(Writer::new(cb, 0).uint(time));
+            self.objects.remove(&cb);
+            self.delete_id(cb);
         }
     }
 
@@ -4246,6 +4330,100 @@ mod tests {
         assert_eq!(popup.role, Role::Popup);
         assert_eq!(popup.parent, 6, "a popup is placed against its parent");
         assert_eq!((popup.rel_x, popup.rel_y), (20, 18));
+    }
+
+    /// The events for object `id` with opcode `op` in `bytes`.
+    fn count(bytes: &[u8], id: u32, op: u16) -> usize {
+        messages(bytes).iter().filter(|(o, p, _)| *o == id && *p == op).count()
+    }
+
+    #[test]
+    fn a_held_buffer_is_released_when_the_host_has_shown_it() {
+        let pool = Placed(0x10_0000, 800 * 100 + 64);
+        let (mut c, _) = placed_window(200, 100, 800);
+        c.set_held(true);
+        c.take_outgoing();
+        // attach 10 again, a frame callback (30), commit.
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 3).new_id(30).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let out = c.take_outgoing();
+        assert_eq!(count(&out, 10, 0), 0, "released before the host read it");
+        assert_eq!(count(&out, 30, 0), 0, "a frame callback before the frame was shown");
+        // Attached again before that was shown: one release for the two.
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let seq = c.commit_seq();
+        assert!(c.has_held());
+        c.present_upto(seq - 1, 7);
+        let out = c.take_outgoing();
+        assert_eq!(count(&out, 10, 0), 0, "released while a later attach of it waits");
+        assert_eq!(count(&out, 30, 0), 1, "the shown commit's frame callback");
+        c.present_upto(seq, 8);
+        let out = c.take_outgoing();
+        assert_eq!(count(&out, 10, 0), 1, "not released once shown");
+        assert!(!c.has_held());
+        c.present_upto(seq, 9);
+        assert_eq!(count(&c.take_outgoing(), 10, 0), 0, "released twice");
+    }
+
+    #[test]
+    fn a_buffer_destroyed_while_held_is_not_released() {
+        let pool = Placed(0x10_0000, 800 * 100 + 64);
+        let (mut c, _) = placed_window(200, 100, 800);
+        c.set_held(true);
+        // A second buffer (31) on the pool, attached and committed, then
+        // destroyed before the host has shown it.
+        c.receive(&Writer::new(9, 0).new_id(31).int(0).int(200).int(100).int(800).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 1).object(31).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 0).finish(), &[], &pool);
+        c.take_outgoing();
+        let seq = c.commit_seq();
+        c.present_upto(seq, 1);
+        assert_eq!(count(&c.take_outgoing(), 31, 0), 0, "a release for a destroyed buffer");
+    }
+
+    #[test]
+    fn a_copied_buffer_is_released_at_once_and_its_frame_held() {
+        // The native host's path: the pixels are copied at the commit, so the
+        // buffer is free then; the frame callback still waits for the frame.
+        let (mut c, _) = draw(vec![0u8; 16], 2, 2, 8);
+        c.set_held(true);
+        c.take_outgoing();
+        let pool = Pool(vec![0u8; 16]);
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 3).new_id(30).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let out = c.take_outgoing();
+        assert_eq!(count(&out, 10, 0), 1, "a copied buffer kept busy");
+        assert_eq!(count(&out, 30, 0), 0);
+        let seq = c.commit_seq();
+        c.present_upto(seq, 16);
+        let out = c.take_outgoing();
+        assert_eq!(count(&out, 30, 0), 1);
+        // done(time): the frame's time.
+        let done = messages(&out).into_iter().find(|(o, p, _)| *o == 30 && *p == 0).unwrap();
+        assert_eq!(u32::from_le_bytes(done.2[..4].try_into().unwrap()), 16);
+    }
+
+    #[test]
+    fn not_held_everything_goes_at_the_commit() {
+        let pool = Placed(0x10_0000, 800 * 100 + 64);
+        let (mut c, _) = placed_window(200, 100, 800);
+        c.take_outgoing();
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 3).new_id(30).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let out = c.take_outgoing();
+        assert_eq!((count(&out, 10, 0), count(&out, 30, 0)), (1, 1));
+        // And turning holding off lets what waited go.
+        c.set_held(true);
+        c.receive(&Writer::new(6, 3).new_id(32).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        assert_eq!(count(&c.take_outgoing(), 32, 0), 0);
+        c.set_held(false);
+        assert_eq!(count(&c.take_outgoing(), 32, 0), 1);
     }
 
     /// `placed_window` with a pointer (object 51) and a drawn popup of

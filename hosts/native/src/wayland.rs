@@ -80,6 +80,18 @@ struct Inner {
     /// What is on screen once a client places windows.
     screen: Mutex<Screen>,
     next_session: Mutex<u64>,
+    /// The paced frame clock (`frame_tick`): when it started, and its last
+    /// tick.
+    clock: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+}
+
+/// How often frames are "shown" natively, which is when a client's frame
+/// callbacks are answered (`GEX_WL_HZ`, default 60; 0: at once, at the
+/// commit, as before). This host copies a buffer's pixels at its commit, so
+/// a buffer is released then; only the frame callbacks wait.
+fn frame_hz() -> u32 {
+    static HZ: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HZ.get_or_init(|| std::env::var("GEX_WL_HZ").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
 }
 
 fn keytrace() -> bool {
@@ -302,6 +314,24 @@ impl Wayland {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Whether a paced frame is due now, and its time in milliseconds since
+    /// the compositor's first: every 1/`GEX_WL_HZ` s, from the last.
+    fn frame_tick(&self) -> Option<u32> {
+        let hz = frame_hz();
+        if hz == 0 {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let mut c = self.inner.clock.lock().unwrap();
+        let (start, last) = c.get_or_insert((now, now - std::time::Duration::from_secs(1)));
+        let period = std::time::Duration::from_secs(1) / hz;
+        if now.duration_since(*last) < period {
+            return None;
+        }
+        *last = now;
+        Some(now.duration_since(*start).as_millis() as u32)
     }
 
     /// A frame was shown (a client's commit, or GL's own present): the
@@ -566,6 +596,7 @@ impl Wayland {
             s.client.set_output_size(out_w, out_h);
         }
         let mut produced = Vec::new();
+        let tick = self.frame_tick();
         sessions.retain_mut(|s| {
             let mut gone = false;
             let mine = s.owner.is_none_or(|o| o == kernel.pid);
@@ -656,6 +687,12 @@ impl Wayland {
             let frames = s.client.take_frames();
             self.inner.screen.lock().unwrap().update(s.id, &mut s.client, &frames);
             produced.extend(frames);
+            // A paced frame: every commit so far is shown, and the frame
+            // callbacks they carried are answered.
+            if let Some(ms) = tick {
+                let seq = s.client.commit_seq();
+                s.client.present_upto(seq, ms);
+            }
             s.out.extend_from_slice(&s.client.take_outgoing());
             // A `wl_keyboard.keymap` event owes a descriptor for its `h`
             // argument: an in-memory file holding the keymap, staged on the
@@ -996,6 +1033,8 @@ impl HostListener for Wayland {
         let mut client = Client::new();
         let (w, h) = *self.inner.size.lock().unwrap();
         client.set_default_size(w, h);
+        // Frame callbacks at the paced clock's frames (`frame_hz`).
+        client.set_held(frame_hz() != 0);
         let id = {
             let mut n = self.inner.next_session.lock().unwrap();
             *n += 1;

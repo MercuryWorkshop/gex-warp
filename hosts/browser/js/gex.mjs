@@ -2498,6 +2498,11 @@ export class Gex {
         // is never copied on its way to the screen.
         wl_publish: (ptr, count) =>
           this.#wl?.publish(this.#memory, ptr >>> 0, count >>> 0),
+        // This process's publishes so far and the last the compositor drew
+        // (read every pixel of): the shim releases a client's buffers and
+        // answers its frame callbacks by them. 0 with no block to publish in.
+        wl_generation: () => (this.#wl?.ok ? this.#wl.generation : 0),
+        wl_drawn: () => (this.#wl?.ok ? this.#wl.drawnGeneration : 0),
         // The reverse: drain this process's input and control ring into `ptr`,
         // so the compositor pump can deliver each event to the client and
         // surface the compositor's own hit test picked.

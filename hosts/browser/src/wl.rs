@@ -31,6 +31,11 @@ extern "C" {
     /// a size, and the rectangle that changed -- and the compositor uploads the
     /// damaged rows straight out of the guest. Nothing copies a frame.
     fn wl_publish(ptr: u32, count: u32);
+    /// This process's publishes so far (its block's generation), and the
+    /// last of them the compositor has drawn -- read every pixel of and put
+    /// on the screen. 0 for both with no compositor.
+    fn wl_generation() -> u32;
+    fn wl_drawn() -> u32;
     /// Pull up to `max` input and control events into `ptr`, packed as i32
     /// records of [`EV`] words: `[kind, a, b, c, d, client, surface, pad]`.
     /// Returns how many were written.
@@ -467,6 +472,11 @@ struct Session {
     /// Where requests are read into, kept rather than a fresh zeroed 64 KiB
     /// each pump (as the native host's `wayland.rs`).
     rbuf: Vec<u8>,
+    /// What the compositor is to draw, oldest first: the publish's number
+    /// (`wl_generation`), the client's last commit then, and when (ns). When
+    /// the compositor has drawn that publish, those commits are shown: their
+    /// buffers released, their frame callbacks answered ([`Session::shown`]).
+    showing: std::collections::VecDeque<(u32, u64, u64)>,
 }
 
 /// The page's drag over one client (`Session::drag`).
@@ -487,7 +497,41 @@ fn drag_data() -> Vec<u8> {
     buf
 }
 
+/// A publish the compositor has not drawn in this long is taken as drawn: a
+/// page whose animation frames stopped (a hidden tab) or a compositor that
+/// draws no more must not stop its clients for good.
+const SHOWN_STALL_NS: u64 = 250_000_000;
+
 impl Session {
+    /// The commits the compositor has now shown (`drawn`, its last drawn
+    /// publish): released and answered. With no compositor drawing (it has
+    /// drawn nothing yet: under Node, or before a page's first frame), at
+    /// once, as at the commit.
+    fn shown(&mut self, drawn: u32, now: u64) {
+        let ms = (now / 1_000_000) as u32;
+        let mut upto = None;
+        while let Some(&(gen, seq, at)) = self.showing.front() {
+            let done = drawn == 0 || (gen.wrapping_sub(drawn) as i32) <= 0 || now.saturating_sub(at) >= SHOWN_STALL_NS;
+            if !done {
+                break;
+            }
+            upto = Some(seq);
+            self.showing.pop_front();
+        }
+        if let Some(seq) = upto {
+            self.client.present_upto(seq, ms);
+        }
+    }
+
+    /// After a pump's publish (or a pump that published nothing new):
+    /// commits since the last entry are shown with publish `gen`.
+    fn showing(&mut self, gen: u32, now: u64) {
+        let seq = self.client.commit_seq();
+        if self.showing.back().is_some_and(|b| b.1 >= seq) || !self.client.has_held() {
+            return;
+        }
+        self.showing.push_back((gen, seq, now));
+    }
     /// The clipboard, each pump: the page's new text offered to the client
     /// (unless the client set it), the client's new selection asked for and
     /// read, and receives written.
@@ -725,6 +769,9 @@ impl WaylandDevice {
         let input = if wanted { poll_input() } else { Vec::new() };
         let mut scene: Vec<i32> = Vec::new();
         let mut changed = false;
+        // (what the compositor has drawn, for `Session::shown`)
+        let drawn = unsafe { wl_drawn() };
+        let now = crate::now_ns();
         sessions.retain_mut(|s| {
             let mut gone = false;
             let mut buf = std::mem::take(&mut s.rbuf);
@@ -921,6 +968,8 @@ impl WaylandDevice {
                     s.xwm = None;
                 }
             }
+            // The commits the compositor has drawn since: released, answered.
+            s.shown(drawn, now);
             s.out.extend_from_slice(&s.client.take_outgoing());
             // A descriptor for the client's source to write its selection
             // into, riding with the `send` that asks for it.
@@ -1004,6 +1053,13 @@ impl WaylandDevice {
             }
             stays
         });
+        // The commits of this pump, shown with the publish it ends in (the
+        // next generation), or with the last one when it publishes nothing:
+        // a commit that changed nothing on the screen has no pixels to read.
+        let next = unsafe { wl_generation() }.wrapping_add(changed as u32);
+        for s in sessions.iter_mut() {
+            s.showing(next, now);
+        }
         // A client that went away changes the scene by its absence.
         let live = sessions.len();
         let mut last = self.inner.published.lock().unwrap();
@@ -1040,6 +1096,16 @@ impl WaylandDevice {
             return true;
         };
         let mut wants = false;
+        // Commits the compositor has drawn since, to answer.
+        if sessions.iter().any(|s| !s.showing.is_empty()) {
+            let drawn = unsafe { wl_drawn() };
+            let now = crate::now_ns();
+            if sessions.iter().any(|s| {
+                s.showing.front().is_some_and(|&(gen, _, at)| drawn == 0 || (gen.wrapping_sub(drawn) as i32) <= 0 || now.saturating_sub(at) >= SHOWN_STALL_NS)
+            }) {
+                return true;
+            }
+        }
         for s in sessions.iter() {
             if s.xwm.is_some() || s.sent < s.out.len() || s.socket.poll_readable() || s.socket.poll_hup() {
                 return true;
@@ -1121,6 +1187,10 @@ fn is_x_server(kernel: &Kernel) -> bool {
 impl HostListener for WaylandDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut client = Client::new();
+        // Frame callbacks and releases follow the compositor's drawing
+        // (`Session::shown`), not the commit: the page reads a buffer's
+        // pixels where they are, at its next animation frame.
+        client.set_held(true);
         let (w, h) = output_size();
         client.set_default_size(w, h);
         client.set_scale(OUTPUT_SCALE.load(std::sync::atomic::Ordering::Relaxed));
@@ -1146,6 +1216,7 @@ impl HostListener for WaylandDevice {
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),
+            showing: Default::default(),
         });
     }
 }
