@@ -30,3 +30,5 @@ ENV GEX_CRT_SRC=/opt/crt/builtins HOME=/root
 RUN git config --global --add safe.directory '*'
 # the EGL and KHR headers wine/deps32.sh and deps64.sh copy
 RUN apt-get update && apt-get install -y --no-install-recommends libegl-dev && rm -rf /var/lib/apt/lists/*
+# wayland-scanner, built natively by wine/deps32.sh and deps64.sh, needs expat
+RUN apt-get update && apt-get install -y --no-install-recommends libexpat1-dev libgmp-dev libxml2-dev zlib1g-dev && rm -rf /var/lib/apt/lists/*
