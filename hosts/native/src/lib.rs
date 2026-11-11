@@ -2976,7 +2976,16 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // without system calls would never stop.
     let paused = (!inside).then(|| cx.gate.pause());
     let (mut child_kernel, regions, ctx_addr) = {
-        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        // The child is a copy of the thread that forked: its signal mask
+        // (and alternate stack) are that thread's. The kernel is the
+        // process's, and the thread state loaded in it is whichever thread
+        // last made a call: another thread's, between the fork's call and
+        // this, gave the child that thread's mask -- a posix_spawn from
+        // the main thread of a program with dispatch's workers (which block
+        // nearly everything) made children deaf to SIGTERM, one spawn in a
+        // few.
+        k.enter_thread(&store.as_context().data().thread);
         // What the parent has mapped, less what it is known to hold only
         // zeros (its reservations): the child's memory is zero already.
         let regions: Vec<(u64, u64)> = {

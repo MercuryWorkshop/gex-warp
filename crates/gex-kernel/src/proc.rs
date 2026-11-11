@@ -414,6 +414,13 @@ struct Proc {
     /// (`signal << 8 | 0x7f`) or its being continued (`0xffff`), as the
     /// wait status that says so, or zero.
     stop_news: u32,
+    /// Its threads have taken a stop signal from the table
+    /// ([`ProcTable::take_signals`]) and the process has yet to stop
+    /// ([`ProcTable::stop`]).
+    stop_taken: bool,
+    /// It was sent `SIGCONT` while [`Proc::stop_taken`]: the stop is taken
+    /// back, as it would have been had the signal not yet been taken.
+    cont_since: bool,
     /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
     crash_more: Vec<u8>,
 }
@@ -615,6 +622,7 @@ impl Table {
         let p = &mut self.procs[i];
         match signo {
             SIGCONT => {
+                p.cont_since |= p.stop_taken;
                 p.pending.fetch_and(!STOPS, Ordering::AcqRel);
                 p.killed &= !STOPS;
                 if std::mem::take(&mut p.stop) == 0 {
@@ -742,6 +750,8 @@ impl ProcTable {
                     crash: Vec::new(),
                     stop: 0,
                     stop_news: 0,
+                    stop_taken: false,
+                    cont_since: false,
                     crash_more: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
@@ -791,6 +801,8 @@ impl ProcTable {
             crash: Vec::new(),
             stop: 0,
             stop_news: 0,
+            stop_taken: false,
+            cont_since: false,
             crash_more: Vec::new(),
         });
         pid
@@ -1520,8 +1532,15 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.take_signals)(pid);
         }
-        match self.lock().procs.iter().find(|p| p.pid == pid) {
-            Some(p) => p.pending.swap(0, Ordering::AcqRel),
+        match self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let taken = p.pending.swap(0, Ordering::AcqRel);
+                if taken & STOPS != 0 {
+                    p.stop_taken = true;
+                    p.cont_since = false;
+                }
+                taken
+            }
             None => 0,
         }
     }
@@ -1687,6 +1706,15 @@ impl ProcTable {
                 return false;
             }
             let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
+            // Continued since its threads took the stop signal: the
+            // `SIGCONT` came after the stop and undoes it, though the
+            // process had not got to stopping. (Else a `SIGSTOP` the
+            // process took, a `SIGCONT`, and then a `SIGTERM`, sent one
+            // after another, left it stopped for good with the `SIGTERM`
+            // waiting.)
+            if std::mem::take(&mut p.stop_taken) && std::mem::take(&mut p.cont_since) {
+                return false;
+            }
             // (One that has ended is not stopped by what it left behind. Its
             // status is not waited for with the table held -- whoever holds
             // it may want the table next, as `end` does -- but asked again.)
@@ -1847,6 +1875,34 @@ mod tests {
         // One that has ended is not stopped.
         t.exit(job, 9);
         assert!(!t.stop(job, SIGSTOP));
+    }
+
+    #[test]
+    fn a_sigcont_after_a_stop_was_taken_takes_it_back() {
+        let t = ProcTable::new();
+        let parent = t.spawn(INIT_PID);
+        let child = t.spawn(parent);
+        // SIGSTOP taken by the child's threads, then SIGCONT and SIGTERM
+        // sent before the child got to stopping: it does not stop, and the
+        // SIGTERM is there for it.
+        t.kill(parent, child, SIGSTOP).unwrap();
+        assert_eq!(t.take_signals(child), 1 << (SIGSTOP - 1));
+        t.kill(parent, child, SIGCONT).unwrap();
+        t.kill(parent, child, 15).unwrap();
+        assert!(!t.stop(child, SIGSTOP));
+        assert_eq!(t.stopped(child), 0);
+        assert_eq!(t.take_signals(child), 1 << (SIGCONT - 1) | 1 << 14);
+        // A stop taken with no SIGCONT after it stops, and SIGCONT starts it.
+        t.kill(parent, child, SIGSTOP).unwrap();
+        t.take_signals(child);
+        assert!(t.stop(child, SIGSTOP));
+        assert_eq!(t.stopped(child), SIGSTOP);
+        t.kill(parent, child, SIGCONT).unwrap();
+        assert_eq!(t.stopped(child), 0);
+        // A SIGCONT long before a stop does not take that stop back.
+        t.kill(parent, child, SIGSTOP).unwrap();
+        t.take_signals(child);
+        assert!(t.stop(child, SIGSTOP));
     }
 
     #[test]
