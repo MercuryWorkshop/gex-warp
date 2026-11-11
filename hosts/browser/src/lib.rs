@@ -20913,9 +20913,22 @@ pub extern "C" fn gex_abandon(code: i32) {
     // No kernel lock: the end is claimed as `exit_process` claims it, and a
     // process already ending (or with a status) is left to that.
     let Some(home) = sigs::home() else { return };
-    if home.exit().status().is_some() || !home.exit().claim() {
+    // A status recorded with nobody having claimed the end is an end of the
+    // shim's own making (`set_exit`: an instruction there is none of, a wild
+    // stack pointer), which this Worker's own run would have claimed on its
+    // way out (`gex_process_gone`), or another thread's whose Worker ends as
+    // a thread's does. Here, instead, the Worker threw first: the end is
+    // claimed and run here, with that status (a signal's as a shell reports
+    // it, 128 and the signal) -- returning on it left the process with its
+    // descriptors open and no status for its parent's `wait4`.
+    if !home.exit().claim() {
         return;
     }
+    let code = match home.exit().status() {
+        Some(said) if (129..=128 + 64).contains(&said) => 128 - said,
+        Some(said) => said,
+        None => code,
+    };
     let pid = home.pid();
     trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
     // The descriptors, on the same terms as `exit_process`: a status alone
