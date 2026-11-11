@@ -90,10 +90,59 @@ impl Kernel {
         if let Err(e) = self.darwin_spawn_actions(m, adesc) {
             return self.darwin_spawn_fails(false, e, a);
         }
+        // What XNU finds before there is a child, and so answers: a
+        // directory is no program (EACCES), and a directory the actions move
+        // to must be one (ENOENT, ENOTDIR). Found in the copy, they were
+        // only its exit status of 127.
+        if self.darwin_is_dir(m, path) {
+            return self.darwin_spawn_fails(false, Errno::EACCES, a);
+        }
+        if let Err(e) = self.darwin_spawn_dirs(m, adesc) {
+            return self.darwin_spawn_fails(false, e, a);
+        }
         self.darwin_text_page(m);
         self.darwin_spawn_at = Some(pid_at);
+        // The child's own group is there when the call returns, as it is on
+        // a Mac: the parent sets it too (`setpgid` from either side is the
+        // usual answer to the race), as soon as the child has a pid.
+        self.darwin_spawn_pgroup = None;
+        if flags & SETPGROUP != 0 {
+            if let Ok(attrp) = m.read_u64(adesc + 8) {
+                self.darwin_spawn_pgroup = m.read_u32(attrp + 12).ok();
+            }
+        }
         *a = [SIGCHLD, 0, 0, 0, 0, 0];
         nr::CLONE
+    }
+
+    /// Whether the guest path at `path` names a directory.
+    fn darwin_is_dir(&mut self, m: &mut GuestMem<'_>, path: u64) -> bool {
+        self.darwin_dir_of(m, path).is_ok()
+    }
+
+    /// The guest path at `path` as a directory: Ok when it is one, else
+    /// what a `chdir` to it answers (ENOENT, ENOTDIR).
+    fn darwin_dir_of(&mut self, m: &mut GuestMem<'_>, path: u64) -> Result<(), Errno> {
+        let io = self.path_io();
+        let p = io.at_path(m, AT_FDCWD as i32, path)?;
+        match io.ns.metadata(&p)?.file_type {
+            crate::vfs::FileType::Directory => Ok(()),
+            _ => Err(Errno::ENOTDIR),
+        }
+    }
+
+    /// Each directory the file actions of `adesc` move to (`addchdir_np`)
+    /// must be one: the error XNU answers for the first that is not.
+    fn darwin_spawn_dirs(&mut self, m: &mut GuestMem<'_>, adesc: u64) -> Result<(), Errno> {
+        let Some((actions, count)) = self.darwin_spawn_actions(m, adesc)? else { return Ok(()) };
+        for i in 0..count {
+            let at = actions + 8 + i * ACTION;
+            if m.read_u32(at)? != 5 {
+                continue;
+            }
+            self.darwin_dir_of(m, at + 8)?;
+        }
+        Ok(())
     }
 
     /// The call has failed with `e`: its answer, or the copy's end.

@@ -739,6 +739,10 @@ pub struct Kernel {
     /// Where the `posix_spawn` in hand wants its child's pid: the fork it
     /// is answers zero, and the pid goes there.
     pub darwin_spawn_at: Option<u64>,
+    /// The group the `posix_spawn` in hand puts its child in
+    /// (`POSIX_SPAWN_SETPGROUP`), set by the parent as well once the child
+    /// has a pid, so that it is there when the call returns.
+    pub darwin_spawn_pgroup: Option<u32>,
     /// Where the Darwin call in hand was made from: a `posix_spawn` made
     /// from the kernel's own page of code is its copy's ([`darwin`]'s
     /// `spawn`).
@@ -10392,6 +10396,7 @@ impl Kernel {
             darwin_ready: None,
             darwin_answer: None,
             darwin_spawn_at: None,
+            darwin_spawn_pgroup: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
             darwin_kevents: Default::default(),
@@ -10917,6 +10922,7 @@ impl Kernel {
             darwin_ready: None,
             darwin_answer: None,
             darwin_spawn_at: None,
+            darwin_spawn_pgroup: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
             darwin_kevents: Default::default(),
@@ -11268,6 +11274,9 @@ impl Kernel {
                     let _ = m.write_u32(at, pid as u32);
                 }
                 let _ = set_result(m, self.ctx_addr, 0);
+                if let Some(group) = self.darwin_spawn_pgroup.take() {
+                    let _ = self.dispatch(m, nr::SETPGID, [pid as u64, group as u64, 0, 0, 0, 0]);
+                }
             }
             if self.trace {
                 eprintln!(
