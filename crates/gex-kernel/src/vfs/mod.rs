@@ -1432,6 +1432,30 @@ impl Namespace {
         std::borrow::Cow::Owned(if abs == "/" { self.root.clone() } else { format!("{}{abs}", self.root) })
     }
 
+    /// The name a socket at absolute `abs` has in the table every process
+    /// shares (an abstract name is itself): as the namespace the process
+    /// started with names it. A `chroot`'s root goes in front
+    /// ([`Namespace::outer_path`]); in a tree entered
+    /// ([`Namespace::enter`]) the name is the one the namespace it was
+    /// entered from has, through what the two share, its directory's links
+    /// followed first -- a Mac root's `/tmp` is a link to the `/private/tmp`
+    /// it shares with the system's `/tmp`, where the system's compositor
+    /// and its other servers are bound, and where another system's program
+    /// looks for what this one binds.
+    pub fn socket_name<'a>(&self, abs: &'a str) -> std::borrow::Cow<'a, str> {
+        let Some(outer) = self.outer.as_ref().filter(|_| abs.starts_with('/')) else {
+            return self.outer_path(abs);
+        };
+        let (dir, base) = match abs.rfind('/') {
+            Some(0) | None => ("/", &abs[1.min(abs.len())..]),
+            Some(i) => (&abs[..i], &abs[i + 1..]),
+        };
+        let dir = self.canonical(dir);
+        let inside = if dir == "/" { format!("/{base}") } else { format!("{dir}/{base}") };
+        let named = self.outer_name(&inside).unwrap_or(inside);
+        std::borrow::Cow::Owned(outer.ns.socket_name(&named).into_owned())
+    }
+
     /// `chroot` to `dir` (absolute, normal, its links followed, a
     /// directory): the mounts at and under it, moved up to `/`, and the
     /// filesystem it is in as the root, from it down ([`subtree::Subtree`]).
@@ -2169,6 +2193,28 @@ mod tests {
     /// mounts under it moved up, the rest out of sight; absolute links and
     /// `..` resolve inside it; a socket's name is the outer path; a second
     /// chroot nests; a fork's copy keeps it.
+    #[test]
+    fn a_socket_in_a_tree_entered_is_named_as_where_it_came_from_names_it() {
+        // A Mac root at /opt/mac: its /tmp a link to the /private/tmp it
+        // shares with the system's /tmp.
+        let root = Arc::new(TmpFs::new());
+        for d in ["tmp", "opt", "opt/mac", "opt/mac/private", "opt/mac/private/tmp", "opt/mac/var", "opt/mac/var/run"] {
+            root.add_dir(d);
+        }
+        root.symlink("private/tmp", "opt/mac/tmp").unwrap();
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        assert_eq!(v.socket_name("/tmp/wayland-0"), "/tmp/wayland-0");
+        v.enter("/opt/mac", &[("/private/tmp", "/tmp")]).unwrap();
+        // The system's compositor, bound at its /tmp/wayland-0, by either
+        // name the root has for that directory.
+        assert_eq!(v.socket_name("/tmp/wayland-0"), "/tmp/wayland-0");
+        assert_eq!(v.socket_name("/private/tmp/wayland-0"), "/tmp/wayland-0");
+        // One of the root's own is under the root's directory.
+        assert_eq!(v.socket_name("/var/run/s"), "/opt/mac/var/run/s");
+        assert_eq!(v.socket_name("\0abstract"), "\0abstract");
+    }
+
     #[test]
     fn chroot_resolves_inside_the_new_root() {
         let root = Arc::new(TmpFs::new());

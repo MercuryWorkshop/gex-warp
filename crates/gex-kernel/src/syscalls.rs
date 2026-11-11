@@ -5482,7 +5482,7 @@ impl NetIo<'_> {
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
             // Named in the table every process shares as the namespace the
             // process started with names it (a `chroot`'s root in front).
-            let name = io.ns.outer_path(&path).into_owned();
+            let name = io.ns.socket_name(&path).into_owned();
             d.bind(&name)?;
             if !path.starts_with('\0') {
                 let _ = io.ns.mksocket(&path);
@@ -5500,7 +5500,7 @@ impl NetIo<'_> {
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
         // Named in the table every process shares as the namespace the
         // process started with names it (a `chroot`'s root in front).
-        let name = io.ns.outer_path(&path).into_owned();
+        let name = io.ns.socket_name(&path).into_owned();
         // In the global kernel when there is one, because the client that
         // will connect is another process -- and with a Worker per process
         // that is another memory, where a name bound here means nothing.
@@ -5548,7 +5548,7 @@ impl NetIo<'_> {
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
             // Named in the table every process shares as the namespace the
             // process started with names it (a `chroot`'s root in front).
-            let name = io.ns.outer_path(&path).into_owned();
+            let name = io.ns.socket_name(&path).into_owned();
             return d.connect(&name);
         }
         let sock = io.unix_of(fd)?;
@@ -5556,7 +5556,7 @@ impl NetIo<'_> {
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
         // Named in the table every process shares as the namespace the
         // process started with names it (a `chroot`'s root in front).
-        let name = io.ns.outer_path(&path).into_owned();
+        let name = io.ns.socket_name(&path).into_owned();
         // The global kernel first, because that is where a name another
         // process bound will be. A host-bound name -- the virtio-gpu socket --
         // is in *this* process's table and never in the kernel's, so the
