@@ -7,7 +7,7 @@ import { PAGE, env, x86Programs, differ } from './programs.mjs';
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 3600 };
 
 const TARGET = 'x86_64-linux-musl';
-const SELF_EXEC = new Set(['exec-signals', 'exec-futex', 'spawn-threads', 'proc-threads', 'fs-threads', 'exec-dethread', 'fork-thread-ctx', 'file-stale-loop']);
+const SELF_EXEC = new Set(['exec-signals', 'exec-futex', 'spawn-threads', 'proc-threads', 'fs-threads', 'exec-dethread', 'fork-thread-ctx', 'file-stale-loop', 'exec-fp-state']);
 
 export default async function (t) {
   const x = x86Programs(t);

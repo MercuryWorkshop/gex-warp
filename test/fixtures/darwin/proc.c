@@ -93,6 +93,11 @@ int main(int argc, char **argv, char **envp, char **apple) {
         t_printf("signal %d", sigs[i]);
         waited("", pid);
     }
+    // Ended by its own doing, an instruction that traps (`brk`, SIGTRAP;
+    // `ud2`, SIGILL): its parent's wait is told, as of any other end.
+    pid = fork_();
+    if (pid == 0) __builtin_trap();
+    waited("a child that traps", pid);
     t_show("kill a signal there is none of", SYS(SYS_kill, me, 99, 1));
     t_show("kill nobody", SYS(SYS_kill, 0x3ffffff, 0, 1));
     t_show("kill myself with 0", SYS(SYS_kill, me, 0, 1));

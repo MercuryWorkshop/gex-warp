@@ -12652,6 +12652,19 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     write_u64(&mut data, c + ctx::PC, entry);
     write_u64(&mut data, c + ctx::MON_SIZE, 0);
     data.write((c + ctx::SAFEPOINT_COUNTER) as u64, &1024i32.to_le_bytes()).expect("a thread's context outside memory");
+    // A new program's floating point is as the processor's at power-on,
+    // whatever the old one's was, as a first program's is (`start`): the
+    // x87 stack empty and its control word 0x37f, MXCSR 0x1f80. The context
+    // is cleared with the memory, and a control word of zero masks nothing:
+    // the first inexact x87 result (musl's `strtod`, or a float printed) ended
+    // the program.
+    if gex_abi::X86 {
+        for at in [ctx::X87_TOP, ctx::X87_SW, ctx::X87_TAGS] {
+            data.write((c + at) as u64, &0u32.to_le_bytes()).expect("a thread's context outside memory");
+        }
+        data.write((c + ctx::X87_CW) as u64, &0x37fu32.to_le_bytes()).expect("a thread's context outside memory");
+        data.write((c + ctx::MXCSR) as u64, &0x1f80u32.to_le_bytes()).expect("a thread's context outside memory");
+    }
     // Every other thread goes with the old program (Linux's de_thread): its
     // Worker, parked or running, sees `gone` and ends, without the process.
     let me = cur();
@@ -20967,9 +20980,26 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         // *its* Host.  Republish from the process Worker unless this Host
         // already recorded the exit; the remote process table accepts this
         // idempotently and, crucially, wakes the parent's wait4.
+        //
+        // And an end of the shim's own making -- an illegal instruction, a
+        // breakpoint, a wild stack pointer, an x87 exception nobody masks:
+        // `set_exit` and a trap out -- has a status recorded and nobody who
+        // claimed the end: nothing of the process was torn down or said, and
+        // a parent waited for good for a child that died so. Its end is
+        // claimed here and run as `exit_process` runs one, the status the
+        // signal's (recorded as a shell reports one, 128 and the signal).
         let pid = my_pid();
-        if !sigs::home().is_some_and(|h| h.exit().over()) {
-            publish_exit(pid, status);
+        match sigs::home() {
+            Some(home) if home.exit().status().is_some() => {
+                if home.exit().claim() {
+                    let said = home.exit().status().unwrap_or(status);
+                    let code = if (129..=128 + 64).contains(&said) { 128 - said } else { said };
+                    home.procs().set_crash_unless_said(pid, b"\0gex could not run it on");
+                    end_process_once(home, code);
+                }
+            }
+            Some(home) if home.exit().over() => {}
+            _ => publish_exit(pid, status),
         }
         return 0;
     }

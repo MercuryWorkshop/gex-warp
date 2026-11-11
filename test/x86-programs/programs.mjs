@@ -39,7 +39,7 @@ export const PAGE = new Set(`fork-dirs dense-lazy dense-holes spawn-threads serv
   sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads
   fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads
   fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop
-  stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes`.split(/\s+/));
+  stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes exec-fp-state`.split(/\s+/));
 const PAGE_ONLY = new Set(['spawn-threads', 'exec-dethread']);
 
 /** NAME's targets and native tiers (t1, fjit, cgen). */
