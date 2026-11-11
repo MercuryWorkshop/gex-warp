@@ -23,13 +23,16 @@
 set -e
 MODE=mp
 [ "${1:-}" != --single ] || { MODE=sp; shift; }
-OUT=$(realpath -m "${1:?usage: page/runtime/build.sh [--single] DIR}")
+# (The directory's own name, made if it is not there: neither `realpath -m`
+# nor `mktemp -p` below is everywhere, a Mac's are BSD's.)
+mkdir -p "${1:?usage: page/runtime/build.sh [--single] DIR}"
+OUT=$(cd "$1" && pwd)
 RT=$(cd "$(dirname "$0")" && pwd)
 WEB=$(dirname "$RT")
 PUB=$WEB/public/gex
 mkdir -p "$OUT"
 
-STAGE=$(mktemp -d -p "$WEB" .runtime-pkg.XXXXXX)
+STAGE=$(mktemp -d "$WEB/.runtime-pkg.XXXXXX")
 CONFIG=$STAGE/vite.config.mjs
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -320,7 +323,7 @@ fi
 EMLIB=
 if [ -n "$REPLAY$XWL$ZSTDW$PROV" ]; then
     command -v emcc > /dev/null || { echo "page/runtime/build.sh: no emcc: Emscripten's licences" >&2; exit 1; }
-    EM=$(dirname "$(readlink -f "$(command -v emcc)")")
+    EM=$(dirname "$(node -e 'console.log(require("fs").realpathSync(process.argv[1]))' "$(command -v emcc)")")
     EMLIB=$EM/system/lib
     section "Emscripten's runtime and system libraries (libc++, libc++abi, libunwind, compiler-rt)" "$REPLAY$XWL$ZSTDW" "emscripten's LICENSE and system/lib's" \
         "$EM/LICENSE" "$EMLIB/libcxx/LICENSE.TXT" "$EMLIB/libcxxabi/LICENSE.TXT" "$EMLIB/libunwind/LICENSE.TXT" "$EMLIB/compiler-rt/LICENSE.TXT"
