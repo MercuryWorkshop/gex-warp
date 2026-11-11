@@ -3216,6 +3216,10 @@ impl Client {
     /// window is, so it -- not this state machine -- decides which surface the
     /// pointer is over.
     pub fn pointer_to(&mut self, surface: u32, x: i32, y: i32, time: u32) {
+        // The client's own drag has the pointer (`Client::is_dragging`).
+        if self.is_dragging() {
+            return;
+        }
         self.pointer_target = Some(surface);
         self.pointer_motion(x, y, time);
     }
@@ -3300,6 +3304,10 @@ impl Client {
     /// implicit grab), at the point clamped to it, as the page's desktop
     /// keeps it. A client with no toplevel takes the point as it is.
     pub fn pointer_in_window(&mut self, x: i32, y: i32, time: u32) {
+        // The client's own drag has the pointer (`Client::is_dragging`).
+        if self.is_dragging() {
+            return;
+        }
         // (a host that places pixels names no focus: its newest window)
         let newest = || {
             self.surfaces
@@ -3339,6 +3347,10 @@ impl Client {
     /// what the page's desktop does -- and a press over no surface goes
     /// nowhere.
     pub fn pointer_button_in_window(&mut self, button: u32, pressed: bool, time: u32) {
+        // The client's own drag has the pointer (`Client::is_dragging`).
+        if self.is_dragging() {
+            return;
+        }
         if pressed && self.grab_surface.is_none() {
             let on = self.pointer_on;
             let open: Vec<u32> = self
@@ -3456,6 +3468,10 @@ impl Client {
 
     /// Pointer moved to surface-local `(x, y)` in pixels.
     pub fn pointer_motion(&mut self, x: i32, y: i32, time: u32) {
+        // The client's own drag has the pointer (`Client::is_dragging`).
+        if self.is_dragging() {
+            return;
+        }
         let Some(ptr) = self.pointer else {
             trace_out("[wl] pointer motion before the client asked for a pointer");
             return;
@@ -3481,6 +3497,10 @@ impl Client {
 
     /// A pointer button (Linux `BTN_*` code) went down or up.
     pub fn pointer_button(&mut self, button: u32, pressed: bool, time: u32) {
+        // The client's own drag has the pointer (`Client::is_dragging`).
+        if self.is_dragging() {
+            return;
+        }
         let Some(ptr) = self.pointer else { return };
         if !self.ensure_pointer_enter() {
             return;
@@ -5250,6 +5270,71 @@ mod tests {
         let st = c.drag_status().unwrap();
         assert!(st.dropped && st.finished, "{st:?}");
         assert!(c.failed.is_none(), "{:?}", c.failed);
+    }
+
+    #[test]
+    fn a_clients_own_drag_is_taken_by_the_host_and_its_source_told_what_happens() {
+        let mut src = with_data_device(3);
+        // create_data_source(30), offer, set_actions; start_drag from surface 6.
+        src.receive(&Writer::new(20, 0).new_id(30).finish(), &[], &no_pool());
+        src.receive(&Writer::new(30, 0).string("text/plain;charset=utf-8").finish(), &[], &no_pool());
+        src.receive(&Writer::new(30, 2).uint(data::DND_COPY | data::DND_MOVE).finish(), &[], &no_pool());
+        src.receive(&Writer::new(21, 0).object(30).object(6).object(0).uint(1).finish(), &[], &no_pool());
+        let start = src.take_drag_start().expect("the drag, for the host");
+        assert_eq!(start, data::DragStart { source: Some(30), mimes: vec!["text/plain;charset=utf-8".into()], actions: data::DND_COPY | data::DND_MOVE, origin: 6, icon: None, serial: 1 });
+        assert!(src.take_drag_start().is_none(), "taken once");
+        assert!(src.is_dragging());
+        let _ = src.take_outgoing();
+        src.pointer_motion(10, 10, 5);
+        src.pointer_button(0x110, false, 6);
+        assert!(src.take_outgoing().is_empty(), "the drag has the pointer");
+        // Over another client, which accepts it and chooses copy.
+        let mut dst = with_data_device(3);
+        let mimes: Vec<&str> = start.mimes.iter().map(String::as_str).collect();
+        assert!(dst.drag_enter(6, 2, 3, &mimes, start.actions));
+        let offer = 0xff00_0000;
+        let serial = dst.drag_serial().unwrap();
+        dst.receive(&Writer::new(offer, 0).uint(serial).string("text/plain;charset=utf-8").finish(), &[], &no_pool());
+        dst.receive(&Writer::new(offer, 4).uint(data::DND_COPY).uint(data::DND_COPY).finish(), &[], &no_pool());
+        src.drag_source_status(30, dst.drag_status().as_ref());
+        let msgs = messages(&src.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, b)| *o == 30 && *op == 0 && b.len() > 4), "target(type)");
+        assert!(msgs.iter().any(|(o, op, b)| *o == 30 && *op == 5 && b[..4] == data::DND_COPY.to_le_bytes()), "action(copy)");
+        src.drag_source_status(30, dst.drag_status().as_ref());
+        assert!(src.take_outgoing().is_empty(), "each said once");
+        // The release: a drop the target takes, then its finish.
+        assert!(dst.drag_drop());
+        src.drag_source_drop(start.source);
+        assert!(!src.is_dragging());
+        assert!(messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 30 && *op == 3), "dnd_drop_performed");
+        dst.receive(&Writer::new(offer, 3).finish(), &[], &no_pool());
+        assert!(dst.drag_status().unwrap().finished);
+        src.drag_source_finished(30);
+        assert!(messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 30 && *op == 4), "dnd_finished");
+        // Pointer events reach it again.
+        src.pointer_motion(11, 11, 7);
+        assert!(src.failed.is_none() && dst.failed.is_none());
+    }
+
+    #[test]
+    fn a_clients_drag_over_nothing_is_cancelled() {
+        let mut src = with_data_device(3);
+        src.receive(&Writer::new(20, 0).new_id(30).finish(), &[], &no_pool());
+        src.receive(&Writer::new(21, 0).object(30).object(6).object(0).uint(1).finish(), &[], &no_pool());
+        assert!(src.take_drag_start().is_some() && src.is_dragging());
+        src.drag_source_status(30, None);
+        let msgs = messages(&src.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, b)| *o == 30 && *op == 0 && b[..4] == [0, 0, 0, 0]), "target(null)");
+        src.drag_source_cancel(Some(30));
+        assert!(messages(&src.take_outgoing()).iter().any(|(o, op, _)| *o == 30 && *op == 2), "cancelled");
+        assert!(!src.is_dragging());
+        // A source destroyed mid-drag ends it too.
+        src.receive(&Writer::new(20, 0).new_id(31).finish(), &[], &no_pool());
+        src.receive(&Writer::new(21, 0).object(31).object(6).object(0).uint(2).finish(), &[], &no_pool());
+        assert!(!src.is_dragging(), "not the drag's until the host takes it");
+        assert!(src.take_drag_start().is_some() && src.is_dragging());
+        src.receive(&Writer::new(31, 1).finish(), &[], &no_pool());
+        assert!(!src.is_dragging());
     }
 
     #[test]

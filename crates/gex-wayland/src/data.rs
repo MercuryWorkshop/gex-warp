@@ -19,7 +19,14 @@
 //!   `wl_data_device.selection` ([`Client::offer_selection`]); the client's
 //!   `receive`s of it come out of [`Client::take_receives`] like a drag's.
 //!
-//! A client's own drags (`start_drag`) are not carried: nothing takes them.
+//! - **A drag the client starts** (`start_drag`): taken by the host
+//!   ([`Client::take_drag_start`]), which carries it to whichever client's
+//!   surface is under the pointer as it carries its own (the target side
+//!   above), and tells this client's source what happens to it
+//!   ([`Client::drag_source_status`], [`Client::drag_source_drop`],
+//!   [`Client::drag_source_finished`], [`Client::drag_source_cancel`]).
+//!   While it lasts the pointer is the drag's ([`Client::is_dragging`]):
+//!   the client is sent no pointer motion or buttons.
 
 use crate::wire::{Fixed, Reader, Writer};
 use crate::{Client, Object};
@@ -43,6 +50,25 @@ const ACTIONS_SINCE: u32 = 3;
 pub struct Source {
     pub mimes: Vec<String>,
     pub actions: u32,
+    /// For a drag's source: the type and action it was last told
+    /// (`target`, `action`), so each is said once per change.
+    told_target: Option<Option<String>>,
+    told_action: Option<u32>,
+}
+
+/// A drag the client started (`wl_data_device.start_drag`), for the host
+/// to carry: its source (`None`: a drag within the client, which offers
+/// nothing to others), what the source offers, the surface it started on,
+/// its icon surface (drawn by the host under the pointer) and the serial of
+/// the press it answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragStart {
+    pub source: Option<u32>,
+    pub mimes: Vec<String>,
+    pub actions: u32,
+    pub origin: u32,
+    pub icon: Option<u32>,
+    pub serial: u32,
 }
 
 /// An offer the compositor made to the client.
@@ -124,6 +150,11 @@ pub(crate) struct DataState {
     /// The host's selection, as last offered: the offer's id.
     host_selection: Option<u32>,
     next_id: u32,
+    /// A drag the client started that the host has yet to take.
+    drag_start: Option<DragStart>,
+    /// The client's own drag is under way, taken by the host: its source,
+    /// 0 for none.
+    dragging: Option<u32>,
 }
 
 /// The action for a drop: the client's preferred one when the source has
@@ -165,8 +196,24 @@ impl Client {
     pub(crate) fn data_device(&mut self, object: u32, opcode: u16, r: &mut Reader) -> bool {
         match opcode {
             // start_drag(source, origin, icon, serial): the client's own drag,
-            // which nothing here takes.
-            0 => true,
+            // for the host to carry.
+            0 => {
+                let (Some(source), Some(origin), Some(icon), Some(serial)) = (r.object(), r.object(), r.object(), r.uint()) else { return false };
+                let src = (source != 0).then(|| self.data.sources.get(&source).cloned()).flatten();
+                if source != 0 && src.is_none() {
+                    return true;
+                }
+                let (mimes, actions) = src.map_or((Vec::new(), DND_NONE), |s| (s.mimes, s.actions));
+                self.data.drag_start = Some(DragStart {
+                    source: (source != 0).then_some(source),
+                    mimes,
+                    actions,
+                    origin,
+                    icon: (icon != 0).then_some(icon),
+                    serial,
+                });
+                true
+            }
             // set_selection(source, serial)
             1 => {
                 let source = r.object().unwrap_or(0);
@@ -199,6 +246,9 @@ impl Client {
             1 => {
                 self.objects.remove(&object);
                 self.data.sources.remove(&object);
+                if self.data.dragging == Some(object) {
+                    self.data.dragging = None;
+                }
                 if self.data.selection == Some(object) {
                     self.data.selection = None;
                     self.data.selection_changed = true;
@@ -404,6 +454,77 @@ impl Client {
     /// The descriptors waiting in [`Client::take_receives`].
     pub(crate) fn receive_fds(&self) -> impl Iterator<Item = u32> + '_ {
         self.data.receives.iter().map(|r| r.fd)
+    }
+
+    // -- the client's own drag -----------------------------------------------
+
+    /// The drag the client started since the last call, for the host to
+    /// carry ([`DragStart`]).
+    ///
+    /// The pointer is the drag's from the take ([`Client::is_dragging`]): a
+    /// host that carries no drags (does not take them) leaves the client's
+    /// pointer as it was, and its drags do nothing, as before.
+    pub fn take_drag_start(&mut self) -> Option<DragStart> {
+        let d = self.data.drag_start.take()?;
+        self.data.dragging = Some(d.source.unwrap_or(0));
+        Some(d)
+    }
+
+    /// Whether the client's own drag is under way: the pointer is the
+    /// drag's, and the client is sent no motion or buttons until it ends.
+    pub fn is_dragging(&self) -> bool {
+        self.data.dragging.is_some()
+    }
+
+    /// Tell the drag's `source` what the target under the pointer takes
+    /// (`status`: what [`Client::drag_status`] says of the target client;
+    /// `None` over nothing that takes drags): `target(type)` and
+    /// `action(dnd_action)`, each when it changes.
+    pub fn drag_source_status(&mut self, source: u32, status: Option<&DragStatus>) {
+        let Some(s) = self.data.sources.get_mut(&source) else { return };
+        let target = status.and_then(|t| t.accepted.clone());
+        let action = status.map_or(DND_NONE, |t| t.action);
+        let mut out = Vec::new();
+        if s.told_target.as_ref() != Some(&target) {
+            s.told_target = Some(target.clone());
+            out.push(match &target {
+                Some(m) => Writer::new(source, 0).string(m),
+                None => Writer::new(source, 0).uint(0),
+            });
+        }
+        if s.actions != DND_NONE && s.told_action != Some(action) {
+            s.told_action = Some(action);
+            out.push(Writer::new(source, 5).uint(action)); // action (version 3)
+        }
+        for w in out {
+            self.send(w);
+        }
+    }
+
+    /// The drag was dropped on a target that takes it: `dnd_drop_performed`.
+    /// The drag is over for the pointer; the source waits for the target's
+    /// finish ([`Client::drag_source_finished`]).
+    pub fn drag_source_drop(&mut self, source: Option<u32>) {
+        self.data.dragging = None;
+        if let Some(s) = source.filter(|s| self.data.sources.contains_key(s)) {
+            self.send(Writer::new(s, 3));
+        }
+    }
+
+    /// The target is done with the data: `dnd_finished`.
+    pub fn drag_source_finished(&mut self, source: u32) {
+        if self.data.sources.contains_key(&source) {
+            self.send(Writer::new(source, 4));
+        }
+    }
+
+    /// The drag ended with nothing taking it (released over nothing that
+    /// accepts, or the host gave up on it): `cancelled`.
+    pub fn drag_source_cancel(&mut self, source: Option<u32>) {
+        self.data.dragging = None;
+        if let Some(s) = source.filter(|s| self.data.sources.contains_key(s)) {
+            self.send(Writer::new(s, 2));
+        }
     }
 
     // -- the selection --------------------------------------------------------
