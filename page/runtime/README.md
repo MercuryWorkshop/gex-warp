@@ -705,12 +705,13 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 
 | Member | Does |
 | --- | --- |
-| `new HostWindows(sys, { width, height, scale })` | The output programs see as their screen, in CSS pixels (default the viewport) and device pixels per CSS pixel (default `devicePixelRatio`, rounded). |
+| `new HostWindows(sys, { width, height, scale, menus })` | The output programs see as their screen, in CSS pixels (default the viewport) and device pixels per CSS pixel (default `devicePixelRatio`, rounded). `menus: true`: the page presents programs' menus (below). |
 | `setOutputSize(width, height, scale)` | When the page's desktop changes size. |
 | `env` | `{ XDG_RUNTIME_DIR, WAYLAND_DISPLAY, DISPLAY }` for `spawn`. |
 | `windows()`, `focused` | Every window; the one with the keyboard. |
 | `keyEvent(e, pressed)` | A `keydown`/`keyup` heard elsewhere (the frame), for the window with the keyboard. |
 | `window` event | `{ window }`: a new `GuestWindow`. A `cursor` event (`css`) when the client's cursor changes; it is also set on every window's canvas. |
+| `menus()`, `menu` event | Every `GuestMenu`; `{ menu }` for a new one (Menus, below). |
 
 `process.windows()` lists a process's windows.
 
@@ -721,6 +722,7 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `canvas` | Its pixels, CSS-sized to the window. Focusable: keys go to the window whose canvas has the page's focus; pointer and wheel input are its own. |
 | `kind` | `'toplevel'`, `'popup'` (a menu, a tooltip: never framed, drawn above its parent and outside its frame) or `'subsurface'`. |
 | `parent`, `title`, `width`, `height` | `title` whole (up to 256 bytes of UTF-8). |
+| `menu` | The `GuestMenu` a shell shows for this window, or `null` (Menus, below). |
 | `pid` | The program's pid: an X window's as the program says (`_NET_WM_PID`, which Qt, GTK and most toolkits set), else its X server's. `process.windows()` uses it. |
 | `decorations` | `'host'` (frame it: a Win32 window with a caption too), `'client'` (it draws its own: a Win32 window without one) or `'none'`. |
 | `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
@@ -729,6 +731,84 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `focus()`, `close()` | The keyboard; a polite close. |
 | `appId` | What application it is, or `null` when the program does not say: a Wayland window's app id (by convention its desktop entry's name, `org.kde.kate`), an X window's `WM_CLASS` class (what a desktop entry's `StartupWMClass` names, `XTerm`). |
 | Events | `title`, `appid`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'minimize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
+
+**Menus**
+
+A desktop with a menu bar of its own says `menus: true`. A program that can
+then hands its menus to the page instead of drawing a menu bar in its
+window: a Mac program's main menu today (and its Dock menu); the protocol
+(`crates/gex-wayland/protocols/gex-menu-v1.xml`, where the design is
+written down) is any toolkit's to use. Without the option nothing changes:
+no program is offered the protocol, and each draws its own menus. Menus a
+program opens itself (context menus, pop-up buttons) are its own windows
+either way.
+
+A menu belongs to the application, not to a window: `window.menu` is the
+same `GuestMenu` for every window of a program (unless a window has a menu
+bar of its own, scope `'window'`), and a shell shows `windows.focused?.menu`,
+looking again on a `menu` event (a program publishes its menu after its
+first window may have appeared), on `closed`, and when the focus moves.
+
+```js
+const hw = new HostWindows(sys, { menus: true });
+function showBar() {
+  const menu = hw.focused?.menu;                    // the focused window's application's
+  bar.replaceChildren(...(menu?.items ?? []).filter((i) => !i.hidden).map((top) => {
+    const b = Object.assign(document.createElement('button'), { textContent: top.title });
+    b.onclick = async () => {
+      const items = await menu.openMenu(top.id);    // validated: enabled, checks, titles
+      dropDown(b, items, (item, e) => menu.activate(item.id, { modifiers: e }), () => menu.closeMenu(top.id));
+    };
+    return b;
+  }));
+  menu?.addEventListener('change', showBar, { once: true });
+}
+hw.addEventListener('menu', showBar);               // and from the page's own focus handling
+```
+
+| `GuestMenu` | Does |
+| --- | --- |
+| `scope` | `'menu-bar'` (the application's), `'dock'` (items for the menu of its icon or task button) or `'window'`. |
+| `title`, `pid`, `windows` | The application's name; its pid; the windows whose `menu` this is. |
+| `items`, `item(id)` | The bar's items; any item by its `id`. Plain frozen data, made again at each `change`. |
+| `openMenu(id, { timeout })` | Before showing a menu (`id` of an item with a `submenu`; 0, the default, for the bar): the program brings that menu's items up to date and the promise resolves with them. After `timeout` ms (300) it resolves with what there is, and a `change` follows if the program answers late. |
+| `closeMenu(id)` | The menu is no longer shown. One for each `openMenu`. |
+| `activate(id, { modifiers })` | The item was chosen. The program does what a click in its own menu does, and nothing if the item cannot be chosen now: its state decides, not the page's copy. `modifiers`: `{ shift, control, alt, logo }` or the page's key or pointer event. Needs no `openMenu` first. |
+| Events | `change` (items or title differ), `closed` (the program took the tree away, or ended). |
+
+An item: `{ id, title, enabled, hidden, separator, header, alternate,
+state, indent, role, shortcut, tooltip, image, submenu }`.
+
+- `id` is the program's number for the item, the same across changes, so a
+  shell can keep a menu open through a `change` and remember an item.
+- `state` is `'off'`, `'on'` or `'mixed'` (a check mark); `indent` a level.
+  `header` is a label for the items after it. An `alternate` item stands in
+  for the item before it while exactly its shortcut's modifiers are held; a
+  shell that does not do that hides it.
+- `shortcut` is `{ key, shift, control, alt, logo }`: `key` as
+  `KeyboardEvent.key` names the unshifted key (`'s'`, `','`, `'Enter'`,
+  `'ArrowUp'`, `'F5'`), `logo` the Command, Windows or Super key.
+  `shortcutLabel(shortcut, { style })` writes it as a menu does: `'mac'`
+  "⇧⌘S", `'plus'` "Ctrl+Shift+S". While the program's window has the
+  keyboard its shortcuts are its own business: the keys reach it as they
+  always did, and the page need not act on them. A page may also bind keys
+  of its own to items and call `activate`.
+- `role` is a hint for a shell that places some items itself, or `null`: on
+  the bar's items `'application'` (the application's own menu: a Mac
+  program's first), `'file'`, `'edit'`, `'view'`, `'window'`, `'help'`;
+  on others `'about'`, `'preferences'`, `'services'`, `'hide'`,
+  `'hide-others'`, `'show-all'`, `'quit'`, `'new'`, `'open'`, `'close'`,
+  `'save'`, `'print'`, `'undo'`, `'redo'`, `'cut'`, `'copy'`, `'paste'`,
+  `'delete'`, `'select-all'`, `'minimize'`, `'zoom'`, `'fullscreen'`,
+  `'bring-all-to-front'`. More may come; ignore what is not known.
+- `image` is `{ width, height, scale, template, data }` or `null`: RGBA
+  bytes for `new ImageData(data, width, height)`, at most 128 pixels a
+  side, shown at `width / scale` CSS pixels; `template` a shape to draw in
+  the text's colour.
+
+Natively the same protocol is offered with `GEX_WL_MENUS=1`, and
+`GEX_WL_INPUT`'s `menu`, `menu-open`, `menu-activate` and `menu-close`
+lines are the shell (`hosts/native/src/wayland.rs`).
 
 ### SingleCanvas (`@gexemu/runtime/windows/single`)
 

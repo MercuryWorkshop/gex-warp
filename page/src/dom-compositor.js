@@ -66,6 +66,11 @@ import {
   EV_MOVED,
   EV_POINTER_LOCK,
   EV_RELATIVE,
+  EV_MENU_OPEN,
+  EV_MENU_CLOSED,
+  EV_MENU_ACTIVATE,
+  menuSeq,
+  takeMenuMessages,
   F_FULLSCREEN,
   F_POINTER_LOCK,
   ROLE_TOPLEVEL,
@@ -648,9 +653,107 @@ export class DomDesktop {
 
   // -- the frame ----------------------------------------------------------
 
+  // -- menus the page presents (`gex_menu_v1`) ------------------------------
+  //
+  // Each tree a client publishes, as its process last sent it (wl_menu.rs:
+  // the tree whole at every commit), by `token:client:tree`; and the trees'
+  // images, by `token:client:serial`. The page's shell is told through
+  // `onmenu(key, tree | null)` and reads `menus()`.
+
+  #menuSeen = 0;
+  #menus = new Map();
+  #menuImages = new Map();
+  #menuAsks = new Map();
+  #menuAsk = 0;
+  /** Called with a tree's key and the tree, published or changed, or null
+   *  when it has gone. */
+  onmenu = null;
+
+  /** Every published tree: `{ key, token, client, tree, scope, surface,
+   *  title, items }`, items as the guest's compositor wrote them. */
+  menus() {
+    return [...this.#menus.values()];
+  }
+
+  /** An item's image by the number the tree gives it: `{ width, height,
+   *  scale, template, data }`, `data` RGBA bytes, or null. */
+  menuImage(tree, serial) {
+    return this.#menuImages.get(`${tree.token}:${tree.client}:${serial}`) ?? null;
+  }
+
+  #takeMenus() {
+    for (const { token, message: m } of takeMenuMessages(this.#channel)) {
+      const client = `${token}:${m.client}`;
+      if (m.picture) {
+        const p = m.picture;
+        const raw = atob(p.rgba);
+        const data = new Uint8ClampedArray(raw.length);
+        for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+        this.#menuImages.set(`${client}:${p.image}`, { width: p.width, height: p.height, scale: p.scale, template: !!p.template, data });
+      } else if (m.opened) {
+        const ask = this.#menuAsks.get(m.opened.serial);
+        this.#menuAsks.delete(m.opened.serial);
+        ask?.();
+      } else if (m.gone !== undefined) {
+        this.#menusGone((t) => t.token === token && t.client === m.client && (!m.gone || t.tree === m.gone));
+        if (!m.gone) for (const k of [...this.#menuImages.keys()]) if (k.startsWith(`${client}:`)) this.#menuImages.delete(k);
+      } else if (m.items) {
+        const key = `${client}:${m.tree}`;
+        const tree = { key, token, ...m };
+        this.#menus.set(key, tree);
+        this.onmenu?.(key, tree);
+      }
+    }
+  }
+
+  #menusGone(which) {
+    for (const [key, t] of [...this.#menus]) {
+      if (!which(t)) continue;
+      this.#menus.delete(key);
+      this.onmenu?.(key, null);
+    }
+  }
+
+  /** The block of the process `token`, where its events go, or -1. */
+  #blockOf(token) {
+    for (const w of this.#windows.values()) if (w.token === token) return w.block;
+    return this.#tokenBlocks.get(token) ?? -1;
+  }
+
+  #tokenBlocks = new Map();
+
+  /** Tell the client the shell is about to show `menu` (0: the bar) of
+   *  `tree`: resolves once its items are current (the tree's `onmenu` has
+   *  then come, if anything changed), false if the tree is gone. */
+  menuOpen(tree, menu) {
+    const block = this.#blockOf(tree.token);
+    if (block < 0 || !this.#menus.has(tree.key)) return Promise.resolve(false);
+    const serial = ++this.#menuAsk;
+    return new Promise((res) => {
+      this.#menuAsks.set(serial, () => res(true));
+      sendEvent(this.#channel, block, EV_MENU_OPEN, tree.tree, menu, serial, 0, tree.client, 0);
+    });
+  }
+
+  menuClosed(tree, menu) {
+    const block = this.#blockOf(tree.token);
+    if (block >= 0) sendEvent(this.#channel, block, EV_MENU_CLOSED, tree.tree, menu, 0, 0, tree.client, 0);
+  }
+
+  /** `modifiers`: `gex_menu_v1.modifiers` bits (shift 1, control 2, alt 4, logo 8). */
+  menuActivate(tree, item, modifiers = 0) {
+    const block = this.#blockOf(tree.token);
+    if (block >= 0) sendEvent(this.#channel, block, EV_MENU_ACTIVATE, tree.tree, item, modifiers, 0, tree.client, 0);
+  }
+
   #frame() {
     if (!this.#running) return;
     try {
+      const menus = menuSeq(this.#channel);
+      if (menus !== this.#menuSeen) {
+        this.#menuSeen = menus;
+        this.#takeMenus();
+      }
       // A guest paces itself against frames displayed, not produced: its
       // `eglSwapBuffers` waits for this count to move.
       // Windows are paired with their GL canvases first, so a frame that
@@ -722,6 +825,9 @@ export class DomDesktop {
       if (!live.has(k)) this.#gone(k, win);
     }
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    // A process that is gone took its menus with it.
+    this.#tokenBlocks = new Map(blocks.map((b) => [b.token, b.block]));
+    if (this.#menus.size) this.#menusGone((t) => !this.#tokenBlocks.has(t.token));
     sceneMark(this.#marks, blocks);
     this.#markedTouch = touched;
   }

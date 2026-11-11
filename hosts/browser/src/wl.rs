@@ -20,6 +20,9 @@ use gex_kernel::GuestMem;
 use gex_wayland::{Buffers, Client, SurfaceInfo};
 use std::sync::{Arc, Mutex};
 
+#[path = "wl_menu.rs"]
+mod menu;
+
 #[link(wasm_import_module = "gex_env")]
 extern "C" {
     /// Hand the host this pump's scene: `count` fixed-size records at `ptr`,
@@ -152,6 +155,8 @@ enum InputEvent {
     /// in 1/256 pixel.
     PointerLock { client: u32, surface: u32, on: bool },
     Relative { client: u32, dx: i32, dy: i32, time: u32 },
+    /// The page's shell and a client's menus (wl_menu.rs `EV_MENU_*`).
+    Menu { client: u32, kind: i32, a: u32, b: u32, c: u32 },
 }
 
 impl InputEvent {
@@ -176,6 +181,7 @@ impl InputEvent {
             | InputEvent::Drop { client, .. }
             | InputEvent::DragLeave { client }
             | InputEvent::PointerLock { client, .. }
+            | InputEvent::Menu { client, .. }
             | InputEvent::Relative { client, .. } => client,
         }
     }
@@ -241,6 +247,9 @@ fn poll_input() -> Vec<InputEvent> {
                 14 => InputEvent::DragLeave { client },
                 15 => InputEvent::PointerLock { client, surface, on: q[1] != 0 },
                 16 => InputEvent::Relative { client, dx: q[1], dy: q[2], time: q[3] as u32 },
+                menu::EV_MENU_OPEN..=menu::EV_MENU_ACTIVATE => {
+                    InputEvent::Menu { client, kind: q[0], a: q[1] as u32, b: q[2] as u32, c: q[3] as u32 }
+                }
                 _ => return None,
             })
         })
@@ -477,6 +486,8 @@ struct Session {
     /// the compositor has drawn that publish, those commits are shown: their
     /// buffers released, their frame callbacks answered ([`Session::shown`]).
     showing: std::collections::VecDeque<(u32, u64, u64)>,
+    /// What the page has been told of this client's menus (wl_menu.rs).
+    menus: menu::SessionMenus,
 }
 
 /// The page's drag over one client (`Session::drag`).
@@ -914,12 +925,15 @@ impl WaylandDevice {
                             s.client.drag_leave();
                             s.drag = None;
                         }
+                        InputEvent::Menu { kind, a, b, c, .. } => menu::input(&mut s.client, &mut s.menus, s.idx, kind, a, b, c),
                     }
                 }
             }
             s.answer_drag();
             let mut clip_fds = Vec::new();
             s.pump_clip(&mut clip_fds);
+            // Its menus, to the page's shell.
+            s.menu_pump(!gone && s.client.failed.is_none());
             // The X window manager, if this client is an X server. Connected
             // lazily: the socket only exists once Xwayland has bound it, which
             // is after its Wayland connection is up.
@@ -1194,6 +1208,7 @@ impl HostListener for WaylandDevice {
         let (w, h) = output_size();
         client.set_default_size(w, h);
         client.set_scale(OUTPUT_SCALE.load(std::sync::atomic::Ordering::Relaxed));
+        client.set_presents_menus(menu::presented());
         let idx = {
             let mut n = self.inner.next_idx.lock().unwrap();
             *n += 1;
@@ -1217,6 +1232,7 @@ impl HostListener for WaylandDevice {
             sent: 0,
             rbuf: Vec::new(),
             showing: Default::default(),
+            menus: Default::default(),
         });
     }
 }
@@ -1249,5 +1265,19 @@ impl Buffers for PoolView<'_, '_> {
         let map = self.maps.pool(file, size as u64)?;
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
+    }
+
+    fn read(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
+        let file = self.fds.get(fd as usize)?.as_ref()?;
+        let mut out = vec![0u8; size];
+        let mut at = 0;
+        while at < size {
+            match file.handle.read_at(at as u64, &mut out[at..]) {
+                Ok(n) if n > 0 => at += n as usize,
+                _ => break,
+            }
+        }
+        out.truncate(at);
+        Some(out)
     }
 }
