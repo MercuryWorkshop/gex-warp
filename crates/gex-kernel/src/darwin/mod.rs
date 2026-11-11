@@ -309,7 +309,7 @@ impl Kernel {
         page[0x37] = 14;
         // The memory's size and the processor's family, as `sysctl` has them.
         page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
-        page[0x80..0x84].copy_from_slice(&0x1b58_8bb3u32.to_le_bytes());
+        page[0x80..0x84].copy_from_slice(&0xda33_d83du32.to_le_bytes());
         // 0x40, the time of day, and 0x90, whether the clock can be read
         // without the kernel, are zero: libSystem asks.
         for at in [commpage::RO, commpage::DATA] {
