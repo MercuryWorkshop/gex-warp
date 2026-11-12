@@ -109,7 +109,12 @@ struct OwnDrag {
     over: Option<Key>,
     /// Dropped on a session that took it: waiting for its finish, since.
     dropped: Option<(u64, std::time::Instant)>,
+    /// Its buttons are up, since: waiting for the target to answer.
+    released: Option<std::time::Instant>,
 }
+
+/// How long a release waits for a target that has not answered the drag.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl OwnDrag {
     /// The session whose offer is this drag's: over, or dropped on.
@@ -955,7 +960,7 @@ impl Wayland {
                 start.origin,
                 start.icon.map(|i| format!(", icon {i}")).unwrap_or_default()
             );
-            let mut d = OwnDrag { src: sessions[i].id, start, over: None, dropped: None };
+            let mut d = OwnDrag { src: sessions[i].id, start, over: None, dropped: None, released: None };
             let at = *self.inner.at.lock().unwrap();
             let over = self.inner.over.lock().unwrap().clone();
             self.drag_to(sessions, &mut d, over.as_ref(), placing, at, 0);
@@ -965,30 +970,41 @@ impl Wayland {
         // the clients as ever).
         if dragging {
             for (ev, ms, over) in due {
-                let Some(d) = own.as_mut().filter(|d| d.dropped.is_none()) else { break };
+                let Some(d) = own.as_mut().filter(|d| d.dropped.is_none() && d.released.is_none()) else { break };
                 match *ev {
                     Ev::Motion(x, y) => self.drag_to(sessions, d, over.as_ref(), placing, (x, y), *ms),
-                    Ev::Button(_, false) => {
-                        let idx = |sessions: &[Session], id: u64| sessions.iter().position(|s| s.id == id);
-                        let target = d.over.and_then(|k| idx(sessions, k.0).map(|i| (i, k)));
-                        let src = idx(sessions, d.src);
-                        let taken = target.is_some_and(|(i, _)| sessions[i].client.drag_drop());
-                        match (taken, target, src) {
-                            (true, Some((ti, k)), Some(si)) => {
-                                eprintln!("[gex] dnd: dropped on {}:{}: taken", k.0, k.1);
-                                sessions[si].client.drag_source_drop(d.start.source);
-                                d.dropped = Some((sessions[ti].id, std::time::Instant::now()));
-                                d.over = None;
-                            }
-                            _ => {
-                                eprintln!("[gex] dnd: released over {:?}: cancelled", d.over);
-                                if let Some(d) = own.take() {
-                                    Self::end_own(sessions, d, false);
-                                }
+                    Ev::Button(_, false) => d.released = Some(std::time::Instant::now()),
+                    _ => {}
+                }
+            }
+        }
+        // Released: dropped on the target under it if that takes it, else
+        // cancelled -- once the target has answered the drag at all. One
+        // that has said nothing yet (busy when the drag came in) is waited
+        // for a while: a slow answer is not a refusal.
+        if let Some(d) = own.as_mut().filter(|d| d.dropped.is_none()) {
+            if let Some(at) = d.released {
+                let idx = |sessions: &[Session], id: u64| sessions.iter().position(|s| s.id == id);
+                let target = d.over.and_then(|k| idx(sessions, k.0).map(|i| (i, k)));
+                let answered = target.is_none_or(|(i, _)| sessions[i].client.drag_status().is_none_or(|st| st.answered));
+                if answered || at.elapsed() > RELEASE_WAIT {
+                    d.released = None;
+                    let src = idx(sessions, d.src);
+                    let taken = target.is_some_and(|(i, _)| sessions[i].client.drag_drop());
+                    match (taken, target, src) {
+                        (true, Some((ti, k)), Some(si)) => {
+                            eprintln!("[gex] dnd: dropped on {}:{}: taken", k.0, k.1);
+                            sessions[si].client.drag_source_drop(d.start.source);
+                            d.dropped = Some((sessions[ti].id, std::time::Instant::now()));
+                            d.over = None;
+                        }
+                        _ => {
+                            eprintln!("[gex] dnd: released over {:?}: cancelled{}", d.over, if answered { "" } else { " (no answer from it)" });
+                            if let Some(d) = own.take() {
+                                Self::end_own(sessions, d, false);
                             }
                         }
                     }
-                    _ => {}
                 }
             }
         }

@@ -774,6 +774,11 @@ export async function waitDrag(channel, block, serial, want, ms) {
  * drag ends, and hands each target's ask for the data (a global pipe) to
  * the source's process, whose `send` writes into it.
  */
+/** In a target's word for a client drag (`B_DRAG2`): it has answered. */
+const HEARD = 0x8000;
+/** How long a release waits for a target that has not answered (ms). */
+const RELEASE_WAIT = 3000;
+
 export class ClientDrags {
   #channel;
   #a;
@@ -816,7 +821,7 @@ export class ClientDrags {
           block: Atomics.load(a, xBase + X_BLOCK),
           client: Atomics.load(a, xBase + X_CLIENT),
           icon: Atomics.load(a, xBase + X_ICON),
-          over: null, said: 0, dropped: 0, on: null,
+          over: null, said: 0, dropped: 0, on: null, released: 0,
         };
       }
     }
@@ -841,7 +846,14 @@ export class ClientDrags {
     const said = d.over ? this.#said(d.over.block, d.serial) : 0;
     if (said !== d.said) {
       d.said = said;
-      this.#send(d.block, EV_DRAG_SOURCE, said & 0xff, (said >> 8) & 0xff, 0, 0, d.client, 0);
+      this.#send(d.block, EV_DRAG_SOURCE, said & 0xff, (said >> 8) & 0x7f, 0, 0, d.client, 0);
+    }
+    // Released over a target that had not answered yet: decided once it
+    // does, or cancelled when it never does.
+    if (d.released) {
+      if (said & HEARD) this.#decide();
+      else if (now - d.released > RELEASE_WAIT) this.#end(0);
+      return !!this.drag && !this.drag.dropped;
     }
     return true;
   }
@@ -876,7 +888,7 @@ export class ClientDrags {
    *  x, y }`, the point in the surface; null: over no window). */
   move(w, t = Math.round(perf.now())) {
     const d = this.drag;
-    if (!d || d.dropped) return;
+    if (!d || d.dropped || d.released) return;
     const same = w && d.over && w.block === d.over.block && w.client === d.over.client && w.surface === d.over.surface;
     if (same) {
       this.#send(w.block, EV_DRAG_MOTION, w.x, w.y, t, 0, w.client, w.surface);
@@ -895,7 +907,21 @@ export class ClientDrags {
    *  takes it, else cancelled. */
   release() {
     const d = this.drag;
-    if (!d || d.dropped) return;
+    if (!d || d.dropped || d.released) return;
+    // A target that has said nothing yet of the drag (a program busy when
+    // it came in: Geany, still drawing, answered two seconds late) is
+    // waited for: a slow answer is not a refusal.
+    if (d.over && !(this.#said(d.over.block, d.serial) & HEARD)) {
+      d.released = perf.now() || 1;
+      return;
+    }
+    this.#decide();
+  }
+
+  /** Dropped where it is if the target there takes it, else cancelled. */
+  #decide() {
+    const d = this.drag;
+    d.released = 0;
     const takes = d.over && (dragState(this.#channel, d.over.block).flags & DRAG_ACCEPTS) && dragState(this.#channel, d.over.block).serial === (d.serial & 0x0fffffff);
     if (!takes) {
       this.#end(0);

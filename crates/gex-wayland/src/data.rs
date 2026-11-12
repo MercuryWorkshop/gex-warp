@@ -85,6 +85,9 @@ struct Offer {
     preferred: u32,
     /// The action the compositor chose and told the client (`action`).
     chosen: u32,
+    /// The client has answered it: `set_actions` (version 3), `accept`
+    /// (below).
+    answered: bool,
     finished: bool,
     /// The client destroyed it after the drop: kept for [`Client::drag_status`].
     destroyed: bool,
@@ -109,6 +112,11 @@ pub struct DragStatus {
     /// The action chosen, for a version 3 client ([`DND_COPY`] ...); a
     /// version 1 or 2 client's drop is always a copy.
     pub action: u32,
+    /// Whether the client has answered the drag at all since it entered
+    /// (version 3's `set_actions`, a lower version's `accept`): until it has, a drop has
+    /// nothing to go by, and a host may wait for it a while (a slow client
+    /// is not a refusal).
+    pub answered: bool,
     /// Whether the drop happened, and the client said it is done with it
     /// (`finish`, version 3; a lower version is done once it destroys the
     /// offer).
@@ -277,6 +285,9 @@ impl Client {
                 let (Some(_serial), Some(mime)) = (r.uint(), r.string()) else { return false };
                 if let Some(o) = self.data.offers.get_mut(&object) {
                     o.accepted = (!mime.is_empty() && o.mimes.contains(&mime)).then_some(mime);
+                    // (From version 3 a drop needs an action too: the client
+                    // has answered once it said which, set_actions.)
+                    o.answered |= o.version < ACTIONS_SINCE;
                 }
                 true
             }
@@ -315,6 +326,7 @@ impl Client {
                 let Some(o) = self.data.offers.get_mut(&object) else { return true };
                 o.actions = actions;
                 o.preferred = preferred;
+                o.answered = true;
                 let chosen = choose(o.source_actions, actions, preferred);
                 if chosen != o.chosen {
                     o.chosen = chosen;
@@ -438,6 +450,7 @@ impl Client {
             surface: d.surface,
             accepted: o.accepted.clone(),
             action: o.chosen,
+            answered: o.answered,
             dropped: d.dropped,
             finished: o.finished || (o.destroyed && o.version < ACTIONS_SINCE),
         })

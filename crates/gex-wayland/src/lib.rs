@@ -5567,8 +5567,10 @@ mod tests {
         assert_eq!(r.fixed().map(|f| f.to_int()), Some(4));
         assert_eq!(r.object(), Some(offer));
         assert!(!c.drag_status().unwrap().takes());
+        assert!(!c.drag_status().unwrap().answered, "nothing said of it yet: a release waits");
         c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
         assert!(c.drag_status().unwrap().takes());
+        assert!(c.drag_status().unwrap().answered);
         c.receive(&Writer::new(offer, 1).string("text/uri-list").finish(), &[55], &no_pool());
         assert!(c.fds_in_use().contains(&55), "a receive's fd is held until the host takes it");
         assert_eq!(c.take_receives(), vec![data::Receive { offer, mime: "text/uri-list".into(), fd: 55 }]);
@@ -5725,11 +5727,13 @@ mod tests {
         let serial = c.drag_serial().unwrap();
         c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
         assert!(!c.drag_status().unwrap().takes(), "no action yet");
+        assert!(!c.drag_status().unwrap().answered, "a version 3 client answers with its actions");
         c.receive(&Writer::new(offer, 4).uint(data::DND_COPY | data::DND_MOVE).uint(data::DND_MOVE).finish(), &[], &no_pool());
         let msgs = messages(&c.take_outgoing());
         let action = msgs.iter().find(|(o, op, _)| *o == offer && *op == 2).expect("action");
         assert_eq!(u32::from_le_bytes(action.2[..4].try_into().unwrap()), data::DND_MOVE);
         assert!(c.drag_status().unwrap().takes());
+        assert!(c.drag_status().unwrap().answered);
         assert!(c.drag_drop());
         c.receive(&Writer::new(offer, 3).finish(), &[], &no_pool());
         assert!(c.drag_status().unwrap().finished);
