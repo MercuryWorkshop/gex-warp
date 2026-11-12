@@ -126,7 +126,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     let host_exe = root.join(rootfs_rel(exe)?.strip_prefix("rootfs")?);
     let bytes = std::fs::read(&host_exe).with_context(|| format!("reading {}", host_exe.display()))?;
     let rootc = root.clone();
-    let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, gex_abi::INTERP_BASE, &|guest| {
+    let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, gex_abi::INTERP_BASE, &mut gex_ld::fresh_arena(), &|guest| {
         std::fs::read(rootc.join(guest.trim_start_matches('/'))).ok()
     })
     .map_err(|e| anyhow!("loading {exe}: {e:?}"))?;

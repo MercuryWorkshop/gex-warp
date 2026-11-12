@@ -98,6 +98,13 @@ pub enum LoadError {
         vaddr: u64,
         size: u64,
     },
+    /// A fixed-address executable, `[start, end)`, that reaches gex's stack
+    /// or the runtime's gap above it: it cannot move, and the stack cannot
+    /// either (translated code is built around its address).
+    ReachesStack {
+        start: u64,
+        end: u64,
+    },
     Malformed(&'static str),
 }
 
@@ -133,6 +140,13 @@ impl fmt::Display for LoadError {
                  program higher, e.g. with -Wl,--image-base=0x{:x}",
                 gex_abi::DISPATCH_DIR_END,
                 gex_abi::PIE_BASE
+            ),
+            LoadError::ReachesStack { start, end } => write!(
+                f,
+                "this executable's image (0x{start:x}..0x{end:x}) reaches gex's stack at 0x{:x}: \
+                 a fixed-address image must end below it; relink it position-independent \
+                 (-pie or -static-pie), which gex places wherever it fits",
+                gex_abi::STACK_TOP - gex_abi::STACK_SIZE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
         }

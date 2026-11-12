@@ -969,7 +969,6 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         &Program {
             exe: image.clone(),
             interp: None,
-            direct: None,
             darwin: None,
         },
         opts,
@@ -3778,6 +3777,9 @@ fn exec_program(
         // loader by that address (its reservations for code stay below 4 GiB
         // in a 64-bit memory).
         gex_abi::INTERP_BASE,
+        // A new address space: an image the fixed layout has no room for
+        // goes at the bottom of the arena, as in `gexc run`.
+        &mut gex_ld::fresh_arena(),
         &|p| kernel.read_file(p),
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
@@ -3810,9 +3812,7 @@ fn exec_program(
         format!("{}/{}", kernel.caller_cwd().trim_end_matches('/'), req.path)
     };
     let opts = RunOptions {
-        // (a program its interpreter maps: the interpreter's command line
-        // for it, gex_ld::Program::direct)
-        args: program.argv(req.argv, &kernel.exe_path),
+        args: req.argv,
         env: req.envp,
         ..opts.clone()
     };

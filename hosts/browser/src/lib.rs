@@ -6336,6 +6336,52 @@ pub unsafe extern "C" fn gex_free(ptr: u32, len: u32) {
     }
 }
 
+/// Run `load`, a `gex_ld` loader, with an arena (`gex_ld::Arena`) that only
+/// records what it is asked, answering as a new address space would: the
+/// lengths, in order. Empty for every program the fixed layout has room for.
+fn arena_asks<R>(load: impl FnOnce(gex_ld::Arena) -> R) -> (R, Vec<u64>) {
+    let mut asks = Vec::new();
+    let mut fresh = gex_ld::fresh_arena();
+    let r = load(&mut |len| {
+        asks.push(len);
+        fresh(len)
+    });
+    (r, asks)
+}
+
+/// The break's room after an image placed in the arena: taken with it, so
+/// the break can grow into what this map owns, before a mapping or this
+/// module's heap (which shares the arena) is there.
+const IMAGE_BRK_ROOM: u64 = 8 << 20;
+
+/// Room for each of `asks` (what [`arena_asks`] recorded) in `map`, as a
+/// mapping's would be found: this module's heap shares the arena and has
+/// taken its bottom already, so the bottom [`gex_abi::exe_bias`] names is
+/// not free here. Each 64 KiB aligned, with [`IMAGE_BRK_ROOM`] after it
+/// (the break follows an executable; after an interpreter it is only
+/// slack). The map keeps the span
+/// as its own arena and nothing in it mapped, for the loader to place the
+/// image's segments in.
+fn arena_room(map: &mut gex_kernel::mem::MemoryMap, asks: &[u64]) -> Option<Vec<u64>> {
+    use gex_kernel::mem::{flags, prot};
+    asks.iter()
+        .map(|&len| {
+            let want = len.next_multiple_of(0x1_0000) + 0x1_0000 + IMAGE_BRK_ROOM;
+            // (below the high arena of a 64-bit memory: it will hold code)
+            let at = map.mmap_low(0, want, prot::NONE, flags::PRIVATE | flags::ANONYMOUS, "").ok()?;
+            map.unmap(at, want).ok()?;
+            Some(at.next_multiple_of(0x1_0000))
+        })
+        .collect()
+}
+
+/// An arena (`gex_ld::Arena`) that answers `room`, in order: the second
+/// load of a program [`arena_asks`] measured.
+fn arena_of(room: Vec<u64>) -> impl FnMut(u64) -> u64 {
+    let mut room = room.into_iter();
+    move |_| room.next().unwrap_or(0)
+}
+
 /// Load a static ELF that JS has written at `ptr`, place it and its stack, and
 /// return the entry point. Zero means the image could not be loaded.
 #[no_mangle]
@@ -6380,10 +6426,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         f.read_at(0, &mut buf).ok()?;
         Some(buf)
     };
-    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
+    // (an image the fixed layout has no room for asks the arena: answered
+    // for real below, once there is a memory map to take room from)
+    let (program, asks) = arena_asks(|arena| gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, arena, &read_file));
+    let program = match program {
         Ok(p) => p,
         Err(e) => {
-            warn_line(&format!("gex_load: load_program failed: {e:?}"));
+            warn_line(&format!("gex_load: load_program failed: {e}"));
             return 0;
         }
     };
@@ -6394,6 +6443,30 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // dynamic program's malloc fell back to mmap -- a different path through
     // libc than the same program takes natively.
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.exe.brk, String::new());
+    // This host's memory has to be allocated up to whatever the map hands
+    // out, so the map asks before it hands anything out.
+    kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
+    // An image too big for the fixed layout goes where the map has room, as a
+    // mapping would: this module's heap shares the arena and has taken its
+    // bottom already. Loaded again there, and the break after it.
+    let program = if asks.is_empty() {
+        program
+    } else {
+        let Some(room) = arena_room(&mut kernel.mem.lock(), &asks) else {
+            warn_line(&format!("gex_load: no room in the arena for an image of {:?} bytes\n", asks));
+            return 0;
+        };
+        match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &mut arena_of(room), &read_file) {
+            Ok(p) => {
+                kernel.mem.lock().set_brk_start(p.exe.brk);
+                p
+            }
+            Err(e) => {
+                warn_line(&format!("gex_load: load_program failed: {e}"));
+                return 0;
+            }
+        }
+    };
     // A 32-bit (i386) program: i386 ABI in the kernel, compatibility-mode
     // decoding in the translator.
     kernel.compat = program.compat();
@@ -6422,9 +6495,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         }
     }
     kernel.pins = Arc::new(std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect());
-    // This host's memory has to be allocated up to whatever the map hands
-    // out, so the map asks before it hands anything out.
-    kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     // The table every process shares, when the host has wired one up. This
     // process is the first, so it keeps the pid the kernel gave it -- the
     // global table's `INIT_PID` is the same 1.
@@ -6588,14 +6658,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         0
     };
     let snap_key_1 = snap_key(&kernel.exe_path, &kernel.envp);
-    let stack_args = program.argv(args.clone(), &kernel.exe_path);
     let layout = gex_ld::build_program_stack(
         &program,
         // `STACK_TOP`, not the top of the addressable range: a stack at the
         // top makes the memory allocate up to it, four gigabytes per process.
         gex_abi::STACK_TOP,
         gex_abi::STACK_SIZE,
-        &stack_args,
+        &args,
         &env,
         *b"gexdeterministic",
         gex_ld::Identity {
@@ -7185,12 +7254,25 @@ static IMAGE_PAGES: SingleThreaded<std::collections::BTreeMap<u64, Vec<usize>>> 
 /// The program whose image this process is running, from the identity the
 /// loader recorded for the mapping at `PIE_BASE`.
 fn current_image_program(p: &Px<'_>) -> Option<String> {
-    p.mm
-        .lock()
-        .vmas()
-        .iter()
-        .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
-        .and_then(|v| v.code.as_ref().map(|(p, _)| p.clone()))
+    root_image_code(&p.mm.lock()).map(|(p, _)| p.clone())
+}
+
+/// The code identity the loader recorded for this process's executable: the
+/// mapping at `PIE_BASE`, or for an executable too big for the fixed layout
+/// (placed in the arena, `gex_abi::exe_bias`) the image mapping its break
+/// starts after. A closure's image pages are all below `INTERP_BASE`, so
+/// such a process is never given them: its own identity is not any root's
+/// at `PIE_BASE` (`gexc build` refuses to build one).
+fn root_image_code(map: &gex_kernel::mem::MemoryMap) -> Option<&(String, u64)> {
+    let vmas = map.vmas();
+    let at_pie = vmas.iter().find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end);
+    let in_arena = || {
+        let brk = map.brk_start();
+        (brk > gex_abi::MMAP_BOTTOM)
+            .then(|| vmas.iter().find(|v| v.end == brk && v.name == "[image]" && v.code.is_some()))
+            .flatten()
+    };
+    at_pie.or_else(in_arena).and_then(|v| v.code.as_ref())
 }
 
 /// Say everything this process knows about one image page.
@@ -7433,15 +7515,7 @@ fn image_pages_are_ours(h: &Host) -> bool {
     if want.is_empty() {
         return true;
     }
-    match h
-        .kernel
-        .mem
-        .lock()
-        .vmas()
-        .iter()
-        .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
-        .and_then(|v| v.code.as_ref())
-    {
+    match root_image_code(&h.kernel.mem.lock()) {
         Some((p, _)) => p.as_str() == want.as_str(),
         None => true,
     }
@@ -12381,19 +12455,22 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // below, once the old image is gone. Reading the whole executable and its
     // interpreter into the heap, parsing their symbols and dynamic tables and
     // then copying every segment again was most of an exec's own cost.
-    let (program, ranges) = if linked.is_some() {
-        (None, Vec::new())
+    let (program, ranges, asks) = if linked.is_some() {
+        (None, Vec::new(), Vec::new())
     } else {
         let read_at = |p: &str, off: u64, out: &mut [u8]| h.kernel.read_file_at(p, off, out);
-        match gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, &read_at) {
-            Ok((p, r)) => (Some(p), r),
-            Err(_) => return 0,
+        // (what the arena is asked is answered once the old image is gone)
+        match arena_asks(|arena| gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, arena, &read_at)) {
+            (Ok((p, r)), asks) => (Some(p), r, asks),
+            (Err(_), _) => return 0,
         }
     };
     note_exec(path, argv);
     // Record, when this is the first process to run the program and there is
     // a linker to catch.
-    let hook = if program.as_ref().is_some_and(|p| p.interp.is_some() && !p.is_darwin()) && snapshots_on() {
+    // (not one placed where this map had room: a recording goes back at its
+    // own addresses, which another process's map need not have free)
+    let hook = if program.as_ref().is_some_and(|p| p.interp.is_some() && !p.is_darwin()) && asks.is_empty() && snapshots_on() {
         SNAP_STUB
     } else {
         0
@@ -12462,6 +12539,26 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if let Some(dead) = dead {
         h.kernel.mem.lock().donate_arena(&dead);
     }
+    // An image too big for the fixed layout: where the new map has room (the
+    // old image's arena among it), planned again there, and the break after
+    // it (`gex_load`'s note).
+    let (program, ranges) = match program {
+        Some(_) if !asks.is_empty() => {
+            let Some(room) = arena_room(&mut h.kernel.mem.lock(), &asks) else {
+                warn_line(&format!("execve {path}: no room in the arena for an image of {asks:?} bytes\n"));
+                return 0;
+            };
+            let read_at = |p: &str, off: u64, out: &mut [u8]| h.kernel.read_file_at(p, off, out);
+            match gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, &mut arena_of(room), &read_at) {
+                Ok((p, r)) => {
+                    h.kernel.mem.lock().set_brk_start(p.exe.brk);
+                    (Some(p), r)
+                }
+                Err(_) => return 0,
+            }
+        }
+        p => (p, ranges),
+    };
     // Everything keyed by a code address there forgets it.
     cgen::on_exec(&reused);
     fjit::on_retire(&reused);
@@ -12617,9 +12714,6 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A restored process is past the linker, so `AT_ENTRY` is the honest
     // answer and the stub is not armed.
     let hook = if restored.is_some() { 0 } else { hook };
-    // (a program its interpreter maps starts as the interpreter's command
-    // line for it: gex_ld::Program::direct)
-    let direct_argv = program.as_ref().filter(|p| p.direct.is_some()).map(|p| p.argv(argv.to_vec(), &h.kernel.exe_path));
     // The process's ids, which a `setuid` before the exec changed.
     let id = gex_ld::Identity { uid: h.kernel.creds.uid(), gid: h.kernel.creds.gid(), interp_base, entry_hook: hook };
     let layout = match program.as_ref().filter(|p| p.is_darwin()) {
@@ -12640,7 +12734,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             // `STACK_TOP`, not the top of the addressable range: a stack at the
             // top makes the memory allocate up to it, four gigabytes per process.
             gex_abi::STACK_TOP,
-            direct_argv.as_deref().unwrap_or(argv),
+            argv,
             envp,
             *b"gexdeterministic",
             id,

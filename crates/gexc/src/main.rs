@@ -854,7 +854,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();
-    let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &|guest_path| {
+    // (a position-independent executable too big for the fixed layout goes
+    // in the arena: `gex_abi::exe_bias`)
+    let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &mut gex_ld::fresh_arena(), &|guest_path| {
         let host = match &sysroot {
             Some(root) => root.join(guest_path.trim_start_matches('/')),
             None => std::path::PathBuf::from(guest_path),
@@ -874,16 +876,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     // that host path may mean nothing to the guest, so it can be overridden.
     let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| ra.path.clone())];
     argv.append(&mut ra.guest_args);
-    // (a program its interpreter maps: the interpreter's command line for
-    // it, by the program's path in the guest)
-    let guest_path = std::fs::canonicalize(&ra.path)
-        .ok()
-        .and_then(|p| gex_native::guest_path_of(&p, sysroot.as_deref(), &ra.opts.binds))
-        .unwrap_or_else(|| ra.path.clone());
-    ra.opts.args = program.argv(argv, &guest_path);
-    // (and `/proc/self/exe` is the program: not its interpreter, and not
-    // the name it is told it was run by, `--argv0`'s, which names no file)
-    if (program.direct.is_some() || ra.argv0.is_some()) && ra.opts.exe.is_none() {
+    ra.opts.args = argv;
+    // (and `/proc/self/exe` is the program: not the name it is told it was
+    // run by, `--argv0`'s, which names no file)
+    if ra.argv0.is_some() && ra.opts.exe.is_none() {
         ra.opts.exe = Some(ra.path.clone());
     }
     // A client finds the display by joining these two, so default them when a
@@ -1174,7 +1170,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     if gex_ld::pe::is_pe(&bytes) {
         return build_pe_image(&path, &bytes, &out, pe_base, exhaustive, shared_memory, cgen, no_validate, functions);
     }
-    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let image = load_exe_ahead(&bytes, &path)?;
     // A 32-bit (i386) program's code must be decoded in compatibility mode,
     // exactly as the runtime path does before translating (`run_program_with`).
     gex_xlate::set_compat(image.class32);
@@ -1624,6 +1620,41 @@ fn is_interp_name(name: &str) -> bool {
     name.starts_with("ld-linux") || name.starts_with("ld-musl") || name == "ld.so"
 }
 
+/// An executable placed where `gexc run` places it (`gex_abi::exe_bias`):
+/// at `PIE_BASE`, or a position-independent one too big for the space below
+/// the interpreter at the bottom of the arena. For the tools that name its
+/// addresses.
+fn load_exe(bytes: &[u8]) -> Result<gex_ld::Image, gex_ld::LoadError> {
+    let at = gex_ld::elf::load(bytes, gex_abi::PIE_BASE)?;
+    let span = at.brk - gex_abi::PIE_BASE;
+    if at.pie && !gex_abi::exe_fits(span) {
+        return gex_ld::elf::load(bytes, gex_abi::exe_bias(span));
+    }
+    Ok(at)
+}
+
+/// An executable at `PIE_BASE`, for a build ahead of time (an image module,
+/// a closure). One too big to fit there is refused: it is placed in the
+/// arena when it runs, natively at its bottom but on the page wherever the
+/// memory map has room, so a translation for any one address would be
+/// refused (by its identity) or, in a closure, whose pages above
+/// `INTERP_BASE` are a library's, applied to whatever is there. Such a
+/// program is translated as it runs.
+fn load_exe_ahead(bytes: &[u8], path: &str) -> Result<gex_ld::Image> {
+    let at = gex_ld::elf::load(bytes, gex_abi::PIE_BASE)?;
+    let span = at.brk - gex_abi::PIE_BASE;
+    if at.pie && !gex_abi::exe_fits(span) {
+        bail!(
+            "{path}: a position-independent executable reaching {} MiB, more than the {} MiB below the \
+             interpreter; gex places it in the arena when it runs, where a build cannot know its \
+             address, so it is translated as it runs instead",
+            span >> 20,
+            (gex_abi::INTERP_BASE - gex_abi::PIE_BASE) >> 20
+        );
+    }
+    Ok(at)
+}
+
 fn place_object(next: &mut u64, span: u64) -> u64 {
     const SLACK: u64 = 0x10000;
     let base = (*next + SLACK - 1) & !(SLACK - 1);
@@ -1661,7 +1692,7 @@ fn closure_of_all(
         ))
         .ok()
     };
-    let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let exe = load_exe_ahead(&bytes, path)?;
     let interp = exe.interp.clone();
     let guest_path = match sysroot {
         Some(r) => path.strip_prefix(r.trim_end_matches('/')).unwrap_or(path).to_string(),
@@ -1689,7 +1720,7 @@ fn closure_of_all(
                 continue;
             }
         };
-        let img = match gex_ld::elf::load(&hb, gex_abi::PIE_BASE) {
+        let img = match load_exe_ahead(&hb, h) {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("gexc: skipping helper {h}: {e:?}");
@@ -1749,7 +1780,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
         .ok()
     };
 
-    let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let exe = load_exe_ahead(&bytes, &path)?;
     // Placed *up* from the bottom of the arena, so pins stay clear of the
     // allocator, which fills down from the top. `ld.so` reserves the span plus
     // up to one max-alignment of slack, maps the segments MAP_FIXED inside, and
@@ -1820,7 +1851,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
 fn cmd_disasm(args: &[String]) -> Result<()> {
     let path = args.first().context("expected an input ELF")?;
     let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
-    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let image = load_exe(&bytes)?;
 
     let mut symbols: Vec<_> = image.symbols.iter().collect();
     symbols.sort_by_key(|s| s.value);
@@ -1865,7 +1896,7 @@ fn cmd_ir(args: &[String]) -> Result<()> {
         // A Windows program: its closure is DLLs, found beside it.
         return pe_info::cmd_pe_info(args);
     }
-    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let image = load_exe(&bytes)?;
     let at = at.unwrap_or(image.entry);
 
     let view = gex_xlate::CodeView::new(&image);
@@ -1942,7 +1973,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         let prog = gex_xlate::func::recover_pe(&image, &extra, &Default::default());
         (image, prog)
     } else {
-        let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+        let image = load_exe(&bytes)?;
         let prog = gex_xlate::func::recover(&image, Some(&bytes), &Default::default());
         (image, prog)
     };
@@ -2366,7 +2397,7 @@ fn cmd_hotset(args: &[String]) -> Result<()> {
         let (image, extra) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
         gex_xlate::func::recover_pe(&image, &extra, &Default::default())
     } else {
-        let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+        let image = load_exe(&bytes)?;
         gex_xlate::set_compat(image.class32);
         gex_xlate::func::recover(&image, Some(&bytes), &Default::default())
     };

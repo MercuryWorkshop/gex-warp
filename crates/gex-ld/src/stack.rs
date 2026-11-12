@@ -288,10 +288,9 @@ pub fn build_program_stack(
             crate::macho::build_stack(darwin, stack_top, args, env, &apple.strings(darwin))
         }
         // (`AT_EXECFN` is the program's path, which `--argv0` or a shell's
-        // `exec -a` leaves apart from `argv[0]`; a program its interpreter
-        // maps was exec'd as the interpreter, its `argv[0]`)
+        // `exec -a` leaves apart from `argv[0]`)
         None => {
-            let execfn = (program.direct.is_none() && !exe_path.is_empty()).then_some(exe_path);
+            let execfn = (!exe_path.is_empty()).then_some(exe_path);
             build_initial_stack_execfn(&program.exe, stack_top, args, env, random, id, execfn)
         }
     }

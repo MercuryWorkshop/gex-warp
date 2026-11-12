@@ -133,6 +133,21 @@ pub(crate) fn layout(
             r => bail!("{}: unknown object role {r:?}", o.path),
         };
         let image = gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path))?;
+        // An executable too big for the space below the interpreter is
+        // placed in the arena when it runs, and on the page where its memory
+        // map has room, so no build can know where: its units would be
+        // refused there (by identity) at best. Refused here instead, rather
+        // than built for an address it never has.
+        if o.role == "exe" && image.pie && !gex_abi::exe_fits(image.brk - base) {
+            bail!(
+                "{}: a position-independent executable of {} MiB, too big for the {} MiB below the \
+                 interpreter; gex places it in the arena at run time, where an ejected build cannot \
+                 know its address",
+                o.path,
+                (image.brk - base) >> 20,
+                (gex_abi::INTERP_BASE - gex_abi::PIE_BASE) >> 20
+            );
+        }
         loaded.push((o, bytes, image));
     }
     // Each library's share of the window: its span and the slack after it.

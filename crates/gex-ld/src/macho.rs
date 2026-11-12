@@ -588,6 +588,30 @@ fn slide_for(m: &MachO, base: u64) -> Result<u64, LoadError> {
     Ok(if m.pie() { base.wrapping_sub(lo) } else { 0 })
 }
 
+/// Where executable `m` goes: `pie_base`, or the arena for a
+/// position-independent one too big for the space below the dynamic linker
+/// there (as an ELF executable, `crate::dynamic`).
+fn exe_base(m: &MachO, pie_base: u64, interp_base: u64, arena: crate::Arena) -> u64 {
+    let span = m.span().map_or(0, |(lo, hi)| hi - lo);
+    if m.pie() && pie_base.checked_add(span).is_none_or(|end| end > interp_base) {
+        arena(span)
+    } else {
+        pie_base
+    }
+}
+
+/// Where dynamic linker `lm` goes: `interp_base`, or the arena when the
+/// executable (a fixed-address one) reaches its range there.
+fn linker_base(exe: &Image, lm: &MachO, interp_base: u64, arena: crate::Arena) -> u64 {
+    let span = lm.span().map_or(0, |(lo, hi)| hi - lo);
+    let hi = interp_base + span;
+    if exe.segments.iter().any(|s| s.vaddr < hi && s.vaddr + s.mem_size > interp_base) {
+        arena(span)
+    } else {
+        interp_base
+    }
+}
+
 /// What a Darwin process is started with beyond its images.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Darwin {
@@ -610,6 +634,7 @@ pub fn load_program(
     bytes: &[u8],
     pie_base: u64,
     interp_base: u64,
+    arena: crate::Arena,
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<Program, LoadError> {
     let (off, len) = guest_slice(bytes)?;
@@ -618,13 +643,14 @@ pub fn load_program(
     if m.filetype != MH_EXECUTE {
         return Err(LoadError::UnsupportedType(m.filetype as u16));
     }
-    let exe = place(&m, Some(data), slide_for(&m, pie_base)?)?;
+    let exe = place(&m, Some(data), slide_for(&m, exe_base(&m, pie_base, interp_base, arena))?)?;
+    crate::dynamic::check_clear_of_stack(&exe)?;
     let mut darwin = darwin_of(&m, &exe);
     let Some(path) = m.dylinker.clone() else {
         if !matches!(m.entry, Some(Entry::Thread { .. })) {
             return Err(bad("an executable with neither a dynamic linker nor a thread state to start from"));
         }
-        return Ok(Program { exe, interp: None, direct: None, darwin: Some(darwin) });
+        return Ok(Program { exe, interp: None, darwin: Some(darwin) });
     };
     let Some(linker_bytes) = read(&path) else {
         return Err(LoadError::NeedsInterpreter(path));
@@ -635,10 +661,10 @@ pub fn load_program(
     if lm.filetype != MH_DYLINKER || !matches!(lm.entry, Some(Entry::Thread { .. })) {
         return Err(bad("the dynamic linker is not one"));
     }
-    let interp = place(&lm, Some(ldata), slide_for(&lm, interp_base)?)?;
+    let interp = place(&lm, Some(ldata), slide_for(&lm, linker_base(&exe, &lm, interp_base, arena))?)?;
     check_apart(&exe, &interp)?;
     darwin.dynamic = true;
-    Ok(Program { exe, interp: Some(interp), direct: None, darwin: Some(darwin) })
+    Ok(Program { exe, interp: Some(interp), darwin: Some(darwin) })
 }
 
 /// Two independently placed images must not claim the same addresses.
@@ -738,20 +764,22 @@ pub fn plan_program(
     exe: &str,
     pie_base: u64,
     interp_base: u64,
+    arena: crate::Arena,
     read_at: &dyn Fn(&str, u64, &mut [u8]) -> Option<usize>,
 ) -> Result<(Program, crate::elf::FileRanges), LoadError> {
     let (m, off) = plan_image(&|o, b| read_at(exe, o, b))?;
     if m.filetype != MH_EXECUTE {
         return Err(LoadError::UnsupportedType(m.filetype as u16));
     }
-    let image = place(&m, None, slide_for(&m, pie_base)?)?;
+    let image = place(&m, None, slide_for(&m, exe_base(&m, pie_base, interp_base, arena))?)?;
+    crate::dynamic::check_clear_of_stack(&image)?;
     let mut ranges: crate::elf::FileRanges = m.mapped().map(|s| (off + s.fileoff, s.filesize)).collect();
     let mut darwin = darwin_of(&m, &image);
     let Some(path) = m.dylinker.clone() else {
         if !matches!(m.entry, Some(Entry::Thread { .. })) {
             return Err(bad("an executable with neither a dynamic linker nor a thread state to start from"));
         }
-        return Ok((Program { exe: image, interp: None, direct: None, darwin: Some(darwin) }, ranges));
+        return Ok((Program { exe: image, interp: None, darwin: Some(darwin) }, ranges));
     };
     let (lm, loff) = match plan_image(&|o, b| read_at(&path, o, b)) {
         Ok(p) => p,
@@ -761,11 +789,11 @@ pub fn plan_program(
     if lm.filetype != MH_DYLINKER || !matches!(lm.entry, Some(Entry::Thread { .. })) {
         return Err(bad("the dynamic linker is not one"));
     }
-    let interp = place(&lm, None, slide_for(&lm, interp_base)?)?;
+    let interp = place(&lm, None, slide_for(&lm, linker_base(&image, &lm, interp_base, arena))?)?;
     check_apart(&image, &interp)?;
     ranges.extend(lm.mapped().map(|s| (loff + s.fileoff, s.filesize)));
     darwin.dynamic = true;
-    Ok((Program { exe: image, interp: Some(interp), direct: None, darwin: Some(darwin) }, ranges))
+    Ok((Program { exe: image, interp: Some(interp), darwin: Some(darwin) }, ranges))
 }
 
 /// What the `apple` vector says of a new process, beyond its path.
@@ -963,7 +991,7 @@ mod tests {
         let low = gex_abi::PIE_BASE;
         let file = image(MH_EXECUTE, 0, low, &[thread(low + 0x400)]);
         assert!(is_macho(&file));
-        let p = load_program(&file, 0x2000_0000, 0x3000_0000, &|_| None).unwrap();
+        let p = load_program(&file, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|_| None).unwrap();
         let d = p.darwin.as_ref().unwrap();
         assert!(!d.dynamic);
         assert_eq!(d.mach_header, low);
@@ -980,7 +1008,7 @@ mod tests {
     fn a_dynamic_executable_is_slid_and_enters_its_linker() {
         let exe = image(MH_EXECUTE, MH_PIE, BASE, &[main_cmd(0x123), string_cmd(LC_LOAD_DYLINKER, "/usr/lib/dyld")]);
         let dyld = image(MH_DYLINKER, 0, 0, &[thread(0x40)]);
-        let p = load_program(&exe, 0x2000_0000, 0x3000_0000, &|path| (path == "/usr/lib/dyld").then(|| dyld.clone())).unwrap();
+        let p = load_program(&exe, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|path| (path == "/usr/lib/dyld").then(|| dyld.clone())).unwrap();
         let d = p.darwin.as_ref().unwrap();
         assert!(d.dynamic);
         // The 4 GiB link address slides down to where gex puts programs.
@@ -989,7 +1017,7 @@ mod tests {
         assert_eq!(p.exe.entry, 0x2000_0000 + 0x123);
         assert_eq!(p.entry(), 0x3000_0000 + 0x40);
         assert_eq!(p.exe.interp.as_deref(), Some("/usr/lib/dyld"));
-        let missing = load_program(&exe, 0x2000_0000, 0x3000_0000, &|_| None).unwrap_err();
+        let missing = load_program(&exe, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|_| None).unwrap_err();
         assert_eq!(missing, LoadError::NeedsInterpreter("/usr/lib/dyld".into()));
     }
 
@@ -1010,8 +1038,8 @@ mod tests {
             out[..n].copy_from_slice(&f[from..from + n]);
             Some(n)
         };
-        let loaded = load_program(&exe, 0x2000_0000, 0x3000_0000, &|p| file(p)).unwrap();
-        let (planned, ranges) = plan_program("/exe", 0x2000_0000, 0x3000_0000, &read_at).unwrap();
+        let loaded = load_program(&exe, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|p| file(p)).unwrap();
+        let (planned, ranges) = plan_program("/exe", 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &read_at).unwrap();
         assert_eq!(planned.entry(), loaded.entry());
         assert_eq!(planned.darwin, loaded.darwin);
         let segs: Vec<_> = loaded.placements().collect();
@@ -1025,7 +1053,7 @@ mod tests {
             let (o, n) = ranges[i];
             assert_eq!(&f[o as usize..(o + n) as usize], &l.bytes[..]);
         }
-        assert!(plan_program("/nope", 0x2000_0000, 0x3000_0000, &read_at).is_err());
+        assert!(plan_program("/nope", 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &read_at).is_err());
     }
 
     #[test]
@@ -1045,7 +1073,7 @@ mod tests {
         fat[at..].copy_from_slice(&thin);
         assert!(is_macho(&fat));
         assert_eq!(guest_slice(&fat).unwrap(), (at, thin.len()));
-        assert!(load_program(&fat, 0x2000_0000, 0x3000_0000, &|_| None).is_ok());
+        assert!(load_program(&fat, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|_| None).is_ok());
         // A Java class file has the same first four bytes.
         assert!(!is_macho(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 0x34]));
     }

@@ -16,7 +16,7 @@ pub mod macho;
 pub mod pe;
 pub mod stack;
 
-pub use dynamic::{load_program, plan_program, Program};
+pub use dynamic::{fresh_arena, load_program, no_arena, plan_program, Arena, Program};
 pub use elf::{Image, LoadError, Segment, Symbol};
 pub use link::{link, Linked, Object};
 pub use stack::{build_initial_stack, build_initial_stack_execfn, build_program_stack, Identity, StackLayout};

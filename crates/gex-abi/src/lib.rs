@@ -304,8 +304,52 @@ pub const INTERP_BASE: u64 = 0x04a0_0000;
 
 /// Highest address the break may reach. The break grows up from the end of
 /// the image at [`PIE_BASE`]; a program that wants more gets a failing `brk`
-/// and libc falls back to `mmap`.
+/// and libc falls back to `mmap`. An image that ends above it has another
+/// ceiling ([`brk_limit`]).
 pub const BRK_TOP: u64 = INTERP_BASE;
+
+/// Whether a position-independent executable whose mappings reach `span`
+/// bytes above its load bias fits at [`PIE_BASE`], below the interpreter.
+/// One that does not is placed in the arena instead ([`exe_bias`]).
+pub const fn exe_fits(span: u64) -> bool {
+    span <= INTERP_BASE - PIE_BASE
+}
+
+/// The load bias of a position-independent executable whose mappings reach
+/// `span` bytes above it, in an address space nothing has been taken from
+/// yet: [`PIE_BASE`] when it fits ([`exe_fits`]), else the bottom of the
+/// arena ([`arena_bottom`], 64 KiB aligned). Linux keeps a PIE well clear of
+/// its loader too. The interpreter and the stack stay where they are, so
+/// nothing else in the fixed layout moves; the break follows the image's
+/// end ([`brk_limit`]).
+///
+/// That is where every host's loader puts it natively, and what an
+/// ahead-of-time build assumes. A host whose own heap shares the arena (the
+/// page) has taken some of it already, and places such an image where its
+/// memory map has room instead: translations keyed to this address are
+/// then refused there, by identity, never applied.
+pub fn exe_bias(span: u64) -> u64 {
+    if exe_fits(span) {
+        PIE_BASE
+    } else {
+        arena_bottom()
+    }
+}
+
+/// The highest address a break that starts at `brk_start` may reach: below
+/// the interpreter for an image in the fixed layout ([`BRK_TOP`]); below the
+/// stack for a fixed-address image that ends between the two (its
+/// interpreter is then in the arena); and the arena's top for an image in
+/// the arena, where the memory map's own mappings are what stop it.
+pub const fn brk_limit(brk_start: u64) -> u64 {
+    if brk_start <= BRK_TOP {
+        BRK_TOP
+    } else if brk_start <= STACK_TOP - STACK_SIZE {
+        STACK_TOP - STACK_SIZE
+    } else {
+        MMAP_TOP
+    }
+}
 
 /// Top of the guest stack. Grows down from here.
 ///

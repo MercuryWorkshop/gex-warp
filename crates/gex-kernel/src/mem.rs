@@ -1715,7 +1715,7 @@ impl MemoryMap {
             return (self.brk_cur, None);
         }
         let new = page_align_up(addr);
-        if new < self.brk_start || new >= gex_abi::BRK_TOP {
+        if new < self.brk_start || new >= gex_abi::brk_limit(self.brk_start) {
             return (self.brk_cur, None);
         }
         let grew = (new > self.brk_cur).then_some((self.brk_cur, new));
@@ -1731,10 +1731,30 @@ impl MemoryMap {
             if self.vmas.iter().any(|v| v.start < to && v.end > from && v.name != "[heap]") {
                 return (self.brk_cur, None);
             }
+            // A break in the arena (after an executable placed there) is
+            // memory the host must hand this map, as a mapping's is: on a host
+            // whose own heap shares the arena it may already be the heap's.
+            if from >= MMAP_BOTTOM && self.claim(from, to).is_err() {
+                return (self.brk_cur, None);
+            }
             self.insert(from, to, prot::READ | prot::WRITE, "[heap]");
         }
         self.brk_cur = new;
         (addr, grew)
+    }
+
+    /// Where the break starts: the end of the executable.
+    pub fn brk_start(&self) -> u64 {
+        self.brk_start
+    }
+
+    /// Start the break at `brk_start` instead: for a host that places the
+    /// executable after the map is made (where its memory map has room,
+    /// [`gex_ld::Arena`]). Only before the break has moved.
+    pub fn set_brk_start(&mut self, brk_start: u64) {
+        debug_assert_eq!(self.brk_cur, self.brk_start, "the break has moved already");
+        self.brk_start = page_align_up(brk_start);
+        self.brk_cur = self.brk_start;
     }
 
     /// Move the break without zeroing what it exposed. Only for callers with no
@@ -2824,6 +2844,40 @@ mod tests {
         assert_eq!(m.brk(0x40_8000), 0x40_4000, "the break must not grow over a mapping");
         assert_eq!(m.brk(0), 0x40_4000);
         assert_eq!(m.brk(0x40_6000), 0x40_6000, "up to the mapping is fine");
+    }
+
+    /// The break of an image too big for the fixed layout (placed in the
+    /// arena, `gex_abi::exe_bias`) grows past `BRK_TOP`, up to a mapping; a
+    /// fixed-address image's that starts between the interpreter and the
+    /// stack stops at the stack. On a host whose memory grows with the arena
+    /// the break is claimed as a mapping is, and refused where the host's
+    /// arena cursor has gone past it (its own heap is there).
+    #[test]
+    fn a_break_follows_an_image_out_of_the_fixed_layout() {
+        let start = gex_abi::exe_bias(96 << 20) + (96 << 20);
+        let mut m = MemoryMap::new(start);
+        assert_eq!(m.brk(start + 0x10_0000), start + 0x10_0000);
+        m.mmap(start + 0x20_0000, 0x1000, prot::READ, flags::FIXED | flags::ANONYMOUS, "next").unwrap();
+        assert_eq!(m.brk(start + 0x30_0000), start + 0x10_0000, "not over a mapping");
+        let stack = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
+        let mut m = MemoryMap::new(gex_abi::INTERP_BASE + 0x10_0000);
+        assert_eq!(m.brk(stack), gex_abi::INTERP_BASE + 0x10_0000, "not into the stack");
+        assert_eq!(m.brk(stack - 0x1000), stack - 0x1000);
+
+        static CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            CURSOR.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(_start: u64, end: u64) -> Option<u64> {
+            Some(CURSOR.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        CURSOR.store(start, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(start);
+        m.grows_on_demand(take, back);
+        assert_eq!(m.brk(start + 0x10_0000), start + 0x10_0000, "claimed from the cursor");
+        // The host's heap takes the next span; the break cannot follow.
+        CURSOR.fetch_add(0x10_0000, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(m.brk(start + 0x30_0000), start + 0x10_0000, "the host's own");
     }
 
     #[test]
