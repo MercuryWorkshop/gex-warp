@@ -20,6 +20,12 @@
 //!
 //! A system whose own tree is a Mac's needs none of this, and nothing is
 //! entered there: its root has the linker.
+//!
+//! The root may be a bottle's ([`super::bottle`]): the environment names
+//! the bottle (`GEX_BOTTLE`, its directory), whose configuration names its
+//! system layer. That is the tree entered, sealed, with the bottle's own
+//! directories bound over it and written through, and the system outside
+//! shared in or not as the bottle says.
 use super::*;
 
 /// What of the system a Mac program's root has in it too: (where in the
@@ -34,9 +40,15 @@ impl Kernel {
     pub fn exec_root(&mut self, path: &str, envp: &[String]) -> String {
         let head = self.read_head(path, 64).unwrap_or_default();
         if gex_ld::macho::is_macho(&head) && !self.vfs.entered() {
-            let Some(root) = self.darwin_root_of(path, envp) else { return path.to_string() };
             let named = self.vfs.canonical(path);
-            if self.enter_root(&root).is_err() {
+            let entered = match self.darwin_bottle_of(path, envp) {
+                Some(layout) => self.enter_bottle(&layout),
+                None => {
+                    let Some(root) = self.darwin_root_of(path, envp) else { return path.to_string() };
+                    self.enter_root(&root)
+                }
+            };
+            if entered.is_err() {
                 return path.to_string();
             }
             self.vfs.inner_name(&named).unwrap_or(named)
@@ -59,6 +71,47 @@ impl Kernel {
         let cwd = self.vfs.cwd.clone();
         let _ = self.set_cwd(&cwd);
         Ok(())
+    }
+
+    /// Enter a tree as it was entered in another process's namespace
+    /// ([`crate::vfs::Namespace::entry`]): a fork's child, on a host where
+    /// each process has a kernel of its own.
+    pub fn enter_root_as(&mut self, root: &str, shared: &[(String, String)], sealed: bool) -> Result<(), Errno> {
+        let shared: Vec<(&str, &str)> = shared.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        self.vfs.enter_sealed(root, &shared, sealed)?;
+        let cwd = self.vfs.cwd.clone();
+        let _ = self.set_cwd(&cwd);
+        Ok(())
+    }
+
+    /// Enter a bottle: its system layer, sealed, with [`SHARED`] (the
+    /// system outside as a volume only if the bottle shares it) and the
+    /// bottle's own directories in it.
+    pub fn enter_bottle(&mut self, layout: &bottle::Layout) -> Result<(), Errno> {
+        let mut shared: Vec<(String, String)> = SHARED.iter().filter(|(_, out)| *out != "/" || layout.shares_system).map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        shared.extend(layout.binds.iter().cloned());
+        self.enter_root_as(&layout.system, &shared, true)
+    }
+
+    /// The bottle a Mac program at `path` is to run in, if its environment
+    /// names one ([`bottle::NAMED`]) that is one: how it is laid out. Its
+    /// system layer is what its configuration names, else what the
+    /// environment or the program's place does ([`Kernel::darwin_root_of`]).
+    fn darwin_bottle_of(&self, path: &str, envp: &[String]) -> Option<bottle::Layout> {
+        let named = envp.iter().find_map(|e| e.strip_prefix(bottle::NAMED).and_then(|v| v.strip_prefix('='))).filter(|d| !d.is_empty())?;
+        let dir = self.vfs.canonical(named);
+        let Some(text) = self.read_file(&format!("{dir}{}", bottle::CONF)) else {
+            eprintln!("[gex:{}] {}={named}: no bottle there (it has no {}); the program is run without one", self.pid, bottle::NAMED, &bottle::CONF[1..]);
+            return None;
+        };
+        let conf = bottle::Conf::parse(&String::from_utf8_lossy(&text));
+        let fallback = self.darwin_root_of(path, envp);
+        let system = conf.get("system").map(|s| self.vfs.canonical(s)).or(fallback)?;
+        let passwd = self.read_file(&format!("{system}/private/etc/passwd")).unwrap_or_default();
+        let there = |p: &str| self.vfs.metadata(p).is_ok_and(|md| md.file_type == crate::vfs::FileType::Directory);
+        let mut layout = bottle::Layout::of(&conf, &dir, Some(&system), &String::from_utf8_lossy(&passwd), &there)?;
+        layout.system = system;
+        Some(layout)
     }
 
     /// The root a Mac program at `path` runs in: what its environment

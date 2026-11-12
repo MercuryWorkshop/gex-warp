@@ -21,6 +21,7 @@ pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
 pub mod blocks;
+pub mod readonly;
 pub mod subtree;
 pub mod tmpfs;
 
@@ -1088,10 +1089,10 @@ impl VfsView {
     }
 
     /// [`Namespace::enter`] of the namespace as published.
-    pub fn enter(&self, dir: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+    pub fn enter(&self, dir: &str, shared: &[(&str, &str)], sealed: bool) -> Result<(), Errno> {
         let mut err = Ok(());
         self.change(|ns| {
-            err = ns.enter(dir, shared);
+            err = ns.enter(dir, shared, sealed);
             err.is_ok()
         });
         err
@@ -1205,11 +1206,18 @@ impl Vfs {
     /// Enter the tree at `path` as a root of its own
     /// ([`Namespace::enter`]): a directory, its links followed.
     pub fn enter(&mut self, path: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+        self.enter_sealed(path, shared, false)
+    }
+
+    /// [`Vfs::enter`], the tree itself not to be written when `sealed`
+    /// (what is shared into it is as it was): a bottle's system layer
+    /// ([`crate::darwin::bottle`]).
+    pub fn enter_sealed(&mut self, path: &str, shared: &[(&str, &str)], sealed: bool) -> Result<(), Errno> {
         let dir = self.ns.canonical(&normalize(path, &self.ns.cwd));
         if self.ns.metadata(&dir)?.file_type != FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
-        self.view.0.enter(&dir, shared)?;
+        self.view.0.enter(&dir, shared, sealed)?;
         self.refresh();
         Ok(())
     }
@@ -1310,6 +1318,8 @@ struct Outer {
     dir: String,
     /// What of `ns` is inside too: where inside, and what it is in `ns`.
     shared: Vec<(String, String)>,
+    /// The tree itself is not to be written ([`readonly::ReadOnly`]).
+    sealed: bool,
 }
 
 /// `abs` with `from` at its head replaced by `to` (each a directory's
@@ -1350,7 +1360,7 @@ impl Namespace {
     /// directory stays the directory it
     /// was, by whichever name the tree has for it; one the tree has no
     /// name for is the tree's root.
-    fn enter(&mut self, dir: &str, shared: &[(&str, &str)]) -> Result<(), Errno> {
+    fn enter(&mut self, dir: &str, shared: &[(&str, &str)], sealed: bool) -> Result<(), Errno> {
         if dir == "/" {
             return Ok(());
         }
@@ -1379,9 +1389,25 @@ impl Namespace {
             }
         };
         self.chroot(dir)?;
+        if sealed {
+            // The tree, not what is mounted in it: its own filesystem from
+            // its directory down, which `chroot` has put at `/`.
+            if let Some(root) = self.mounts.get("/").cloned() {
+                self.mounts.insert("/".to_string(), Arc::new(readonly::ReadOnly::new(root)));
+            }
+        }
         self.cwd = cwd;
-        self.outer = Some(Arc::new(Outer { ns: before, dir: dir.to_string(), shared: kept }));
+        self.outer = Some(Arc::new(Outer { ns: before, dir: dir.to_string(), shared: kept, sealed }));
         Ok(())
+    }
+
+    /// How a tree entered was entered ([`Namespace::enter`]): its
+    /// directory, what is shared into it, and whether it is sealed -- what
+    /// entering it again in another process's namespace takes (a fork's
+    /// child on a host where each process has a kernel of its own).
+    pub fn entry(&self) -> Option<(String, Vec<(String, String)>, bool)> {
+        let outer = self.outer.as_ref()?;
+        Some((outer.dir.clone(), outer.shared.clone(), outer.sealed))
     }
 
     /// Absolute `abs`, a name in the namespace a tree was entered from, as
@@ -2228,6 +2254,45 @@ mod tests {
         jailed.chroot("/var").unwrap();
         assert_eq!(jailed.socket_name("/run/s"), "/opt/mac/var/run/s");
         assert_eq!(jailed.socket_name("/private/tmp/x"), "/opt/mac/var/private/tmp/x");
+    }
+
+    /// A tree entered sealed (a bottle's system layer): read, and not
+    /// written, with the errors that come before `EROFS` on any filesystem;
+    /// what is shared into it is written through, where it came from; and
+    /// how it was entered is told, for the namespace that enters it again.
+    #[test]
+    fn a_tree_entered_sealed_is_not_written_but_for_what_is_shared_into_it() {
+        use crate::fs::oflags::{O_CREAT, O_RDONLY, O_WRONLY};
+        let root = Arc::new(TmpFs::new());
+        for d in ["tmp", "opt", "opt/mac", "opt/mac/usr", "opt/mac/Library", "opt/mac/private", "opt/mac/private/tmp", "b", "b/Library"] {
+            root.add_dir(d);
+        }
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        v.open("/opt/mac/usr/file", O_CREAT | O_WRONLY, 0o644).unwrap();
+        v.open("/opt/mac/Library/layers", O_CREAT | O_WRONLY, 0o644).unwrap();
+        let shared = [("/private/tmp", "/tmp"), ("/Library", "/b/Library")];
+        v.enter_sealed("/opt/mac", &shared, true).unwrap();
+        assert!(v.open("/usr/file", O_RDONLY, 0).is_ok());
+        assert_eq!(v.open("/usr/file", O_WRONLY, 0).err(), Some(Errno::EROFS));
+        assert!(v.open("/usr/file", O_CREAT | O_RDONLY, 0o644).is_ok());
+        assert_eq!(v.open("/usr/new", O_CREAT | O_WRONLY, 0o644).err(), Some(Errno::EROFS));
+        assert_eq!(v.open("/usr/none", O_WRONLY, 0).err(), Some(Errno::ENOENT));
+        assert_eq!(v.mkdir("/usr", 0o755).err(), Some(Errno::EEXIST));
+        assert_eq!(v.mkdir("/usr/dir", 0o755).err(), Some(Errno::EROFS));
+        assert_eq!(v.unlink("/usr/file").err(), Some(Errno::EROFS));
+        assert_eq!(v.unlink("/usr/none").err(), Some(Errno::ENOENT));
+        assert_eq!(v.rename("/usr/file", "/usr/other").err(), Some(Errno::EROFS));
+        // The bottle's own directory is over the layer's, and written.
+        assert!(v.metadata("/Library/layers").is_err());
+        v.open("/Library/made", O_CREAT | O_WRONLY, 0o644).unwrap();
+        v.open("/private/tmp/made", O_CREAT | O_WRONLY, 0o644).unwrap();
+        v.mkdir("/Library/Preferences", 0o755).unwrap();
+        assert_eq!(v.entry(), Some(("/opt/mac".to_string(), shared.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), true)));
+        assert!(v.leave());
+        assert!(v.metadata("/b/Library/made").is_ok() && v.metadata("/tmp/made").is_ok() && v.metadata("/b/Library/Preferences").is_ok());
+        assert!(v.metadata("/opt/mac/Library/made").is_err() && v.metadata("/opt/mac/usr/file").is_ok());
+        assert_eq!(v.entry(), None);
     }
 
     #[test]

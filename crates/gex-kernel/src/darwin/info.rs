@@ -4,8 +4,9 @@
 //! libSystem asks these before `main` runs -- the page size, the number of
 //! processors, the kernel's version, whether the program is signed -- and
 //! none of them has a canonical call. The machine described is one Apple
-//! made (an M2's identifiers on arm64), running the Darwin whose system
-//! calls [`super::nr`] was generated from.
+//! made ([`Mac`]: a row of the root's table of them, the one the process's
+//! bottle or environment chose or one its macOS ran on), running the
+//! Darwin whose system calls [`super::nr`] was generated from.
 
 use super::nr as d;
 use super::*;
@@ -380,6 +381,19 @@ const NAMES: &[(&str, &[i32])] = &[
     ("hw.optional.arm.FEAT_FlagM2", &[]),
     ("hw.optional.arm.AdvSIMD", &[]),
     ("hw.optional.arm.FP_SyncExceptions", &[]),
+    ("hw.perflevel1.physicalcpu", &[]),
+    ("hw.perflevel1.physicalcpu_max", &[]),
+    ("hw.perflevel1.logicalcpu", &[]),
+    ("hw.perflevel1.logicalcpu_max", &[]),
+    ("hw.perflevel1.name", &[]),
+    ("machdep.cpu.brand_string", &[]),
+    ("machdep.cpu.core_count", &[]),
+    ("machdep.cpu.thread_count", &[]),
+    ("machdep.cpu.cores_per_package", &[]),
+    ("machdep.cpu.logical_per_package", &[]),
+    ("gex.bottle.name", &[]),
+    ("gex.bottle.graphics", &[]),
+    ("gex.bottle.serial", &[]),
     ("user.cs_path", &[CTL_USER, 1]),
     ("sysctl.proc_translated", &[]),
     ("security.mac.proc_enforce", &[]),
@@ -436,10 +450,29 @@ const ABSENT: &[&str] = &[
     "hw.optional.arm.caps",
 ];
 
-/// The top-level number of a name with no fixed one.
+/// The Mac a process is told it is on: a row of its root's table
+/// ([`bottle::MODELS`]), and what its bottle says of itself.
+#[derive(Clone, Debug, Default)]
+pub struct Mac {
+    pub row: bottle::Model,
+    /// Chosen, by the environment ([`bottle::MODEL`]) or the root's
+    /// configuration, and not the default of the process's macOS. A chosen
+    /// Mac has its own processors; the default has the host's, as it had
+    /// before a Mac could be chosen.
+    pub chosen: bool,
+    /// The graphics profile the configuration comes to for this process
+    /// ([`bottle::Model::graphics`]). Nothing in the kernel acts on it: it
+    /// is told to who asks (`gex.bottle.graphics`).
+    pub graphics: String,
+}
+
 /// The machine, as `sysctl` and the host port both tell of it.
 pub(super) struct Machine {
     pub cpus: i64,
+    /// The cores of each kind, where the Mac has two and was chosen.
+    pub levels: Option<(i64, i64)>,
+    pub cpufamily: u32,
+    pub cpusubfamily: u32,
     /// Bytes of memory. As `sysinfo` has it.
     pub mem: i64,
     /// CPU_TYPE_ARM64 with CPU_SUBTYPE_ARM64E, which every Mac with Apple's
@@ -449,18 +482,20 @@ pub(super) struct Machine {
     pub cpusubtype: i64,
 }
 
-impl Machine {
-    pub fn this() -> Machine {
-        let x86 = gex_abi::X86;
-        Machine { cpus: crate::cpus::count() as i64, mem: 4 << 30, cputype: if x86 { 7 } else { 0x0100_000c }, cpusubtype: if x86 { 3 } else { 2 } }
-    }
-}
+/// CPUFAMILY_INTEL_WESTMERE: what an x86-64 program under Rosetta is told
+/// (this Mac, `arch -x86_64 sysctl hw.cpufamily`), its subfamily 0.
+const ROSETTA_FAMILY: u32 = 0x573b_5eec;
+
+/// The number `gex.*` names are under: none of XNU's.
+const CTL_GEX: i32 = 0x6765;
 
 fn top_of(name: &str) -> i32 {
     match name.split('.').next() {
         Some("kern") => CTL_KERN,
         Some("vm") => CTL_VM,
         Some("hw") => CTL_HW,
+        Some("machdep") => 7,
+        Some("gex") => CTL_GEX,
         Some("user") => CTL_USER,
         Some("security") => 14,
         _ => 0,
@@ -477,7 +512,7 @@ fn oid_of(name: &str) -> Option<Vec<i32>> {
 }
 
 /// The names at the top: `CTL_KERN` and its kind.
-const TOPS: [(i32, &str); 8] = [(1, "kern"), (2, "vm"), (3, "vfs"), (4, "net"), (5, "debug"), (6, "hw"), (7, "machdep"), (8, "user")];
+const TOPS: [(i32, &str); 9] = [(1, "kern"), (2, "vm"), (3, "vfs"), (4, "net"), (5, "debug"), (6, "hw"), (7, "machdep"), (8, "user"), (CTL_GEX, "gex")];
 
 /// A `struct kinfo_proc`: a process's id, its parent's and its group's,
 /// whether it has ended and waits to be collected, its name (16 bytes at
@@ -534,11 +569,15 @@ impl Kernel {
     pub fn darwin_os(&self) -> &Os {
         self.darwin_os.get_or_init(|| {
             let rows = self.read_file(RELEASES).map(|t| Release::parse(&String::from_utf8_lossy(&t))).unwrap_or_default();
-            if let Some(spec) = self.envp.iter().find_map(|e| e.strip_prefix(CHOSEN).and_then(|v| v.strip_prefix('='))).filter(|v| !v.is_empty()) {
+            // The environment's word, then the configuration's: the
+            // program's own application's, else its bottle's.
+            let env = self.envp.iter().find_map(|e| e.strip_prefix(CHOSEN).and_then(|v| v.strip_prefix('='))).filter(|v| !v.is_empty());
+            let conf = self.darwin_conf().setting(&self.exe_path, "macos");
+            for (spec, said) in env.map(|s| (s, format!("{CHOSEN}={s}"))).into_iter().chain(conf.map(|s| (s, format!("{}: macos = {s}", bottle::CONF)))) {
                 match Release::find(&rows, spec) {
                     Some(r) => return Os::from_release(r, true),
                     None => eprintln!(
-                        "[gex:{}] {CHOSEN}={spec}: no such release in {RELEASES}{}; this process is told its root's",
+                        "[gex:{}] {said}: no such release in {RELEASES}{}; this process is told its root's",
                         self.pid,
                         if rows.is_empty() { " (the root has none: a pyrus root built since it had the table has)".to_string() } else { format!(" (it has {})", rows.iter().map(|r| r.product.as_str()).collect::<Vec<_>>().join(" ")) }
                     ),
@@ -550,6 +589,75 @@ impl Kernel {
                 None => os,
             }
         })
+    }
+
+    /// The configuration of the root this process is in ([`bottle::CONF`]:
+    /// its bottle's, or a plain root's own), read once for each program;
+    /// empty where the root has none.
+    pub fn darwin_conf(&self) -> &bottle::Conf {
+        self.darwin_conf.get_or_init(|| self.read_file(bottle::CONF).map(|t| bottle::Conf::parse(&String::from_utf8_lossy(&t))).unwrap_or_default())
+    }
+
+    /// The Mac this process is told it is on, worked out once for each
+    /// program it runs: the model its environment chooses
+    /// ([`bottle::MODEL`]), else its configuration's (its application's,
+    /// else its bottle's), from the table its root has
+    /// ([`bottle::MODELS`]); else the first of the table that ran the
+    /// macOS the process is told it is on ([`bottle::Model::default_for`]).
+    /// An x86-64 program is on an Intel Mac unless its macOS ran on none
+    /// ([`rosetta`]): then on the Mac an arm64 program is, translated. A
+    /// model of the other processor's is not this process's to be told of,
+    /// and it has the default.
+    pub fn darwin_mac(&self) -> &Mac {
+        self.darwin_mac.get_or_init(|| {
+            let os = self.darwin_os();
+            let conf = self.darwin_conf();
+            let rows = self.read_file(bottle::MODELS).map(|t| bottle::Model::parse(&String::from_utf8_lossy(&t))).filter(|r| !r.is_empty());
+            let rows = rows.unwrap_or_else(|| bottle::Model::parse(bottle::BUILTIN));
+            let arch = if gex_abi::X86 && !rosetta(&os.product) { "x86_64" } else { "arm64" };
+            let env = self.envp.iter().find_map(|e| e.strip_prefix(bottle::MODEL).and_then(|v| v.strip_prefix('='))).filter(|v| !v.is_empty());
+            let mut chosen = None;
+            for spec in env.into_iter().chain(conf.setting(&self.exe_path, "machine")) {
+                match bottle::Model::find(&rows, spec) {
+                    Some(m) if m.arch == arch => {
+                        chosen = Some(m.clone());
+                        break;
+                    }
+                    Some(_) => {}
+                    None => eprintln!("[gex:{}] no Mac {spec} in {} (it has {}); this process is told its macOS's default", self.pid, bottle::MODELS, rows.iter().map(|m| m.model.as_str()).collect::<Vec<_>>().join(" ")),
+                }
+            }
+            let row = chosen.clone().or_else(|| bottle::Model::default_for(&rows, arch, &os.product).cloned());
+            let row = row.or_else(|| bottle::Model::default_for(&bottle::Model::parse(bottle::BUILTIN), arch, &os.product).cloned()).unwrap_or_default();
+            let graphics = row.graphics(conf.setting(&self.exe_path, "graphics"));
+            Mac { row, chosen: chosen.is_some(), graphics }
+        })
+    }
+
+    /// The machine's numbers, as `sysctl`, the host port and the comm page
+    /// tell them: the processors of the Mac this process was told to be on
+    /// (the host's, for the default Mac), its processor's family (under
+    /// Rosetta, the one Rosetta says; CPUFAMILY_UNKNOWN and
+    /// CPUSUBFAMILY_UNKNOWN, 0, where the Mac's row does not know), and the
+    /// memory gex gives a process whatever the Mac had.
+    pub(super) fn darwin_machine(&self) -> Machine {
+        let x86 = gex_abi::X86;
+        let mac = self.darwin_mac();
+        let translated = x86 && mac.row.arch != "x86_64";
+        let own = mac.chosen.then_some(()).and_then(|()| Some((mac.row.pcores? as i64, mac.row.ecores.unwrap_or(0) as i64, mac.row.threads)));
+        let (cpus, levels) = match own {
+            Some((p, e, threads)) => (threads.map_or(p + e, |t| t as i64).max(1), (e > 0).then_some((p, e))),
+            None => (crate::cpus::count() as i64, None),
+        };
+        Machine {
+            cpus,
+            levels,
+            cpufamily: if translated { ROSETTA_FAMILY } else { mac.row.cpufamily.unwrap_or(0) },
+            cpusubfamily: if translated { 0 } else { mac.row.cpusubfamily.unwrap_or(0) },
+            mem: 4 << 30,
+            cputype: if x86 { 7 } else { 0x0100_000c },
+            cpusubtype: if x86 { 3 } else { 2 },
+        }
     }
 
     /// What this process is given for the file at `path` in place of the
@@ -576,17 +684,20 @@ impl Kernel {
     fn darwin_sysctl_value(&self, name: &str) -> Option<Val> {
         use Val::*;
         let x86 = gex_abi::X86;
-        let Machine { cpus, mem, cputype, cpusubtype } = Machine::this();
+        let Machine { cpus, levels, cpufamily, cpusubfamily, mem, cputype, cpusubtype } = self.darwin_machine();
+        let mac = self.darwin_mac();
         // The Mac an x86-64 program is on: an Intel one, unless the
         // release ran on none.
         let intel = x86 && !rosetta(&self.darwin_os().product);
+        // The performance cores, where the efficiency ones are apart.
+        let fast = levels.map_or(cpus, |(p, _)| p);
         let page = abi::PAGE_SIZE as i64;
         let nofile = self.rlimits.get()[RLIMIT_NOFILE];
         Some(match name {
             "kern.ostype" => Str("Darwin".into()),
             "kern.osrelease" => Str(self.darwin_os().release.clone()),
             "kern.osrevision" => Int(199506),
-            "kern.version" => Str(darwin_version(self.darwin_os())),
+            "kern.version" => Str(darwin_version(self.darwin_os(), mac.row.soc.as_deref())),
             "kern.osversion" => Str(self.darwin_os().build.clone()),
             // (The version a program built for 10.15 or before is shown,
             // to a task that has asked for it, where the release has one:
@@ -632,24 +743,39 @@ impl Kernel {
             }
             "vm.pagesize" | "hw.pagesize" | "hw.pagesize32" => Quad(page),
             "hw.machine" => Str(if x86 { "x86_64" } else { "arm64" }.into()),
-            "hw.model" | "hw.product" => Str(if intel { "MacBookPro16,1" } else { "Mac14,3" }.into()),
-            "hw.target" => Str(if intel { "Mac-E1008331FDC96864" } else { "J473AP" }.into()),
+            // The Mac's own names, where its row knows them (one it does
+            // not know is a name this Mac has not).
+            "hw.model" | "hw.product" => Str(mac.row.model.clone()),
+            "hw.target" => Str(mac.row.target.clone()?),
             // The board without the "AP" (as a Mac's J616sAP is J616s).
-            "hw.targettype" if !intel => Str("J473".into()),
-            "hw.ncpu" | "hw.availcpu" | "hw.activecpu" | "hw.physicalcpu" | "hw.physicalcpu_max" | "hw.logicalcpu" | "hw.logicalcpu_max" => Int(cpus),
-            "hw.perflevel0.physicalcpu" | "hw.perflevel0.physicalcpu_max" | "hw.perflevel0.logicalcpu" | "hw.perflevel0.logicalcpu_max" => Int(cpus),
+            "hw.targettype" if !intel => Str(mac.row.targettype.clone()?),
+            "machdep.cpu.brand_string" => Str(mac.row.brand.clone()?),
+            "hw.ncpu" | "hw.availcpu" | "hw.activecpu" | "hw.logicalcpu" | "hw.logicalcpu_max" | "machdep.cpu.thread_count" | "machdep.cpu.logical_per_package" => Int(cpus),
+            // (An Intel Mac's two threads a core are one processor each.)
+            "hw.physicalcpu" | "hw.physicalcpu_max" | "machdep.cpu.core_count" | "machdep.cpu.cores_per_package" => Int(if mac.chosen && intel { mac.row.pcores.map_or(cpus, |p| p as i64) } else { cpus }),
+            "hw.perflevel0.physicalcpu" | "hw.perflevel0.physicalcpu_max" | "hw.perflevel0.logicalcpu" | "hw.perflevel0.logicalcpu_max" => Int(fast),
             "hw.perflevel0.name" => Str("Performance".into()),
-            "hw.nperflevels" | "hw.packages" => Int(1),
+            "hw.perflevel1.physicalcpu" | "hw.perflevel1.physicalcpu_max" | "hw.perflevel1.logicalcpu" | "hw.perflevel1.logicalcpu_max" => Int(levels?.1),
+            "hw.perflevel1.name" => Str(levels.map(|_| "Efficiency".to_string())?),
+            "hw.nperflevels" => Int(if levels.is_some() { 2 } else { 1 }),
+            "hw.packages" => Int(1),
+            // What the root's configuration says of itself, for who is to
+            // act on it (a graphics layer, an IOKit): the bottle's name,
+            // the profile this process's settings come to, the serial
+            // number made with the bottle.
+            "gex.bottle.name" => Str(self.darwin_conf().get("name").unwrap_or("").into()),
+            "gex.bottle.graphics" => Str(mac.graphics.clone()),
+            "gex.bottle.serial" => Str(self.darwin_conf().get("serial").unwrap_or("").into()),
             "hw.byteorder" => Int(1234),
             // An `int`, so no more than it holds.
             "hw.physmem" | "hw.usermem" => Int(mem.min(i32::MAX as i64)),
             "hw.memsize" | "hw.memsize_usable" => Quad(mem),
-            // The family is the M2's (Blizzard and Avalanche), or Skylake's.
+            // The family is the Mac's (an M2's is Blizzard and Avalanche).
             "hw.cputype" => Int(cputype),
             "hw.cpusubtype" => Int(cpusubtype),
             "hw.cpu64bit_capable" => Int(1),
-            "hw.cpufamily" => Int(if x86 { 0x37fc_219f } else { 0xda33_d83d }),
-            "hw.cpusubfamily" => Int(if x86 { 0 } else { 2 }),
+            "hw.cpufamily" => Int(cpufamily as i64),
+            "hw.cpusubfamily" => Int(cpusubfamily as i64),
             "hw.cachelinesize" => Quad(if x86 { 64 } else { 128 }),
             "hw.l1icachesize" => Quad(if x86 { 32 << 10 } else { 128 << 10 }),
             "hw.l1dcachesize" => Quad(if x86 { 32 << 10 } else { 64 << 10 }),
@@ -1121,11 +1247,11 @@ pub fn rosetta(product: &str) -> bool {
 /// `kern.version`, as `uname -v` prints it: the release's kernel by its
 /// name and the date it was built, where the table knows them (else this
 /// one's, [`XNU`], and the word "gex" where the date is), and the machine
-/// it was built for: the M2's, or an Intel Mac's (or, under Rosetta, the
-/// M2's still).
-pub fn darwin_version(os: &Os) -> String {
+/// it was built for: the chip `soc` of the Mac the process is told it is
+/// on ([`Mac`]), or an Intel Mac's (under Rosetta, the chip's still).
+pub fn darwin_version(os: &Os, soc: Option<&str>) -> String {
     let row = os.row.as_ref();
-    let soc = if gex_abi::X86 && !rosetta(&os.product) { "X86_64" } else { "ARM64_T8112" };
+    let soc = if gex_abi::X86 && !rosetta(&os.product) { "X86_64".to_string() } else { soc.map_or("ARM64".to_string(), |s| format!("ARM64_{s}")) };
     let date = row.and_then(|r| r.kdate.as_deref()).unwrap_or("gex");
     let xnu = row.and_then(|r| r.xnu.as_deref()).unwrap_or(XNU);
     format!("Darwin Kernel Version {}: {date}; root:{xnu}/RELEASE_{soc}", os.release)
@@ -1186,7 +1312,7 @@ mod tests {
     #[test]
     fn the_kernel_is_named_as_the_release_says() {
         let rows = Release::parse(TABLE);
-        let v = |s: &str| darwin_version(&Os::from_release(Release::find(&rows, s).unwrap(), true));
+        let v = |s: &str| darwin_version(&Os::from_release(Release::find(&rows, s).unwrap(), true), Some("T8112"));
         // (27 on either processor: an x86-64 program on it is under Rosetta.)
         assert_eq!(v("27.0.1"), "Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T8112");
         assert_eq!(v("27.0"), "Darwin Kernel Version 27.0.0: gex; root:xnu-13432/RELEASE_ARM64_T8112");

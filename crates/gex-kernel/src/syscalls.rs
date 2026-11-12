@@ -773,6 +773,12 @@ pub struct Kernel {
     /// The system a Darwin process is told it is on, once asked
     /// ([`darwin::info::Os`]).
     pub darwin_os: Arc<std::sync::OnceLock<darwin::info::Os>>,
+    /// The Mac a Darwin process is told it is on, once asked
+    /// ([`darwin::info::Mac`]), and its root's configuration, once read
+    /// ([`darwin::bottle::Conf`]): each program's own to work out, as
+    /// which system is.
+    pub darwin_mac: Arc<std::sync::OnceLock<darwin::info::Mac>>,
+    pub darwin_conf: Arc<std::sync::OnceLock<darwin::bottle::Conf>>,
     /// Whether the task has asked to be shown the version a program built
     /// for 10.15 or before is (`kern.system_version_compat`, which
     /// Libsystem's initializer sets): its threads', a fork's too, not the
@@ -10623,6 +10629,8 @@ impl Kernel {
             darwin_restart: Arc::default(),
             darwin_commpage: false,
             darwin_os: Default::default(),
+            darwin_mac: Default::default(),
+            darwin_conf: Default::default(),
             darwin_compat: Default::default(),
             darwin_threads: Default::default(),
             fd_activity: false,
@@ -10801,6 +10809,8 @@ impl Kernel {
         // Which system the new program is told it is on is its own to work
         // out: its environment may choose another release.
         self.darwin_os = Default::default();
+        self.darwin_mac = Default::default();
+        self.darwin_conf = Default::default();
         self.darwin_compat = Default::default();
     }
 
@@ -11152,6 +11162,9 @@ impl Kernel {
             darwin_restart: Arc::new(self.darwin_restart.copy()),
             darwin_commpage: self.darwin_commpage,
             darwin_os: Default::default(),
+            // (The same program still: told what its parent was.)
+            darwin_mac: Arc::clone(&self.darwin_mac),
+            darwin_conf: Arc::clone(&self.darwin_conf),
             darwin_compat: Arc::new(std::sync::atomic::AtomicBool::new(self.darwin_compat.load(std::sync::atomic::Ordering::Relaxed))),
             // The child's libpthread is the parent's, registered already.
             darwin_threads: Arc::new(std::sync::Mutex::new(*self.darwin_threads.lock().unwrap_or_else(|e| e.into_inner()))),

@@ -1595,7 +1595,7 @@ impl Kernel {
                             put(36, resident);
                             put(38, abi::PAGE_SIZE);
                             put(40, if gex_abi::mem64() { gex_abi::LIMIT64 } else { 1 << 32 });
-                            put(84, super::info::Machine::this().mem as u64);
+                            put(84, self.darwin_machine().mem as u64);
                             v[2] = regions;
                             v[3] = abi::PAGE_SIZE as u32;
                             v.truncate(*n);
@@ -1818,7 +1818,7 @@ impl Kernel {
             // in 32-bit words; too little room for it is a failure.
             (Kind::Host, 200) => {
                 let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
-                let mc = super::info::Machine::this();
+                let mc = self.darwin_machine();
                 let (cpus, mem) = (mc.cpus as u32, mc.mem as u64);
                 let words: Option<Vec<u32>> = match flavor {
                     // HOST_BASIC_INFO: the processors and the memory. The
@@ -1875,7 +1875,7 @@ impl Kernel {
             // less (an older structure) is given that much.
             (Kind::Host, 216 | 219) => {
                 let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
-                let mc = super::info::Machine::this();
+                let mc = self.darwin_machine();
                 let pages = (mc.mem as u64 / abi::PAGE_SIZE) as u32;
                 let words = match flavor {
                     // HOST_LOAD_INFO: three averages, and three Mach
