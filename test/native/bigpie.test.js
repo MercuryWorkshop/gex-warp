@@ -1,8 +1,8 @@
 // A position-independent executable too big to place below the interpreter
-// (fixtures/native/bigpie: 96 MiB of .bss) runs through its interpreter
-// (gex_ld::Program::direct): argv[0], the arguments and /proc/self/exe are
-// the program's, in the process gexc starts and in one it execs. An aarch64
-// musl program, natively.
+// (fixtures/native/bigpie: 96 MiB of .bss) is placed in the arena
+// (gex_abi::exe_bias): argv[0], the arguments and /proc/self/exe are the
+// program's, in the process gexc starts and in one it execs. An aarch64
+// musl program, natively. (native/bigexe checks its memory, on the page too.)
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { native, trim, tail } from '../lib/native.mjs';
 
