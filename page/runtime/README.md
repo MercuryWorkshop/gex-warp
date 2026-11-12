@@ -1062,7 +1062,8 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `parent`, `title`, `width`, `height` | `title` whole (up to 256 bytes of UTF-8). |
 | `menu` | The `GuestMenu` a shell shows for this window, or `null` (Menus, below). |
 | `pid` | The program's pid: an X window's as the program says (`_NET_WM_PID`, which Qt, GTK and most toolkits set), else its X server's. `process.windows()` uses it. |
-| `decorations` | `'host'` (frame it: a Win32 window with a caption too), `'client'` (it draws its own: a Win32 window without one) or `'none'`. |
+| `decorations` | `'host'` (frame it: a Win32 window with a caption too), `'client'` (it draws its own, or wants none: a Win32 window without a caption, a GTK header-bar window, a borderless Mac window) or `'none'`. |
+| `geometry` | The window inside its canvas without the invisible margins its program keeps for shadows (GTK's): `{ x, y, w, h }` in CSS pixels, or null for the whole canvas. |
 | `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
 | `place(x, y)` | Where the page put it on the output; call after each move (X windows' menus read it). |
 | `resize(w, h)`, `setStates({ maximized, fullscreen, resizing }, w, h)` | Ask for a size, with states. |

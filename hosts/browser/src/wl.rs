@@ -750,7 +750,10 @@ impl Session {
             }
             let st = self.client.drag_status();
             let accepted = st.as_ref().and_then(|st| st.accepted.as_ref()).and_then(|m| types.iter().position(|t| t == m)).map_or(0, |i| i as u32 + 1);
-            let said2 = accepted | st.as_ref().map_or(0, |st| st.action) << 8;
+            // (0x80 in the action's byte: the client has answered at all,
+            // which a release over it waits for -- ClientDrags.release.)
+            let heard = st.as_ref().is_some_and(|st| st.answered) as u32 * 0x80;
+            let said2 = accepted | (st.as_ref().map_or(0, |st| st.action) | heard) << 8;
             if said2 != d.said2 {
                 d.said2 = said2;
                 unsafe { wl_cdrag_status(d.serial, accepted, said2 >> 8) };
@@ -1088,6 +1091,7 @@ impl WaylandDevice {
                                         surface: 0,
                                         accepted: o.types.get(accepted as usize - 1).cloned(),
                                         action,
+                                        answered: true,
                                         dropped: false,
                                         finished: false,
                                     });

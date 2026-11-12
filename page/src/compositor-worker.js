@@ -1017,7 +1017,8 @@ class Compositor {
   /** Whether the compositor draws a window's frame: a toplevel's, unless its
    *  client places it and draws the whole window itself. */
   #decorated(win) {
-    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged) && !win.fullscreen;
+    // (and not one whose client draws its own frame or wants none: `deco` 1)
+    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged) && !win.fullscreen && win.info?.deco !== 1;
   }
 
   /** Absolute position of a surface: popups and subsurfaces follow a parent. */

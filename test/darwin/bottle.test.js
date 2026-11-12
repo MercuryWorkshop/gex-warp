@@ -23,7 +23,7 @@
 // becomes it), a shell there running the program as its child.
 // The root: GEX_TEST_DARWIN_ROOT (or _X86), by default ../pyrus/out/root.
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { native, ROOT } from '../lib/native.mjs';
 
@@ -108,7 +108,9 @@ export default async function (t) {
       }
     }
     const list = await gexc(['list']);
-    t.check('both are listed, with what each was told', list.stdout === `one\t-\t-\t${system}\ntwo\t${sonoma.product.split('.')[0]}\t${bottleMac}\t${system}\n`, JSON.stringify(list.stdout));
+    // (gexc names the system by its real path: a temporary directory's is under /private.)
+    const real = realpathSync(system);
+    t.check('both are listed, with what each was told', list.stdout === `one\t-\t-\t${real}\ntwo\t${sonoma.product.split('.')[0]}\t${bottleMac}\t${real}\n`, JSON.stringify(list.stdout));
     return gexc;
   };
 

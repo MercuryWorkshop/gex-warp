@@ -94,7 +94,10 @@ function winNote(win, what) {
 
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
 /** `DomWindow.decorations` for a surface record. */
-const decorationsOf = (s) => (s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none');
+/** A toplevel's frame is the page's unless its client places and draws it
+ *  (a Win32 window), or said it draws its own or wants none (`deco` 1: a
+ *  GTK header-bar window, a borderless Mac window). */
+const decorationsOf = (s) => (s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) && s.deco !== 1 ? 'server' : 'none');
 
 /** One window, as the page sees it. */
 class DomWindow {
@@ -117,6 +120,10 @@ class DomWindow {
      * the page's HTML is the frame. GTK draws its own inside that anyway --
      * there is no signal for it, and no compositor gets one. */
     this.decorations = decorationsOf(s);
+    /** The window inside the surface, without the margins its client keeps
+     *  for shadows (`xdg_surface.set_window_geometry`): `{x, y, w, h}` in
+     *  surface units, or null for the whole surface. */
+    this.geometry = s.geometry;
     /** Placed by its client (`gex_window_placement_v1`: a Win32 window, an X
      * menu): `relX`/`relY` are where it goes in the desktop's pixels, and
      * `layer` (0 normal, 1 topmost, 2 menus) and `onrestack` how it stacks.
@@ -877,6 +884,7 @@ export class DomDesktop {
   }
 
   #update(win, s) {
+    win.geometry = s.geometry;
     if (s.title !== win.title) {
       win.title = s.title;
       win.onretitle?.(s.title);

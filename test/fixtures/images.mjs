@@ -38,6 +38,9 @@
 //            (GEX_TEST_DARWIN_QC_ROOT, default ../pyrus-qc/out/root).
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
+//   linux-gtk  linux-gtk.tar: an x86-64 Linux tree with GTK 3 programs
+//            (Alpine's mousepad and geany; the demo's linux.tar is one),
+//            from GEX_TEST_LINUX_GTK, linked as it is.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
 //            @gexemu/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
@@ -119,7 +122,7 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 'linux-gtk': ['linux-gtk.tar'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
 export const images = {
   // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
@@ -351,6 +354,14 @@ export const images = {
     };
     walk(join(src, 'repo'), '');
     writeFileSync(join(work, 'slim-repo.json'), JSON.stringify(list));
+    return null;
+  },
+
+  async 'linux-gtk'(work) {
+    const src = process.env.GEX_TEST_LINUX_GTK;
+    if (!src || !existsSync(src)) return 'GEX_TEST_LINUX_GTK: a tar of an x86-64 Linux tree with mousepad and geany (the demo\'s linux.tar)';
+    rmSync(join(work, 'linux-gtk.tar'), { force: true });
+    symlinkSync(realpathSync(src), join(work, 'linux-gtk.tar'));
     return null;
   },
 

@@ -127,6 +127,34 @@ impl Role {
     }
 }
 
+/// Who draws a toplevel's frame, as its client and the compositor settled
+/// it: through `zxdg_decoration_manager_v1` (always the compositor's, where
+/// it decorates), or KDE's `org_kde_kwin_server_decoration_manager` (what
+/// GTK 3 and 4 speak: the compositor's for a plain window, the client's for
+/// a header-bar window).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Decorations {
+    /// The client said nothing: the host decides, as before.
+    #[default]
+    Unsaid,
+    /// The client draws its own frame, or wants none: the host shows the
+    /// window bare.
+    Client,
+    /// The host frames it.
+    Server,
+}
+
+impl Decorations {
+    /// The record's word (`R_DECO`): 0 unsaid, 1 the client's, 2 the host's.
+    pub fn code(self) -> i32 {
+        match self {
+            Decorations::Unsaid => 0,
+            Decorations::Client => 1,
+            Decorations::Server => 2,
+        }
+    }
+}
+
 /// A `wl_region`: the rectangles a client added, less the ones it
 /// subtracted, kept as disjoint rectangles in surface coordinates.
 ///
@@ -333,6 +361,13 @@ pub struct SurfaceInfo {
     /// A client's `zwp_locked_pointer_v1` asks for the pointer on this
     /// surface (`flags` bit 31): the host locks it when it can (pointer.rs).
     pub pointer_lock: bool,
+    /// Who draws the frame ([`Decorations`]).
+    pub decorations: Decorations,
+    /// The window inside the surface (`xdg_surface.set_window_geometry`):
+    /// x, y, width, height in surface units, without the invisible margins
+    /// a client keeps for its shadows. `None` when the client set none (the
+    /// whole surface is the window).
+    pub geometry: Option<(i32, i32, i32, i32)>,
 }
 
 /// A placed surface's position and stacking, as its client asked for them
@@ -474,6 +509,12 @@ pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[33..37].copy_from_slice(&info.input_words());
     // The address's high half: a memory64 process's pool may sit above 4 GiB.
     r[37] = (info.addr >> 32) as u32 as i32;
+    // The window inside the surface, without its shadow margins (width 0:
+    // none set), and who draws its frame.
+    if let Some((x, y, w, h)) = info.geometry {
+        r[18..22].copy_from_slice(&[x, y, w, h]);
+    }
+    r[22] = info.decorations.code();
     put_text(&mut r[REC_TITLE..REC_TITLE + REC_TITLE_BYTES / 4], &info.title);
     put_text(&mut r[REC_APP_ID..REC_APP_ID + REC_APP_ID_BYTES / 4], &info.app_id);
     r[REC_PID] = info.pid as i32;
@@ -598,6 +639,12 @@ const GLOBALS: &[(&str, u32)] = &[
     // grabs the pointer and hides it.
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_pointer_constraints_v1", 1),
+    // KDE's server-decoration protocol, which GTK 3 (and 4) speak where
+    // they do not speak `zxdg_decoration_manager_v1`: told the default mode is the
+    // compositor's (where the host frames windows: `set_host_frames`), a
+    // GTK window without a header bar draws no title bar of its own; one
+    // with a header bar asks for client-side decoration and is shown bare.
+    ("org_kde_kwin_server_decoration_manager", 1),
 ];
 
 /// What an object id currently is.
@@ -633,6 +680,8 @@ enum Object {
     Viewport { surface: u32 },
     DecorationManager,
     Decoration { surface: u32 },
+    KdeDecorationManager,
+    KdeDecoration { surface: u32 },
     PlacementManager,
     Placement { surface: u32 },
     RelativePointerManager,
@@ -766,6 +815,11 @@ struct SurfaceState {
     /// margins GTK leaves for its shadows. What the compositor decorates and
     /// hit-tests, when it is set.
     geom: Option<(i32, i32, i32, i32)>,
+    /// Who draws the frame, as settled ([`Decorations`]).
+    deco: Decorations,
+    /// The toplevel's last configure: its size and states, for configuring
+    /// it again when its decorations change (`set_decorations`).
+    last_configure: Option<(i32, i32, u32)>,
     /// The last window-management request, and its number (see
     /// [`SurfaceInfo::request`]).
     request: Request,
@@ -862,6 +916,8 @@ pub struct Client {
     /// The version this client bound `gex_window_placement_manager_v1` at,
     /// which its placement objects share: `origin` is for 2 and up.
     placement_version: u32,
+    /// Whether the host frames toplevels (`set_host_frames`).
+    host_frames: bool,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
     /// What each `wl_region` holds.
@@ -968,6 +1024,7 @@ impl Client {
             scale: 1,
             wm_base_version: 0,
             placement_version: 0,
+            host_frames: true,
             positioners: HashMap::new(),
             regions: HashMap::new(),
             dirty: false,
@@ -1028,11 +1085,21 @@ impl Client {
         }
     }
 
-    /// `configure_bounds`: the output in surface units, less the frame the
-    /// host draws around a window (a title bar and a border, `FRAME_*`).
-    fn bounds(&self) -> (i32, i32) {
+    /// `configure_bounds` for the toplevel of `xdg_surface`: the output in
+    /// surface units, less the frame a host draws around it (a title bar and
+    /// a border, `FRAME_*`) -- not for a window that draws its own frame or
+    /// wants none ([`Decorations::Client`], a borderless window). Taken off a
+    /// borderless window, the frame it never has shrank it: pyrus's 256x256
+    /// borderless window on a 256x256 output came out 254x229. (The same on
+    /// every host, the native one too, whose windows are shown bare: what
+    /// its tests check is the room the page's desktop would give.)
+    fn bounds(&self, xdg_surface: u32) -> (i32, i32) {
         let (w, h) = self.default_size;
         let k = self.scale.max(1);
+        let own = self.surface_of_xdg(xdg_surface).and_then(|s| self.surfaces.get(&s)).is_some_and(|s| s.deco == Decorations::Client);
+        if own {
+            return ((w.max(k)) / k, (h.max(k)) / k);
+        }
         ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
     }
 
@@ -1174,6 +1241,8 @@ impl Client {
                 Object::Subsurface { surface } => self.subsurface(object, surface, opcode, &mut r),
                 Object::DecorationManager => self.decoration_manager(opcode, &mut r),
                 Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
+                Object::KdeDecorationManager => self.kde_decoration_manager(opcode, &mut r),
+                Object::KdeDecoration { surface } => self.kde_decoration(object, surface, opcode, &mut r),
                 Object::PlacementManager => self.placement_manager(opcode, &mut r),
                 Object::Placement { surface } => self.placement(object, surface, opcode, &mut r),
                 Object::RelativePointerManager => self.relative_pointer_manager(object, opcode, &mut r),
@@ -1419,6 +1488,12 @@ impl Client {
             }
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
+            }
+            "org_kde_kwin_server_decoration_manager" => {
+                self.objects.insert(id, Object::KdeDecorationManager);
+                // default_mode(mode), on the bind.
+                let mode = self.kde_default_mode();
+                self.send(Writer::new(id, 0).uint(mode));
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
@@ -2351,7 +2426,7 @@ impl Client {
         // The room there is, in surface units, before the configure it goes
         // with: a client choosing its own size keeps within it.
         if self.wm_base_version >= 4 {
-            let (bw, bh) = self.bounds();
+            let (bw, bh) = self.bounds(xdg_surface);
             self.send(Writer::new(toplevel, 2).int(bw).int(bh));
         }
         let ev = Writer::new(toplevel, 0).int(w).int(h).array(&states);
@@ -2361,8 +2436,39 @@ impl Client {
         self.send(ev);
         if let Some(s) = self.surface_of_xdg(xdg_surface).and_then(|k| self.surfaces.get_mut(&k)) {
             s.configure_sent = serial;
+            s.last_configure = Some((w, h, states_in));
         }
         self.dirty = true;
+    }
+
+    /// Who draws `surface`'s frame is now `deco`: when that changed after its
+    /// toplevel was configured, it is configured again (as xdg-decoration
+    /// asks), so the bounds it chooses its size within are the right ones --
+    /// with the frame taken off, or not.
+    fn set_decorations(&mut self, surface: u32, deco: Decorations) {
+        let Some(s) = self.surfaces.get_mut(&surface) else { return };
+        if s.deco == deco {
+            return;
+        }
+        // (only a change of whether a frame is taken off changes its bounds)
+        let framed = |d: Decorations| d != Decorations::Client;
+        let again = framed(s.deco) != framed(deco);
+        s.deco = deco;
+        self.dirty = true;
+        let Some((w, h, states)) = s.last_configure.filter(|_| again) else { return };
+        let xdg = self.objects.iter().find_map(|(id, o)| match o {
+            Object::XdgSurface { surface: x } if *x == surface => Some(*id),
+            _ => None,
+        });
+        let toplevel = xdg.and_then(|xdg| {
+            self.objects.iter().find_map(|(id, o)| match o {
+                Object::XdgToplevel { xdg_surface } if *xdg_surface == xdg => Some(*id),
+                _ => None,
+            })
+        });
+        if let (Some(xdg), Some(toplevel)) = (xdg, toplevel) {
+            self.send_toplevel_configure(toplevel, xdg, w, h, states);
+        }
     }
 
     // -- xdg_positioner -----------------------------------------------------
@@ -2706,13 +2812,14 @@ impl Client {
                 // answer before it lays anything out.
                 let w = Writer::new(id, 0).uint(2);
                 self.send(w);
+                self.set_decorations(surface, Decorations::Server);
                 true
             }
             _ => false,
         }
     }
 
-    fn decoration(&mut self, object: u32, _surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+    fn decoration(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
             // destroy
             0 => {
@@ -2720,13 +2827,76 @@ impl Client {
                 self.delete_id(object);
                 true
             }
-            // set_mode(mode) / unset_mode: the answer is server_side either
-            // way. A client may ask for client_side and this compositor says no
-            // -- which is allowed, and is the point of drawing the frames here.
+            // set_mode(mode) / unset_mode: server_side, unless the client
+            // asks for client_side (1): a window that draws its own frame or
+            // wants none (pyrus's borderless windows ask so), which the host
+            // then shows bare and whose bounds have no frame taken off.
+            // unset_mode is the compositor's choice: server_side.
             1 | 2 => {
-                let _ = r.uint();
-                let w = Writer::new(object, 0).uint(2);
+                let asked = if opcode == 1 { r.uint().unwrap_or(2) } else { 2 };
+                let mode = if asked == 1 { 1 } else { 2 };
+                let w = Writer::new(object, 0).uint(mode);
                 self.send(w);
+                self.set_decorations(surface, if mode == 1 { Decorations::Client } else { Decorations::Server });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // -- org_kde_kwin_server_decoration ----------------------------------------
+
+    /// Whether the host draws toplevels' frames (default yes: the page's
+    /// desktops do). A host that shows windows bare (the native host) says
+    /// no, and KDE's protocol then tells clients to draw their own (and so
+    /// to take the whole output as their room).
+    pub fn set_host_frames(&mut self, on: bool) {
+        self.host_frames = on;
+    }
+
+    /// KDE's `default_mode`: Server (2) where the host frames windows, else
+    /// Client (1).
+    fn kde_default_mode(&self) -> u32 {
+        if self.host_frames { 2 } else { 1 }
+    }
+
+    /// A KDE decoration mode (0 none, 1 client, 2 server) as settled.
+    fn kde_mode(mode: u32) -> Decorations {
+        if mode == 2 { Decorations::Server } else { Decorations::Client }
+    }
+
+    fn kde_decoration_manager(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // create(id, surface): its mode is the default until it asks.
+            0 => {
+                let (Some(id), Some(surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                self.objects.insert(id, Object::KdeDecoration { surface });
+                let mode = self.kde_default_mode();
+                self.send(Writer::new(id, 0).uint(mode)); // mode
+                self.set_decorations(surface, Self::kde_mode(mode));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn kde_decoration(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // release
+            0 => {
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // request_mode(mode): a client may always draw its own (or
+            // none); the compositor's only where the host frames windows.
+            1 => {
+                let Some(asked) = r.uint() else { return false };
+                let mode = if asked == 2 && !self.host_frames { 1 } else { asked.min(2) };
+                self.send(Writer::new(object, 0).uint(mode)); // mode
+                self.set_decorations(surface, Self::kde_mode(mode));
                 true
             }
             _ => false,
@@ -2915,6 +3085,8 @@ impl Client {
                 placement: s.placement,
                 input: s.input.clone(),
                 pointer_lock: self.wants_lock(*id),
+                decorations: s.deco,
+                geometry: s.geom.filter(|g| g.2 > 0 && g.3 > 0),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -4871,6 +5043,41 @@ mod tests {
     }
 
     #[test]
+    fn kde_server_decoration_says_whose_frame_it_is() {
+        let mut c = with_seat();
+        // bind org_kde_kwin_server_decoration_manager (50): default_mode(server).
+        c.receive(&Writer::new(2, 0).uint(13).string("org_kde_kwin_server_decoration_manager").uint(1).new_id(50).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        let d = msgs.iter().find(|(o, op, _)| *o == 50 && *op == 0).expect("default_mode");
+        assert_eq!(d.2[..4], 2u32.to_le_bytes(), "server, where the host frames windows");
+        // create(51, surface 6): mode(server), and the window is the host's to frame.
+        c.receive(&Writer::new(50, 0).new_id(51).object(6).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, b)| *o == 51 && *op == 0 && b[..4] == 2u32.to_le_bytes()));
+        assert_eq!(c.surfaces[&6].deco, Decorations::Server);
+        // A header-bar window asks for its own frame: it gets it, and is bare.
+        c.receive(&Writer::new(51, 1).uint(1).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, b)| *o == 51 && *op == 0 && b[..4] == 1u32.to_le_bytes()));
+        assert_eq!(c.surfaces[&6].deco, Decorations::Client);
+        // A host that frames nothing gives no one the compositor's frame.
+        c.set_host_frames(false);
+        c.receive(&Writer::new(51, 1).uint(2).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, b)| *o == 51 && *op == 0 && b[..4] == 1u32.to_le_bytes()));
+        assert_eq!(c.surfaces[&6].deco, Decorations::Client);
+        // The window inside the surface (set_window_geometry on xdg_surface 7).
+        c.receive(&Writer::new(7, 3).int(2).int(3).int(40).int(50).finish(), &[], &no_pool());
+        assert_eq!(c.surfaces[&6].geom, Some((2, 3, 40, 50)));
+        // Both go to the host in the surface's record: words 18..22 and 22.
+        let info = SurfaceInfo { surface: 6, role: Role::Toplevel, decorations: Decorations::Client, geometry: Some((2, 3, 40, 50)), ..Default::default() };
+        let mut rec = Vec::new();
+        push_record(&mut rec, 1, &info);
+        assert_eq!(&rec[18..23], &[2, 3, 40, 50, 1]);
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+    }
+
+    #[test]
     fn a_toplevel_decoration_is_answered_server_side() {
         let pool = Placed(0x7000, 4096);
         let (mut c, _) = placed_window(64, 64, 256);
@@ -5154,6 +5361,36 @@ mod tests {
     }
 
     #[test]
+    fn a_borderless_window_is_given_the_whole_output_as_its_bounds() {
+        // pyrus's borderless window on a 256x256 output came out 254x229:
+        // its bounds had the host's frame taken off, a frame it asked not to
+        // have (zxdg_toplevel_decoration_v1.set_mode(client_side)).
+        let pool = Placed(0x5000, 4096);
+        let mut c = Client::new();
+        c.set_default_size(256, 256);
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &pool);
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        for (name, iface, ver, id) in [(1u32, "wl_compositor", 4u32, 3u32), (5, "xdg_wm_base", 4, 5), (8, "zxdg_decoration_manager_v1", 1, 9)] {
+            go(&mut c, Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish());
+        }
+        go(&mut c, Writer::new(3, 0).new_id(6).finish());
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish());
+        go(&mut c, Writer::new(7, 1).new_id(8).finish());
+        let bounds = |out: &[(u32, u16, Vec<u8>)]| {
+            out.iter().filter(|(id, op, _)| *id == 8 && *op == 2).map(|b| (i32::from_le_bytes(b.2[..4].try_into().unwrap()), i32::from_le_bytes(b.2[4..8].try_into().unwrap()))).last()
+        };
+        assert_eq!(bounds(&messages(&c.take_outgoing())), Some((256 - 2, 256 - 27)), "a framed window: the frame off");
+        // get_toplevel_decoration(10, 8), set_mode(client_side): configured
+        // again, the whole output its bounds; and shown bare.
+        go(&mut c, Writer::new(9, 1).new_id(10).object(8).finish());
+        go(&mut c, Writer::new(10, 1).uint(1).finish());
+        let out = messages(&c.take_outgoing());
+        assert!(out.iter().any(|(id, op, b)| *id == 10 && *op == 0 && b[..4] == 1u32.to_le_bytes()), "client_side granted");
+        assert_eq!(bounds(&out), Some((256, 256)), "configured again, nothing taken off");
+        assert_eq!(c.surfaces[&6].deco, Decorations::Client);
+    }
+
+    #[test]
     fn a_new_window_chooses_its_size_within_the_room_there_is() {
         // foot opened four screens wide at scale 2: every toplevel was told
         // the whole output, and no surface was ever said to be on the output,
@@ -5330,8 +5567,10 @@ mod tests {
         assert_eq!(r.fixed().map(|f| f.to_int()), Some(4));
         assert_eq!(r.object(), Some(offer));
         assert!(!c.drag_status().unwrap().takes());
+        assert!(!c.drag_status().unwrap().answered, "nothing said of it yet: a release waits");
         c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
         assert!(c.drag_status().unwrap().takes());
+        assert!(c.drag_status().unwrap().answered);
         c.receive(&Writer::new(offer, 1).string("text/uri-list").finish(), &[55], &no_pool());
         assert!(c.fds_in_use().contains(&55), "a receive's fd is held until the host takes it");
         assert_eq!(c.take_receives(), vec![data::Receive { offer, mime: "text/uri-list".into(), fd: 55 }]);
@@ -5488,11 +5727,13 @@ mod tests {
         let serial = c.drag_serial().unwrap();
         c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
         assert!(!c.drag_status().unwrap().takes(), "no action yet");
+        assert!(!c.drag_status().unwrap().answered, "a version 3 client answers with its actions");
         c.receive(&Writer::new(offer, 4).uint(data::DND_COPY | data::DND_MOVE).uint(data::DND_MOVE).finish(), &[], &no_pool());
         let msgs = messages(&c.take_outgoing());
         let action = msgs.iter().find(|(o, op, _)| *o == offer && *op == 2).expect("action");
         assert_eq!(u32::from_le_bytes(action.2[..4].try_into().unwrap()), data::DND_MOVE);
         assert!(c.drag_status().unwrap().takes());
+        assert!(c.drag_status().unwrap().answered);
         assert!(c.drag_drop());
         c.receive(&Writer::new(offer, 3).finish(), &[], &no_pool());
         assert!(c.drag_status().unwrap().finished);
