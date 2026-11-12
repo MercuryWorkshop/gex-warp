@@ -26,7 +26,10 @@
 //            a test program with its shader library and what Apple's
 //            Metal answered, and its replayer for a page (the Worker, the
 //            channel and the wasm core). Without one the directory is
-//            empty and the test leaves that half out. And in mink/view,
+//            empty and the test leaves that half out. In mink/programs
+//            and mink/corpus, every program of mink's tests with what it
+//            printed and wrote on Apple's Metal, and their shader
+//            libraries (programs.json lists them). And in mink/view,
 //            for darwin/metal-view: mink's view sample, its Metal and
 //            MetalKit for a pyrus root with QuartzCore, and that root
 //            (GEX_TEST_DARWIN_QC_ROOT, default ../pyrus-qc/out/root).
@@ -357,6 +360,31 @@ export const images = {
       ]) {
         if (existsSync(join(mink, from))) copyFileSync(join(mink, from), join(out, to));
       }
+    }
+    // And every program mink's own tests list (its tests/programs/LIST: NAME
+    // and the shader library it loads, `-` none, `@` all of them), with what
+    // each printed and wrote on Apple's Metal, and the shader libraries.
+    if (existsSync(join(out, 'mink_host.js')) && existsSync(join(mink, 'tests/programs/LIST'))) {
+      const list = readFileSync(join(mink, 'tests/programs/LIST'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.trim().split(/\s+/));
+      const programs = [];
+      mkdirSync(join(out, 'programs'), { recursive: true });
+      for (const [name, lib] of list) {
+        const need = [`build/oracle/${name}`, `build/oracle/${name}.txt`];
+        if (!need.every((f) => existsSync(join(mink, f)))) continue;
+        copyFileSync(join(mink, need[0]), join(out, 'programs', `${name}.aarch64`));
+        copyFileSync(join(mink, need[1]), join(out, 'programs', `${name}.txt`));
+        // (A program that writes no records has no result file.)
+        const result = join(mink, `build/oracle/${name}.out`);
+        if (existsSync(result)) copyFileSync(result, join(out, 'programs', `${name}.out`));
+        else writeFileSync(join(out, 'programs', `${name}.out`), '');
+        const x86 = existsSync(join(mink, `build/oracle-x86_64/${name}`));
+        if (x86) copyFileSync(join(mink, `build/oracle-x86_64/${name}`), join(out, 'programs', `${name}.x86`));
+        programs.push({ name, lib, x86 });
+      }
+      const libraries = existsSync(join(mink, 'build/corpus')) ? readdirSync(join(mink, 'build/corpus')).filter((f) => f.endsWith('.metallib')) : [];
+      mkdirSync(join(out, 'corpus'), { recursive: true });
+      for (const f of libraries) copyFileSync(join(mink, 'build/corpus', f), join(out, 'corpus', f));
+      writeFileSync(join(out, 'programs.json'), JSON.stringify({ programs, libraries }));
     }
     // And its view sample (darwin/metal-view): the program, what it printed
     // and read back on a Mac, mink's Metal and MetalKit built for a pyrus

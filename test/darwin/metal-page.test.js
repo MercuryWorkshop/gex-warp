@@ -16,15 +16,68 @@
 // mink's replayer in a Worker of its own on the browser's WebGPU, mink's
 // Metal.framework in the root, and one of mink's test programs, an
 // unmodified Mach-O linked against Metal. Its picture must be the one
-// Apple's Metal drew. Without mink, or under Node (no WebGPU), that half
-// says so and is left out.
+// Apple's Metal drew. And then every program mink's own tests list (depth
+// and stencil, blending, blits, textures, samplers, buffers, its shader
+// corpus, argument buffers ...), each of which prints text and writes
+// records (pixels, buffer contents): on this page they must print what they
+// printed on a Mac, and their records must be the Mac's within the tolerance
+// each record states (none, for nearly all), where the browser's WebGPU is
+// the machine's GPU. Without mink, or under Node (no WebGPU), that half says
+// so and is left out.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { Metal } from '../../page/runtime/src/metal.js';
 import { bytesOf } from '../../page/runtime/src/internal.js';
 import { HEAD, TAIL, CLOSED, RING_HEADER_BYTES } from '../../hosts/browser/js/metal-bridge.mjs';
 
-export const meta = { hosts: ['node', 'browser'], arches: ['a64', 'x86'], images: ['darwin-root', 'mink'], timeout: 600 };
+export const meta = { hosts: ['node', 'browser'], arches: ['a64', 'x86'], images: ['darwin-root', 'mink'], timeout: 1800 };
+
+/**
+ * mink's rule for a program's result (its tools/compare.py): the text must be
+ * the reference's, which has a line `record NAME LENGTH TOLERANCE` for each
+ * record of the result file, in order; a record's bytes must be the
+ * reference's within TOLERANCE, a number (the largest difference of a byte)
+ * or `f32:R` (32-bit floats, each within R relative to the larger of 1 and
+ * their magnitudes). Answers null, or what is wrong.
+ */
+function compareRecords(text, want, got, wantText) {
+  if (text !== wantText) {
+    const a = wantText.split('\n'), b = text.split('\n');
+    const i = a.findIndex((l, k) => l !== b[k]);
+    return `it printed otherwise: line ${i + 1}: a Mac ${JSON.stringify(a[i] ?? null)}, here ${JSON.stringify(b[i] ?? null)}`;
+  }
+  // (A program with no record lines writes one unnamed result: the whole file, exact.)
+  if (!/^record /m.test(wantText)) {
+    if (got.length !== want.length) return `${got.length} bytes of ${want.length}`;
+    const i = want.findIndex((v, k) => v !== got[k]);
+    return i < 0 ? null : `byte ${i} is ${got[i]}, a Mac's ${want[i]}`;
+  }
+  let at = 0;
+  for (const line of wantText.split('\n')) {
+    const w = line.split(' ');
+    if (w.length !== 4 || w[0] !== 'record') continue;
+    const length = Number(w[2]);
+    const a = want.subarray(at, at + length), b = got.subarray(at, at + length);
+    at += length;
+    if (b.length !== length) return `record ${w[1]}: ${b.length} bytes of ${length}`;
+    if (w[3].startsWith('f32:')) {
+      const rel = Number(w[3].slice(4));
+      const fa = new DataView(a.buffer, a.byteOffset, length), fb = new DataView(b.buffer, b.byteOffset, length);
+      for (let i = 0; i + 4 <= length; i += 4) {
+        const x = fa.getFloat32(i, true), y = fb.getFloat32(i, true);
+        if (x === y || (Number.isNaN(x) && Number.isNaN(y))) continue;
+        const error = Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) / Math.max(1, Math.abs(x), Math.abs(y)) : Infinity;
+        if (error > rel) return `record ${w[1]}: float ${i / 4} is ${y}, a Mac's ${x}`;
+      }
+    } else {
+      const tolerance = Number(w[3]);
+      for (let i = 0; i < length; i++) {
+        if (Math.abs(a[i] - b[i]) > tolerance) return `record ${w[1]}: byte ${i} is ${b[i]}, a Mac's ${a[i]} (tolerance ${tolerance})`;
+      }
+    }
+  }
+  return null;
+}
 
 /** A replayer that sends back what it is sent, on this thread. */
 function echo({ toHost, toGuest, wake }) {
@@ -78,6 +131,26 @@ export default async function (t) {
     } catch {
       mink = null;
     }
+    // And the rest of mink's programs, where the image has them for this processor.
+    if (mink) {
+      try {
+        const listed = JSON.parse(new TextDecoder().decode(await bytesOf(t.work('mink/programs.json'))));
+        mink.libraries = {};
+        for (const f of listed.libraries) mink.libraries[`/work/${f}`] = await bytesOf(t.work(`mink/corpus/${f}`));
+        mink.programs = [];
+        for (const p of listed.programs) {
+          if (arch === 'x86' && !p.x86) continue;
+          mink.programs.push({
+            ...p,
+            binary: await bytesOf(t.work(`mink/programs/${p.name}.${arch}`)),
+            text: new TextDecoder().decode(await bytesOf(t.work(`mink/programs/${p.name}.txt`))),
+            out: await bytesOf(t.work(`mink/programs/${p.name}.out`)),
+          });
+        }
+      } catch {
+        mink.programs = [];
+      }
+    }
   }
 
   const { arch: _, ...debug } = t.debug();
@@ -91,6 +164,8 @@ export default async function (t) {
       '/System/Library/Frameworks/Metal.framework/Versions/A/Metal': mink.framework,
       '/work/triangle': mink.program,
       '/work/triangle.metallib': mink.library,
+      ...mink.libraries,
+      ...Object.fromEntries((mink.programs ?? []).map((p) => [`/work/programs/${p.name}`, p.binary])),
     }, { mode: 0o755 });
   }
   // The replayer: the echo, until mink's Worker is asked for.
@@ -162,6 +237,26 @@ export default async function (t) {
   const close = drawn.length === mink.want.length && (software ? differing <= mink.want.length / 50 : differing === 0);
   check(`mink's triangle, drawn through the node on this browser's WebGPU (${adapter}), is the picture Apple's Metal drew${software ? ' but for edge pixels' : ', to the byte'}`, d.code === 0 && close,
     `exit ${d.code}, ${drawn.length} bytes (want ${mink.want.length}), ${differing} differ (the largest by ${largest}); ${failed ?? ''} ${(d.stdout + d.stderr).trim().split('\n').slice(-4).join(' / ')}`);
+  // Every program of mink's tests, each a process of its own with a
+  // connection of its own.
+  // (On the machine's GPU only: a software adapter places edges otherwise,
+  // and these records are compared to the byte.)
+  if (software && mink.programs?.length) say(`a software adapter (${adapter}): mink's ${mink.programs.length} other programs are not run (--gpu)`);
+  let passed = 0;
+  for (const p of software ? [] : mink.programs ?? []) {
+    const arg = p.lib === '-' ? '-' : p.lib === '@' ? '.' : `${p.lib}.metallib`;
+    const out = `${p.name}.out`;
+    const run = await timeout(sys.run([`/work/programs/${p.name}`, arg, out], { env, cwd: '/work' }), 600000, `mink's ${p.name}`).catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
+    let wrote = new Uint8Array(0);
+    try {
+      wrote = await fs.readFile(`/work/${out}`);
+    } catch {}
+    const wrong = run.code !== 0 ? `exit ${run.code}: ${(run.stdout + run.stderr).trim().split('\n').slice(-3).join(' / ')}` : compareRecords(run.stdout, p.out, wrote, p.text);
+    const records = p.text.split('\n').filter((l) => l.startsWith('record ')).length;
+    check(`mink's ${p.name} (${records} records, ${p.out.length} bytes) prints and writes here what it did on Apple's Metal`, !wrong, `${failed ?? ''} ${wrong ?? ''}`.slice(0, 500));
+    if (!wrong) passed++;
+  }
+  if (!software && mink.programs?.length) say(`  ${passed} of ${mink.programs.length} of mink's programs agree with Apple's Metal on this page`);
   worker.terminate();
   await sys.shutdown();
 }
