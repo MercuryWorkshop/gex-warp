@@ -21,6 +21,10 @@
 #               i386 one (a tree of its own: the display driver's PE halves)
 #   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy, the default)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
+#   pfx64-P-gex-wG  with WINE64_GEXC (a host that runs no 32-bit x86 code), it
+#               with the WoW64 pass's i386 half run by the install under gex,
+#               after the install (G: the install, the steps); the session's
+#               prefix is then made from it
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX; each keeps the keys of the
 #               installs it is printed with (.gex-dists, wine/prefix-key.sh)
@@ -319,8 +323,57 @@ pfx_make() {
 fresh() { [ -f "$C/$1/pfx/.gex-dists" ] || rm -f "$C/$1/.done"; }
 # -gex: made as user gex (before, as the build machine's user).
 PX=$P-gex
-fresh pfx64-$PX
-log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
+# WINE64_GEXC=GEXC (wine/mac-build.sh on an arm64 Mac, whose x86-64 Linux is
+# Rosetta's): a WoW64 prefix's i386 half is made by the install itself, under
+# that gexc, once the install is made. Rosetta runs no WoW64 process: the
+# native Wine's wineboot -i makes the 64-bit half, and the 32-bit rundll32 of
+# its Wow64Install pass dies at its first signal return, leaving syswow64
+# empty and the registry without its 32-bit view. That pass, the only 32-bit
+# code wineboot runs, is then run again by the install under gex (pfx32_make),
+# in a prefix of its own (pfx64-PX-wG; G: the install and the steps); the
+# session's 32-bit regsvr32 likewise. Without it, as before.
+GX=; [ "$WOW" = 0 ] || [ "$M64" != 0 ] || GX=${WINE64_GEXC:-}
+[ -z "$GX" ] || [ -x "$GX" ] || { log "WINE64_GEXC=$GX is not an executable"; exit 1; }
+gex_wine() { # PFX ARGS...: the install's loader under gexc, a WoW64 session, in PFX
+	local p=$1; shift
+	env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$PWD/home" timeout 5400 nice -n 10 "$GX" run \
+		--env WINEPREFIX="$PWD/$p" --env WINEGEX_WOW64=1 --env WINEDEBUG="${WINE64_GEX_WINEDEBUG:--all}" \
+		--env USER=gex --env LOGNAME=gex --env HOME="$PWD/home" --env XDG_CONFIG_HOME="$PWD/home/.config" \
+		"$DIST/lib/wine/x86_64-unix/wine" "$@"
+}
+pfx32_make() {
+	cp -a "$C/pfx64-$PX/pfx" pfx
+	rm -f pfx/.gex-dists pfx/.gex-builtins
+	mkdir -p home
+	# wineboot's own command line for the pass (start_rundll32), over the
+	# install's wine.inf (the native Wine's, copied)
+	local inf n64 n32
+	inf='\\?\Z:'$(printf %s "$DIST/share/wine/wine.inf" | tr / '\\')
+	cmp -s "$DIST/share/wine/wine.inf" "$N/share/wine/wine.inf" || { echo "$DIST's wine.inf is not $N's"; return 1; }
+	# syswow64 with the install's i386 builtins first, as the pass's
+	# WineFakeDlls copies them there: the install's WoW64 loader takes an
+	# i386 builtin only through its file in syswow64 (kernel32.dll, failing
+	# c0000135 without it), and the native Wine's pass, which put them there
+	# before its first 32-bit process, is the one that died
+	mkdir -p pfx/drive_c/windows/syswow64 || return 1
+	( cd "$DIST/lib/wine/i386-windows" && ls | grep -Ev '\.(a|so|wasm|wasmref|m64)$' |
+		while read -r f; do [ ! -f "$f" ] || cp -p "$f" "$OLDPWD/pfx/drive_c/windows/syswow64/" || exit 1; done ) || return 1
+	gex_wine pfx 'C:\windows\syswow64\rundll32.exe' setupapi,InstallHinfSection Wow64Install 128 "$inf"
+	rm -rf home
+	n64=$(find pfx/drive_c/windows/system32 -maxdepth 1 -type f | wc -l)
+	n32=$(find pfx/drive_c/windows/syswow64 -maxdepth 1 -type f | wc -l)
+	echo "system32: $n64 files, syswow64: $n32"
+	[ $((n32 * 10)) -ge $((n64 * 8)) ] || { echo "syswow64 has $n32 files to system32's $n64: the i386 pass did not finish"; return 1; }
+	# its registrations: the 32-bit view of the classes, as many as the 64-bit one's
+	local c64 c32
+	c64=$(grep -c '^\[Software\\\\Classes\\\\CLSID\\\\' pfx/system.reg)
+	c32=$(grep -c '^\[Software\\\\Classes\\\\Wow6432Node\\\\CLSID\\\\' pfx/system.reg)
+	echo "classes: $c64 64-bit, $c32 32-bit"
+	[ $((c32 * 10)) -ge $((c64 * 9)) ] || { echo "the i386 pass registered $c32 classes to the 64-bit side's $c64"; return 1; }
+	grep -q '^\[Software\\\\Wow6432Node\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\AeDebug\]' pfx/system.reg ||
+		{ echo "no 32-bit AeDebug key in pfx/system.reg: the i386 pass's registry was not saved"; return 1; }
+	: > pfx/.gex-dists
+}
 
 # The session 32-bit Wine's prefixes have (wine32-session.reg):
 # the 64-bit loader has no Unix side for winebus, wineusb or winebth
@@ -341,7 +394,7 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # without a Unix side), by the native Wine's regsvr32 of each arch.
 R=$( (cat "$here"/session.reg "$here"/wine64-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs; [ "$PADS" = 0 ] || echo pads) | sha256sum | cut -c1-10)
 pfs_make() {
-	cp -a "$C/pfx64-$PX/pfx" pfx
+	cp -a "$C/pfx64-$PXS/pfx" pfx
 	[ -z "$WD" ] || [ "$WOW" = 0 ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	if [ "$WOW" != 0 ]; then
@@ -363,19 +416,21 @@ pfs_make() {
 			timeout 300 nice -n 10 "$N/bin/wine" regsvr32 /s winegstreamer.dll
 		if [ "$WOW" != 0 ]; then
 			cp -p "$GS/i386-windows/winegstreamer.dll" pfx/drive_c/windows/syswow64/
-			env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
+			[ -n "$GX" ] || env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 				timeout 300 nice -n 10 "$N/bin/wine" 'C:\windows\syswow64\regsvr32.exe' /s winegstreamer.dll
 		fi
 	fi
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
+	# (the i386 regsvr32 under gex, once the native Wine's server is gone)
+	if [ -n "$GS" ] && [ -n "$GX" ]; then
+		mkdir -p home; gex_wine pfx 'C:\windows\syswow64\regsvr32.exe' /s winegstreamer.dll; rm -rf home
+	fi
 	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
 	[ -z "$GS" ] || [ "$(grep -c 'winegstreamer.dll"$' pfx/system.reg)" -ge 10 ] || { echo "winegstreamer was not registered"; return 1; }
 	: > pfx/.gex-dists
 }
-fresh pfs64-$PX-$R
-log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
 # Each prefix names the builtins it was made for (.gex-builtins, "ARCH NAME"
 # lines): its Wine's, and those pfs_make adds (winegstreamer's halves, the
@@ -391,9 +446,23 @@ builtins_list() { # PFX [NAME...]: N's lib/wine/*-windows names, and each NAME i
 		{ ls "$N/lib/wine/$a-windows"; printf '%s\n' "$@"; } | grep -Ev '\.(a|so|wasm|wasmref|m64)$' | sort -u | sed "s/^/$a /"
 	done > "$pfx/.gex-builtins.tmp" && mv "$pfx/.gex-builtins.tmp" "$pfx/.gex-builtins"
 }
-[ -f "$C/pfx64-$PX/pfx/.gex-builtins" ] || builtins_list "$C/pfx64-$PX/pfx"
-# shellcheck disable=SC2046
-[ -f "$C/pfs64-$PX-$R/pfx/.gex-builtins" ] || builtins_list "$C/pfs64-$PX-$R/pfx" $([ -z "$GS" ] || echo winegstreamer.dll) $([ -z "$WD" ] || echo winewayland.drv)
+prefixes() { # the steps above, in order; PXS: the prefix the session is made from
+	fresh pfx64-$PX
+	log "win64 prefix ($PX)"; step pfx64-$PX pfx_make || exit 1
+	PXS=$PX
+	if [ -n "$GX" ]; then
+		PXS=$PX-w$( { basename "$DIST"; declare -f gex_wine pfx32_make; } | sha256sum | cut -c1-6)
+		fresh pfx64-$PXS
+		log "WoW64 prefix's i386 half, by the install under gex ($PXS)"; step pfx64-$PXS pfx32_make || exit 1
+	fi
+	fresh pfs64-$PXS-$R
+	log "win64 prefix's session ($PXS, $R)"; step pfs64-$PXS-$R pfs_make || exit 1
+	[ -f "$C/pfx64-$PXS/pfx/.gex-builtins" ] || builtins_list "$C/pfx64-$PXS/pfx"
+	# shellcheck disable=SC2046
+	[ -f "$C/pfs64-$PXS-$R/pfx/.gex-builtins" ] || builtins_list "$C/pfs64-$PXS-$R/pfx" $([ -z "$GS" ] || echo winegstreamer.dll) $([ -z "$WD" ] || echo winewayland.drv)
+}
+# (with WINE64_GEXC, after the install: below)
+[ -n "$GX" ] || prefixes
 
 deps64_build() {
 	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" JOBS=$J nice -n 10 "$here/deps64.sh" "$PWD" "$C/dl"
@@ -672,6 +741,8 @@ fi
 # default's, as winepe.wasm.m64, which a process with a 64-bit memory loads
 # in its place (one set of skeletons: the same DLLs and exports).
 # Off by default: the default install and its downloads do not grow.
+# (WINE64_GEXC: the prefixes now, by this install)
+[ -z "$GX" ] || prefixes
 BASE=$DIST
 if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	MO=$(WINE64_TWIN=0 WINE64_MEM64=1 WINE64_M64_NATIVE=1 "$0" "$W" "$C") || { log "the memory64 build for the twin failed"; exit 1; }
@@ -701,9 +772,9 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	log "twin native PE core ($K, $NK, $MK)"; step pen64-$K-$NK-twin$MK twin_native
 	NATIVE=$C/pen64-$K-$NK-twin$MK
 fi
-for d in "$BASE" "$DIST"; do "$here/prefix-key.sh" --add "$C/pfs64-$PX-$R/pfx" "$d" || exit 1; done
+for d in "$BASE" "$DIST"; do "$here/prefix-key.sh" --add "$C/pfs64-$PXS-$R/pfx" "$d" || exit 1; done
 echo "WINE64_DIST=$DIST"
-echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"
+echo "WINE64_PREFIX=$C/pfs64-$PXS-$R/pfx"
 echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
 echo "WINE64_BUILD=$C/b64-$K-$S"

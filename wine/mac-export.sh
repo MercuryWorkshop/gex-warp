@@ -24,6 +24,9 @@ docker run --rm --platform linux/amd64 -v "$VOLUME":/root/.cache/gex -v "$dest":
   # (the display driver in its system32, as dist.sh puts it there: a prefix
   # made before it did has none, and the page then finds no driver)
   [ -f /dest/pfx/drive_c/windows/system32/winewayland.drv ] ||
-    { echo "export: $WINE64_PREFIX has no system32/winewayland.drv: make it again (wine/dist.sh)" >&2; exit 1; }'
+    { echo "export: $WINE64_PREFIX has no system32/winewayland.drv: make it again (wine/dist.sh)" >&2; exit 1; }
+  # (and a WoW64 one its 32-bit half: syswow64 and its driver)
+  [ ! -d "$WINE64_DIST/lib/wine/i386-windows" ] || [ -f /dest/pfx/drive_c/windows/syswow64/winewayland.drv ] ||
+    { echo "export: $WINE64_PREFIX has no syswow64/winewayland.drv: not a WoW64 session prefix (wine/dist.sh)" >&2; exit 1; }'
 echo "WINE64_DIST=$dest/dist"
 echo "WINE64_PAGE_PREFIX=$dest/pfx"
