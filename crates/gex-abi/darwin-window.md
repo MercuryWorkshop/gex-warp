@@ -63,5 +63,13 @@ translation key (`gex_emit::tier1::knobs`), and in the C units' header.
 - The commpage is still at gex's address below 4 GiB (pyrus's headers name
   `0xffc000`); it is reachable in the window too (`0x1_00ffc000`), and a
   userland rebuilt with that address would have nothing below 4 GiB at all.
+  XNU's own addresses (`0x7fffffe00000` on x86-64, `0xfffffc000` and the
+  read-only `0xfffff4000` on arm64), which Apple's dyld and libSystem read
+  by constant, are folded into gex's page in the window as the translators
+  lift the constant (`gex_abi::fold_commpage`: x86-64's `movabsq`, an A0-A3
+  absolute address, arm64's `mov` of a bitmask, and a constant address the
+  emitter sees whole), so no access pays for it. A pointer into XNU's page
+  made any other way (arithmetic the lifter does not see as a constant,
+  across blocks) still faults.
 - `/dev/gex-gl`'s rings carry the guest's own pointers, which the device
   reads as offsets; no Darwin userland uses the device.

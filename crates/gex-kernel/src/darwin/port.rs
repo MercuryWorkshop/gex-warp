@@ -1498,6 +1498,32 @@ impl Kernel {
                     }
                 }
             }
+            // task_get_special_port(task, which): the task's own port
+            // (TASK_KERNEL_PORT) and the host's (TASK_HOST_PORT) as
+            // task_self and host_self give them; any other, the bootstrap
+            // port among them, is none: no launchd hands this task one,
+            // as for a process started outside it. (libxpc takes a null
+            // bootstrap port; what it would look up there is not found.)
+            (Kind::Task, 3409) => {
+                let which = get32(&req.body, 8);
+                let own = match which {
+                    1 => sp.names.get(&names::TASK).map(|e| Arc::clone(&e.port)),
+                    2 => sp.names.get(&names::HOST).map(|e| Arc::clone(&e.port)),
+                    _ => None,
+                };
+                match own {
+                    Some(port) => with_port(port),
+                    None => {
+                        let mut b = vec![0u8; 16];
+                        put32(&mut b, 0, 1);
+                        b[4 + 10] = disp::MOVE_SEND as u8;
+                        Msg { complex: true, ..reply(b, Vec::new()) }
+                    }
+                }
+            }
+            // task_set_special_port(task, which, port): taken, and kept
+            // nowhere (nothing here asks for one back but the two above).
+            (Kind::Task, 3410) => plain(0, &[]),
             // semaphore_create(task, out semaphore, policy, value): the
             // value follows the NDR record and the policy.
             (Kind::Task, 3418) => {

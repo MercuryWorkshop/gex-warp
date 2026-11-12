@@ -51,6 +51,9 @@ const LC_SEGMENT_64: u32 = 0x19;
 const LC_UUID: u32 = 0x1b;
 const LC_REEXPORT_DYLIB: u32 = 0x1f | LC_REQ_DYLD;
 const LC_FUNCTION_STARTS: u32 = 0x26;
+const LC_DYLD_INFO: u32 = 0x22;
+const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
 const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
 const LC_LOAD_UPWARD_DYLIB: u32 = 0x23 | LC_REQ_DYLD;
 
@@ -240,6 +243,9 @@ pub struct MachO {
     symtab: Option<(u64, u64, u64, u64)>,
     /// `(dataoff, datasize)` of `LC_FUNCTION_STARTS`.
     function_starts: Option<(u64, u64)>,
+    /// `(offset, size)` of the export trie (`LC_DYLD_INFO`'s or
+    /// `LC_DYLD_EXPORTS_TRIE`'s).
+    exports: Option<(u64, u64)>,
 }
 
 impl MachO {
@@ -309,6 +315,7 @@ fn parse_head(data: &[u8], len: u64) -> Result<MachO, LoadError> {
         uuid: None,
         symtab: None,
         function_starts: None,
+        exports: None,
     };
     let mut at = 32u64;
     let cmds_end = 32 + sizeofcmds;
@@ -399,6 +406,12 @@ fn parse_head(data: &[u8], len: u64) -> Result<MachO, LoadError> {
             LC_FUNCTION_STARTS if size >= 16 => {
                 m.function_starts = Some((r.u32(at + 8)? as u64, r.u32(at + 12)? as u64));
             }
+            LC_DYLD_INFO | LC_DYLD_INFO_ONLY if size >= 48 => {
+                m.exports = Some((r.u32(at + 40)? as u64, r.u32(at + 44)? as u64)).filter(|e| e.1 != 0);
+            }
+            LC_DYLD_EXPORTS_TRIE if size >= 16 => {
+                m.exports = Some((r.u32(at + 8)? as u64, r.u32(at + 12)? as u64)).filter(|e| e.1 != 0);
+            }
             _ => {}
         }
         at = end;
@@ -427,11 +440,19 @@ fn functions(m: &MachO, data: &[u8]) -> Vec<Symbol> {
     let sections: Vec<&MachSection> = m.segments.iter().flat_map(|s| s.sections.iter()).collect();
     let is_code = |s: &MachSection| s.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0;
     let mut found: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    // A symbol resolver's address (`N_SYMBOL_RESOLVER` in `n_desc`, or an
+    // export the trie gives a resolver): the function dyld runs to choose
+    // the implementation, under the name it chooses for (libplatform's
+    // `_memset` and `___bzero` on a Mac of before 10.15, over `$VARIANT$`
+    // implementations), as an ELF `STT_GNU_IFUNC` is.
+    const N_SYMBOL_RESOLVER: u16 = 0x0100;
+    let mut resolvers = export_resolvers(m, data);
     if let Some((symoff, nsyms, stroff, strsize)) = m.symtab {
         for i in 0..nsyms.min(1 << 24) {
             let at = symoff + i * 16;
-            let (Ok(strx), Ok(info), Ok(value)) = (r.u32(at), r.bytes(at + 4, 2), r.u64(at + 8)) else { break };
+            let (Ok(strx), Ok(info), Ok(value)) = (r.u32(at), r.bytes(at + 4, 4), r.u64(at + 8)) else { break };
             let (n_type, n_sect) = (info[0], info[1]);
+            let n_desc = u16::from_le_bytes([info[2], info[3]]);
             if n_type & N_STAB != 0 || n_type & N_TYPE != N_SECT || n_sect == 0 {
                 continue;
             }
@@ -446,6 +467,9 @@ fn functions(m: &MachO, data: &[u8]) -> Vec<Symbol> {
             // Assembler-local labels (`ltmp0`, `L...`) name no function.
             if name.is_empty() || name.starts_with('L') || name.starts_with("ltmp") {
                 continue;
+            }
+            if n_desc & N_SYMBOL_RESOLVER != 0 {
+                resolvers.insert(value);
             }
             found.entry(value).or_insert(name);
         }
@@ -484,9 +508,64 @@ fn functions(m: &MachO, data: &[u8]) -> Vec<Symbol> {
                 .find(|s| value >= s.addr && value < s.addr + s.size)
                 .map_or(value, |s| s.addr + s.size);
             let next = starts.get(i + 1).copied().unwrap_or(u64::MAX);
-            Symbol { name, value, size: next.min(sect_end) - value, ifunc: false }
+            Symbol { name, value, size: next.min(sect_end) - value, ifunc: resolvers.contains(&value) }
         })
         .collect()
+}
+
+/// The addresses (unslid) of the exports dyld binds through a resolver
+/// (`EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER`): the stub and the resolver
+/// both, neither of them the function it names.
+fn export_resolvers(m: &MachO, data: &[u8]) -> std::collections::BTreeSet<u64> {
+    const REEXPORT: u64 = 0x08;
+    const STUB_AND_RESOLVER: u64 = 0x10;
+    let mut out = std::collections::BTreeSet::new();
+    let (Some((off, size)), Some(base)) = (m.exports, m.header_vmaddr()) else { return out };
+    let Some(trie) = usize::try_from(off).ok().and_then(|o| data.get(o..o.checked_add(size as usize)?)) else { return out };
+    let uleb = |at: &mut usize| -> Option<u64> {
+        let (mut v, mut shift) = (0u64, 0u32);
+        loop {
+            let b = *trie.get(*at)?;
+            *at += 1;
+            v |= ((b & 0x7f) as u64).checked_shl(shift).unwrap_or(0);
+            shift += 7;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+    };
+    let mut todo = vec![0usize];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(node) = todo.pop() {
+        if !seen.insert(node) || seen.len() > 1 << 20 {
+            continue;
+        }
+        let mut at = node;
+        let Some(info) = uleb(&mut at) else { continue };
+        let children = at + info as usize;
+        if info > 0 {
+            let mut i = at;
+            if let Some(flags) = uleb(&mut i) {
+                if flags & REEXPORT == 0 && flags & STUB_AND_RESOLVER != 0 {
+                    if let (Some(stub), Some(resolver)) = (uleb(&mut i), uleb(&mut i)) {
+                        out.insert(base.wrapping_add(stub));
+                        out.insert(base.wrapping_add(resolver));
+                    }
+                }
+            }
+        }
+        let mut at = children;
+        let Some(&n) = trie.get(at) else { continue };
+        at += 1;
+        for _ in 0..n {
+            // The edge's label, then the child's offset in the trie.
+            let Some(nul) = trie.get(at..).and_then(|t| t.iter().position(|&b| b == 0)) else { break };
+            at += nul + 1;
+            let Some(child) = uleb(&mut at) else { break };
+            todo.push(child as usize);
+        }
+    }
+    out
 }
 
 /// Place a parsed image: its mapped segments at `vmaddr + slide`, with
@@ -995,6 +1074,70 @@ mod tests {
         }
         v[p as usize] = 0x5a;
         v
+    }
+
+    #[test]
+    fn a_symbol_dyld_resolves_through_a_resolver_is_no_function_of_its_name() {
+        // A library whose `_memset` is exported with a stub and a resolver
+        // (libplatform's, before 10.15): the symbol table names the
+        // resolver `_memset`, and only the trie says what it is.
+        let p = PAGE_SIZE as usize;
+        let mut text = segment("__TEXT", 0, p as u64, 0, p as u64, VM_PROT_READ | VM_PROT_EXECUTE);
+        let mut sect = vec![0u8; 80];
+        sect[..6].copy_from_slice(b"__text");
+        sect[16..22].copy_from_slice(b"__TEXT");
+        put64(&mut sect, 32, 0x100);
+        put64(&mut sect, 40, 0x300);
+        put32(&mut sect, 48, 0x100);
+        put32(&mut sect, 64, S_ATTR_PURE_INSTRUCTIONS);
+        text.extend(sect);
+        put32(&mut text, 4, 72 + 80);
+        put32(&mut text, 64, 1);
+        let (trie_at, sym_at, str_at) = (p + 0x100, p + 0x200, p + 0x300);
+        // The root: no export, one edge, "_memset", to the node after it,
+        // which exports a stub (0x300) and its resolver (0x200).
+        let mut trie = vec![0u8, 1];
+        trie.extend(b"_memset\0");
+        trie.push(11);
+        trie.extend([5, 0x10, 0x80, 0x06, 0x80, 0x04, 0]);
+        let strings = b"\0_memset\0_memset$VARIANT$Base\0";
+        let mut info = vec![0u8; 48];
+        put32(&mut info, 0, LC_DYLD_INFO_ONLY);
+        put32(&mut info, 4, 48);
+        put32(&mut info, 40, trie_at as u32);
+        put32(&mut info, 44, trie.len() as u32);
+        let mut symtab = vec![0u8; 24];
+        put32(&mut symtab, 0, LC_SYMTAB);
+        put32(&mut symtab, 4, 24);
+        put32(&mut symtab, 8, sym_at as u32);
+        put32(&mut symtab, 12, 2);
+        put32(&mut symtab, 16, str_at as u32);
+        put32(&mut symtab, 20, strings.len() as u32);
+        let cmds = [text, info, symtab];
+        let mut v = vec![0u8; 2 * p];
+        put32(&mut v, 0, MH_MAGIC_64);
+        put32(&mut v, 4, CPU_TYPE_GUEST);
+        put32(&mut v, 12, MH_DYLIB);
+        put32(&mut v, 16, cmds.len() as u32);
+        put32(&mut v, 20, cmds.iter().map(|c| c.len()).sum::<usize>() as u32);
+        let mut at = 32;
+        for c in &cmds {
+            v[at..at + c.len()].copy_from_slice(c);
+            at += c.len();
+        }
+        v[trie_at..trie_at + trie.len()].copy_from_slice(&trie);
+        for (i, (strx, value)) in [(1u32, 0x200u64), (9, 0x280)].into_iter().enumerate() {
+            let e = sym_at + 16 * i;
+            put32(&mut v, e, strx);
+            v[e + 4] = N_SECT | 1;
+            v[e + 5] = 1;
+            put64(&mut v, e + 8, value);
+        }
+        v[str_at..str_at + strings.len()].copy_from_slice(strings);
+        let (_, syms, _) = file_functions(&v).unwrap();
+        let of = |n: &str| syms.iter().find(|s| s.name == n).map(|s| (s.value, s.ifunc));
+        assert_eq!(of("_memset"), Some((0x200, true)));
+        assert_eq!(of("_memset$VARIANT$Base"), Some((0x280, false)));
     }
 
     #[test]

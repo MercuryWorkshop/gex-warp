@@ -74,15 +74,15 @@ pub const END: u64 = 0x4_0000;
 /// is loaded (arm64's two pages the same distance apart); and a userland
 /// built for gex is built with these addresses where Apple's headers have
 /// XNU's (`_COMM_PAGE64_BASE_ADDRESS`, `_COMM_PAGE64_RO_ADDRESS`). A
-/// library Apple built looks where XNU's is and finds nothing.
+/// library Apple built reads XNU's by constant, and in a process with the
+/// Darwin window the translators fold that constant into this page
+/// (`gex_abi::fold_commpage`).
+///
+/// `TEXT` is a page of code the kernel keeps for a task, between the two:
+/// where a `posix_spawn`'s copy is sent back into the kernel from
+/// (`spawn`). Made at a process's first `posix_spawn`.
 pub mod commpage {
-    pub const DATA: u64 = 0x00ff_c000;
-    pub const RO: u64 = 0x00ff_4000;
-    /// A page of code the kernel keeps for a task, between the two: where
-    /// a `posix_spawn`'s copy is sent back into the kernel from
-    /// (`spawn`). Made at a process's first `posix_spawn`.
-    pub const TEXT: u64 = 0x00ff_8000;
-    pub const PAGE: u64 = 0x4000;
+    pub use gex_abi::commpage::{DATA, PAGE, RO, TEXT};
     /// `_COMM_PAGE_THIS_VERSION`.
     pub const VERSION: u16 = 3;
     /// `_cpu_capabilities`: a 128-byte cache line, the thread pointer in a
@@ -91,10 +91,20 @@ pub mod commpage {
     /// exceptions; and the processor count in bits 16 to 23.
     pub const CAPABILITIES: u64 = 0x40 | 0x80 | 0x100 | 0x400 | 0x2000 | 0x0200_0000 | 0x0400_0000 | 1 << 48 | 1 << 58;
     pub const UP: u64 = 0x8000;
-    /// x86-64's version, and its capabilities: MMX, SSE, SSE2, a 64-byte
-    /// cache line, the thread pointer in a segment register, 64 bits.
+    /// x86-64's version, and its capabilities: MMX, SSE, SSE2, SSE3, a
+    /// 64-byte cache line, the thread pointer in a segment register,
+    /// SSSE3, 64 bits (what gex's `cpuid` says the processor has).
     pub const VERSION_X86: u16 = 14;
-    pub const CAPABILITIES_X86: u64 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x200;
+    pub const CAPABILITIES_X86: u64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x80 | 0x100 | 0x200;
+    /// The processor family an x86-64 page names, whatever Mac the process
+    /// is told it is on: Westmere (CPUFAMILY_INTEL_WESTMERE, as Rosetta
+    /// says), the newest whose code gex runs. libplatform chooses its
+    /// `memmove`, `bzero` and the rest by this word alone, and a later
+    /// family's are AVX, which gex's processor does not have (`cpuid`).
+    pub const CPUFAMILY_X86: u32 = 0x573b_5eec;
+    /// How many times a lock is tried before its waiter sleeps
+    /// (`_COMM_PAGE_SPIN_COUNT`, XNU's `MP_SPIN_TRIES`).
+    pub const SPIN_COUNT: u32 = 1000;
 }
 
 /// The first Mach port name a task allocates.
@@ -295,7 +305,7 @@ impl Kernel {
         let machine = self.darwin_machine();
         let cpus = machine.cpus.clamp(1, 255) as u8;
         if gex_abi::X86 {
-            return self.darwin_map_commpage_x86(m, cpus, machine.cpufamily);
+            return self.darwin_map_commpage_x86(m, cpus);
         }
         let caps = commpage::CAPABILITIES | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
         let mut page = [0u8; 0x100];
@@ -324,14 +334,18 @@ impl Kernel {
         }
     }
 
-    /// x86-64's page (`osfmk/i386/cpu_capabilities.h`): the same facts at
-    /// other offsets, and the clock. There `mach_absolute_time` does not
-    /// ask the kernel: it reads the processor's counter and scales it by
-    /// what the page says, `((tsc - base) << shift) * scale >> 32 + ns`,
-    /// while a generation there is not zero. gex's counter counts
-    /// nanoseconds, so the scale is one (a half, shifted once), and the
-    /// base is where the kernel's own clock was zero.
-    fn darwin_map_commpage_x86(&mut self, m: &mut GuestMem<'_>, cpus: u8, cpufamily: u32) {
+    /// x86-64's page (`osfmk/i386/cpu_capabilities.h`, as of 10.14's
+    /// xnu-4903): the same facts at other offsets, and the clock. There
+    /// `mach_absolute_time` does not ask the kernel: it reads the
+    /// processor's counter and scales it by what the page says,
+    /// `((tsc - base) << shift) * scale >> 32 + ns`, while a generation
+    /// there is not zero. gex's counter counts nanoseconds, so the scale is
+    /// one (a half, shifted once), and the base is where the kernel's own
+    /// clock was zero. `gettimeofday` too reads the time of day from the
+    /// page (`_COMM_PAGE_NEWTIMEOFDAY_DATA`): the time when the page was
+    /// made and the absolute time then, good for a second after it (past
+    /// that, libSystem asks the kernel).
+    fn darwin_map_commpage_x86(&mut self, m: &mut GuestMem<'_>, cpus: u8) {
         let caps = commpage::CAPABILITIES_X86 | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
         let mut page = [0u8; 0x100];
         page[..16].copy_from_slice(b"commpage 64-bit\0");
@@ -340,22 +354,38 @@ impl Kernel {
         page[0x20..0x24].copy_from_slice(&(caps as u32).to_le_bytes());
         page[0x22] = cpus;
         page[0x26..0x28].copy_from_slice(&64u16.to_le_bytes());
+        page[0x30..0x34].copy_from_slice(&commpage::SPIN_COUNT.to_le_bytes());
+        // The active, physical and logical processors.
         page[0x34..0x37].fill(cpus);
         page[0x37] = 1;
         page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
-        page[0x40..0x44].copy_from_slice(&cpufamily.to_le_bytes());
+        page[0x40..0x44].copy_from_slice(&commpage::CPUFAMILY_X86.to_le_bytes());
         // The kernel's and a process's page shift.
         page[0x4d] = 12;
         page[0x4e] = 12;
         // The counter is the wall clock in nanoseconds; the kernel's clock
         // is that less where it began.
         let (secs, nanos) = (self.clock)();
-        let base = (secs * 1_000_000_000 + nanos as u64).wrapping_sub(clock_ns(self.clock, 1));
+        let now = clock_ns(self.clock, 1);
+        let base = (secs * 1_000_000_000 + nanos as u64).wrapping_sub(now);
         page[0x50..0x58].copy_from_slice(&base.to_le_bytes());
         page[0x58..0x5c].copy_from_slice(&0x8000_0000u32.to_le_bytes());
         page[0x5c..0x60].copy_from_slice(&1u32.to_le_bytes());
         page[0x68..0x6c].copy_from_slice(&1u32.to_le_bytes());
-        // 0x6c, the time of day's generation, is zero: libSystem asks.
+        // 0x6c, the old time of day's generation, is zero: what reads it
+        // asks the kernel. 0x80, the approximate time, is not kept
+        // (0x88), and the continuous time is the absolute time (0xc0).
+        // When the machine started, in microseconds of the epoch.
+        let boot = (secs * 1_000_000 + nanos as u64 / 1000).saturating_sub(now / 1000);
+        page[0xc8..0xd0].copy_from_slice(&boot.to_le_bytes());
+        // The time of day (`new_commpage_timeofday_data_t`): the absolute
+        // time it was taken at, its seconds and fraction (of 2^64), a
+        // tick's worth of fraction, and the ticks in a second.
+        let frac = (((nanos as u128) << 64) / 1_000_000_000) as u64;
+        let per_tick = ((1u128 << 64) / 1_000_000_000) as u64;
+        for (i, v) in [now.max(1), secs, frac, per_tick, 1_000_000_000].into_iter().enumerate() {
+            page[0xd0 + 8 * i..0xd8 + 8 * i].copy_from_slice(&v.to_le_bytes());
+        }
         if self.mem.mmap_anon(m, commpage::DATA, commpage::PAGE, 3, mflags::FIXED_NOREPLACE, false, "[commpage]").is_ok() {
             let _ = m.write(commpage::DATA, &page);
         }

@@ -515,6 +515,60 @@ pub fn windowed_limit(limit: u64) -> u64 {
     limit + guest_base()
 }
 
+/// The commpage: where XNU puts it, and where gex does.
+///
+/// XNU maps it at `0x7FFFFFE00000` on x86-64 and at `0xFFFFFC000` on arm64
+/// (with a read-only page at `0xFFFFF4000`), past the end of any memory a
+/// guest has; gex maps its pages just under where a program is loaded
+/// ([`DATA`](commpage::DATA), [`RO`](commpage::RO)), where a userland built
+/// for gex looks. Apple's own dyld and libSystem read XNU's addresses by
+/// constant (`movabsq`, `mov x8, #0xfffffc000`), and the translators fold
+/// such a constant into gex's page as they lift it ([`fold_commpage`]):
+/// nothing at run time, no access pays for it.
+pub mod commpage {
+    /// The page of facts: XNU's `_COMM_PAGE64_BASE_ADDRESS`, here.
+    pub const DATA: u64 = 0x00ff_c000;
+    /// arm64's read-only page (`_COMM_PAGE64_RO_ADDRESS`), here: the same
+    /// distance below [`DATA`] as on arm64.
+    pub const RO: u64 = 0x00ff_4000;
+    /// A page of code the kernel keeps for a task, between the two.
+    pub const TEXT: u64 = 0x00ff_8000;
+    /// Each page's size (one of a Mac's on arm64; four x86-64 pages).
+    pub const PAGE: u64 = 0x4000;
+    /// XNU's x86-64 commpage (`_COMM_PAGE64_BASE_ADDRESS`).
+    pub const XNU_X86: u64 = 0x7fff_ffe0_0000;
+    /// XNU's arm64 commpage and its read-only page.
+    pub const XNU_A64: u64 = 0xf_ffff_c000;
+    pub const XNU_A64_RO: u64 = 0xf_ffff_4000;
+}
+
+/// A constant the guest makes as an address inside XNU's commpage (this
+/// architecture's, [`commpage`]), as the address of the same byte of gex's
+/// page in the Darwin window; `None` for any other value, and for every
+/// value of a process without the window (a Linux one; a Darwin one linked
+/// below 4 GiB, which reads gex's page where it is). The window's bit is in
+/// every translation key, so a fold is never reused where it does not hold.
+#[inline]
+pub fn fold_commpage(c: u64) -> Option<u64> {
+    use commpage::*;
+    if guest_base() == 0 {
+        return None;
+    }
+    let (from, to) = if X86 {
+        if c.wrapping_sub(XNU_X86) >= PAGE {
+            return None;
+        }
+        (XNU_X86, DATA)
+    } else if c.wrapping_sub(XNU_A64) < PAGE {
+        (XNU_A64, DATA)
+    } else if c.wrapping_sub(XNU_A64_RO) < PAGE {
+        (XNU_A64_RO, RO)
+    } else {
+        return None;
+    };
+    Some(guest_addr(c - from + to))
+}
+
 // ---------------------------------------------------------------------------
 // Thread context
 // ---------------------------------------------------------------------------
@@ -1646,8 +1700,18 @@ mod tests {
         assert_eq!(guest_addr(0), 0);
         assert_eq!(windowed_limit(GUEST_LIMIT), DARWIN_BASE + GUEST_LIMIT);
         assert!(darwin_windowed(DARWIN_BASE, false) && darwin_windowed(0x4000, true) && !darwin_windowed(0x4000, false));
+        // XNU's commpage, by constant, is gex's page in the window; its
+        // neighbours are themselves.
+        let (xnu, below) = if X86 { (commpage::XNU_X86, commpage::XNU_X86 - 1) } else { (commpage::XNU_A64, commpage::XNU_A64 - 1) };
+        assert_eq!(fold_commpage(xnu + 0x10), Some(DARWIN_BASE + commpage::DATA + 0x10));
+        assert_eq!(fold_commpage(xnu + commpage::PAGE - 1), Some(DARWIN_BASE + commpage::DATA + commpage::PAGE - 1));
+        assert_eq!((fold_commpage(below), fold_commpage(xnu + commpage::PAGE)), (None, None));
+        if !X86 {
+            assert_eq!(fold_commpage(commpage::XNU_A64_RO + 0x25), Some(DARWIN_BASE + commpage::RO + 0x25));
+        }
         set_guest_base(0);
         assert_eq!(canon(0x1_7e00_1230), 0x1_7e00_1230);
+        assert_eq!(fold_commpage(xnu), None);
     }
 
     // The context layout is a compile-time contract between codegen, the

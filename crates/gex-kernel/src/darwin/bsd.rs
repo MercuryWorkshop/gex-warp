@@ -29,10 +29,15 @@ mod f {
     pub const NOCACHE: u64 = 48;
     pub const GETPATH: u64 = 50;
     pub const FULLFSYNC: u64 = 51;
+    pub const ADDSIGS: u64 = 59;
+    pub const ADDFILESIGS: u64 = 61;
     pub const DUPFD_CLOEXEC: u64 = 67;
     pub const SETNOSIGPIPE: u64 = 73;
     pub const GETNOSIGPIPE: u64 = 74;
+    pub const ADDFILESIGS_FOR_DYLD_SIM: u64 = 83;
     pub const BARRIERFSYNC: u64 = 85;
+    pub const ADDFILESIGS_RETURN: u64 = 97;
+    pub const CHECK_LV: u64 = 98;
     pub const GETPATH_NOFIRMLINK: u64 = 102;
 }
 
@@ -1079,6 +1084,23 @@ impl Kernel {
             // no less of anyway.
             f::RDAHEAD | f::NOCACHE | f::FULLFSYNC | f::BARRIERFSYNC | f::SETNOSIGPIPE | f::SETOWN => self.fds.get(fd).map(|_| 0),
             f::GETNOSIGPIPE | f::GETOWN => self.fds.get(fd).map(|_| 0),
+            // A code signature given to the kernel, as Apple's dyld gives
+            // every image's (`fsignatures_t`): taken, and nothing checks it.
+            // `_RETURN` answers how far into the file it covers, which dyld
+            // keeps: all of the image up to the signature (`fs_file_start`,
+            // the image's start in the file, and `fs_blob_start`, the
+            // signature's offset in the image).
+            f::ADDSIGS | f::ADDFILESIGS | f::ADDFILESIGS_FOR_DYLD_SIM => self.fds.get(fd).map(|_| 0),
+            f::ADDFILESIGS_RETURN => {
+                self.fds.get(fd)?;
+                let start = m.read_u64(arg)?;
+                let blob = m.read_u64(arg + 8)?;
+                m.write_u64(arg, start.wrapping_add(blob))?;
+                Ok(0)
+            }
+            // Whether the file may be loaded by a process that validates
+            // libraries (`fchecklv`): every file may.
+            f::CHECK_LV => self.fds.get(fd).map(|_| 0),
             // A part of a file that will be read soon: advice a file takes,
             // and nothing else can.
             f::RDADVISE => match self.fds.get(fd)?.handle.metadata()?.file_type {

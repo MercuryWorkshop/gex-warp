@@ -411,6 +411,11 @@ impl<'a> Lifter<'a> {
                 gex_ir::note_kuser_fold();
                 f as i64
             }
+            // `movabs 0x7fffffe00020, %eax` (A0-A3's 64-bit address):
+            // XNU's commpage is gex's (`gex_abi::fold_commpage`).
+            _ if !m.addr32 && !m.rip && m.seg.is_none() && m.base.is_none() && m.index.is_none() => {
+                gex_abi::fold_commpage(named).map_or(m.disp, |f| f as i64)
+            }
             _ => m.disp,
         };
         match sum {
@@ -464,6 +469,13 @@ impl<'a> Lifter<'a> {
             Operand::Reg(Reg::Seg(seg)) => self.sel_val(seg, w),
             Operand::Reg(r) => self.rd_reg(r),
             Operand::Mem(m) => self.load(&m, w),
+            // `movabsq $0x7fffffe00010, %rax`: XNU's commpage, by constant,
+            // is gex's (`gex_abi::fold_commpage`). Only a 64-bit immediate
+            // reaches it.
+            Operand::Imm(v) if w == Width::Q => {
+                let v = v as u64;
+                self.k64(gex_abi::fold_commpage(v).unwrap_or(v))
+            }
             Operand::Imm(v) => self.k(ty_of(w), (v as u64) & w.mask()),
         }
     }

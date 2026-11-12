@@ -20670,7 +20670,7 @@ fn scan_macho_intrinsics(path: &str, start: u64, offset: u64) -> Option<Vec<(u64
     let (lo, hi) = (seg.vmaddr, seg.vmaddr + seg.vmsize);
     Some(
         syms.iter()
-            .filter(|s| s.value >= lo && s.value < hi)
+            .filter(|s| s.value >= lo && s.value < hi && !s.ifunc)
             .filter_map(|s| gex_xlate::intrinsic::recognise_macho(&s.name).map(|k| (s.value.wrapping_add(bias), k)))
             .collect(),
     )

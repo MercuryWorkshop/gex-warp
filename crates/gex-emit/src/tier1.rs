@@ -1611,6 +1611,11 @@ impl<'a> Emitter<'a> {
                 gex_ir::note_kuser_fold();
                 ea = f;
             }
+            // XNU's commpage, made in pieces the lifter did not see whole
+            // (arm64's `movz`/`movk`), folded into gex's page.
+            if let Some(f) = gex_abi::fold_commpage(ea) {
+                ea = f;
+            }
             // Below the null guard: the poisoned address, as past the end
             // (32-bit Wine with folding on: the named fault, as for a pointer).
             if null_guard && ea < gex_abi::NULL_GUARD {

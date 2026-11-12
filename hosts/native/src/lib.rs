@@ -8003,7 +8003,7 @@ fn note_macho_intrinsics(caller: &mut Caller<'_, HostState>, mapped: &[gex_kerne
         let (lo, hi) = (seg.vmaddr, seg.vmaddr + seg.vmsize);
         let found: Vec<(u64, gex_xlate::Intrinsic)> = syms
             .iter()
-            .filter(|s| s.value >= lo && s.value < hi)
+            .filter(|s| s.value >= lo && s.value < hi && !s.ifunc)
             .filter_map(|s| gex_xlate::intrinsic::recognise_macho(&s.name).map(|k| (s.value.wrapping_add(bias), k)))
             .collect();
         if found.is_empty() {

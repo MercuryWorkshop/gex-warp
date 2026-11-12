@@ -714,6 +714,13 @@ impl<'a> Lifter<'a> {
                 imm,
             } => {
                 let ty = ty_of(sz);
+                // `mov x8, #0xfffffc000` (`orr` from the zero register): XNU's
+                // commpage, by constant, is gex's (`gex_abi::fold_commpage`).
+                if let (LogOp::Orr, false, RegSel::Zr, Sz::X, Some(f)) = (op, set_flags, rn, sz, gex_abi::fold_commpage(imm)) {
+                    let v = self.konst(ty, f);
+                    self.wr_gp(rd, sz, v);
+                    return Flow::Next;
+                }
                 let a = self.rd_gp(rn, sz);
                 let b = self.konst(ty, imm & ty.mask());
                 self.logical(ty, op, false, set_flags, rd, sz, a, b);

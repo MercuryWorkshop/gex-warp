@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define G4 0x100000000ull
@@ -159,6 +160,22 @@ int main(int argc, char **argv) {
         printf("MAP_FIXED at 0x130000000: %s\n", strcmp(at, "high") == 0 ? "written and read back" : "NOT READ BACK");
         munmap(at, 1 << 16);
     }
+
+    // The commpage, read where XNU puts it, by constant, as libSystem
+    // reads it: its signature, and its count of processors hw.ncpu's.
+#if defined(__arm64__)
+    const volatile char *cp = (const volatile char *)(uintptr_t)0x0000000fffffc000ull;
+#else
+    const volatile char *cp = (const volatile char *)(uintptr_t)0x00007fffffe00000ull;
+#endif
+    char sig[16];
+    for (int i = 0; i < 15; i++) sig[i] = cp[i];
+    sig[15] = 0;
+    printf("the commpage at XNU's address: \"%s\"\n", sig);
+    int ncpu = 0;
+    size_t ncpu_len = sizeof ncpu;
+    sysctlbyname("hw.ncpu", &ncpu, &ncpu_len, NULL, 0);
+    printf("the commpage's processors: %s\n", cp[0x22] == ncpu ? "hw.ncpu's" : "NOT hw.ncpu's");
 
     pthread_t t;
     pthread_create(&t, NULL, thread_main, NULL);
