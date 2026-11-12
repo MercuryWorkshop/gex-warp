@@ -71,10 +71,10 @@ mod sys {
         libc::fgetxattr(fd, name, b, l)
     }
     pub unsafe fn set(path: *const libc::c_char, name: *const libc::c_char, v: *const libc::c_void, l: usize, flags: i32) -> isize {
-        libc::lsetxattr(path, name, v, l, flags)
+        libc::lsetxattr(path, name, v, l, flags) as isize
     }
     pub unsafe fn fset(fd: i32, name: *const libc::c_char, v: *const libc::c_void, l: usize, flags: i32) -> isize {
-        libc::fsetxattr(fd, name, v, l, flags)
+        libc::fsetxattr(fd, name, v, l, flags) as isize
     }
     pub unsafe fn list(path: *const libc::c_char, b: *mut libc::c_char, l: usize) -> isize {
         libc::llistxattr(path, b, l)
@@ -83,10 +83,10 @@ mod sys {
         libc::flistxattr(fd, b, l)
     }
     pub unsafe fn remove(path: *const libc::c_char, name: *const libc::c_char) -> isize {
-        libc::lremovexattr(path, name)
+        libc::lremovexattr(path, name) as isize
     }
     pub unsafe fn fremove(fd: i32, name: *const libc::c_char) -> isize {
-        libc::fremovexattr(fd, name)
+        libc::fremovexattr(fd, name) as isize
     }
 }
 

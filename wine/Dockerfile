@@ -36,3 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends libexpat1-dev l
 RUN apt-get update && apt-get install -y --no-install-recommends gcc-multilib && rm -rf /var/lib/apt/lists/*
 # wasm-objdump (wine/pelink.py)
 RUN apt-get update && apt-get install -y --no-install-recommends wabt && rm -rf /var/lib/apt/lists/*
+# gexc for Linux (wine/mac-gexc.sh: a WoW64 prefix's i386 half on an arm64
+# Mac) links the host's GLESv2 for its --gl
+RUN apt-get update && apt-get install -y --no-install-recommends libgles-dev && rm -rf /var/lib/apt/lists/*
