@@ -268,6 +268,16 @@ impl Kernel {
         if let Some(kreq) = same {
             return self.sys_ioctl(m, fd, kreq, arg);
         }
+        // gex's own devices' requests (group 'g': /dev/gex-gl's submit,
+        // limits and surface) are numbers of gex's, Linux's `_IOC` packing
+        // of them, which the guest library passes as constants on Darwin
+        // too (pyrus's OpenGL.framework is that library built as Mach-O):
+        // they go to the device as they are, as a Linux program's do.
+        // Without this a Mach-O program's GL never reached the host (an
+        // unknown request was ENOTTY, ENODEV of a character device).
+        if (request >> 8) & 0xff == b'g' as u64 {
+            return self.sys_ioctl(m, fd, request, arg);
+        }
         match request {
             // The kernel's structure is the smaller: it is read into the
             // caller's own buffer, and respelled there.
