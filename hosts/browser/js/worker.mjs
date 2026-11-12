@@ -948,6 +948,11 @@ async function handle(msg) {
     const { MetalProxy } = await bridge('metal');
     gex.useMetal(new MetalProxy(msg.metalChannel));
   }
+  // The page's services (/dev/gex-services): a channel of the same kind.
+  if (msg.servicesChannel) {
+    const { MetalProxy } = await bridge('metal');
+    gex.useServices(new MetalProxy(msg.servicesChannel));
+  }
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
   // load, so it must run before `load` -- which binds `wayland-0` only when it

@@ -99,6 +99,39 @@ export interface HostCalls {
   names(): string[];
 }
 
+/** One program's connection to a service the page provides (/dev/gex-services). Events: `message` (`message`, a parsed JSON object; `data`, the frame's bytes, which the message names as `{ at, size, type }`), `close`. */
+export interface ServiceConnection extends EventTarget {
+  /** A number of its own. */
+  readonly id: number;
+  /** The process that opened the node. */
+  readonly pid: number;
+  /** The service's name, and the version agreed on. */
+  readonly service: string;
+  readonly version: number;
+  readonly closed: boolean;
+  /** One frame to the program: `message` as JSON (at most 64 KiB) and `data` (at most 4 MiB). False once closed; a RangeError over the limits. */
+  send(message: object, data?: Uint8Array | ArrayBuffer | null): boolean;
+  /** End it: the program reads the end of the stream. */
+  close(): void;
+}
+
+export interface ServiceProvider {
+  /** The highest version of its messages it speaks (1). */
+  version?: number;
+  /** Each program's connection to the service. */
+  open(connection: ServiceConnection): void;
+}
+
+/** `sys.services`: the services the page's shell provides to programs. */
+export interface Services {
+  /** Whether programs have /dev/gex-services (not in the single-thread build). */
+  readonly available: boolean;
+  /** Provide service `name` (lower-case letters, digits, `.`, `-`); returns a function that stops providing it. */
+  provide(name: string, provider: ServiceProvider | ((connection: ServiceConnection) => void)): () => void;
+  names(): string[];
+  connections(name?: string): ServiceConnection[];
+}
+
 export interface GuestConnection extends EventTarget {
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array | string>;
@@ -129,6 +162,8 @@ export declare class System extends EventTarget {
   run(argv: string[], options?: RunOptions & { encoding?: string }): Promise<RunResult<string>>;
   run(argv: string[], options: RunOptions & { encoding: null }): Promise<RunResult<Uint8Array>>;
   get hostCalls(): HostCalls;
+  /** The services the page's shell provides to programs (README: Services). */
+  get services(): Services;
   /** Where programs' connections out go (a Network the page implements), or null: then they fail as unreachable. Set before or after boot; one at a time. */
   get network(): Network | null;
   set network(network: Network | null);

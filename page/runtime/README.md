@@ -136,6 +136,11 @@ sys.hostCalls.register('open-url', ({ url }) => { openBrowserWindow(url); return
 //   exec 3<>/dev/gex-host; printf 'open-url\0{"url":"%s"}' "$1" >&3; cat <&3 > /dev/null
 ```
 
+**Notifications.** A `Notifications` hands the desktop each program's
+notifications to present (a toast, a list, a badge on its taskbar entry)
+and takes the user's answers back (Notifications below); `sys.services` is
+the channel it and other services of the desktop's are carried on.
+
 **Sound, GL, input.**
 - Sound: make a `WebAudio` in the first click's handler. Browsers hold audio
   until a gesture.
@@ -625,6 +630,160 @@ const off = sys.hostCalls.register('notify', ({ title }) => { showToast(title); 
 | --- | --- |
 | `register(name, fn)` | `fn(value)` may return a promise. Returns a function that unregisters it. |
 | `unregister(name)`, `names()` | |
+
+## Services
+
+The services the page's shell provides to programs: a program asks, the
+shell answers, and the shell tells the program of what happens. Notifications
+are the first (below); a location, Bluetooth and others are to follow, each a
+service on the same channel. A program reaches them through one device,
+`/dev/gex-services`, each open a connection to one service (a Mac
+program's frameworks open it through pyrus's `libpyrusservices`). The page
+provides a service with `sys.services.provide(name, provider)`, before or
+after boot; a part such as `Notifications` provides its own.
+
+```js
+// A service of the page's own: `clock`, which answers `now` and says `tick` each second.
+sys.services.provide('clock', {
+  version: 1,
+  open(conn) {
+    const timer = setInterval(() => conn.send({ op: 'tick', at: Date.now() }), 1000);
+    conn.addEventListener('message', ({ message }) => {
+      if (message.op === 'now') conn.send({ seq: message.seq, at: Date.now() });
+    });
+    conn.addEventListener('close', () => clearInterval(timer));
+  },
+});
+```
+
+| Member | Does |
+| --- | --- |
+| `sys.services.provide(name, provider)` | Provide service `name` (lower-case letters, digits, `.` and `-`, at most 64): `provider.open(connection)` for each program's connection to it, at `provider.version` (default 1) or the lower version the program asks for. A function is `open` alone. Returns a function that stops providing it (connections made stay). A second provider of a name throws. |
+| `sys.services.names()`, `connections(name)` | The names provided; the connections open (of one service). |
+| `sys.services.available` | Whether programs have the node: not in the single-thread build, which has no shared memory to carry it (its programs find no node, which they take as every service refused). |
+
+A **connection** (`ServiceConnection`) is an EventTarget: `id`, `pid` (the
+process that opened it), `service`, `version`, `closed`; `send(message,
+data)` sends one frame and `close()` ends it (the program reads the end);
+the events are `message` (`message`, the parsed JSON object; `data`, a
+`Uint8Array` of the frame's binary data) and `close`. Everything a program
+sends is the program's word: a provider bounds what it keeps, never
+interprets text, and checks binary data before it uses it.
+
+**The channel.** A frame is the same for every service:
+
+```
+u32 LE  J, the JSON text's length     (at most 64 KiB)
+u32 LE  D, the data's length          (at most 4 MiB)
+J bytes a JSON object, UTF-8
+D bytes binary payloads, which the object names as {"at": OFFSET, "size": N, "type": "..."}
+```
+
+The program's first frame names the service, `{"service": "notifications",
+"version": 1}`; the runtime answers `{"service": "notifications",
+"version": V}`, V the provider's version (no higher than asked), or 0 when
+the page provides no such service, and then ends the stream. A page without
+the service and one that refuses it are told alike, and a program's
+framework then behaves as a Mac's where that service is denied or not there.
+Every frame after the first is the provider's. By convention a message with
+a `seq` asks for an answer, which carries the same `seq`; one without is an
+event; both directions are independent, so an answer may wait for as long as
+a prompt the user answers, and an event come at any time. A frame over the
+limits, or one that is not a JSON object, ends the connection. Natively,
+gexc's `/dev/gex-services` is the same channel with stand-in shells for
+tests (`hosts/native/src/services.rs`): notifications with `GEX_NOTIFY=1`.
+
+**Adding a service** needs no change to the kernel: a schema (its messages,
+written down as Notifications' are below), a provider class of the
+runtime's built on `sys.services.provide` (as `notifications.js` is), a
+`Service` of the native host's for tests (a module beside `notify.rs`, and a
+line in `services.rs`'s `registry`), and on the guest's side a framework
+over `libpyrusservices`.
+
+## Notifications
+
+`Notifications` (`@gexemu/runtime/notifications`): the page's shell
+presents programs' user notifications, as it presents their menus. A Mac
+program's UserNotifications and Foundation's `NSUserNotificationCenter`
+(pyrus's) post through it; a Linux bridge for `org.freedesktop.Notifications`
+and Windows toasts are to come over the same messages. A notification
+belongs to no window, and may come from a program with no window at all.
+Without a `Notifications` nothing is offered: a program's framework behaves
+as a Mac whose user denied it notifications.
+
+```js
+import { Notifications } from '@gexemu/runtime/notifications';
+
+const notes = new Notifications(sys, { authorize: ({ app }) => confirm(`Allow ${app.name} to send notifications?`) });
+const toasts = new Map();                                    // key -> its element
+notes.addEventListener('notification', ({ notification: n }) => {
+  const toast = document.createElement('div');
+  toast.append(Object.assign(document.createElement('b'), { textContent: n.title }), ' ', n.body);   // text, never markup
+  for (const a of n.actions) toast.append(Object.assign(document.createElement('button'), { textContent: a.title, onclick: (e) => { e.stopPropagation(); n.activate(a.id); } }));
+  toast.onclick = () => n.activate();                        // the notification itself: its default action
+  toast.oncontextmenu = (e) => { e.preventDefault(); n.dismiss(); };
+  toasts.get(n.key)?.remove();
+  toasts.set(n.key, toast);
+  document.body.append(toast);
+});
+// Answered, withdrawn by the program, replaced, or its program gone.
+notes.addEventListener('withdrawn', ({ notification: n }) => { toasts.get(n.key)?.remove(); toasts.delete(n.key); });
+notes.addEventListener('badge', ({ app, count, label }) => { document.title = `${app.name} ${label ?? (count || '')}`; });
+```
+
+| Member | Does |
+| --- | --- |
+| `new Notifications(sys, { authorize })` | One per system, made any time. `authorize(request)` decides, the first time an application asks, whether it may notify: `request` is `{ pid, app, options }` (frozen; `options` among `'alert'`, `'sound'`, `'badge'`, `'provisional'`, `'critical'`, `'settings'`). It returns or resolves `true`, `false`, `'provisional'` or `{ alert, sound, badge }`; a throw is a denial. The decision is kept per application for the system's life. Without `authorize` every application is allowed. |
+| `list(pid)` | The notifications outstanding, oldest first (one process's, or all). |
+| `apps()` | The applications connected: `[{ pid, app }]`. |
+| `decision(appId)`, `setDecision(appId, d)` | The decision kept (`{ status, alert, sound, badge }`, `status` `'authorized'`, `'denied'` or `'provisional'`), or null; change it (null forgets it), and its programs are told. |
+| `openSettings(appId)` | The user asked for the application's notification settings (a Mac program's delegate hears `openSettingsForNotification:`). |
+| Events | `notification` (`notification`), `withdrawn` (`notification`, `reason`: `'program'`, `'replaced'`, `'answered'`, `'cleared'`, `'limit'`, `'gone'`), `badge` (`app`, `pid`, `count`, `label`: the application's badge, 0 and null to clear), `connect` and `disconnect` (`app`, `pid`). |
+
+**GuestNotification** is plain frozen data and the means to answer it:
+
+| Member | Is |
+| --- | --- |
+| `key` | Unique on the page. |
+| `id`, `pid`, `app` | The program's identifier for it (a later one of the same `id` replaces it: `withdrawn` with `'replaced'`, then a `notification` whose `replaces` is true), its process, and its application `{ id, name, icon }` (a bundle identifier, a name, and a `Blob` or null). |
+| `title`, `subtitle`, `body` | Text (bounded, control characters other than line breaks and tabs removed). Put it in the page as text: it is never markup. |
+| `sound` | `'default'`, `{ name }` or null: a sound the shell may play. The runtime plays none. |
+| `badge` | The application's badge it sets, or null. |
+| `thread`, `category` | What to group it with, and its category's name ('' for none). |
+| `actions` | `[{ id, title, destructive, foreground, authenticate, text }]`, at most 10; `text` is `{ button, placeholder }` for an action that takes typed text, else null. |
+| `image` | Its image attachment, a `Blob` (PNG, JPEG, GIF or WebP, at most 2 MiB, of the type its bytes say), or null. |
+| `banner`, `list`, `interruption` | Whether to show it now and to keep it in a list (a program in front may ask for either alone); `'passive'`, `'active'`, `'time-sensitive'` or `'critical'`. |
+| `date`, `replaces`, `outstanding` | When the page was given it; whether it replaced one; whether it is still the shell's to show. |
+| `activate(actionId, { text })` | The user chose it: with no `actionId` (or an unknown one), the notification itself; else that action, with the `text` typed for one that takes text. It is no longer outstanding. |
+| `dismiss()` | The user closed it. |
+| `clear()` | The shell took it away without an answer (expired; cleared with others). |
+| `openSettings()` | The user asked for its application's settings from it. |
+
+What crosses the channel, the service `notifications`, version 1 (all text
+bounded as above; the limits are `LIMITS`):
+
+| From the program | |
+| --- | --- |
+| `{ op: 'hello', app: { id, name, icon } }` | First: which application it is (`icon` a reference to PNG data, at most 256 KiB). Answered `{ op: 'welcome', limits }`. |
+| `{ op: 'authorize', seq, options, ask }` | The decision (`ask`: may the user be asked now). Answered `{ op: 'authorization', seq, status, alert, sound, badge }`, `status` `'not-determined'` when nothing was decided and `ask` was false. |
+| `{ op: 'post', id, title, subtitle, body, sound, badge, thread, category, actions, image, banner, list, interruption, replace }` | A notification to show now (`sound` `'default'`, a name or null; `actions` `[{ id, title, destructive, foreground, authenticate, text: { button, placeholder } }]`; `image` a reference to the data; `replace` false to show a notification of an `id` outstanding as a new one). Answered `{ op: 'shown', id, presented }`, or `{ op: 'refused', id, reason }` when the application is not allowed. Scheduling stays in the program: what the shell is given is due now. |
+| `{ op: 'withdraw', ids }`, `{ op: 'withdraw', all: true }` | Take delivered ones back. |
+| `{ op: 'badge', count }`, `{ op: 'badge', label }` | The application's badge (0 clears it; a label is at most 16 bytes). |
+
+| To the program | |
+| --- | --- |
+| `{ op: 'response', id, action, text }` | The user's answer: `action` `'default'` (the notification itself), `'dismiss'` (closed), or an action's `id`, with `text` for one that takes text. |
+| `{ op: 'cleared', id }` | The shell took it away without an answer. |
+| `{ op: 'settings', id }` | The user asked for the application's settings (`id` null for none in particular). |
+| `{ op: 'authorization', status, alert, sound, badge }` | The decision changed (`setDecision`). |
+
+A program's notifications go when it ends (`withdrawn` with `'gone'`): its
+answers could reach nobody. Natively, gexc presents notifications with
+`GEX_NOTIFY=1` in its own environment: what a shell would be given is
+printed as `[notify]` lines, and `GEX_NOTIFY_INPUT` names a script of the
+shell's answers (`hosts/native/src/notify.rs`: `authorize grant|deny|provisional
+[APP]`, `on ID [after S] activate [ACTION] [text WORDS]`, `on ID dismiss`,
+`on * clear`, `at S settings`).
 
 ## Audio
 

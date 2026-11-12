@@ -55,16 +55,19 @@ const STATE = 0, SEQ = 1, QUEUE = 2, WSLOTS = 3, PID = 4, SERVED = 5;
 const FREE = 0, OPEN = 1, SHUT = 2;
 
 /** The channel: `connections` streams at once (each open of the node is
- *  one), `capacity` bytes in each ring. */
-export function makeMetalChannel({ connections = 8, capacity = 1 << 21 } = {}) {
-  if (capacity & (capacity - 1)) throw new Error('a ring\'s capacity is a power of two');
-  const ring = () => {
-    const b = new SharedArrayBuffer(RING_HEADER_BYTES + capacity);
-    new Int32Array(b, 0, 8)[CAPACITY] = capacity;
+ *  one), `capacity` bytes in each ring (`toGuestCapacity` in the rings
+ *  toward the guest, if they are to be another size). Any channel made so
+ *  is served the same way: /dev/gex-services is one too (page/runtime
+ *  services.js). */
+export function makeMetalChannel({ connections = 8, capacity = 1 << 21, toGuestCapacity = capacity } = {}) {
+  if ((capacity & (capacity - 1)) || (toGuestCapacity & (toGuestCapacity - 1))) throw new Error('a ring\'s capacity is a power of two');
+  const ring = (cap) => {
+    const b = new SharedArrayBuffer(RING_HEADER_BYTES + cap);
+    new Int32Array(b, 0, 8)[CAPACITY] = cap;
     return b;
   };
   const control = new SharedArrayBuffer((SLOT_BASE + SLOT_WORDS * connections) * 4);
-  return { control, rings: Array.from({ length: connections }, () => ({ toHost: ring(), toGuest: ring() })) };
+  return { control, rings: Array.from({ length: connections }, () => ({ toHost: ring(capacity), toGuest: ring(toGuestCapacity) })) };
 }
 
 const words = (b) => new Int32Array(b, 0, 8);

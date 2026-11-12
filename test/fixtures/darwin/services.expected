@@ -1,0 +1,13 @@
+a service nobody provides: {"service":"no-such-service","version":0}
+and then: the end of the stream
+notifications: {"service":"notifications","version":1}
+hello: {"op":"welcome","limits":{"icon":262144,"image":2097152,"title":1024,"body":8192,"actions":10,"outstanding":100}}
+settings before asking: {"op":"authorization","seq":1,"status":"not-determined","alert":false,"sound":false,"badge":false}
+authorization: {"op":"authorization","seq":2,"status":"authorized","alert":true,"sound":true,"badge":true}
+event {"op":"shown","id":"one","presented":true}
+event {"op":"shown","id":"one","presented":true}
+event {"op":"shown","id":"two","presented":true}
+event {"op":"response","id":"two","action":"dismiss"}
+event {"op":"response","id":"one","action":"reply","text":"Hi there"}
+events: the end of the stream
+closed

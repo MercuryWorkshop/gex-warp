@@ -19,8 +19,10 @@
 //            for a Mac where there is a compiler for one,
 //            darwin-arches.ARCH (fixtures/darwin/arches.c, static), and
 //            darwin-beside.ARCH, its Linux program (zig, or a musl
-//            cross gcc), and darwin-metalecho.ARCH
-//            (fixtures/darwin/metalecho.c: darwin/metal-page's program).
+//            cross gcc), darwin-metalecho.ARCH
+//            (fixtures/darwin/metalecho.c: darwin/metal-page's program),
+//            and darwin-services.ARCH (fixtures/darwin/services.c:
+//            darwin/services-page's).
 //   mink     mink/: what darwin/metal-page runs of mink's, copied from a
 //            built checkout (GEX_TEST_MINK, default ../mink beside this
 //            repository): its Metal.framework's binary for a pyrus root,
@@ -245,6 +247,12 @@ export const images = {
         const prog = join(work, `darwin-metalecho.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'metalecho.c')], { stdio: 'ignore' });
+      }
+      // And /dev/gex-services' (darwin/services-page): another.
+      {
+        const prog = join(work, `darwin-services.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'services.c')], { stdio: 'ignore' });
       }
       // And one that needs no root (darwin/both): fixtures/darwin/arches.c
       // over t.c, static, at the address the page's programs load.

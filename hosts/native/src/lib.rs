@@ -20,6 +20,8 @@ pub(crate) mod elfprov;
 pub mod aot_share;
 pub mod gl;
 mod metal;
+mod notify;
+mod services;
 pub mod profile;
 pub mod pe_units;
 pub mod wasmprog;
@@ -3976,6 +3978,9 @@ fn mount_filesystems(
             Arc::new(move || crate::metal::MetalDevice::new(helper.clone()) as Arc<dyn gex_kernel::vfs::FileHandle>),
         );
     }
+    // The services the host's shell provides to programs (services.rs):
+    // each open is a connection to one, which the shell may not provide.
+    devfs.add_per_open("gex-services", Arc::new(|| crate::services::ServicesDevice::new() as Arc<dyn gex_kernel::vfs::FileHandle>));
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();

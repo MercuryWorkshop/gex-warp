@@ -378,6 +378,12 @@ a Wayland compositor at a socket in `/tmp`, which a Mac program reaches as
 any program does. `test/darwin/window.test.js` runs one that speaks the
 protocol itself (a Mac has no library for it), its pixels in shared memory
 whose descriptor it passes, and the compositor shows its window.
+And what a Mac program asks of the system beyond its windows (its
+notifications first) it asks of the page's shell through one device,
+`/dev/gex-services`, each open a connection to a service the page provides
+or does not (`page/runtime/README.md`, Services); natively `gexc` stands in
+for a shell that presents notifications (`GEX_NOTIFY=1`,
+`hosts/native/src/notify.rs`).
 
 #### Bottles
 

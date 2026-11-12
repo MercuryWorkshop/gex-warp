@@ -20,6 +20,7 @@ import { PageFsHost } from './mount.js';
 import { Kernel, errno } from './kernel.js';
 import { Files } from './kfs.js';
 import { Programs } from './programs.js';
+import { Services } from './services.js';
 import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../hosts/browser/js/mode.mjs';
 import { serveSlots, claimStore, storeBusy } from '../../../hosts/browser/js/blocks.mjs';
@@ -169,6 +170,8 @@ export class System extends EventTarget {
   /** And its kernel. */
   #singleKernel = null;
   #hostCalls = new Map();
+  /** The services the page provides to programs (`services`). */
+  #services = null;
   /** The page's unix socket listeners (`listen`): `{ path, l, bind,
    *  binding, closed }`, `l` the kernel's listener once bound. */
   #unix = new Set();
@@ -284,6 +287,7 @@ export class System extends EventTarget {
       restBundle: () => this.#restBundle,
       preset: this.#preset,
     };
+    this.#services = new Services(this);
   }
 
   /** `phase` ('new', 'booting', 'running', 'stopped', 'failed'), `error`,
@@ -455,7 +459,7 @@ export class System extends EventTarget {
     // The page's devices, each made by the part that owns it (windows: the
     // compositor and its channel; MesaGl: the GL ring), before the processes'
     // host, which hands their channels to every Worker.
-    const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null, metalChannel: null };
+    const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null, metalChannel: null, servicesChannel: null };
     for (const { fn, stage } of this.#devices.sort((a, b) => a.stage - b.stage)) {
       await fn(dev);
       this.#mark(`device ${fn.name || 'at stage'} ${stage}`);
@@ -482,7 +486,7 @@ export class System extends EventTarget {
       // /dev/gex-host. Every Worker reaches the network through the page;
       // which network is the page's to set, any time (net.js).
       uid: 0, ...this.#preset.host,
-      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, metalChannel: dev.metalChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
+      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, metalChannel: dev.metalChannel, servicesChannel: dev.servicesChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
     }, {
       onOutput: (fd, text) => this.#say(text),
       // The compositor lets go of an exited process's memory.
@@ -490,6 +494,8 @@ export class System extends EventTarget {
         if (typeof pid === 'number') compositor?.dropMemory?.(pid);
         // And of what it left open on /dev/gex-metal.
         if (typeof pid === 'number') this.#parts.get('metal')?.drop(pid);
+        // And on /dev/gex-services.
+        if (typeof pid === 'number') this.#services.drop(pid);
       },
       // No program reads the page's console: each has its own pipes or pty.
       readStdin: () => new Promise(() => {}),
@@ -814,6 +820,16 @@ export class System extends EventTarget {
       },
       names: () => [...calls.keys()],
     };
+  }
+
+  /**
+   * The services the page's shell provides to programs through
+   * /dev/gex-services (notifications, and more to come): `provide(name,
+   * provider)` and the connections programs made (services.js, the README's
+   * Services). A part such as `Notifications` provides its own.
+   */
+  get services() {
+    return this.#services;
   }
 
   /** Into the guest: `connectGuest(port)`, a connection to what a program

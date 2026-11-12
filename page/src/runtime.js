@@ -586,7 +586,7 @@ export async function makeProcessHost({
   kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
   restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
   closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
-  netChannel = null, network = null, winsize, metalChannel = null,
+  netChannel = null, network = null, winsize, metalChannel = null, servicesChannel = null,
 }, on) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const makeGuestWorker = await guestWorkerFactory();
@@ -669,6 +669,8 @@ export async function makeProcessHost({
     // The Metal channel's shared buffers (metal-bridge.mjs), so a Worker
     // whose program opens /dev/gex-metal reaches the page's replayer.
     metalChannel: metalChannel ?? undefined,
+    // And the services channel's (page/runtime services.js): /dev/gex-services.
+    servicesChannel: servicesChannel ?? undefined,
     // The Wayland ring's shared buffers, so a Worker that binds the
     // compositor can carry its frames to the page's canvas. Like glChannel.
     wlChannel: wlChannel ?? undefined,
