@@ -1,0 +1,36 @@
+// POSIX shared memory between Mac processes that each open it by name
+// (fixtures/darwin/shmshare.c): a forked child that maps the object after
+// the fork, and a process posix_spawn starts. Each sees the other's stores
+// while both run, as on a Mac (IOSurface's cross-process surfaces depend on
+// it): natively a later mapping of a file another process maps shared is
+// made that process's pages (MapIo::join_shared_file). The same lines on
+// this Mac and under gexc in a Mac root, both processors.
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { exec, native, ROOT } from '../lib/native.mjs';
+
+export const meta = { hosts: ['node'], arches: ['a64', 'x86'], timeout: 300 };
+
+export default async function (t) {
+  if (process.platform !== 'darwin' || process.arch !== 'arm64') t.skip('a Mac program is built and checked on an arm64 Mac');
+  const x86 = t.arch === 'x86';
+  const n = native(t);
+  const mac = process.env[x86 ? 'GEX_TEST_DARWIN_ROOT_X86' : 'GEX_TEST_DARWIN_ROOT'] || join(ROOT, '..', 'pyrus', 'out', x86 ? 'root-x86_64' : 'root');
+  if (!existsSync(join(mac, 'usr/lib/dyld'))) t.skip(`no Mac root at ${mac} (GEX_TEST_DARWIN_ROOT${x86 ? '_X86' : ''}: pyrus builds one)`);
+  const d = n.dir('shmshare');
+  const prog = join(d, 'shmshare');
+  try {
+    execFileSync('xcrun', ['clang', '-arch', x86 ? 'x86_64' : 'arm64', '-O1', '-Wall', '-o', prog, join(ROOT, 'test/fixtures/darwin/shmshare.c')], { stdio: 'pipe' });
+  } catch (e) {
+    t.skip(`xcrun clang: ${String(e.stderr || e).trim().split('\n').pop()}`);
+  }
+  const want = await exec(x86 ? ['arch', '-x86_64', prog] : [prog], { timeout: 60000 });
+  t.check('the Mac ran it', want.code === 0, `exit ${want.code}: ${want.stderr.trim()}`);
+  // (It spawns itself by its own name: one the Mac root has, through a bind.)
+  const got = await n.gexc(['run', '--sysroot', mac, '--bind', `${d}=/work`, '--cwd', '/work', '--argv0', '/work/shmshare', prog], { timeout: 120000 });
+  t.say(got.stdout.trim());
+  const a = want.stdout.trim().split('\n');
+  const b = got.stdout.trim().split('\n');
+  for (let k = 0; k < a.length; k++) t.check(`as on the Mac: ${a[k]}`, a[k] === b[k], `got ${JSON.stringify(b[k] ?? null)}`);
+}

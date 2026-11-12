@@ -667,7 +667,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         Some(own) => std::borrow::Cow::Owned(own),
         None => std::borrow::Cow::Borrowed(&home.proc_fs),
     };
-    let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
+    let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc, peers: None };
     let f = Free {
         io: FdIo { fds, compat, wasm32: crate::WASM32.load(std::sync::atomic::Ordering::Relaxed), ns: &ns, pid: home.pid, creds: &home.creds, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
         map: map(),

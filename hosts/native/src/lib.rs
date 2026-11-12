@@ -2925,6 +2925,21 @@ pub(crate) fn wasm_trace() -> bool {
 struct PeerMemory(gex_mem::GuestMemory);
 
 impl gex_kernel::proc::PeerMem for PeerMemory {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// Another process's pages made this one's (`shmem`'s remap, at two
+    /// addresses).
+    fn share_from(&self, from: &dyn gex_kernel::proc::PeerMem, from_at: u64, at: u64, len: u64) -> bool {
+        let Some(from) = from.as_any().downcast_ref::<PeerMemory>() else { return false };
+        self.0.share_pages_from(&from.0, from_at, at, len).is_ok()
+    }
+
+    fn host_base(&self) -> u64 {
+        self.0.base()
+    }
+
     fn read(&self, addr: u64, out: &mut [u8]) -> bool {
         let b = self.0.bytes();
         match usize::try_from(addr).ok().and_then(|a| Some(a..a.checked_add(out.len())?)) {

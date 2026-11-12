@@ -9,9 +9,10 @@
 // GEX_TOOLCHAIN, _X86) under gexc, against what Linux printed
 // (fixtures/darwin/sharedmem.linux.txt: Alpine in Docker, both processors
 // alike). Both processors. Natively the parent's pages are the child's
-// (hosts/native/src/shmem.rs); what that does not reach is said and not
-// checked: a child's own mapping of a shm_open name after the fork (a
-// copy, as before). A Mac's process-shared mutex is checked here and in
+// (hosts/native/src/shmem.rs), and a child's own mapping of a shm_open
+// name after the fork is joined to its parent's pages
+// (MapIo::join_shared_file; darwin/shmshare has posix_spawn's too). Every
+// line is checked. A Mac's process-shared mutex is checked here and in
 // darwin/pshared.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -20,17 +21,15 @@ import { exec, native, ROOT } from '../lib/native.mjs';
 
 export const meta = { hosts: ['node'], arches: ['a64', 'x86'], timeout: 600 };
 
-/** Lines of `want` and `got` that differ, but for those `known` matches. */
-function compare(t, what, want, got, known) {
+/** Lines of `want` and `got` that differ. */
+function compare(t, what, want, got) {
   const a = want.split('\n');
   const b = got.split('\n');
   const off = [];
-  const said = [];
   for (let k = 0; k < Math.max(a.length, b.length); k++) {
     if (a[k] === b[k]) continue;
-    (known.test(a[k] ?? '') ? said : off).push(`line ${k + 1}: want ${JSON.stringify(a[k] ?? null)}, got ${JSON.stringify(b[k] ?? null)}`);
+    off.push(`line ${k + 1}: want ${JSON.stringify(a[k] ?? null)}, got ${JSON.stringify(b[k] ?? null)}`);
   }
-  for (const l of said) t.say(`${what}, not checked: ${l}`);
   t.check(`${what}: as it should be (${a.length - 1} lines)`, off.length === 0, off.slice(0, 3).join(' / '));
 }
 
@@ -45,7 +44,7 @@ export default async function (t) {
   await n.cc(['-O1', '-static', '-Wl,-Ttext-segment=0x1000000', '-o', lin, src, '-lpthread']);
   const want = readFileSync(join(ROOT, 'test/fixtures/darwin/sharedmem.linux.txt'), 'utf8');
   const gotL = await n.gexc(['run', lin], { timeout: 200000 });
-  compare(t, 'Linux', want, gotL.stdout, /a child's own mapping of the name/);
+  compare(t, 'Linux', want, gotL.stdout);
 
   const mac = process.env[x86 ? 'GEX_TEST_DARWIN_ROOT_X86' : 'GEX_TEST_DARWIN_ROOT'] || join(ROOT, '..', 'pyrus', 'out', x86 ? 'root-x86_64' : 'root');
   if (!existsSync(join(mac, 'usr/lib/dyld'))) t.skip(`no Mac root at ${mac} (GEX_TEST_DARWIN_ROOT${x86 ? '_X86' : ''}: pyrus builds one)`);
@@ -58,5 +57,5 @@ export default async function (t) {
   const wantM = await exec(x86 ? ['arch', '-x86_64', prog] : [prog], { timeout: 120000 });
   t.check('the Mac ran it', wantM.code === 0, `exit ${wantM.code}: ${wantM.stderr.trim()}`);
   const gotM = await n.gexc(['run', '--sysroot', mac, prog], { timeout: 200000 });
-  compare(t, 'Mac', wantM.stdout, gotM.stdout, /a child's own mapping of the name/);
+  compare(t, 'Mac', wantM.stdout, gotM.stdout);
 }

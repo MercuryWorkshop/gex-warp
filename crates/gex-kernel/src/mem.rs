@@ -996,6 +996,25 @@ impl MemoryMap {
         self.publish_shares();
     }
 
+    /// `[start, end)` was just mapped `MAP_SHARED` onto pages another
+    /// process has (a mapping of a file it maps shared:
+    /// [`crate::proc::PeerMem::share_from`]): the same share as there, its
+    /// key `key` at `start` ([`MapView::share_key`]), so a futex word in it
+    /// is one word in both; backed by this process's memory `host_base`.
+    pub fn join_share(&mut self, start: u64, end: u64, key: u64, host_base: u64) {
+        if start >= end {
+            return;
+        }
+        self.drop_shares(start, end);
+        let (id, off) = (key >> 40, key & ((1 << 40) - 1));
+        let i = self.shares.partition_point(|s| s.start < start);
+        self.shares.insert(i, Share { start, end, id, off, backed: true });
+        if host_base != 0 {
+            self.host_base = HostBase(host_base);
+        }
+        self.publish_shares();
+    }
+
     /// The shares over `[start, end)` end there (an unmap, a mapping over
     /// them, an exec); a backed one's pages are made private again first
     /// ([`set_unshare_hook`]). What is left of one either side keeps its id.

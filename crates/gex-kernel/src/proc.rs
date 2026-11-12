@@ -430,6 +430,22 @@ struct Proc {
 pub trait PeerMem: Send + Sync {
     fn read(&self, addr: u64, out: &mut [u8]) -> bool;
     fn write(&self, addr: u64, data: &[u8]) -> bool;
+    /// Make `len` bytes at `at` of this memory the same pages as `len` at
+    /// `from_at` of `from`'s, so a store in either is in both (a mapping of
+    /// a file another process has mapped shared: [`crate::mem::MemoryMap::join_share`]).
+    /// On whole host pages ([`crate::mem::share_granule`]); false where the
+    /// host cannot.
+    fn share_from(&self, from: &dyn PeerMem, from_at: u64, at: u64, len: u64) -> bool {
+        let _ = (from, from_at, at, len);
+        false
+    }
+    /// This memory as the host's own type, for [`PeerMem::share_from`].
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// The host's name for this memory (its base): what an unshare names
+    /// ([`crate::mem::set_unshare_hook`]). 0 where the host has none.
+    fn host_base(&self) -> u64 {
+        0
+    }
 }
 
 /// A process's address space as another process reaches it: its memory map,
@@ -823,6 +839,17 @@ impl ProcTable {
 
     /// `pid`'s address space as last published: `ESRCH` for no such process
     /// or one that has exited, `ENOSYS` where the table keeps none.
+    /// Every live process's address space but `except`'s: what a mapping
+    /// of a file looks through for another process's mapping of it
+    /// (`Kernel::join_shared_file`).
+    pub fn vms(&self, except: i32) -> Vec<(i32, Arc<PeerVm>)> {
+        if self.remote.is_some() {
+            return Vec::new();
+        }
+        let t = self.lock();
+        t.procs.iter().filter(|p| p.pid != except).filter_map(|p| Some((p.pid, p.vm.clone()?))).collect()
+    }
+
     pub fn vm(&self, pid: i32) -> Result<Arc<PeerVm>, Errno> {
         if self.remote.is_some() {
             return Err(Errno::ENOSYS);

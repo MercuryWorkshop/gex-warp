@@ -4847,6 +4847,9 @@ pub struct MapIo<'a> {
     /// The call's pc: a mapping the dynamic loader asks for stays below
     /// 4 GiB, since it will hold code.
     pub pc: u64,
+    /// The process table and this process's pid, where other processes'
+    /// memories can be joined ([`MapIo::join_shared_file`]).
+    pub peers: Option<(&'a ProcTable, i32)>,
 }
 
 impl MapIo<'_> {
@@ -5101,10 +5104,59 @@ impl MapIo<'_> {
                 if !self.fds.get(a[4] as i32).is_ok_and(|f| f.handle.maps_own_memory()) || a[3] & mflags::ANONYMOUS != 0 {
                     let end = end.max(start + crate::mem::page_align_up(a[1]));
                     self.mem.lock().add_share(start, end);
+                    if a[3] & mflags::ANONYMOUS == 0 {
+                        self.join_shared_file(a[4] as i32, start, end - start, a[5]);
+                    }
                 }
             }
         }
         r
+    }
+
+    /// A shared mapping of a file just made, `len` bytes at `start` of the
+    /// file from `offset`: where another process maps the same file shared
+    /// already, the part both map on whole host pages is made that
+    /// process's pages ([`crate::proc::PeerMem::share_from`]) and its share
+    /// ([`crate::mem::MemoryMap::join_share`]). A process that opens an
+    /// object by name after a fork, or one `posix_spawn` started, then has
+    /// the memory, not a copy that meets the other's only at a write-back.
+    /// Natively, where the host shares pages ([`crate::mem::share_granule`]
+    /// above the guest's page); on the page each process's memory is its own.
+    fn join_shared_file(&self, fd: i32, start: u64, len: u64, offset: u64) {
+        let g = crate::mem::share_granule();
+        let Some((procs, pid)) = self.peers.filter(|_| g > crate::mem::PAGE_SIZE) else { return };
+        let Ok(file) = self.fds.get(fd) else { return };
+        let Ok(me) = procs.vm(pid) else { return };
+        // One join at a time in the system: two processes mapping each
+        // other's file at once do not each take the other's half-made pages.
+        static JOIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = JOIN.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, vm) in procs.vms(pid) {
+            for map in vm.mm.shared_maps().get().iter() {
+                if !map.file.same_file(&file) {
+                    continue;
+                }
+                let (lo, hi) = (offset.max(map.offset), (offset + len).min(map.offset + map.len));
+                if lo >= hi {
+                    continue;
+                }
+                let (at, peer_at) = (start + (lo - offset), map.start + (lo - map.offset));
+                if at % g != peer_at % g {
+                    continue;
+                }
+                let a = at.next_multiple_of(g);
+                let b = (start + (hi - offset)) & !(g - 1);
+                if a >= b {
+                    continue;
+                }
+                let pa = peer_at + (a - at);
+                let Some(key) = vm.mm.view().share_key(pa) else { continue };
+                if me.mem.share_from(&*vm.mem, pa, a, b - a) {
+                    self.mem.lock().join_share(a, b, key, me.mem.host_base());
+                    return;
+                }
+            }
+        }
     }
 
     /// Whether `mmap(a)`, a shared mapping of a file, is one
@@ -12026,7 +12078,7 @@ impl Kernel {
 
     /// The mapping calls' part of this kernel ([`MapIo`]).
     pub fn map_io(&self) -> MapIo<'_> {
-        MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc }
+        MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc, peers: Some((&self.procs, self.pid)) }
     }
 
     /// Note that `[addr, addr + len)` no longer holds the code it did
@@ -14540,6 +14592,9 @@ mod tests {
     struct BufPeer(std::sync::Mutex<Vec<u8>>);
 
     impl crate::proc::PeerMem for BufPeer {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         fn read(&self, addr: u64, out: &mut [u8]) -> bool {
             let b = self.0.lock().unwrap();
             let a = addr as usize;

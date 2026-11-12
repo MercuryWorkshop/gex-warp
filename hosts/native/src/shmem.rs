@@ -18,17 +18,33 @@
 //! remap call per shared mapping, with no copy of its pages; at an unmap of
 //! one, an `mmap` per host page.
 //!
-//! What it does not do: share a mapping made after the fork (a child's own
-//! `shm_open` of the same name, a file mapped again in another process),
-//! which is still each process's copy, met at `msync`, `munmap` and file
-//! locks as before; share a host page (16 KiB here) only partly inside a
+//! A mapping made later is joined too: a `MAP_SHARED` mapping of a file
+//! (`shm_open`'s object, a regular file) that another process already maps
+//! shared is remapped onto that process's pages at the `mmap`
+//! (`MapIo::join_shared_file`: the same file, a host page of it at the same
+//! offset in both), and from then on is one memory with it like a fork's.
+//! A forked child's own `shm_open` of its parent's name and a process
+//! `posix_spawn` started that opens the name itself (IOSurface's surfaces)
+//! both see the other's stores while both run. Only the overlap on whole
+//! host pages at the same phase joins; the rest is the process's copy.
+//!
+//! What it does not do: share a host page (16 KiB here) only partly inside a
 //! shared mapping -- the kernel places one on whole host pages for this
 //! (`MapIo::place_shared`), but one a program placed itself (`MAP_FIXED`)
 //! may begin or end inside one, and that page is the child's copy; move a
-//! shared mapping with `mremap` and keep it shared; share between the
-//! processes of the page (each a wasm memory in a Worker of its own, which
-//! cannot be made one another's); and `__ulock` with the shared flag,
-//! whose queues are each process's. (Darwin's process-shared psynch objects
+//! shared mapping with `mremap` and keep it shared; join a file mapped
+//! shared by no other process at the time (it is the first, and is joined
+//! by those after it); and share between the processes of the page. There
+//! each process is a wasm memory in a Worker of its own, and a memory
+//! cannot be mapped into another's: what the page can do for shared memory
+//! is copies kept in step at the points the kernel sees (`msync`, `munmap`,
+//! exit, a file lock, the shared-memory write-back it does now), not one
+//! memory -- a store is not seen by another process until then, and an
+//! atomic or a futex between two processes' copies is not one. A page whose
+//! processes are threads of one shared `WebAssembly.Memory` could, at the
+//! price of one address space for all of them; it is not built. Nor does
+//! it share `__ulock` with the shared flag, whose queues are each
+//! process's. (Darwin's process-shared psynch objects
 //! are the system's, keyed by share: `gex_kernel::darwin::psynch`.)
 
 use gex_mem::GuestMemory;

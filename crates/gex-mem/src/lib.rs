@@ -60,8 +60,16 @@ impl GuestMemory {
     /// Whatever this memory held there is dropped. `Err` with the host's
     /// answer where it cannot (a host other than macOS: not yet).
     pub fn share_pages(&self, from: &GuestMemory, start: u64, end: u64) -> Result<(), i32> {
+        self.share_pages_from(from, start, start, end.wrapping_sub(start))
+    }
+
+    /// [`Self::share_pages`] of `len` bytes at `start` here onto those at
+    /// `from_start` of `from`'s: a mapping a process made of a file another
+    /// process has mapped shared already, at another address.
+    pub fn share_pages_from(&self, from: &GuestMemory, from_start: u64, start: u64, len: u64) -> Result<(), i32> {
         let page = host_page();
-        if start % page != 0 || end % page != 0 || start >= end || end > self.len() as u64 || end > from.len() as u64 {
+        let end = start.wrapping_add(len);
+        if start % page != 0 || from_start % page != 0 || len % page != 0 || len == 0 || end > self.len() as u64 || from_start.saturating_add(len) > from.len() as u64 {
             return Err(-1);
         }
         #[cfg(target_os = "macos")]
@@ -80,7 +88,7 @@ impl GuestMemory {
                     0,
                     mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
                     mach::mach_task_self_,
-                    from.base() + start,
+                    from.base() + from_start,
                     0,
                     &mut cur,
                     &mut max,
