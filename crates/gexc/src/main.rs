@@ -17,6 +17,7 @@ use std::process::ExitCode;
 mod bottle;
 mod prof;
 mod eject;
+mod nt;
 mod pe_info;
 mod units;
 mod host_mkfifo;
@@ -315,6 +316,10 @@ run options:
   --bottle DIR    run in the bottle at DIR (gexc bottle create): its system
                   layer is the root, read-only, with the bottle's /Users,
                   /Applications, /Library and /private/var over it
+  --wine-dist D   a Windows program (an .exe) runs in the Wine dist at D
+                  (GEX_WINE_DIST; default ~/.cache/gex/wine-on-mac/export-wow64/dist)
+  --wine-prefix P its Wine prefix (GEX_WINE_PREFIX; default ~/.gex/wine/default),
+                  made as a copy of GEX_WINE_TEMPLATE (the dist's ../pfx) if new
   --bind H=G      mount host file or directory H at guest path G (repeatable)
   --bind-ro H=G   the same, not to be written
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
@@ -430,6 +435,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut guest = false;
     let mut host_env = false;
     let mut in_bottle: Option<String> = None;
+    let mut wine = nt::Wine::default();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -569,6 +575,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--host-env" => host_env = true,
             "--guest" => guest = true,
+            // A Windows program runs in Wine (see nt.rs): where it is.
+            "--wine-dist" => {
+                i += 1;
+                wine.dist = Some(args.get(i).context("--wine-dist needs a Wine dist's directory")?.clone());
+            }
+            "--wine-prefix" => {
+                i += 1;
+                wine.prefix = Some(args.get(i).context("--wine-prefix needs a prefix's directory")?.clone());
+            }
             // Which macOS a Mac program is told it is on, as a Wine
             // prefix's Windows version is chosen: the kernel's word for it
             // is the environment's (gex_kernel darwin::info::CHOSEN), which
@@ -600,6 +615,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     }
     if let Some(dir) = in_bottle {
         bottle::apply(&dir, &mut opts)?;
+    }
+    // A Windows program: Wine's loader is the program, and it the argument.
+    let (mut path, mut guest_args) = (path, guest_args);
+    if !guest && nt::file_is_pe(&path) {
+        let (loader, mut first) = nt::command(&wine, &path, &mut opts.env)?;
+        first.append(&mut guest_args);
+        guest_args = first;
+        path = loader;
     }
     // `GEX_PROFILE=1` is `--record $GEX_PROFILE_OUT`.
     if opts.record.is_none()

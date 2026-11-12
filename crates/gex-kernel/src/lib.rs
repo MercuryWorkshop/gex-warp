@@ -45,7 +45,9 @@ pub mod ftab;
 pub mod futex;
 pub mod mem;
 pub mod net;
-pub mod win;
+pub mod nt;
+/// The older name, which the Wine code in other crates still uses.
+pub use nt as win;
 pub mod pipe;
 pub mod phase;
 pub mod pidfd;
