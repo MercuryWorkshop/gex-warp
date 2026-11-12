@@ -323,6 +323,52 @@ const mounts = [];
   rest.push(...av.slice(i));
 }
 
+// A `--file` or `--dir` under a directory the root has as a symbolic link
+// (a Mac root's `/tmp -> private/tmp`): placed where the link leads, as a
+// bind mount resolves its target when it is made -- under the link's own
+// name it was in a directory the guest never reaches, and every call on it
+// said ENOENT.
+{
+  const through = (path) => {
+    const todo = path.split('/').filter(Boolean);
+    const done = [];
+    for (let hops = 0; todo.length;) {
+      const c = todo.shift();
+      if (c === '.') continue;
+      if (c === '..') { done.pop(); continue; }
+      const here = `/${[...done, c].join('/')}`;
+      const t = todo.length ? symlinks[here] : undefined;
+      if (t !== undefined && hops++ < 40) {
+        if (t.startsWith('/')) done.length = 0;
+        todo.unshift(...t.split('/').filter(Boolean));
+        continue;
+      }
+      done.push(c);
+    }
+    return `/${done.join('/')}`;
+  };
+  const move = (map, from, to) => {
+    for (const k of Object.keys(map)) {
+      if (k === from || k.startsWith(`${from}/`)) {
+        const v = map[k];
+        delete map[k];
+        map[to + k.slice(from.length)] = v;
+      }
+    }
+  };
+  for (const m of mounts) {
+    const from = m[0].replace(/\/+$/, '');
+    if (!from) continue;
+    const to = through(`${from}/.`).replace(/\/+$/, '');
+    if (to === from) continue;
+    for (const map of [files, mtimes, modes, xattrs, hard, symlinks]) move(map, from, to);
+    for (let i = 0; i < dirs.length; i++) {
+      if (dirs[i] === from || dirs[i].startsWith(`${from}/`)) dirs[i] = to + dirs[i].slice(from.length);
+    }
+    m[0] = to + m[0].slice(from.length);
+  }
+}
+
 const [guestPath, elfPath, ...guestArgs] = rest;
 if (!guestPath || !elfPath) {
   console.error('usage: run-node.mjs [opts] <guest.wasm> <program.elf> [args...]');

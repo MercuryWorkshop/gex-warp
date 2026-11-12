@@ -1589,8 +1589,27 @@ impl Namespace {
         Ok(())
     }
 
+    /// Where a mount at `at` (absolute, normal) goes: under a directory the
+    /// tree has as a link (a Mac root's `/tmp -> private/tmp`), at the place
+    /// the link leads, as a Linux mount resolves its target when it is
+    /// made. At the link's own name it was in a directory no walk reaches,
+    /// and every call on it said ENOENT. (The last name is the mount's own,
+    /// a link or not.)
+    fn mount_point(&self, at: String) -> String {
+        if at == "/" || !self.mounts.contains_key("/") {
+            return at;
+        }
+        match at.rsplit_once('/') {
+            Some(("", _)) | None => at,
+            Some((parent, name)) => {
+                let parent = self.canonical(parent);
+                if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
+            }
+        }
+    }
+
     fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
-        let at = normalize(at, "/");
+        let at = self.mount_point(normalize(at, "/"));
         self.mounts.insert(at, fs);
         self.list_others();
     }
@@ -1744,7 +1763,11 @@ impl Namespace {
     /// that unmounts `/` has nothing left to run from.
     fn unmount(&mut self, path: &str) -> bool {
         let at = normalize(path, &self.cwd);
-        let gone = at != "/" && self.mounts.remove(&at).is_some();
+        // (at its own name, or where a mount by that name went: `mount_point`)
+        let gone = at != "/" && (self.mounts.remove(&at).is_some() || {
+            let real = self.mount_point(at.clone());
+            real != at && self.mounts.remove(&real).is_some()
+        });
         if gone {
             self.list_others();
         }
