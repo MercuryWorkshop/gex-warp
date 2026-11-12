@@ -459,6 +459,9 @@ impl<'a> Lifter<'a> {
     /// Read an operand at width `w`.
     fn rd(&mut self, o: Operand, w: Width) -> Value {
         match o {
+            // A selector at the instruction's width: `mov %es, %rdx` (REX.W
+            // 8C) writes all of a 64-bit register, so it reads an `I64`.
+            Operand::Reg(Reg::Seg(seg)) => self.sel_val(seg, w),
             Operand::Reg(r) => self.rd_reg(r),
             Operand::Mem(m) => self.load(&m, w),
             Operand::Imm(v) => self.k(ty_of(w), (v as u64) & w.mask()),

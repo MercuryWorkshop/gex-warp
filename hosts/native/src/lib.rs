@@ -1278,10 +1278,18 @@ fn run_program_with(
                 );
             }
             let mut built: Option<Stats> = None;
+            let mut kept: Option<Vec<u8>> = None;
             let loaded = gex_cache::load_or_compile(&engine, &dir, &key, || {
                 let (m, s) = translate();
                 built = Some(s);
+                if dump_bad_wasm_dir().is_some() {
+                    kept = Some(m.wasm.clone());
+                }
                 Ok((m.wasm.clone(), m.metadata().encode()))
+            })
+            .map_err(|e| match kept.as_deref() {
+                Some(w) => keep_bad_image_wasm(e, w),
+                None => e,
             })?;
             if let Some(s) = built {
                 stats = s;
@@ -1302,7 +1310,9 @@ fn run_program_with(
             stats = s;
             let meta = m.metadata();
             (
-                gex_cache::compile(&engine, &m.wasm).context("validating translated wasm")?,
+                gex_cache::compile(&engine, &m.wasm)
+                    .map_err(|e| keep_bad_image_wasm(e, &m.wasm))
+                    .context("validating translated wasm")?,
                 meta,
             )
         }
@@ -6451,7 +6461,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // `GEX_DUMP_BAD_WASM=DIR`: keep a translation the engine rejects, as
     // DIR/PC.wasm, to take apart offline (wasm-tools validate/print).
     let keep_bad = |e: anyhow::Error| -> anyhow::Error {
-        if let Some(dir) = std::env::var_os("GEX_DUMP_BAD_WASM") {
+        if let Some(dir) = dump_bad_wasm_dir() {
             let path = std::path::Path::new(&dir).join(format!("{pc:x}.wasm"));
             let _ = std::fs::create_dir_all(&dir);
             if std::fs::write(&path, &translated_module.wasm).is_ok() {
@@ -8396,4 +8406,23 @@ mod resolve_in_root_tests {
         assert_eq!(super::host_path_of("/tmp/bound/f", r, &binds), std::path::PathBuf::from("/host/dir/f"));
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// `GEX_DUMP_BAD_WASM=DIR`, where a translation the engine rejects is kept.
+fn dump_bad_wasm_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("GEX_DUMP_BAD_WASM")
+}
+
+/// The image's ahead-of-time module, when the engine rejects it: kept as
+/// DIR/image.wasm under `GEX_DUMP_BAD_WASM`, as a runtime translation is, and
+/// the error says where.
+fn keep_bad_image_wasm(e: anyhow::Error, wasm: &[u8]) -> anyhow::Error {
+    if let Some(dir) = dump_bad_wasm_dir() {
+        let path = std::path::Path::new(&dir).join("image.wasm");
+        let _ = std::fs::create_dir_all(&dir);
+        if std::fs::write(&path, wasm).is_ok() {
+            return e.context(format!("the module is in {}", path.display()));
+        }
+    }
+    e
 }
