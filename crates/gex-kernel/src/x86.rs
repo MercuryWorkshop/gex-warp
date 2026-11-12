@@ -302,6 +302,7 @@ pub mod raw {
     pub const SYNCFS: u64 = 306;
     pub const MOUNT: u64 = 165;
     pub const UMOUNT2: u64 = 166;
+    pub const PIVOT_ROOT: u64 = 155;
     pub const REBOOT: u64 = 169;
     pub const GETTID: u64 = 186;
     pub const TKILL: u64 = 200;
@@ -356,6 +357,7 @@ pub mod raw {
     pub const TIMERFD_GETTIME: u64 = 287;
     pub const ACCEPT4: u64 = 288;
     pub const EVENTFD2: u64 = 290;
+    pub const SIGNALFD4: u64 = 289;
     pub const INOTIFY_INIT: u64 = 253;
     pub const INOTIFY_ADD_WATCH: u64 = 254;
     pub const INOTIFY_RM_WATCH: u64 = 255;
@@ -638,6 +640,7 @@ pub fn translate(
         x::SYNC_FILE_RANGE => nr::SYNC_FILE_RANGE,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
+        x::PIVOT_ROOT => nr::PIVOT_ROOT,
         x::REBOOT => nr::REBOOT,
         x::GETTID => nr::GETTID,
         x::TKILL => nr::TKILL,
@@ -690,6 +693,7 @@ pub fn translate(
         x::TIMERFD_GETTIME => nr::TIMERFD_GETTIME,
         x::ACCEPT4 => nr::ACCEPT4,
         x::EVENTFD2 => nr::EVENTFD2,
+        x::SIGNALFD4 => nr::SIGNALFD4,
         x::EPOLL_CREATE1 => nr::EPOLL_CREATE1,
         x::INOTIFY_INIT => {
             *a = [0; 6];

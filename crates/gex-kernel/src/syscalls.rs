@@ -111,6 +111,7 @@ pub mod nr {
     pub const UMASK: u64 = 166;
     pub const UMOUNT2: u64 = 39;
     pub const MOUNT: u64 = 40;
+    pub const PIVOT_ROOT: u64 = 41;
     pub const GETITIMER: u64 = 102;
     pub const SETITIMER: u64 = 103;
     pub const SCHED_SETPARAM: u64 = 118;
@@ -177,6 +178,7 @@ pub mod nr {
     pub const FLOCK: u64 = 32;
     pub const FALLOCATE: u64 = 47;
     pub const EVENTFD2: u64 = 19;
+    pub const SIGNALFD4: u64 = 74;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const INOTIFY_INIT1: u64 = 26;
     pub const INOTIFY_ADD_WATCH: u64 = 27;
@@ -585,6 +587,19 @@ pub mod clone_flags {
     pub const PARENT_SETTID: u64 = 0x0010_0000;
     pub const CHILD_CLEARTID: u64 = 0x0020_0000;
     pub const CHILD_SETTID: u64 = 0x0100_0000;
+    pub const NEWNS: u64 = 0x0002_0000;
+    pub const NEWCGROUP: u64 = 0x0200_0000;
+    pub const NEWUTS: u64 = 0x0400_0000;
+    pub const NEWIPC: u64 = 0x0800_0000;
+    pub const NEWUSER: u64 = 0x1000_0000;
+    pub const NEWPID: u64 = 0x2000_0000;
+    pub const NEWNET: u64 = 0x4000_0000;
+    /// Every namespace a sandbox asks for. A process's mount table is its
+    /// own from its fork (gex has no shared one to leave), so `NEWNS` only
+    /// lets it mount for itself ([`crate::vfs::Namespace::is_own`]);
+    /// `NEWUSER` gives it every capability, as the owner of a new user
+    /// namespace has; the rest change nothing (see [`Kernel::clone_ns`]).
+    pub const NAMESPACES: u64 = NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET;
 }
 
 /// Whether a path names a shared object, by the only thing available at
@@ -739,6 +754,12 @@ pub struct Kernel {
     /// Where the `posix_spawn` in hand wants its child's pid: the fork it
     /// is answers zero, and the pid goes there.
     pub darwin_spawn_at: Option<u64>,
+    /// The namespaces (`clone_flags::NAMESPACES`) the process `clone` in
+    /// hand asked for, for its child to have ([`Kernel::fork_kernel`]):
+    /// a sandbox such as bubblewrap starting itself. What isolation that is
+    /// not: the child shares the system's processes, network, IPC, host
+    /// name and users; its mounts are its own, as every process's are here.
+    pub clone_ns: std::sync::atomic::AtomicU64,
     /// The group the `posix_spawn` in hand puts its child in
     /// (`POSIX_SPAWN_SETPGROUP`), set by the parent as well once the child
     /// has a pid, so that it is there when the call returns.
@@ -4553,11 +4574,33 @@ impl PathIo<'_> {
         if n == nr::CHROOT {
             return self.chroot(m, a[0]);
         }
+        // A process with a mount namespace of its own (a sandbox building
+        // its root: bubblewrap) mounts for itself: binds, read-only
+        // remounts, `pivot_root`, a detached unmount of a tree.
+        let own = self.ns.is_own();
+        if n == nr::PIVOT_ROOT {
+            if !own {
+                return Err(Errno::EPERM);
+            }
+            let new_root = self.mount_path(m, a[0])?;
+            let put_old = self.mount_path(m, a[1])?;
+            return self.view.pivot_root(&new_root, &put_old).map(|_| 0);
+        }
         if n == nr::UMOUNT2 {
+            const MNT_DETACH: u64 = 2;
+            if own && a[1] & MNT_DETACH != 0 {
+                let target = self.mount_path(m, a[0])?;
+                return if self.view.unmount_tree(&target) { Ok(0) } else { Err(Errno::EINVAL) };
+            }
             let target = self.at_path(m, AT_FDCWD, a[0])?;
             return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
         }
-        let target = self.at_path(m, AT_FDCWD, a[1])?;
+        if own {
+            if let Some(r) = self.own_mount(m, a) {
+                return r;
+            }
+        }
+        let target = if own { self.mount_path(m, a[1])? } else { self.at_path(m, AT_FDCWD, a[1])? };
         let fstype = if a[2] == 0 {
             String::new()
         } else {
@@ -4598,6 +4641,77 @@ impl PathIo<'_> {
             }
             _ => Err(Errno::ENODEV),
         }
+    }
+
+    /// A path a mount call names, as the namespace has it: absolute, its
+    /// links followed, and a `/proc/self/fd/N` the path of that descriptor
+    /// (bubblewrap names what it binds by descriptors it opened `O_PATH`).
+    fn mount_path(&self, m: &GuestMem<'_>, at: u64) -> Result<String, Errno> {
+        let p = self.at_path(m, AT_FDCWD, at)?;
+        let p = self.ns.canonical(&p);
+        if let Some(n) = p.strip_prefix("/proc/self/fd/").and_then(|n| n.parse::<i32>().ok()) {
+            return Ok(self.ns.canonical(&self.map.fds.get(n)?.path));
+        }
+        Ok(p)
+    }
+
+    /// `mount` in a namespace of the process's own ([`crate::vfs::Namespace::is_own`]):
+    /// a bind (`MS_BIND`, with `MS_REC` its submounts), a remount
+    /// read-only (`MS_REMOUNT | MS_BIND | MS_RDONLY`; other remounts change
+    /// nothing gex keeps), a propagation change (nothing to propagate: a
+    /// mount table here is the process's alone), and `proc` mounted again
+    /// where it is asked for. `None`: what every process's mount does
+    /// (`tmpfs`, `devtmpfs`, ...).
+    fn own_mount(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
+        const MS_RDONLY: u64 = 1;
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        const MS_REC: u64 = 16384;
+        const PROPAGATION: u64 = (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+        let flags = a[3];
+        if flags & MS_REMOUNT != 0 {
+            if flags & (MS_BIND | MS_RDONLY) == MS_BIND | MS_RDONLY {
+                return Some(self.mount_path(m, a[1]).and_then(|t| if self.view.remount_readonly(&t) { Ok(0) } else { Err(Errno::EINVAL) }));
+            }
+            return Some(Ok(0));
+        }
+        if flags & MS_BIND != 0 {
+            return Some((|| {
+                let src = self.mount_path(m, a[0])?;
+                let dst = self.mount_path(m, a[1])?;
+                // Linux's: what is bound onto is there, and is a directory
+                // for a directory, a file for a file.
+                let (s, d) = (self.ns.metadata(&src)?, self.ns.metadata(&dst)?);
+                if (s.file_type == FileType::Directory) != (d.file_type == FileType::Directory) {
+                    return Err(if d.file_type == FileType::Directory { Errno::ENOTDIR } else { Errno::EISDIR });
+                }
+                self.view.bind(&src, &dst, flags & MS_REC != 0).map(|_| 0)
+            })());
+        }
+        if flags & PROPAGATION != 0 && a[2] == 0 {
+            return Some(Ok(0));
+        }
+        let fstype = if a[2] == 0 { String::new() } else { String::from_utf8_lossy(&m.read_cstr(a[2], 64).ok()?).into_owned() };
+        if matches!(fstype.as_str(), "proc" | "procfs" | "devpts") {
+            // The system's `/proc` (and its pseudo-terminals) again, at the
+            // new place: there is one process table, and a sandbox's
+            // `devpts` is not a pty namespace of its own. A system with no
+            // `devpts` mounted gives an empty directory for one.
+            return Some((|| {
+                let dst = self.mount_path(m, a[1])?;
+                let want = if fstype == "devpts" { "devpts" } else { "proc" };
+                let table = self.ns.mount_table();
+                match table.iter().find(|(_, ty)| *ty == want).map(|(at, _)| at.clone()) {
+                    Some(at) => self.view.bind(&at, &dst, false).map(|_| 0),
+                    None if want == "devpts" => {
+                        self.view.mount(&dst, Arc::new(crate::vfs::TmpFs::new()));
+                        Ok(0)
+                    }
+                    None => Err(Errno::ENODEV),
+                }
+            })());
+        }
+        None
     }
 
     /// `chroot(path)`: the namespace's root, as published, now `path`
@@ -6392,7 +6506,7 @@ fn is_path(n: u64) -> bool {
 /// The calls on the process's and the thread's own signal state, behind
 /// their own locks (`ProcSig`, `ThreadSig`), and `getrandom`: canonical.
 pub fn is_own_state(n: u64) -> bool {
-    matches!(n, nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::SIGALTSTACK | nr::SETITIMER | nr::GETITIMER | nr::ALARM | nr::GETRANDOM)
+    matches!(n, nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::SIGALTSTACK | nr::SETITIMER | nr::GETITIMER | nr::ALARM | nr::GETRANDOM | nr::SIGNALFD4)
 }
 
 /// `process_vm_readv` (`write` false) and `process_vm_writev`: bytes
@@ -6754,7 +6868,14 @@ impl Creds {
         self.keep_caps.store(false, std::sync::atomic::Ordering::Release);
     }
 
-    /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS`.
+    /// The owner of a new user namespace (`clone(CLONE_NEWUSER)`): every
+    /// capability in it, its ids as they were.
+    pub fn own_user_namespace(&self) {
+        let [_, _, inh] = self.caps();
+        self.set_caps([CAPS_ALL, CAPS_ALL, inh]);
+    }
+
+        /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS`.
     pub fn keep_caps(&self) -> bool {
         self.keep_caps.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -6898,7 +7019,7 @@ fn cap_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, se
 /// `mount` and `umount2`: the namespace's mount table, which its
 /// published view ([`crate::vfs::VfsView`]) writes. Canonical.
 pub fn is_mount(n: u64) -> bool {
-    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT)
+    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT | nr::PIVOT_ROOT)
 }
 
 /// The calls on the calling thread's own state alone:
@@ -7326,7 +7447,11 @@ pub fn thread_own_call(
         // Only a thread's own working directory (CLONE_FS) is unshared;
         // a private descriptor table or namespace is not supported.
         nr::UNSHARE => {
-            if a[0] & !clone_flags::FS != 0 {
+            // Namespaces a sandbox asks for of itself: none of them changes
+            // anything here (a process's mounts are its own already, and
+            // `clone` is where bubblewrap takes its user namespace's
+            // capabilities: [`Kernel::clone_ns`]).
+            if a[0] & !(clone_flags::FS | clone_flags::NAMESPACES) != 0 {
                 return Err(Errno::EINVAL);
             }
             if a[0] & clone_flags::FS != 0 {
@@ -7490,6 +7615,27 @@ pub fn pidfd_call(fds: &FdTable, procs: &Arc<ProcTable>, to: &KillTo<'_>, n: u64
 /// taken, with its `siginfo_t`; none is `EAGAIN`. A call with none pending
 /// and time to wait parks first ([`sigwait_park`]) and comes here once one
 /// is. For the kernel's arm and [`free_call`] alike.
+/// `signalfd4(fd, mask, sizemask, flags)` (and `signalfd`, flags 0): the
+/// process's pending signals of the set as a descriptor
+/// ([`crate::signalfd`]); on a descriptor that is one already, its new set.
+pub fn signalfd4(signals: &Signals, fds: &FdTable, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+    const SFD_NONBLOCK: u64 = oflags::O_NONBLOCK;
+    const SFD_CLOEXEC: u64 = oflags::O_CLOEXEC;
+    if a[2] != 8 || a[3] & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mask = m.read_u64(a[1]).map_err(|_| Errno::EFAULT)?;
+    if a[0] as i32 != -1 {
+        let f = fds.get(a[0] as i32)?;
+        let sfd = f.handle.as_signalfd().ok_or(Errno::EINVAL)?;
+        sfd.set_mask(mask);
+        return Ok(a[0] as i32 as u64);
+    }
+    let handle = Arc::new(crate::signalfd::SignalFd::new(signals.share(), mask));
+    let file = OpenFile::new(handle, "anon_inode:[signalfd]".to_string(), (a[3] & SFD_NONBLOCK) | oflags::O_RDONLY, true, false);
+    fds.insert(file, a[3] & SFD_CLOEXEC != 0)
+}
+
 pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u64; 6]) -> SysResult {
     let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
     // The timeout is read and checked before anything is taken, as Linux
@@ -7896,6 +8042,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHOWN | x::FCHOWN16 => nr::FCHOWN,
             x::RT_SIGACTION => nr::RT_SIGACTION,
             x::RT_SIGPENDING => nr::RT_SIGPENDING,
+            x::SIGNALFD4 => nr::SIGNALFD4,
             x::SIGALTSTACK => nr::SIGALTSTACK,
             // Their itimervals widened and narrowed (`i386::translate`).
             x::SETITIMER => nr::SETITIMER,
@@ -8002,6 +8149,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHOWN => nr::FCHOWN,
             x::RT_SIGACTION => nr::RT_SIGACTION,
             x::RT_SIGPENDING => nr::RT_SIGPENDING,
+            x::SIGNALFD4 => nr::SIGNALFD4,
             x::SIGALTSTACK => nr::SIGALTSTACK,
             x::SETITIMER => nr::SETITIMER,
             x::GETITIMER => nr::GETITIMER,
@@ -8357,6 +8505,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::SETITIMER => itimer(f.signals, now(), m, a[0], a[1], a[2], true),
             nr::GETITIMER => itimer(f.signals, now(), m, a[0], 0, a[1], false),
             nr::ALARM => Ok(alarm(f.signals, now(), a[0])),
+            nr::SIGNALFD4 => signalfd4(f.signals, f.io.fds, m, a),
             _ => getrandom(f.path.ns, m, a[0], a[1]),
         }
     } else if is_path(n) {
@@ -9534,7 +9683,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FCHOWNAT
         | nr::FCHMODAT
         | nr::STATX => a[1],
-        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 | nr::TRUNCATE => a[0],
+        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 | nr::PIVOT_ROOT | nr::TRUNCATE => a[0],
         nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => a[1],
         // `symlinkat` names the link it creates third, not second.
         nr::SYMLINKAT => a[2],
@@ -10663,6 +10812,7 @@ impl Kernel {
             darwin_ready: None,
             darwin_answer: None,
             darwin_spawn_at: None,
+            clone_ns: Default::default(),
             darwin_spawn_pgroup: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
@@ -11113,6 +11263,15 @@ impl Kernel {
 
     pub fn fork_kernel(&self) -> Kernel {
         let mut child = self.fork_kernel_inner();
+        // The namespaces its `clone` asked for ([`Kernel::clone_ns`]).
+        let ns = self.clone_ns.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if ns & (clone_flags::NEWNS | clone_flags::NEWUSER) != 0 {
+            child.vfs.view().make_own();
+            child.vfs.refresh();
+        }
+        if ns & clone_flags::NEWUSER != 0 {
+            child.creds.own_user_namespace();
+        }
         let cwd = child.proc_fs.get();
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
@@ -11195,6 +11354,7 @@ impl Kernel {
             darwin_ready: None,
             darwin_answer: None,
             darwin_spawn_at: None,
+            clone_ns: Default::default(),
             darwin_spawn_pgroup: None,
             darwin_pc: 0,
             darwin_psynch: Default::default(),
@@ -11554,6 +11714,7 @@ impl Kernel {
                     let _ = self.dispatch(m, nr::SETPGID, [pid as u64, group as u64, 0, 0, 0, 0]);
                 }
             }
+            self.clone_ns.store(a[0] & clone_flags::NAMESPACES, std::sync::atomic::Ordering::Relaxed);
             if self.trace {
                 eprintln!(
                     "[gex] clone(flags={:#x}, stack={:#x}) = {pid} (new process)",
@@ -12239,6 +12400,7 @@ impl Kernel {
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGTIMEDWAIT => sigtimedwait(&self.signals, m, self.compat, a),
+            nr::SIGNALFD4 => signalfd4(&self.signals, &self.fds, m, a),
             // Reached only when the new mask could not be read (the
             // blocking path takes the rest).
             nr::RT_SIGSUSPEND => Err(Errno::EFAULT),
@@ -14176,6 +14338,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
         nr::EVENTFD2 => "eventfd2",
+        nr::SIGNALFD4 => "signalfd4",
         nr::INOTIFY_INIT1 => "inotify_init1",
         nr::INOTIFY_ADD_WATCH => "inotify_add_watch",
         nr::INOTIFY_RM_WATCH => "inotify_rm_watch",
@@ -14268,6 +14431,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::STATX => "statx",
         nr::MOUNT => "mount",
         nr::UMOUNT2 => "umount2",
+        nr::PIVOT_ROOT => "pivot_root",
         nr::REBOOT => "reboot",
         nr::RT_SIGTIMEDWAIT => "rt_sigtimedwait",
         nr::SOCKET => "socket",

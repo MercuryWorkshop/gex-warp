@@ -52,6 +52,7 @@ pub mod pidfd;
 pub mod proc;
 pub mod pty;
 pub mod signal;
+pub mod signalfd;
 pub mod stdio;
 pub mod sync;
 pub mod tar;

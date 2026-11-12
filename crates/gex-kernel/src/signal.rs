@@ -886,6 +886,12 @@ impl Signals {
 
     /// A process's signal state as thread `cur` sees it: for a host that
     /// delivers to its own thread without the kernel.
+    /// The same process's and thread's signals, another handle on them (a
+    /// signalfd's: [`crate::signalfd`]).
+    pub fn share(&self) -> Signals {
+        Signals { proc: Arc::clone(&self.proc), cur: Arc::clone(&self.cur) }
+    }
+
     pub fn view(proc: Arc<ProcSig>, cur: Arc<ThreadSig>) -> Signals {
         Signals { proc, cur }
     }
