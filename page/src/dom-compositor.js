@@ -1173,12 +1173,16 @@ export class DomDesktop {
 
   #attach(win) {
     const c = win.canvas;
-    // Inside the window, except for a placed window while a button holds the
-    // pointer (Wayland's implicit grab): Wine's own move and size loops
-    // (SC_MOVE, SC_SIZE) follow the pointer past the window's edge.
+    // Inside the window, except while a button holds the pointer (Wayland's
+    // implicit grab, the canvas's capture): then in the window's own
+    // coordinates even when they are negative or past its size, as wlroots,
+    // Weston and Mutter send them -- Wine's own move and size loops (SC_MOVE,
+    // SC_SIZE) follow the pointer past the window's edge, and a menu opened
+    // under a held button (a pop-up button's) learns from them where the
+    // pointer is past its parent's edge.
     const at = (e) => {
       const x = Math.round(e.offsetX), y = Math.round(e.offsetY);
-      if (win.placed && c.hasPointerCapture?.(e.pointerId)) return { x, y, t: Math.round(e.timeStamp) };
+      if (c.hasPointerCapture?.(e.pointerId)) return { x, y, t: Math.round(e.timeStamp) };
       return {
         x: Math.max(0, Math.min(win.width - 1, x)),
         y: Math.max(0, Math.min(win.height - 1, y)),

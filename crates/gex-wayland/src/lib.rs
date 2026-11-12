@@ -3555,8 +3555,10 @@ impl Client {
     /// own coordinates, with a leave and an enter when that changes, as a
     /// compositor sends them; over none of them, the pointer leaves. While
     /// a button is held it stays with the surface that took the press (the
-    /// implicit grab), at the point clamped to it, as the page's desktop
-    /// keeps it. A client with no toplevel takes the point as it is.
+    /// implicit grab), at that surface's own point, which may be negative or
+    /// past its size, as wlroots, Weston and Mutter send it: a menu opened
+    /// under the held button learns from it where the pointer is past its
+    /// parent's edge. A client with no toplevel takes the point as it is.
     pub fn pointer_in_window(&mut self, x: i32, y: i32, time: u32) {
         // The client's own drag has the pointer (`Client::is_dragging`).
         if self.is_dragging() {
@@ -3567,8 +3569,9 @@ impl Client {
             return;
         };
         if let Some(grab) = self.grab_surface.filter(|g| self.surfaces.contains_key(g)) {
-            if let Some(&(_, sx, sy, w, h)) = self.window_stack(top).iter().find(|o| o.0 == grab) {
-                self.pointer_to(grab, (x - sx).clamp(0, (w - 1).max(0)), (y - sy).clamp(0, (h - 1).max(0)), time);
+            if let Some(&(_, sx, sy, _, _)) = self.window_stack(top).iter().find(|o| o.0 == grab) {
+                self.pointer_out = false;
+                self.pointer_to(grab, x - sx, y - sy, time);
                 return;
             }
         }
@@ -4837,13 +4840,41 @@ mod tests {
     }
 
     #[test]
+    fn a_held_pointer_past_the_window_is_the_window_at_its_own_point() {
+        let pool = Placed(0x5000, 64 * 1024);
+        let (mut c, _) = placed_window(300, 200, 1200);
+        c.receive(&Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 0).new_id(51).finish(), &[], &pool); // get_pointer
+        // Pressed on the window near its bottom edge, and held.
+        c.pointer_in_window(70, 190, 1);
+        c.pointer_button_in_window(0x110, true, 2);
+        // Below the window's edge and left of it: still the window's, at its
+        // own point past its size (not clamped to it), with no leave.
+        c.pointer_in_window(70, 240, 3);
+        c.pointer_in_window(-15, 250, 4);
+        let ev = pointer_events(&c.take_outgoing());
+        assert!(ev.iter().all(|e| e.0 != 1), "the implicit grab let the pointer go: {ev:?}");
+        let moves: Vec<&[i32]> = ev.iter().filter(|e| e.0 == 2).map(|e| &e.1[1..]).collect();
+        assert_eq!(moves[moves.len() - 2..], [&[70 * 256, 240 * 256][..], &[-15 * 256, 250 * 256][..]], "{ev:?}");
+        // The release is the window's there too.
+        c.pointer_button_in_window(0x110, false, 5);
+        let ev = pointer_events(&c.take_outgoing());
+        assert_eq!(ev.iter().filter(|e| e.0 == 3).map(|e| e.1[3]).collect::<Vec<_>>(), vec![0], "{ev:?}");
+        // Let go, the pointer past the edge is over nothing: it leaves.
+        c.pointer_in_window(70, 240, 6);
+        let ev = pointer_events(&c.take_outgoing());
+        assert_eq!(ev.iter().map(|e| e.0).collect::<Vec<_>>(), vec![1], "{ev:?}");
+    }
+
+    #[test]
     fn a_press_outside_a_popup_dismisses_it_and_inside_keeps_it() {
         let mut c = window_with_popup();
         let done = |bytes: &[u8]| messages(bytes).iter().any(|(id, op, _)| *id == 23 && *op == 1);
         // A press on the popup: the popup has it, and stays.
         c.pointer_in_window(100, 80, 1);
         c.pointer_button_in_window(0x110, true, 2);
-        // Held, the pointer stays with the popup past its edge (clamped).
+        // Held, the pointer stays with the popup past its edge, in the
+        // popup's own coordinates (negative here), as other compositors send.
         c.pointer_in_window(10, 10, 3);
         c.pointer_button_in_window(0x110, false, 4);
         let out = c.take_outgoing();
@@ -4851,7 +4882,7 @@ mod tests {
         let ev = pointer_events(&out);
         assert!(ev.iter().all(|e| e.0 != 1), "the grab let the pointer go: {ev:?}");
         assert_eq!(ev.iter().filter(|e| e.0 == 3).count(), 2, "the popup did not get both halves of the click");
-        assert_eq!(ev.iter().rev().find(|e| e.0 == 2).map(|e| &e.1[1..]), Some(&[0, 0][..]));
+        assert_eq!(ev.iter().rev().find(|e| e.0 == 2).map(|e| &e.1[1..]), Some(&[-50 * 256, -40 * 256][..]));
         // Released over the window, then a press on the window: popup_done.
         c.pointer_in_window(10, 10, 5);
         c.pointer_button_in_window(0x110, true, 6);
