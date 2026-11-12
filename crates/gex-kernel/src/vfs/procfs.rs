@@ -318,6 +318,25 @@ impl FileHandle for Generated {
     }
 }
 
+/// A user namespace's map as written (`uid_map`, `gid_map`, `setgroups`):
+/// taken whole and kept nowhere. There is one user namespace, and every id
+/// in it is itself; a sandbox (bubblewrap) that maps its own uid to itself
+/// is told yes.
+#[derive(Debug)]
+struct Sink;
+
+impl FileHandle for Sink {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o644, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+    }
+}
+
 #[derive(Debug)]
 struct GenDir {
     entries: Vec<DirEntry>,
@@ -498,6 +517,14 @@ impl ProcFs {
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
+            // The ids a user namespace shows for those it does not map
+            // (bubblewrap reads them before it makes one).
+            "sys/kernel/overflowuid" | "sys/kernel/overflowgid" => b"65534\n".to_vec(),
+            // A user namespace's maps: every id itself (there is one
+            // namespace), and what is written taken and kept nowhere
+            // ([`Sink`]).
+            "self/uid_map" | "self/gid_map" => b"         0          0 4294967295\n".to_vec(),
+            "self/setgroups" => b"allow\n".to_vec(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             _ => return None,
@@ -515,6 +542,9 @@ impl FileSystem for ProcFs {
             return Err(Errno::EISDIR);
         }
         let (path, tid) = self.canonical(path)?;
+        if super::writes(flags) && matches!(path.as_str(), "self/uid_map" | "self/gid_map" | "self/setgroups") {
+            return Ok(Arc::new(Sink));
+        }
         if path == "self/mountinfo" {
             // The count before the table: a change after it is one this
             // reader has not seen.
@@ -542,6 +572,9 @@ impl FileSystem for ProcFs {
                     }
                     &[]
                 }
+                // (Its namespaces: none of its own to name. bubblewrap
+                // opens the directory and lets each missing one go.)
+                "ns" => &[],
                 _ => return Err(Errno::ENOENT),
             };
             for name in names {
@@ -598,8 +631,9 @@ impl FileSystem for ProcFs {
                 }
                 return Ok(Arc::new(GenDir { entries: out }));
             }
+            "self/ns" => vec![],
             "sys" => vec!["kernel", "vm"],
-            "sys/kernel" => vec!["osrelease", "pid_max"],
+            "sys/kernel" => vec!["osrelease", "pid_max", "overflowuid", "overflowgid"],
             "sys/vm" => vec!["overcommit_memory"],
             _ => return Err(Errno::ENOENT),
         };
@@ -630,7 +664,7 @@ impl FileSystem for ProcFs {
         }
         if let Some((e, rest)) = self.other(&path) {
             return match rest.as_str() {
-                "" | "task" => Ok(Metadata::dir()),
+                "" | "task" | "ns" => Ok(Metadata::dir()),
                 r if self.generate_other(&e, r, tid).is_some() => Ok(Metadata {
                     file_type: FileType::Regular,
                     size: 0,
@@ -645,7 +679,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "self/ns" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,

@@ -206,8 +206,25 @@ impl NetlinkRoute {
         NetlinkRoute { replies: Mutex::new(VecDeque::new()), queue: crate::wait::Queue::new() }
     }
 
-    /// The reply to one request (`nlmsghdr` + body), if it is owed one.
+    /// The reply to one request (`nlmsghdr` + body), if it is owed one:
+    /// each message addressed to the port the request came from, as Linux
+    /// addresses it (bubblewrap checks every reply's `nlmsg_pid` is its pid).
     fn answer(req: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Self::answer_unaddressed(req)?;
+        let port = &req[12..16];
+        let mut at = 0;
+        while at + 16 <= out.len() {
+            let len = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+            out[at + 12..at + 16].copy_from_slice(port);
+            if len < 16 {
+                break;
+            }
+            at += (len + 3) & !3;
+        }
+        Some(out)
+    }
+
+    fn answer_unaddressed(req: &[u8]) -> Option<Vec<u8>> {
         let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
         let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
         let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
@@ -220,6 +237,19 @@ impl NetlinkRoute {
             // No IPv6 addresses: a dump for AF_INET6 is only its end.
             RTM_GETADDR if dump && (family == AF_UNSPEC || family == AF_INET) => addrs(&mut out, seq),
             RTM_GETADDR if dump => {}
+            // A new address or a link brought up: what a sandbox setting up
+            // its own network namespace's loopback asks (bubblewrap's
+            // `--unshare-net`: 127.0.0.1 on `lo`, `lo` up). There is one
+            // network here, whose loopback is there and up already: done.
+            RTM_NEWADDR | RTM_NEWLINK => {
+                if flags & NLM_F_ACK == 0 {
+                    return None;
+                }
+                let mut b = 0i32.to_le_bytes().to_vec();
+                b.extend_from_slice(&req[..16]);
+                message(&mut out, NLMSG_ERROR, 0, seq, &b);
+                return Some(out);
+            }
             _ => {
                 if flags & (NLM_F_ACK | NLM_F_DUMP) == 0 {
                     return None;

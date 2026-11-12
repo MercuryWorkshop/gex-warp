@@ -508,6 +508,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a signalfd (`crate::signalfd`), when it is one.
+    fn as_signalfd(&self) -> Option<&crate::signalfd::SignalFd> {
+        None
+    }
+
     /// This handle as an anonymous shared file (`memfd_create`), when it is
     /// one: its seals and `fallocate`.
     /// An `inotify` instance's descriptor ([`crate::inotify::Inotify`]).
@@ -986,13 +991,15 @@ pub(crate) fn writes(flags: u64) -> bool {
 /// The id of the mount at `at` (`/proc/self/mountinfo`'s first field,
 /// `statx`'s `stx_mnt_id`): 1 for the root, and for another the same number
 /// wherever and whenever it is asked, a forked child's table and the
-/// table after other mounts come and go included.
+/// table after other mounts come and go included. Under 65536, as Linux's
+/// are small: a reader that sizes a table by the largest id (bubblewrap's
+/// `parse_mountinfo`) asked for 8 GiB with ids up to a billion.
 pub fn mount_id(at: &str) -> u64 {
     if at == "/" {
         return 1;
     }
     let h = at.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
-    2 + h % 0x3fff_fff0
+    2 + h % 0xfff0
 }
 
 /// Whether absolute `abs` is `at` or below it.
@@ -1076,6 +1083,42 @@ impl VfsView {
     /// Remove the mount at exactly `path` ([`Namespace::unmount`]).
     pub fn unmount(&self, path: &str) -> bool {
         self.change(|ns| ns.unmount(path))
+    }
+
+    /// The process has a mount namespace of its own from now
+    /// ([`Namespace::is_own`]).
+    pub fn make_own(&self) {
+        self.change(|ns| !std::mem::replace(&mut ns.own, true));
+    }
+
+    /// [`Namespace::bind`] of the namespace as published.
+    pub fn bind(&self, src: &str, dst: &str, recursive: bool) -> Result<(), Errno> {
+        let mut err = Ok(());
+        self.change(|ns| {
+            err = ns.bind(src, dst, recursive);
+            err.is_ok()
+        });
+        err
+    }
+
+    /// [`Namespace::remount_readonly`] of the namespace as published.
+    pub fn remount_readonly(&self, at: &str) -> bool {
+        self.change(|ns| ns.remount_readonly(at))
+    }
+
+    /// [`Namespace::pivot_root`] of the namespace as published.
+    pub fn pivot_root(&self, new_root: &str, put_old: &str) -> Result<(), Errno> {
+        let mut err = Ok(());
+        self.change(|ns| {
+            err = ns.pivot_root(new_root, put_old);
+            err.is_ok()
+        });
+        err
+    }
+
+    /// [`Namespace::unmount_tree`] of the namespace as published.
+    pub fn unmount_tree(&self, path: &str) -> bool {
+        self.change(|ns| ns.unmount_tree(path))
     }
 
     /// [`Namespace::chroot`] of the namespace as published.
@@ -1200,6 +1243,12 @@ impl Vfs {
             }
         }
         self.ns.outer.clone_from(&ns.outer);
+        self.ns.own = ns.own;
+        if self.ns.stacked != ns.stacked || (ns.own && self.held.is_none()) {
+            // (A `pivot_root` moves the directory with the mounts.)
+            self.ns.cwd.clone_from(&ns.cwd);
+        }
+        self.ns.stacked = ns.stacked;
         self.mounts = now;
     }
 
@@ -1307,6 +1356,16 @@ pub struct Namespace {
     /// What this namespace was entered from ([`Namespace::enter`]), if it
     /// is a tree entered and not the system's own.
     outer: Option<Arc<Outer>>,
+    /// The process made a mount namespace of its own (`clone` or `unshare`
+    /// with `CLONE_NEWNS` or `CLONE_NEWUSER`: a sandbox such as bubblewrap
+    /// building itself a root). Its binds are mounts then, and it may
+    /// `pivot_root`; before, a bind is a no-op, as it always was here (a
+    /// mount table is a process's own from its fork, so nothing it does
+    /// reaches another process either way).
+    own: bool,
+    /// A `pivot_root(".", ".")` stacked the old root on the new one: the
+    /// `umount2(".", MNT_DETACH)` that follows takes it off ([`Namespace::pivot_root`]).
+    stacked: bool,
 }
 
 /// The namespace a tree was entered from ([`Namespace::enter`]): what
@@ -1342,6 +1401,8 @@ impl Namespace {
             cwd: "/".to_string(),
             root: "/".to_string(),
             outer: None,
+            own: false,
+            stacked: false,
         }
     }
 
@@ -1525,6 +1586,110 @@ impl Namespace {
         let at = normalize(at, "/");
         self.mounts.insert(at, fs);
         self.list_others();
+    }
+
+    /// Whether the process made a mount namespace of its own ([`Namespace::own`]).
+    pub fn is_own(&self) -> bool {
+        self.own
+    }
+
+    /// `mount --bind src dst` (each absolute, normal, links followed): what
+    /// is at `src` -- the filesystem it is in from it down
+    /// ([`subtree::Subtree`]), or the one mounted there -- mounted at `dst`
+    /// too; with `recursive` (`MS_REC`), each mount under `src` again under
+    /// `dst`. A file can be bound onto a file.
+    fn bind(&mut self, src: &str, dst: &str, recursive: bool) -> Result<(), Errno> {
+        let (fs, rel) = self.mount_of(src.to_string())?;
+        let root: Arc<dyn FileSystem> = if rel.is_empty() { fs.clone() } else { Arc::new(subtree::Subtree::new(fs.clone(), &rel)) };
+        let mut add = vec![(dst.to_string(), root)];
+        if recursive {
+            for (at, fs) in &self.mounts {
+                if at != src && within(at, src) {
+                    add.push((rehead(at, src, dst), fs.clone()));
+                }
+            }
+        }
+        for (at, fs) in add {
+            self.mounts.insert(at, fs);
+        }
+        self.list_others();
+        Ok(())
+    }
+
+    /// A remount read-only (`MS_REMOUNT | MS_BIND | MS_RDONLY`) of the mount
+    /// at exactly `at` ([`readonly::ReadOnly`]); false when nothing is
+    /// mounted there.
+    fn remount_readonly(&mut self, at: &str) -> bool {
+        let Some(fs) = self.mounts.get(at).cloned() else { return false };
+        self.mounts.insert(at.to_string(), Arc::new(readonly::ReadOnly::new(fs)));
+        true
+    }
+
+    /// `pivot_root(new_root, put_old)` (each absolute, normal, links
+    /// followed): the mount at `new_root` is `/`, the mounts under it moved
+    /// up with it, and the old root and the rest of its mounts under
+    /// `put_old`, which is under `new_root`. `put_old` the same as
+    /// `new_root` (`pivot_root(".", ".")`, bubblewrap's and runc's second
+    /// pivot) stacks the old root over the new one, for an
+    /// `umount2(".", MNT_DETACH)` to take off: here the old root goes at
+    /// once, and that unmount only clears [`Namespace::stacked`].
+    fn pivot_root(&mut self, new_root: &str, put_old: &str) -> Result<(), Errno> {
+        if new_root == "/" || !self.mounts.contains_key(new_root) || !within(put_old, new_root) {
+            return Err(Errno::EINVAL);
+        }
+        let same = put_old == new_root;
+        let old_at = rehead(put_old, new_root, "/");
+        let mut mounts = BTreeMap::new();
+        if !same {
+            for (at, fs) in &self.mounts {
+                if !within(at, new_root) {
+                    mounts.insert(rehead(at, "/", &old_at), fs.clone());
+                }
+            }
+        }
+        for (at, fs) in &self.mounts {
+            if within(at, new_root) {
+                mounts.insert(rehead(at, new_root, "/"), fs.clone());
+            }
+        }
+        // The old root's `/proc`, kept at `/proc` when the new root has none
+        // and the old one goes (the second pivot): a descriptor opened on it
+        // before keeps working, as on Linux, where it names the mount and
+        // not the path -- bubblewrap writes its user namespace's maps
+        // through one after its last pivot, and gex's descriptors are paths.
+        // (So a sandbox given no `/proc` still has the system's.)
+        if same && !mounts.contains_key("/proc") {
+            if let Some(proc) = self.mounts.get("/proc") {
+                mounts.insert("/proc".to_string(), proc.clone());
+            }
+        }
+        self.mounts = mounts;
+        self.list_others();
+        self.cwd = if within(&self.cwd, new_root) {
+            rehead(&self.cwd, new_root, "/")
+        } else if same {
+            "/".to_string()
+        } else {
+            rehead(&self.cwd, "/", &old_at)
+        };
+        self.stacked = same;
+        Ok(())
+    }
+
+    /// `umount2(path, MNT_DETACH)`: the mount at exactly `path` and every
+    /// one under it. `/` only takes off a root [`Namespace::pivot_root`]
+    /// stacked. False when nothing is mounted there.
+    fn unmount_tree(&mut self, path: &str) -> bool {
+        let at = normalize(path, &self.cwd);
+        if at == "/" {
+            return std::mem::replace(&mut self.stacked, false);
+        }
+        if !self.mounts.contains_key(&at) {
+            return false;
+        }
+        self.mounts.retain(|m, _| !within(m, &at));
+        self.list_others();
+        true
     }
 
     fn list_others(&mut self) {
@@ -2293,6 +2458,63 @@ mod tests {
         assert!(v.metadata("/b/Library/made").is_ok() && v.metadata("/tmp/made").is_ok() && v.metadata("/b/Library/Preferences").is_ok());
         assert!(v.metadata("/opt/mac/Library/made").is_err() && v.metadata("/opt/mac/usr/file").is_ok());
         assert_eq!(v.entry(), None);
+    }
+
+    #[test]
+    fn a_sandbox_binds_and_pivots_its_own_root() {
+        // bubblewrap's dance: a tmpfs, a bind of a directory read-only and of
+        // a file onto a file, the first pivot with the old root under it,
+        // the second pivot onto itself, and the old root gone.
+        let root = Arc::new(TmpFs::new());
+        root.add_dir("usr");
+        root.add_file("usr/f", b"system".to_vec());
+        root.add_dir("dev");
+        root.add_file("dev/null", b"".to_vec());
+        root.add_dir("tmp");
+        root.add_dir("etc");
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        let proc_fs = Arc::new(TmpFs::new());
+        v.mount("/proc", proc_fs);
+        let view = Arc::clone(v.view());
+        view.make_own();
+        v.refresh();
+        assert!(v.is_own());
+        let read = |v: &Vfs, p: &str| {
+            let h = v.open(p, 0, 0).map_err(|e| e.0)?;
+            let mut b = [0u8; 16];
+            let n = h.read_at(0, &mut b).map_err(|e| e.0)?;
+            Ok::<_, i32>(String::from_utf8_lossy(&b[..n as usize]).into_owned())
+        };
+        view.mount("/tmp", Arc::new(TmpFs::new()));
+        v.refresh();
+        v.set_cwd("/tmp").unwrap();
+        v.mkdir("/tmp/newroot", 0o755).unwrap();
+        view.bind("/tmp/newroot", "/tmp/newroot", true).unwrap();
+        v.mkdir("/tmp/oldroot", 0o755).unwrap();
+        view.pivot_root("/tmp", "/tmp/oldroot").unwrap();
+        v.refresh();
+        assert_eq!(v.cwd, "/");
+        assert_eq!(read(&v, "/oldroot/usr/f").unwrap(), "system");
+        v.mkdir("/newroot/usr", 0o755).unwrap();
+        view.bind("/oldroot/usr", "/newroot/usr", true).unwrap();
+        assert!(view.remount_readonly("/newroot/usr"));
+        v.open("/newroot/null", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_WRONLY, 0o644).unwrap();
+        view.bind("/oldroot/dev/null", "/newroot/null", false).unwrap();
+        v.mkdir("/proc", 0o755).unwrap();
+        view.bind("/oldroot/proc", "/proc", true).unwrap();
+        assert!(view.unmount_tree("/oldroot"));
+        v.refresh();
+        v.set_cwd("/newroot").unwrap();
+        view.pivot_root("/newroot", "/newroot").unwrap();
+        assert!(view.unmount_tree("/"));
+        v.refresh();
+        assert_eq!(read(&v, "/usr/f").unwrap(), "system");
+        assert_eq!(v.mkdir("/usr/g", 0o755).err(), Some(Errno::EROFS));
+        assert_eq!(v.metadata("/null").map(|m| m.file_type), Ok(FileType::Regular));
+        assert!(v.metadata("/etc").is_err(), "only what was bound is there");
+        assert!(v.metadata("/oldroot").is_err());
+        assert!(v.is_mount_point("/proc"), "a descriptor on the old /proc keeps working");
     }
 
     #[test]

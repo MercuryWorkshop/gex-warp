@@ -82,6 +82,7 @@ pub mod raw {
     pub const GETEUID16: u64 = 49;
     pub const GETEGID16: u64 = 50;
     pub const UMOUNT2: u64 = 52;
+    pub const PIVOT_ROOT: u64 = 217;
     pub const IOCTL: u64 = 54;
     pub const FCNTL: u64 = 55;
     pub const SETPGID: u64 = 57;
@@ -248,6 +249,7 @@ pub mod raw {
     pub const TIMERFD_GETTIME: u64 = 326;
     pub const FALLOCATE: u64 = 324;
     pub const EVENTFD2: u64 = 328;
+    pub const SIGNALFD4: u64 = 327;
     pub const INOTIFY_INIT: u64 = 291;
     pub const INOTIFY_ADD_WATCH: u64 = 292;
     pub const INOTIFY_RM_WATCH: u64 = 293;
@@ -618,6 +620,7 @@ pub fn translate(
         x::SETGROUPS | x::SETGROUPS16 => nr::SETGROUPS,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
+        x::PIVOT_ROOT => nr::PIVOT_ROOT,
         x::ALARM => nr::ALARM,
         x::PAUSE => {
             // pause() is rt_sigsuspend with the current mask.
@@ -1016,6 +1019,7 @@ pub fn translate(
             nr::EPOLL_PWAIT2
         }
         x::EVENTFD2 => nr::EVENTFD2,
+        x::SIGNALFD4 => nr::SIGNALFD4,
         x::INOTIFY_INIT => {
             *a = [0; 6];
             nr::INOTIFY_INIT1
