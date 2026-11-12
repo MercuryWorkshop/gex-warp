@@ -49,6 +49,12 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+/// The nodes' device numbers: misc devices (10) of the local-use range,
+/// beside /dev/gex-host's 240, each its own (a terminal's name is found by
+/// its number among /dev's devices).
+pub const RDEV: u64 = (10 << 8) | 241;
+pub const RDEV_BULK: u64 = (10 << 8) | 242;
+
 /// The largest JSON text a frame carries.
 pub const JSON_MAX: usize = 64 << 10;
 /// The most binary data a frame carries.
@@ -139,6 +145,8 @@ struct Conn {
 
 /// One open of the node.
 pub struct ServicesDevice {
+    /// Its device number: /dev/gex-services' or /dev/gex-services-bulk's.
+    rdev: u64,
     conn: Arc<Mutex<Conn>>,
     /// What the program wrote that is not yet a whole frame.
     input: Mutex<Vec<u8>>,
@@ -153,8 +161,8 @@ impl std::fmt::Debug for ServicesDevice {
 }
 
 impl ServicesDevice {
-    pub fn new() -> Arc<ServicesDevice> {
-        Arc::new(ServicesDevice { conn: Arc::new(Mutex::new(Conn::default())), input: Mutex::new(Vec::new()), session: Mutex::new(None) })
+    pub fn new(bulk: bool) -> Arc<ServicesDevice> {
+        Arc::new(ServicesDevice { rdev: if bulk { RDEV_BULK } else { RDEV }, conn: Arc::new(Mutex::new(Conn::default())), input: Mutex::new(Vec::new()), session: Mutex::new(None) })
     }
 
     fn link(&self) -> Link {
@@ -240,7 +248,7 @@ impl FileHandle for ServicesDevice {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: self.rdev, times: Default::default() })
     }
 
     fn is_stream(&self) -> bool {

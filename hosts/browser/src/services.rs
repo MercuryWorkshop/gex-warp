@@ -32,8 +32,13 @@ extern "C" {
     fn svc_close(slot: i32);
 }
 
-pub static SERVICES: RingOps = RingOps { open: svc_open, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close };
-pub static BULK: RingOps = RingOps { open: svc_open_bulk, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close };
+/// The nodes' device numbers: misc devices (10) of the local-use range,
+/// beside /dev/gex-host's 240, so that no terminal is ever named for them.
+pub const RDEV: u64 = (10 << 8) | 241;
+pub const RDEV_BULK: u64 = (10 << 8) | 242;
+
+pub static SERVICES: RingOps = RingOps { open: svc_open, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close, rdev: RDEV };
+pub static BULK: RingOps = RingOps { open: svc_open_bulk, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close, rdev: RDEV_BULK };
 
 static mut HAVE: bool = false;
 

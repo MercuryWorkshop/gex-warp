@@ -80,9 +80,12 @@ pub struct RingOps {
     pub ready: unsafe extern "C" fn(slot: i32) -> i32,
     pub available: unsafe extern "C" fn(slot: i32) -> u32,
     pub close: unsafe extern "C" fn(slot: i32),
+    /// The node's device number (`st_rdev`): each node's its own, since a
+    /// terminal's name is found by its number among /dev's devices.
+    pub rdev: u64,
 }
 
-pub static METAL: RingOps = RingOps { open: metal_open, read: metal_read, write: metal_write, ready: metal_ready, available: metal_available, close: metal_close };
+pub static METAL: RingOps = RingOps { open: metal_open, read: metal_read, write: metal_write, ready: metal_ready, available: metal_available, close: metal_close, rdev: 0 };
 
 /// One open of a node whose other end is a connection of a ring channel.
 #[derive(Debug)]
@@ -155,7 +158,7 @@ impl FileHandle for RingDevice {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: self.ops.rdev, times: Default::default() })
     }
 
     fn is_stream(&self) -> bool {

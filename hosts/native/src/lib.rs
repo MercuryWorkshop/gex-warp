@@ -3981,8 +3981,8 @@ fn mount_filesystems(
     }
     // The services the host's shell provides to programs (services.rs):
     // each open is a connection to one, which the shell may not provide.
-    devfs.add_per_open("gex-services", Arc::new(|| crate::services::ServicesDevice::new() as Arc<dyn gex_kernel::vfs::FileHandle>));
-    devfs.add_per_open("gex-services-bulk", Arc::new(|| crate::services::ServicesDevice::new() as Arc<dyn gex_kernel::vfs::FileHandle>));
+    devfs.add_per_open("gex-services", Arc::new(|| crate::services::ServicesDevice::new(false) as Arc<dyn gex_kernel::vfs::FileHandle>));
+    devfs.add_per_open("gex-services-bulk", Arc::new(|| crate::services::ServicesDevice::new(true) as Arc<dyn gex_kernel::vfs::FileHandle>));
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
