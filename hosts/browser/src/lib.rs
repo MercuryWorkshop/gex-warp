@@ -10349,6 +10349,14 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let ranges = k.darwin_restart.carry();
     if k.vfs.entered() || !ranges.is_empty() {
         v.extend_from_slice(if k.vfs.entered() { b"\0darwin" } else { b"\0" });
+        // (And how it was entered, for one that is a bottle's: whether
+        // sealed, and what is shared into it.)
+        if let Some((_, shared, sealed)) = k.vfs.entry() {
+            v.extend_from_slice(if sealed { b"\x011" } else { b"\x010" });
+            for (inside, outside) in shared {
+                v.extend_from_slice(format!("\x01{inside}\x02{outside}").as_bytes());
+            }
+        }
     }
     if !ranges.is_empty() {
         v.push(0);
@@ -10383,14 +10391,22 @@ fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
     k.creds.restore(&rest[ids..saved]);
     let root = String::from_utf8_lossy(&rest[saved..]);
     let mut fields = root.split('\0');
-    let (root, entered) = (fields.next().unwrap_or(""), fields.next() == Some("darwin"));
+    let (root, how) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+    let mut how = how.split('\x01');
+    let entered = how.next() == Some("darwin");
+    let sealed = how.next() == Some("1");
+    let shared: Vec<(String, String)> = how.filter_map(|p| p.split_once('\x02')).map(|(a, b)| (a.to_string(), b.to_string())).collect();
     k.darwin_restart.adopt(fields.next().unwrap_or(""));
     if !root.is_empty() && root != "/" {
         // The directory came over in the chrooted namespace's terms, and
         // was set before there was one (where it may have named nothing,
         // or something else).
         let cwd = if cwd.is_empty() { k.cwd() } else { cwd.to_string() };
-        let there = if entered { k.enter_root(root).is_ok() } else { k.vfs.chroot(root).is_ok() };
+        let there = match entered {
+            true if shared.is_empty() => k.enter_root(root).is_ok(),
+            true => k.enter_root_as(root, &shared, sealed).is_ok(),
+            false => k.vfs.chroot(root).is_ok(),
+        };
         if there {
             let _ = k.set_cwd(&cwd);
         }

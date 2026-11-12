@@ -431,6 +431,54 @@ them, path by path. A new tree gets a new store `name`. Nothing kept by the
 `IdbPersist` of earlier versions is read: those IndexedDB databases are left
 as they were, and a page may delete them.
 
+## Bottles
+
+`Bottles` (`@gexemu/runtime/bottles`) manages Mac environments that share
+one Mac root, as Wine prefixes share one Wine (gex's README, Bottles, says
+what a bottle is). The root, pyrus's, is a directory of the system's tree
+(a tar laid with `addTar(src, { at: '/opt/mac' })`): the system layer,
+which no bottle writes. A bottle is a directory with its own `Users`,
+`Applications`, `Library` and `private/var` and a configuration; a
+program started in it finds those over the layer, read-only, and is told
+it is on the macOS and the Mac the bottle (or its application's section)
+says. It is `gexc bottle` over the page's filesystem, and the two write the
+same bottles.
+
+```javascript
+import { Bottles } from '@gexemu/runtime/bottles';
+
+const bottles = new Bottles(sys, { dir: '/bottles', system: '/opt/mac' });
+await bottles.create('work', { macos: '14', machine: 'Macmini9,1' });
+await bottles.set('work', { macos: '11' }, { app: 'TextEdit' });
+const { stdout } = await bottles.run('work', ['/usr/bin/uname', '-v']);
+const sh = await bottles.spawn('work', ['/bin/zsh', '-l'], { pty: { cols: 80, rows: 24 } });
+```
+
+| Member | Does |
+| --- | --- |
+| `new Bottles(sys, { dir, system })` | One per system. `dir` (default `/bottles`): where the bottles are; `system` (default `/opt/mac`): the Mac root new ones are over. The system needs a Filesystem. |
+| `create(name, settings, { system })` | A new bottle: its directories copied from the system layer's, its user's home, and a configuration with a `uuid` and a `serial` of its own and `settings`. Resolves with the bottle. Rejects (`code` `EEXIST`) when there is one of that name, with a `RangeError` for a macOS or a Mac the layer's tables have no row of, a `TypeError` for a setting there is not. |
+| `list()` | The bottles: `[{ name, dir, settings, apps }]`. |
+| `get(name)` | One: `settings` its own (`{ name, system, uuid, serial, macos, machine, graphics, 'share.system', 'share.home' }`, those it has), `apps` each application's (`{ TextEdit: { macos } }`). Rejects (`code` `ENOENT`) when there is none. |
+| `set(name, settings, { app })` | Changes settings; a null or empty value forgets one. `macos`: a release (`'14'`, `'14.8.9'`, `'sonoma'`); `machine`: a model (`'Mac14,3'`); `graphics`: `'honest'`, `'machine'` or a GPU family (stored, and told to the program that asks: nothing acts on it yet); `'share.system'`: `false` keeps the system outside from being `/Volumes/Linux`; `'share.home'`: a directory outside that is the user's home. With `app`, that application's own `macos`, `machine` or `graphics`. Programs started afterwards are told so. |
+| `removeApp(name, app)` | Drops an application's settings. |
+| `delete(name)` | The bottle and everything in it. |
+| `machines(name)`, `releases(name)` | The rows of the system layer's tables: the Macs (`{ model, arch, target, targettype, soc, cpufamily, cpusubfamily, pcores, ecores, threads, brand, first, last, gpufamily, name }`, null what is not known) and the macOS releases (`{ product, build, ... }`); without a name, the default layer's. |
+| `spawn(name, argv, opts)`, `run(name, argv, opts)` | `sys.spawn` and `sys.run` in the bottle (each resolves: `spawn` with the Process): `argv[0]` and `opts.cwd` paths in the bottle's root (`cwd` by default the user's home), the environment `env(name, opts.env)`. |
+| `env(name, env)` | The environment a program of the bottle is started with: `GEX_BOTTLE` (the bottle's directory, which is how the kernel knows), `HOME`, `PATH`, and `env` over the last two. |
+| `outer(name, path)` | The name in the system's tree of a path in the bottle's root. |
+| `path(name)`, `dir`, `system` | The bottle's directory; the options. |
+
+A bottle is files, so it is kept as the filesystem keeps files: with a
+store (an `OPFSFilesystem`) across loads, its configuration and everything
+its programs wrote; in a `MemoryFilesystem` until the page is left. The
+system layer is the tar the page lays at each load, and no bottle changes
+it.
+
+The root has an application for the same settings from inside,
+`/System/Applications/Settings.app` (pyrus's): it writes the bottle's
+configuration as `set` does.
+
 ## Network
 
 The guest's connections out go to the page, which carries them over whatever

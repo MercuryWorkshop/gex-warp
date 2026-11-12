@@ -592,9 +592,12 @@ impl Kernel {
                 m.write(x[0], &name)?;
                 Ok(0)
             }
-            // The machine's identifier: one every gex machine has.
+            // The machine's identifier: its bottle's own, made with the
+            // bottle ([`bottle::identifiers`]); the one every gex machine
+            // has where there is none.
             d::GETHOSTUUID => {
-                m.write(x[0], b"gex\0\0\0\0\0\0\0\0\0\0\0\0\x01")?;
+                let uuid = self.darwin_conf().get("uuid").and_then(bottle::uuid_bytes).unwrap_or(*b"gex\0\0\0\0\0\0\0\0\0\0\0\0\x01");
+                m.write(x[0], &uuid)?;
                 Ok(0)
             }
             // The calling thread's own user and group, when it has taken

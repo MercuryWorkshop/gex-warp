@@ -19,6 +19,7 @@
 //! under canonical numbers of its own ([`NATIVE`], [`MACH`], [`MDEP`]).
 
 pub mod abi;
+pub mod bottle;
 mod attr;
 mod reclaim;
 pub mod restart;
@@ -288,9 +289,12 @@ impl Kernel {
     /// Map the [`commpage`] and fill it in: at a process's first call, which
     /// comes before anything of libSystem's reads it.
     fn darwin_map_commpage(&mut self, m: &mut GuestMem<'_>) {
-        let cpus = crate::cpus::count().min(255) as u8;
+        // The processors and their family, as `sysctl` has them: the Mac's
+        // this process is told it is on ([`info::Mac`]).
+        let machine = self.darwin_machine();
+        let cpus = machine.cpus.clamp(1, 255) as u8;
         if gex_abi::X86 {
-            return self.darwin_map_commpage_x86(m, cpus);
+            return self.darwin_map_commpage_x86(m, cpus, machine.cpufamily);
         }
         let caps = commpage::CAPABILITIES | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
         let mut page = [0u8; 0x100];
@@ -309,7 +313,7 @@ impl Kernel {
         page[0x37] = 14;
         // The memory's size and the processor's family, as `sysctl` has them.
         page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
-        page[0x80..0x84].copy_from_slice(&0xda33_d83du32.to_le_bytes());
+        page[0x80..0x84].copy_from_slice(&machine.cpufamily.to_le_bytes());
         // 0x40, the time of day, and 0x90, whether the clock can be read
         // without the kernel, are zero: libSystem asks.
         for at in [commpage::RO, commpage::DATA] {
@@ -326,7 +330,7 @@ impl Kernel {
     /// while a generation there is not zero. gex's counter counts
     /// nanoseconds, so the scale is one (a half, shifted once), and the
     /// base is where the kernel's own clock was zero.
-    fn darwin_map_commpage_x86(&mut self, m: &mut GuestMem<'_>, cpus: u8) {
+    fn darwin_map_commpage_x86(&mut self, m: &mut GuestMem<'_>, cpus: u8, cpufamily: u32) {
         let caps = commpage::CAPABILITIES_X86 | (cpus as u64) << 16 | if cpus == 1 { commpage::UP } else { 0 };
         let mut page = [0u8; 0x100];
         page[..16].copy_from_slice(b"commpage 64-bit\0");
@@ -338,7 +342,7 @@ impl Kernel {
         page[0x34..0x37].fill(cpus);
         page[0x37] = 1;
         page[0x38..0x40].copy_from_slice(&(4u64 << 30).to_le_bytes());
-        page[0x40..0x44].copy_from_slice(&0x37fc_219fu32.to_le_bytes());
+        page[0x40..0x44].copy_from_slice(&cpufamily.to_le_bytes());
         // The kernel's and a process's page shift.
         page[0x4d] = 12;
         page[0x4e] = 12;

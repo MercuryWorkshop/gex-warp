@@ -161,6 +161,10 @@ pub struct RunOptions {
     /// (over whatever is there), e.g. a caching `xkbcomp` over
     /// `/usr/bin/xkbcomp` for a translated Xwayland.
     pub binds: Vec<(std::path::PathBuf, String)>,
+    /// The guest paths among those mounts that are not to be written
+    /// (`--bind-ro`), `/` for the sysroot itself (a bottle's system layer:
+    /// `--bottle`).
+    pub read_only: Vec<String>,
     /// The program file when argv[0] does not name it (`--busybox` running
     /// `/bin/sh`): what `/proc/self/exe` is, which hush re-executes.
     pub exe: Option<String>,
@@ -346,6 +350,7 @@ impl Default for RunOptions {
             sysroot: None,
             busybox: None,
             binds: Vec::new(),
+            read_only: Vec::new(),
             exe: None,
             identity: None,
             sample: false,
@@ -3931,7 +3936,11 @@ fn mount_filesystems(
             if !root.is_dir() {
                 bail!("sysroot {} is not a directory", root.display());
             }
-            kernel.vfs.mount("/", Arc::new(HostFs::new(root)));
+            // (Sealed as the page's kernel seals a bottle's system layer:
+            // the same refusals, a name that is there before `EROFS`.)
+            let fs: Arc<dyn gex_kernel::vfs::FileSystem> = Arc::new(HostFs::new(root));
+            let sealed = opts.read_only.iter().any(|g| g == "/");
+            kernel.vfs.mount("/", if sealed { Arc::new(gex_kernel::vfs::readonly::ReadOnly::new(fs)) } else { fs });
         }
         None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
     }
@@ -3946,7 +3955,9 @@ fn mount_filesystems(
         }
     }
     for (host, guest) in &opts.binds {
-        kernel.vfs.mount(&resolve_in_root(opts.sysroot.as_deref(), guest), Arc::new(HostFs::new(host)));
+        let fs: Arc<dyn gex_kernel::vfs::FileSystem> = Arc::new(HostFs::new(host));
+        let fs = if opts.read_only.contains(guest) { Arc::new(gex_kernel::vfs::readonly::ReadOnly::new(fs)) } else { fs };
+        kernel.vfs.mount(&resolve_in_root(opts.sysroot.as_deref(), guest), fs);
     }
     let mut devfs = DevFs::new();
     if opts.gl {

@@ -216,6 +216,16 @@ the image low. What works is what a program can do with the kernel alone:
   `/System/Library/CoreServices/SystemVersion.plist` says (macOS 26.0 with
   none), so the version a program sees is a setting of the root it runs
   in, as a Windows version is of a Wine prefix;
+- which Mac it is: `hw.model`, `hw.target`, `hw.targettype`,
+  `hw.cpufamily` and `hw.cpusubfamily` (the comm page's too), the
+  processor counts and performance levels, `machdep.cpu.brand_string` and
+  the chip `kern.version` and `uname` name are one row of the root's table
+  of Macs (`/usr/share/gex/mac-models`, pyrus's): the model the process's
+  bottle or environment chose (`GEX_MAC_MODEL`, `gexc run --machine`), or
+  the first of the table that ran the macOS the process is told it is on,
+  so that no program is told of a Mac older or newer than its system
+  (Bottles, below). What the processor can do (`hw.optional.*`) is what
+  gex translates whichever Mac is named: a model adds nothing to it;
 - job control, which is the kernel's own and so every guest's: a signal
   that stops a process (`SIGSTOP`, and a terminal's `^Z`, its
   `SIGTTIN` and `SIGTTOU` in a job a shell controls) holds each of its
@@ -368,6 +378,88 @@ a Wayland compositor at a socket in `/tmp`, which a Mac program reaches as
 any program does. `test/darwin/window.test.js` runs one that speaks the
 protocol itself (a Mac has no library for it), its pixels in shared memory
 whose descriptor it passes, and the compositor shows its window.
+
+#### Bottles
+
+A bottle is to a Mac root what a Wine prefix is to Wine: an environment of
+its own over one shared system. A Mac keeps its system on a sealed volume
+and everything else on a data volume, joined at a few directories; a
+bottle is that split with many data volumes over one system
+(`crates/gex-kernel/src/darwin/bottle.rs`):
+
+- the **system layer** is the Mac root as pyrus builds it (`/System`,
+  `/usr`, `/bin`, `/sbin`, `/private/etc`): one tree, which every bottle
+  reads and none can write (`EROFS`);
+- a **bottle** is a directory with its own `Users`, `Applications`,
+  `Library` and `private/var`, bound over the layer's directories of those
+  names and written as any directory is. A new bottle's are copies of the
+  layer's, with the first person's home made, so it starts as the root it
+  was made from;
+- its **configuration** is `Library/Preferences/bottle.conf` in the
+  bottle, a file of `key = value` lines with a section for each
+  application that has settings of its own:
+
+  ```
+  name = work
+  system = /opt/mac
+  uuid = 6F9619FF-8B86-4011-B42D-00C04FC964FF
+  serial = C7GQ2WK1TL
+  macos = 14
+  machine = Macmini9,1
+  graphics = machine
+  share.system = no
+  share.home = /home/user
+
+  [app TextEdit]
+  macos = 11
+  ```
+
+  | key | |
+  |---|---|
+  | `system` | the system layer, by its name outside the bottle |
+  | `macos` | the release its programs are told they are on, a row of the layer's `/usr/share/gex/macos-releases` (`14`, `14.8.9`, `sonoma`); the layer's own without it |
+  | `machine` | the Mac they are told they are on, a model of the layer's `/usr/share/gex/mac-models`; without it the first row that ran that macOS. A chosen Mac has its own processor counts; the default has the host's |
+  | `graphics` | the graphics profile: `honest` (the default), `machine` (the chosen Mac's GPU family) or a family (`mac2`, `apple7`, `apple8`). Nothing acts on it yet: the kernel tells who asks what it comes to for the asking process (`sysctl gex.bottle.graphics`), which is where a Metal layer is to read it |
+  | `share.system` | `no`: the system outside is not the volume `/Volumes/Linux` |
+  | `share.home` | a directory outside that is the user's home in place of the bottle's |
+  | `uuid`, `serial`, `name` | made with the bottle: `gethostuuid` answers the first, `sysctl gex.bottle.serial` and `gex.bottle.name` the others |
+
+  `macos`, `machine` and `graphics` may be an application's own, in the
+  section named as its program's file or its bundle (`[app TextEdit]`
+  for anything in `TextEdit.app`), as `winecfg` keeps a Windows version
+  for each application. The environment's word (`GEX_MACOS_VERSION`,
+  `GEX_MAC_MODEL`) is over both.
+
+The kernel reads the configuration when a program starts, so a change is
+what programs started afterwards find. A root that is no bottle's is
+configured by the same file, where it has one. The joins are per-directory
+binds because the namespace is already a table of mounts by path, and
+because a Mac writes nothing outside those directories that a union of two
+whole trees (whiteouts, copy-up) would be needed for.
+
+`gexc bottle` makes and manages them on a disk:
+
+```console
+$ gexc bottle create work --system ../pyrus/out/root macos=14 machine=Macmini9,1
+$ gexc bottle set work --app TextEdit macos=11
+$ gexc bottle run work /usr/bin/uname -v
+Darwin Kernel Version 23.6.0: gex; root:xnu-12377.1.9/RELEASE_ARM64_T8103
+$ gexc bottle list; gexc bottle show work; gexc bottle machines work; gexc bottle delete work
+```
+
+(`GEX_BOTTLES`, by default `~/.gex/bottles`, is where a bottle named by a
+name alone is; a name with a `/` is a directory. `gexc run --bottle DIR`
+is `bottle run` with the program a path on the disk; `--bind-ro HOST=GUEST`
+is the read-only bind it is made of.) There the layer is `gexc`'s root,
+mounted read-only, and the bottle's directories are mounts over it. On the
+page, where the root is a directory of another tree, a Mac program started
+with `GEX_BOTTLE` naming a bottle's directory is entered into it as into a
+plain root: the layer sealed, the bottle's directories and `/dev`, `/tmp`
+and (unless it says no) `/Volumes/Linux` in it; the page runtime's
+`Bottles` (`page/runtime/README.md`) is `gexc bottle` there. A bottle on
+the page is kept as its filesystem keeps anything: across loads in a
+store (`OPFSFilesystem`), not at all in a `MemoryFilesystem`.
+`test/darwin/bottle.test.js` and `bottle-page.test.js` run both.
 
 ### Build the page
 

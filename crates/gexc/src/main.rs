@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod bottle;
 mod prof;
 mod eject;
 mod pe_info;
@@ -76,7 +77,7 @@ fn real_main() -> Result<ExitCode> {
     // Only for what runs here: `gexc build` makes modules for the browser.
     // An ejected project's native build and run too (its units are the
     // native flavor; the web build's are built apart).
-    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-c")
+    let native = matches!(argv[1].as_str(), "run" | "bottle" | "cgen-image" | "cgen-c")
         || (argv[1] == "eject" && matches!(argv.get(2).map(String::as_str), Some("build" | "run")));
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
@@ -99,6 +100,21 @@ fn real_main() -> Result<ExitCode> {
             prof::finish();
             r
         }
+        // `bottle run` runs the guest, as `run` does; the rest are files.
+        "bottle" => match bottle::cmd(&argv[2..])? {
+            Some(args) => {
+                let r = std::thread::Builder::new()
+                    .name("gex-main".into())
+                    .stack_size(gex_native::guest_thread_stack())
+                    .spawn(move || cmd_run(&args))
+                    .expect("spawning the main guest thread")
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                prof::finish();
+                r
+            }
+            None => Ok(ExitCode::SUCCESS),
+        },
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -292,7 +308,15 @@ run options:
                   macOS: 14, 14.8.9 or sonoma, any release the Mac root's
                   /usr/share/gex/macos-releases has; its root says which
                   otherwise. The same as --env GEX_MACOS_VERSION=VERSION
+  --machine MODEL a Mac program (and what it runs) is told it is on that
+                  Mac: a model the Mac root's /usr/share/gex/mac-models has
+                  (Mac14,3); its bottle's or its macOS's default otherwise.
+                  The same as --env GEX_MAC_MODEL=MODEL
+  --bottle DIR    run in the bottle at DIR (gexc bottle create): its system
+                  layer is the root, read-only, with the bottle's /Users,
+                  /Applications, /Library and /private/var over it
   --bind H=G      mount host file or directory H at guest path G (repeatable)
+  --bind-ro H=G   the same, not to be written
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
                   coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
   --pin FILE      place each object where FILE says, as written by
@@ -370,6 +394,7 @@ run options:
         pe_info::USAGE,
         eject::USAGE
     );
+    eprintln!("\nbottles (Mac environments that share one Mac root, as Wine prefixes share one Wine):\n{}", bottle::usage());
 }
 
 /// Split gexc's own flags from the guest's argument vector.
@@ -404,6 +429,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut argv0: Option<String> = None;
     let mut guest = false;
     let mut host_env = false;
+    let mut in_bottle: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -459,13 +485,29 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
             }
-            "--bind" => {
+            "--bind" | "--bind-ro" => {
                 i += 1;
-                let v = args.get(i).context("--bind needs HOST=GUEST")?;
-                let (host, guest) = v.split_once('=').context("--bind wants HOST=GUEST")?;
-                anyhow::ensure!(guest.starts_with('/'), "--bind {v}: the guest path must be absolute");
-                let host = std::fs::canonicalize(host).with_context(|| format!("--bind {v}"))?;
+                let v = args.get(i).with_context(|| format!("{a} needs HOST=GUEST"))?;
+                let (host, guest) = v.split_once('=').with_context(|| format!("{a} wants HOST=GUEST"))?;
+                anyhow::ensure!(guest.starts_with('/'), "{a} {v}: the guest path must be absolute");
+                let host = std::fs::canonicalize(host).with_context(|| format!("{a} {v}"))?;
                 opts.binds.push((host, guest.to_string()));
+                if a == "--bind-ro" {
+                    opts.read_only.push(guest.to_string());
+                }
+            }
+            // A bottle (`gexc bottle create`): its system layer the root,
+            // not to be written, and its own directories over it.
+            "--bottle" => {
+                i += 1;
+                in_bottle = Some(args.get(i).context("--bottle needs a bottle's directory")?.clone());
+            }
+            // Which Mac a Mac program is told it is on: the kernel's word
+            // for it is the environment's, as `--macos`'s is.
+            "--machine" => {
+                i += 1;
+                let v = args.get(i).context("--machine needs a model (Mac14,3)")?;
+                opts.env.push(format!("{}={v}", gex_kernel::darwin::bottle::MODEL));
             }
             "--busybox" => {
                 i += 1;
@@ -555,6 +597,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             .collect();
         env.append(&mut opts.env);
         opts.env = env;
+    }
+    if let Some(dir) = in_bottle {
+        bottle::apply(&dir, &mut opts)?;
     }
     // `GEX_PROFILE=1` is `--record $GEX_PROFILE_OUT`.
     if opts.record.is_none()
