@@ -11,8 +11,8 @@
 // alike). Both processors. Natively the parent's pages are the child's
 // (hosts/native/src/shmem.rs); what that does not reach is said and not
 // checked: a child's own mapping of a shm_open name after the fork (a
-// copy, as before), and on a Mac a process-shared mutex (Darwin's psynch
-// queues are each process's).
+// copy, as before). A Mac's process-shared mutex is checked here and in
+// darwin/pshared.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -58,5 +58,5 @@ export default async function (t) {
   const wantM = await exec(x86 ? ['arch', '-x86_64', prog] : [prog], { timeout: 120000 });
   t.check('the Mac ran it', wantM.code === 0, `exit ${wantM.code}: ${wantM.stderr.trim()}`);
   const gotM = await n.gexc(['run', '--sysroot', mac, prog], { timeout: 200000 });
-  compare(t, 'Mac', wantM.stdout, gotM.stdout, /a child's own mapping of the name|^mutex: the child/);
+  compare(t, 'Mac', wantM.stdout, gotM.stdout, /a child's own mapping of the name/);
 }

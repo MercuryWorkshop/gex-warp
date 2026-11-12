@@ -15,8 +15,20 @@
 //! This is XNU's `libpthread/kern/kern_synch.c`, routine for routine, and
 //! the words it hands back are that file's: libpthread's own half assumes
 //! them. What is not here is what has no meaning here: the turnstiles and
-//! owners (priority inheritance), and objects shared between processes
-//! (every one is its process's own).
+//! owners (priority inheritance).
+//!
+//! An object shared between processes (`PTHREAD_PROCESS_SHARED`, which
+//! libpthread says in the call's flags) in memory they share
+//! ([`crate::mem::Share`]: a fork's `MAP_SHARED` pages, natively) has its
+//! queue in the system's table ([`shared_psynch`]), keyed by the share and
+//! the offset as XNU's `ksyn_findobj` keys it by VM object and offset.
+//! A thread of another process waits on the object's own word, as a futex
+//! of the share, and is woken there; as that word does not move with the
+//! kernel's answer, such a wait also looks again every
+//! [`SHARED_POLL_NS`], and one that finds nothing for it ends as a wait
+//! that was interrupted (libpthread takes the call again; a condition's
+//! waiter returns, as POSIX allows any). On the page no memory is shared
+//! between processes, and such an object is each process's own.
 //!
 //! A thread that waits sleeps as a futex waiter on a word of its own, in a
 //! page the kernel keeps in the task's memory. Whoever grants it what it
@@ -790,6 +802,35 @@ struct Wait {
     granted: Option<u32>,
 }
 
+/// A call's flags (`_PTHREAD_MTX_OPT_PSHARED` among them), by call.
+fn call_flags(code: u64, x: &[u64; 8]) -> u32 {
+    (match code {
+        d::PSYNCH_MUTEXWAIT | d::PSYNCH_MUTEXDROP => x[4],
+        d::PSYNCH_CVWAIT => x[5],
+        d::PSYNCH_CVSIGNAL => x[7],
+        d::PSYNCH_CVBROAD => x[3],
+        d::PSYNCH_CVCLRPREPOST => x[6],
+        d::PSYNCH_RW_RDLOCK | d::PSYNCH_RW_WRLOCK | d::PSYNCH_RW_UNLOCK => x[4],
+        _ => 0,
+    }) as u32
+}
+
+/// How often a wait on a process-shared object looks again for what it
+/// was granted, when the wake did not reach it.
+const SHARED_POLL_NS: u64 = 20_000_000;
+
+/// `_PTHREAD_MTX_OPT_PSHARED` in a call's flags (`PTHREAD_PSHARED_FLAGS_MASK`).
+const PSHARED: u32 = 0x10;
+const PSHARED_MASK: u32 = 0x30;
+
+/// The system's queues for objects shared between processes, keyed by
+/// [`crate::mem::MapView::share_key`], and their waits, by thread (thread
+/// ids are the system's).
+fn shared_psynch() -> &'static Arc<std::sync::Mutex<Psynch>> {
+    static T: std::sync::OnceLock<Arc<std::sync::Mutex<Psynch>>> = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
 /// A process's psynch state: what its threads share, and a fork does not
 /// inherit.
 #[derive(Default, Debug)]
@@ -1127,7 +1168,15 @@ impl Kernel {
     /// canonical call that sleeps on the thread's word is returned, its
     /// arguments in `a`, with [`Post::Psynch`] left to finish it.
     pub(super) fn darwin_psynch(&mut self, m: &mut GuestMem<'_>, code: u64, x: [u64; 8], a: &mut [u64; 6]) -> u64 {
-        let shared = Arc::clone(&self.darwin_psynch);
+        // A process-shared object in shared memory: the system's queue, by
+        // its share and offset.
+        let object = x[0];
+        let key = (call_flags(code, &x) & PSHARED_MASK == PSHARED).then(|| self.mem.view().share_key(object)).flatten();
+        let mut x = x;
+        if let Some(k) = key {
+            x[0] = k;
+        }
+        let shared = if key.is_some() { Arc::clone(shared_psynch()) } else { Arc::clone(&self.darwin_psynch) };
         let mut ps = shared.lock().unwrap_or_else(|e| e.into_inner());
         let now = clock_ns(self.clock, 1);
         let tid = self.tid;
@@ -1180,6 +1229,14 @@ impl Kernel {
                 self.darwin_answer = Some(r.map(u64::from));
                 NATIVE + code
             }
+            Out::Park(w) if key.is_some() => match self.darwin_psynch_park_shared(m, &mut ps, w, object, now, a) {
+                Ok(call) => call,
+                Err(e) => {
+                    let _ = ps.resume(tid, w, e, now);
+                    self.darwin_answer = Some(Err(e));
+                    NATIVE + code
+                }
+            },
             Out::Park(w) => match self.darwin_psynch_park(m, &mut ps, w, now, a) {
                 Ok(call) => call,
                 Err(e) => {
@@ -1189,8 +1246,32 @@ impl Kernel {
                 }
             },
         };
-        self.darwin_psynch_wake(m, &mut ps);
+        if key.is_some() {
+            // Whoever this granted waits on the object's word, in whichever
+            // process: woken there.
+            if !std::mem::take(&mut ps.wake).is_empty() {
+                drop(ps);
+                let _ = self.sys_futex(m, [object, crate::futex::op::WAKE as u64, i32::MAX as u64, 0, 0, 0]);
+            }
+        } else {
+            self.darwin_psynch_wake(m, &mut ps);
+        }
         n
+    }
+
+    /// A wait on a process-shared object: on the object's word, a futex of
+    /// the share every process of it reaches, until `w`'s time or for
+    /// [`SHARED_POLL_NS`] at most.
+    fn darwin_psynch_park_shared(&mut self, m: &mut GuestMem<'_>, ps: &mut Psynch, w: Wait, object: u64, now: u64, a: &mut [u64; 6]) -> Result<u64, Errno> {
+        let seen = m.read_u32(object)?;
+        let left = w.deadline.map_or(SHARED_POLL_NS, |d| d.saturating_sub(now).clamp(1, SHARED_POLL_NS));
+        let ts = self.ctx_addr + SCRATCH_SLOT as u64;
+        m.write_u64(ts, left / 1_000_000_000)?;
+        m.write_u64(ts + 8, left % 1_000_000_000)?;
+        ps.waits.insert(self.tid, w);
+        self.darwin_post = Post::Psynch;
+        *a = [object, crate::futex::op::WAIT as u64, seen as u64, ts, 0, 0];
+        Ok(nr::FUTEX)
     }
 
     /// The word thread `tid` sleeps on, in the page the task's memory
@@ -1239,6 +1320,16 @@ impl Kernel {
     /// out, or (a signal, or a wake that was another thread's) it was
     /// interrupted, which libpthread takes as cause to look again.
     pub(super) fn darwin_psynch_end(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SysResult {
+        // A wait on a process-shared object: the system's table has it. Its
+        // own timeouts are looks again, not its time running out.
+        {
+            let mut ps = shared_psynch().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = ps.waits.remove(&self.tid) {
+                let now = clock_ns(self.clock, 1);
+                let error = if w.deadline.is_some_and(|at| now >= at) { Errno::ETIMEDOUT } else { Errno::EINTR };
+                return ps.resume(self.tid, w, error, now).map(u64::from);
+            }
+        }
         let shared = Arc::clone(&self.darwin_psynch);
         let mut ps = shared.lock().unwrap_or_else(|e| e.into_inner());
         let now = clock_ns(self.clock, 1);
