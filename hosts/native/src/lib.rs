@@ -2264,14 +2264,17 @@ fn perform_block(
             }
         },
         BlockOp::Poll {
-            fds,
+            mut fds,
             deadline,
-            report,
+            mut report,
         } => {
             let start = std::time::Instant::now();
             loop {
                 let seen = ready::seq();
                 service(data);
+                // An `epoll_wait` whose set another thread added to since it
+                // parked waits on the set as it is now.
+                gex_kernel::syscalls::epoll_refresh(&mut fds, &mut report);
                 if gex_kernel::syscalls::poll_ready(&fds) {
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);

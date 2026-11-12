@@ -9743,6 +9743,51 @@ pub fn poll_ready(fds: &[PollFd]) -> bool {
     fds.iter().any(|p| poll_revents(p) != 0)
 }
 
+/// A parked `epoll_wait` whose set's interest list changed since it parked
+/// (`epoll_ctl` from another thread -- async-io's reactor waits in
+/// `epoll_wait` while the threads it serves add their descriptors, and
+/// glycin's image loaders talked to nobody): its descriptors and tokens
+/// again, from the set, which knows the open file of every watch `epoll_ctl`
+/// added. A watch whose file the set does not know keeps the one in hand.
+/// False when the list in hand is current (or this is not an `epoll_wait`).
+pub fn epoll_refresh(fds: &mut Vec<PollFd>, report: &mut PollReport) -> bool {
+    let PollReport::Epoll { data, set, generation, .. } = report else { return false };
+    let now = set.generation();
+    if now == *generation {
+        return false;
+    }
+    *generation = now;
+    let old = std::mem::take(fds);
+    let watches = set.watches();
+    for w in &watches {
+        let events = (w.events & 0xffff) as u16;
+        let edge = w.events & unix::epoll_flag::ET != 0;
+        match set.owner(w.fd) {
+            Some(Some((handle, writable))) => {
+                set.rechain(w.fd, handle.wait_queue());
+                fds.push(PollFd {
+                    addr: 0,
+                    fd: w.fd,
+                    events,
+                    handle: Some(handle),
+                    writable,
+                    epoll: Some(Arc::clone(set)),
+                    edge,
+                    gone: None,
+                });
+            }
+            Some(None) => set.forget(w.fd),
+            None => {
+                if let Some(p) = old.iter().find(|p| p.fd == w.fd) {
+                    fds.push(PollFd { events, edge, ..p.clone() });
+                }
+            }
+        }
+    }
+    *data = watches.iter().map(|w| (w.fd, w.data)).collect();
+    true
+}
+
 /// Read-ready and write-ready counts from the last `select`. See the note
 /// where they are set.
 pub static SELECT_READY: [core::sync::atomic::AtomicU64; 2] = [
