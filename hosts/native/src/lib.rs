@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod crashinfo;
 mod lockstep;
 use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
@@ -2538,7 +2539,59 @@ enum Stopped {
     Exec(ExecRequest),
 }
 
+/// [`run_thread_loop_inner`], and on the thread's fatal signal the report of
+/// where it was (`crashinfo`).
 fn run_thread_loop(
+    store: &mut Store<HostState>,
+    instance: &wasmtime::Instance,
+    ctx_addr: u64,
+    entry: u64,
+) -> Result<Stopped> {
+    let r = run_thread_loop_inner(store, instance, ctx_addr, entry);
+    if let Ok(Stopped::Exited(Exit::Signal { signal, internal: false, .. })) = &r {
+        if crash_signal(*signal) && crashinfo::enabled() {
+            report_crash(store, ctx_addr, *signal);
+        }
+    }
+    let _ = crashinfo::take_fault();
+    r
+}
+
+/// Say where the thread of `store` died of `signal`: its registers as last
+/// written back, the guest's map, and the files of the images in it.
+fn report_crash(store: &mut Store<HostState>, ctx_addr: u64, signal: i32) {
+    // Another thread already ended the process: this one only stopped.
+    if store.data().spawn.as_ref().is_some_and(|s| s.stopping.load(std::sync::atomic::Ordering::Acquire)) {
+        return;
+    }
+    let Some(memory) = store.data().memory.clone() else { return };
+    struct Src<'a, 'b> {
+        gm: GuestMem<'a>,
+        store: &'b mut Store<HostState>,
+    }
+    impl crashinfo::Source for Src<'_, '_> {
+        fn word(&mut self, addr: u64) -> Option<u64> {
+            self.gm.read_u64(gex_abi::canon(addr)).ok()
+        }
+        fn file(&mut self, path: &str) -> Option<Vec<u8>> {
+            self.store.data_mut().with_kernel(|k| k.read_file(path))
+        }
+    }
+    let tid = store.data().thread.tid;
+    let pid = store.data_mut().with_kernel(|k| k.pid);
+    let (vmas, exe) = store.data_mut().with_kernel(|k| (k.mem.lock().vmas().to_vec(), k.exe_path.clone()));
+    let mut gm = GuestMem::new(memory.bytes());
+    let mut rd = |off: usize| gm.read_u64(ctx_addr + off as u64).unwrap_or(0);
+    let regs = if gex_abi::X86 {
+        crashinfo::Regs { pc: rd(ctx::PC), lr: None, sp: rd(ctx::SP), fp: rd(ctx::x(5)) }
+    } else {
+        crashinfo::Regs { pc: rd(ctx::PC), lr: Some(rd(ctx::x(30))), sp: rd(ctx::SP), fp: rd(ctx::x(29)) }
+    };
+    let mut src = Src { gm: GuestMem::new(memory.bytes()), store };
+    crashinfo::on_end(signal, regs, crashinfo::take_fault(), &vmas, &exe, &mut src, pid, tid);
+}
+
+fn run_thread_loop_inner(
     store: &mut Store<HostState>,
     instance: &wasmtime::Instance,
     ctx_addr: u64,
@@ -2662,6 +2715,9 @@ fn run_thread_loop(
                     // last written back, so a handler that makes the page
                     // writable and returns runs the block again.
                     let at_addr = e.downcast_ref::<wasmtime::WasmFault>().map(|f| f.wasm_address);
+                    if let Some(a) = at_addr {
+                        crashinfo::note_fault(a);
+                    }
                     if let (Some(addr), Some(memory)) = (at_addr, store.data().memory.clone().filter(|m| m.has_view())) {
                         if fault_hook_of(store.data()).is_none() {
                             let (darwin, mapped) = store.data_mut().with_kernel(|k| (k.darwin, k.mem.lock().vma_at(addr).is_some()));
@@ -2732,9 +2788,12 @@ fn run_thread_loop(
                         }
                     }
                     if action.handler == 0 {
+                        // (Its pc was 0: the context's, the block the access was
+                        // in, is what a report of the crash needs.)
+                        let at = store.data().memory.clone().map_or(0, |m| read_u64(m.bytes(), (ctx_addr + ctx::PC as u64) as usize));
                         return Ok(Stopped::Exited(Exit::Signal {
                             signal: signal::SIGSEGV,
-                            pc: 0,
+                            pc: at,
                             detail: "guest memory access out of bounds".into(),
                             internal: false,
                         }));
