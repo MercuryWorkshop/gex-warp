@@ -245,6 +245,15 @@ export class GuestWindow extends EventTarget {
    *  subsurface: never framed). A placed window can be the host's: a Win32
    *  window with a caption under a Wine that asks for server-side
    *  decoration, whose client area this is. */
+  /** The window inside its canvas, without the invisible margins its
+   *  client keeps for shadows (`xdg_surface.set_window_geometry`): `{ x, y,
+   *  w, h }` in CSS pixels, or null when the whole canvas is the window. A
+   *  page that crops or places a window by its visible part reads this. */
+  get geometry() {
+    const g = this.#w.geometry;
+    return g ? { ...g } : null;
+  }
+
   get decorations() {
     if (this.kind !== 'toplevel') return 'none';
     return this.#w.decorations === 'server' ? 'host' : 'client';

@@ -12,7 +12,13 @@
 // open File, Wrap's check mark moves and the count goes up, before the
 // answer; what the shell opens, closes and chooses is said.
 //
-//   window TITLE [WIDTH HEIGHT]
+//   window TITLE [WIDTH HEIGHT] [bare] [geometry X Y W H]
+//
+// `bare`: it draws its own frame, or none (a borderless window), and says so
+// (zxdg_toplevel_decoration_v1.set_mode(client_side)). `geometry`: the window
+// is only that part of its surface (xdg_surface.set_window_geometry), as a
+// program with shadow margins says. It says the room it is given
+// (xdg_toplevel.configure_bounds) as "window: bounds W by H".
 //
 // The socket is $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (wayland-0 if that is not
 // set). Says what it does on its output, a line each.
@@ -103,7 +109,7 @@ static int event(uint32_t *object, uint32_t *opcode, const uint32_t **args, unsi
     }
 }
 
-enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER, SEAT, POINTER, KEYBOARD, MENUS, MENU };
+enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER, SEAT, POINTER, KEYBOARD, MENUS, MENU, DECO_MANAGER, DECORATION };
 
 // gex_menu_v1.item(id, flags, state, indent 0, title); flags: 1 disabled,
 // 4 a separator, 8 a submenu.
@@ -173,6 +179,12 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *title = argc > 1 ? argv[1] : "window";
     int width = argc > 3 ? atoi(argv[2]) : 320, height = argc > 3 ? atoi(argv[3]) : 200;
+    int bare = 0, geometry[4] = {0};
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "bare")) bare = 1;
+        if (!strcmp(argv[i], "geometry") && i + 4 < argc)
+            for (int k = 0; k < 4; k++) geometry[k] = atoi(argv[++i]);
+    }
     const char *dir = getenv("XDG_RUNTIME_DIR"), *name = getenv("WAYLAND_DISPLAY");
     struct sockaddr_un at = {0};
     at.sun_family = AF_UNIX;
@@ -188,7 +200,7 @@ int main(int argc, char **argv) {
     request(DISPLAY, 1, a, 1, -1);
     a[0] = SYNC;
     request(DISPLAY, 0, a, 1, -1);
-    uint32_t compositor = 0, shm = 0, wm = 0, seat = 0, menus = 0, compositor_version = 0, wm_version = 0, seat_version = 0;
+    uint32_t compositor = 0, shm = 0, wm = 0, seat = 0, menus = 0, deco = 0, compositor_version = 0, wm_version = 0, seat_version = 0;
     uint32_t object, opcode;
     const uint32_t *args;
     unsigned words;
@@ -207,6 +219,7 @@ int main(int argc, char **argv) {
         if (!strcmp(interface, "xdg_wm_base")) wm = args[0], wm_version = version;
         if (!strcmp(interface, "wl_seat")) seat = args[0], seat_version = version;
         if (!strcmp(interface, "gex_menu_manager_v1")) menus = args[0];
+        if (!strcmp(interface, "zxdg_decoration_manager_v1") && bare) deco = args[0];
     }
     printf("window: a compositor %s, shared memory %s, windows %s\n", compositor ? "yes" : "no", shm ? "yes" : "no", wm ? "yes" : "no");
     if (!compositor || !shm || !wm) return 1;
@@ -214,8 +227,9 @@ int main(int argc, char **argv) {
         uint32_t *name, id;
         const char *interface;
         uint32_t *has, most;
-    } binds[] = {{&compositor, COMPOSITOR, "wl_compositor", &compositor_version, 4}, {&shm, SHM, "wl_shm", 0, 1}, {&wm, WM, "xdg_wm_base", &wm_version, 2}, {&seat, SEAT, "wl_seat", &seat_version, 5}};
-    for (unsigned i = 0; i < 4; i++) {
+    } binds[] = {{&compositor, COMPOSITOR, "wl_compositor", &compositor_version, 4}, {&shm, SHM, "wl_shm", 0, 1}, {&wm, WM, "xdg_wm_base", &wm_version, 4}, {&seat, SEAT, "wl_seat", &seat_version, 5},
+                 {&deco, DECO_MANAGER, "zxdg_decoration_manager_v1", 0, 1}};
+    for (unsigned i = 0; i < 5; i++) {
         if (!*binds[i].name) continue;
         unsigned n = 0;
         a[n++] = *binds[i].name;
@@ -241,8 +255,20 @@ int main(int argc, char **argv) {
     a[0] = TOPLEVEL;
     request(XDG_SURFACE, 1, a, 1, -1);
     request(TOPLEVEL, 2, a, put_string(a, title), -1);
+    if (deco) {
+        // get_toplevel_decoration(id, toplevel), set_mode(client_side).
+        a[0] = DECORATION, a[1] = TOPLEVEL;
+        request(DECO_MANAGER, 1, a, 2, -1);
+        a[0] = 1;
+        request(DECORATION, 1, a, 1, -1);
+    }
+    if (geometry[2] > 0) {
+        memcpy(a, geometry, sizeof geometry);
+        request(XDG_SURFACE, 3, a, 4, -1);
+    }
     request(SURFACE, 6, a, 0, -1);
 
+    int bounds_w = 0, bounds_h = 0, moded = 0;
     // The compositor says how it is to be (a size, or none of its own),
     // which is acknowledged before anything is shown.
     for (;;) {
@@ -252,12 +278,21 @@ int main(int argc, char **argv) {
             request(WM, 3, a, 1, -1);
         }
         if (object == TOPLEVEL && opcode == 0 && args[0] && args[1]) width = (int)args[0], height = (int)args[1];
+        if (object == TOPLEVEL && opcode == 2) bounds_w = (int)args[0], bounds_h = (int)args[1];
+        if (object == DECORATION && opcode == 0) {
+            printf("window: its frame is %s\n", args[0] == 1 ? "its own" : "the compositor's");
+            moded = args[0] == 1;
+        }
         if (object == XDG_SURFACE && opcode == 0) {
             a[0] = args[0];
             request(XDG_SURFACE, 4, a, 1, -1);
+            // (a window that asked for its own frame takes the configure that
+            // follows the answer)
+            if (deco && !moded) continue;
             break;
         }
     }
+    if (bounds_w) printf("window: bounds %d by %d\n", bounds_w, bounds_h);
     printf("window: configured\n");
 
     // The pixels: memory shared by its name, which is then let go, and by

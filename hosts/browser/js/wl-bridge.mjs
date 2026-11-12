@@ -72,7 +72,13 @@ export const R_DAMAGE_H = 15;
 export const R_FLAGS = 16;
 /** The X window this surface is, or zero. See `F_EXTERNAL`. */
 export const R_XID = 17;
-// Words 18..25 are free (the title's, before it had room).
+/** The window inside the surface (`xdg_surface.set_window_geometry`), x,
+ *  y, width, height in surface units, width 0 when its client set none; and
+ *  who draws its frame (`gex_wayland::Decorations`): 0 unsaid, 1 the client
+ *  (its own frame, or none: show it bare), 2 the host. */
+export const R_GEOM = 18;
+export const R_DECO = 22;
+// Words 23..25 are free (the title's, before it had room).
 export const R_TITLE = 38;
 export const R_TITLE_WORDS = 64;
 export const R_APP_ID = 102;
@@ -611,6 +617,10 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         below: a[r + R_STACK_BELOW] >>> 0,
         restack: a[r + R_RESTACK] >>> 0,
         activate: a[r + R_ACTIVATE] >>> 0,
+        geometry: a[r + R_GEOM + 2] > 0
+          ? { x: a[r + R_GEOM], y: a[r + R_GEOM + 1], w: a[r + R_GEOM + 2], h: a[r + R_GEOM + 3] }
+          : null,
+        deco: a[r + R_DECO],
         input: (a[r + R_FLAGS] & F_INPUT_REGION)
           ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
           : null,
