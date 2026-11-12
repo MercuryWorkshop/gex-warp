@@ -16,6 +16,7 @@ import * as wisp from '../../page/runtime/src/net/wisp.mjs';
 import * as audio from '../../page/runtime/src/audio.js';
 import * as gl from '../../page/runtime/src/gl.js';
 import * as input from '../../page/runtime/src/input.js';
+import * as bottles from '../../page/runtime/src/bottles.js';
 import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
@@ -185,6 +186,9 @@ function members(t) {
     'PointerLock': [input.PointerLock.prototype, ['locked', 'release']],
     'Clipboard': [input.Clipboard.prototype, ['text', 'setText']],
     'Gamepads': [input.Gamepads.prototype, ['pads']],
+    // (Its example needs a Mac root, which the tree here is not: it is
+    // run by darwin/bottle-page, and is not a block this test counts.)
+    'Bottles': [bottles.Bottles.prototype, ['create', 'list', 'get', 'set', 'removeApp', 'delete', 'machines', 'releases', 'spawn', 'run', 'env', 'outer', 'path', 'dir', 'system']],
     'HostWindows': [host.HostWindows.prototype, ['setOutputSize', 'env', 'windows', 'focused', 'keyEvent']],
     'GuestWindow': [host.GuestWindow.prototype, ['parent', 'pid', 'title', 'width', 'height', 'decorations', 'placed', 'x', 'y', 'place', 'resize', 'setStates', 'focus', 'close', 'appId']],
     'SingleCanvas': [single.SingleCanvas.prototype, ['env', 'describe', 'resized']],
