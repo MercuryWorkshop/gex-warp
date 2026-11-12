@@ -6,6 +6,12 @@
 // and answers the compositor until its input ends, saying what the pointer
 // and the keyboard do in it.
 //
+// Where the compositor's shell presents menus (gex_menu_manager_v1), it
+// hands it a menu bar: File (Save with a picture and a shortcut, Wrap, a
+// separator, a line that counts) and Help. Each time the shell is about to
+// open File, Wrap's check mark moves and the count goes up, before the
+// answer; what the shell opens, closes and chooses is said.
+//
 //   window TITLE [WIDTH HEIGHT]
 //
 // The socket is $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (wayland-0 if that is not
@@ -97,7 +103,71 @@ static int event(uint32_t *object, uint32_t *opcode, const uint32_t **args, unsi
     }
 }
 
-enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER, SEAT, POINTER, KEYBOARD };
+enum { DISPLAY = 1, REGISTRY, SYNC, COMPOSITOR, SHM, WM, SURFACE, XDG_SURFACE, TOPLEVEL, POOL, BUFFER, SEAT, POINTER, KEYBOARD, MENUS, MENU };
+
+// gex_menu_v1.item(id, flags, state, indent 0, title); flags: 1 disabled,
+// 4 a separator, 8 a submenu.
+static void menu_item(uint32_t id, uint32_t flags, uint32_t state, const char *title) {
+    uint32_t a[40] = {id, flags, state, 0};
+    request(MENU, 2, a, 4 + put_string(a + 4, title), -1);
+}
+
+// gex_menu_v1.set_items(menu, the children's numbers).
+static void menu_children(uint32_t menu, const uint32_t *ids, unsigned count) {
+    uint32_t a[40] = {menu, 4 * count};
+    memcpy(a + 2, ids, 4 * count);
+    request(MENU, 9, a, 2 + count, -1);
+}
+
+// The File menu's items that change each time it is about to be shown.
+static void menu_file(unsigned opens) {
+    char line[40];
+    snprintf(line, sizeof line, "Opened %u times", opens);
+    menu_item(11, 0, opens & 1, "Wrap");
+    menu_item(13, 1, 0, line);
+}
+
+// The whole tree, published.
+static void menu_publish(const char *title) {
+    uint32_t a[40];
+    a[0] = MENU, a[1] = 1; // get_application_menu(id, menu_bar)
+    request(MENUS, 1, a, 2, -1);
+    request(MENU, 1, a, put_string(a, title), -1);
+    menu_item(1, 8, 0, "File");
+    menu_item(2, 8, 0, "Help");
+    menu_item(10, 0, 0, "Save");
+    menu_item(12, 4, 0, "");
+    menu_file(0);
+    menu_item(20, 0, 0, "About");
+    // Save: logo+shift+s, the role, a tool tip, and a picture of 2 by 2
+    // (red, green; blue, half-clear white) at scale 2.
+    unsigned n = 0;
+    a[n++] = 10;
+    n += put_string(a + n, "s");
+    a[n++] = 1 | 8;
+    request(MENU, 3, a, n, -1);
+    a[0] = 10;
+    request(MENU, 4, a, 1 + put_string(a + 1, "save"), -1);
+    a[0] = 10;
+    request(MENU, 5, a, 1 + put_string(a + 1, "Keep it"), -1);
+    a[0] = 2;
+    request(MENU, 4, a, 1 + put_string(a + 1, "help"), -1);
+    char name[40];
+    snprintf(name, sizeof name, "/gex-window-menu-%d", (int)getpid());
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) fail("shm_open");
+    shm_unlink(name);
+    const uint32_t picture[4] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0x80808080};
+    if (ftruncate(fd, sizeof picture) || pwrite(fd, picture, sizeof picture, 0) != sizeof picture) fail("the menu's picture");
+    a[0] = 10, a[1] = 2, a[2] = 2, a[3] = 2, a[4] = 0;
+    request(MENU, 6, a, 5, fd);
+    close(fd);
+    const uint32_t bar[] = {1, 2}, file[] = {10, 11, 12, 13}, help[] = {20};
+    menu_children(0, bar, 2);
+    menu_children(1, file, 4);
+    menu_children(2, help, 1);
+    request(MENU, 10, a, 0, -1);
+}
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -118,7 +188,7 @@ int main(int argc, char **argv) {
     request(DISPLAY, 1, a, 1, -1);
     a[0] = SYNC;
     request(DISPLAY, 0, a, 1, -1);
-    uint32_t compositor = 0, shm = 0, wm = 0, seat = 0, compositor_version = 0, wm_version = 0, seat_version = 0;
+    uint32_t compositor = 0, shm = 0, wm = 0, seat = 0, menus = 0, compositor_version = 0, wm_version = 0, seat_version = 0;
     uint32_t object, opcode;
     const uint32_t *args;
     unsigned words;
@@ -136,6 +206,7 @@ int main(int argc, char **argv) {
         if (!strcmp(interface, "wl_shm")) shm = args[0];
         if (!strcmp(interface, "xdg_wm_base")) wm = args[0], wm_version = version;
         if (!strcmp(interface, "wl_seat")) seat = args[0], seat_version = version;
+        if (!strcmp(interface, "gex_menu_manager_v1")) menus = args[0];
     }
     printf("window: a compositor %s, shared memory %s, windows %s\n", compositor ? "yes" : "no", shm ? "yes" : "no", wm ? "yes" : "no");
     if (!compositor || !shm || !wm) return 1;
@@ -219,6 +290,19 @@ int main(int argc, char **argv) {
     request(SURFACE, 6, a, 0, -1);
     printf("window: shown, %d by %d\n", width, height);
 
+    // Its menus, where the compositor's shell presents them.
+    unsigned opens = 0;
+    if (menus) {
+        unsigned n = 0;
+        a[n++] = menus;
+        n += put_string(a + n, "gex_menu_manager_v1");
+        a[n++] = 1;
+        a[n++] = MENUS;
+        request(REGISTRY, 0, a, n, -1);
+        menu_publish(title);
+    }
+    printf("window: the shell presents menus: %s\n", menus ? "yes" : "no");
+
     // Until its input ends: the compositor's pings answered, a new size
     // acknowledged, its word that the window is closed heeded; and what the
     // pointer and the keyboard do here said: where the pointer is when a
@@ -256,6 +340,20 @@ int main(int argc, char **argv) {
         if (object == POINTER && opcode == 2) px = (int32_t)args[1] >> 8, py = (int32_t)args[2] >> 8;
         if (object == POINTER && opcode == 3)
             printf("window: button %u %s, the pointer %s the window\n", args[2], args[3] ? "down" : "up", px >= 0 && py >= 0 && px < width && py < height ? "in" : "not in");
+        // The shell is about to show a menu (menu, serial), which is brought
+        // up to date and the shell told; has closed one; an item is chosen
+        // (item, modifiers).
+        if (object == MENU && opcode == 0) {
+            if (args[0] == 1) {
+                menu_file(++opens);
+                request(MENU, 10, a, 0, -1);
+            }
+            a[0] = args[1];
+            request(MENU, 11, a, 1, -1);
+            printf("window: menu %u about to open\n", args[0]);
+        }
+        if (object == MENU && opcode == 1) printf("window: menu %u closed\n", args[0]);
+        if (object == MENU && opcode == 2) printf("window: menu item %u chosen, modifiers %u\n", args[0], args[1]);
         // A key is (serial, time, which, down).
         if (object == KEYBOARD && opcode == 3) printf("window: key %u %s\n", args[2], args[3] ? "down" : "up");
     }

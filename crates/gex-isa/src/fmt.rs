@@ -1054,6 +1054,33 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::VPmull { vd, vn, vm, upper } => {
+            let (m, half) = if upper { ("pmull2", "2d") } else { ("pmull", "1d") };
+            format!("{m} v{}.1q, v{}.{half}, v{}.{half}", vd.0, vn.0, vm.0)
+        }
+        Inst::VAes { op, vd, vn } => {
+            let m = match op {
+                VAesOp::Encrypt => "aese",
+                VAesOp::Decrypt => "aesd",
+                VAesOp::MixColumns => "aesmc",
+                VAesOp::InvMixColumns => "aesimc",
+            };
+            format!("{m} v{}.16b, v{}.16b", vd.0, vn.0)
+        }
+        Inst::Flags(op) => match op {
+            FlagOp::Cfinv => "cfinv".into(),
+            FlagOp::Axflag => "axflag".into(),
+            FlagOp::Xaflag => "xaflag".into(),
+            FlagOp::Rmif { rn, shift, mask } => format!("rmif {}, #{shift}, #{mask}", reg(rn, Sz::X)),
+            FlagOp::Setf { rn, bits } => format!("setf{bits} {}", reg(rn, Sz::W)),
+        },
+        Inst::FpJsToInt { rd, vn } => format!("fjcvtzs {}, d{}", reg(rd, Sz::W), vn.0),
+        Inst::VSha3 { op, vd, vn, vm, va, rot } => match op {
+            VSha3Op::Eor3 => format!("eor3 v{}.16b, v{}.16b, v{}.16b, v{}.16b", vd.0, vn.0, vm.0, va.0),
+            VSha3Op::Bcax => format!("bcax v{}.16b, v{}.16b, v{}.16b, v{}.16b", vd.0, vn.0, vm.0, va.0),
+            VSha3Op::Rax1 => format!("rax1 v{}.2d, v{}.2d, v{}.2d", vd.0, vn.0, vm.0),
+            VSha3Op::Xar => format!("xar v{}.2d, v{}.2d, v{}.2d, #{rot}", vd.0, vn.0, vm.0),
+        },
         Inst::VCnt { vd, vn, q } => {
             let w = if q { "16b" } else { "8b" };
             format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)

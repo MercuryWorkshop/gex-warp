@@ -2529,6 +2529,10 @@ export class Gex {
         wl_cdrag_info: (ptr, max) => this.#wl?.clientDragInfo?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         wl_cdrag_status: (serial, accepted, action) => this.#wl?.clientDragStatus?.(serial >>> 0, accepted >>> 0, action >>> 0),
         wl_cdrag_receive: (serial, type, pipe) => this.#wl?.clientDragReceive?.(serial >>> 0, type >>> 0, pipe | 0),
+        // Menus the page's shell presents (wl_menu.rs): whether it does,
+        // and a message for it.
+        wl_menus: () => this.#wl?.menus?.() ?? 0,
+        wl_menu_post: (ptr, len) => this.#wl?.menuPost?.(this.#memory, ptr >>> 0, len >>> 0) ?? 1,
     };
   }
 

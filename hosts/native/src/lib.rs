@@ -19,6 +19,7 @@ pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
 pub mod gl;
+mod metal;
 pub mod profile;
 pub mod pe_units;
 pub mod wasmprog;
@@ -188,6 +189,11 @@ pub struct RunOptions {
     /// Give the guest a graphics device at `/dev/gex-gl`, so its GL calls run
     /// on the host's GL. See the `gl` module.
     pub gl: bool,
+    /// Give the guest `/dev/gex-metal`: a byte stream to this program, which
+    /// is started for each open and replays a guest Metal framework's
+    /// commands on a GPU. See the `metal` module. `GEX_METAL_HOST` in gexc's
+    /// environment names one when this is `None`.
+    pub metal: Option<std::path::PathBuf>,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time. Off
     /// by default: measured slower (32s vs 0.60s warm on `dpkg --version`)
@@ -350,6 +356,7 @@ impl Default for RunOptions {
             wayland_out: None,
             wayland_gpu: false,
             gl: false,
+            metal: None,
             recompile_objects: false,
             profile: false,
             jit: false,
@@ -3949,6 +3956,14 @@ fn mount_filesystems(
         let dev = crate::gl::GlDevice::new(1024, 1024);
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
+    }
+    // A Metal replayer, if the host was given one: each open of the node is
+    // its own connection, with its own child process.
+    if let Some(helper) = opts.metal.clone().or_else(|| std::env::var_os("GEX_METAL_HOST").filter(|v| !v.is_empty()).map(Into::into)) {
+        devfs.add_per_open(
+            "gex-metal",
+            Arc::new(move || crate::metal::MetalDevice::new(helper.clone()) as Arc<dyn gex_kernel::vfs::FileHandle>),
+        );
     }
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).

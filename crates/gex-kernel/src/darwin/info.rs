@@ -4,7 +4,7 @@
 //! libSystem asks these before `main` runs -- the page size, the number of
 //! processors, the kernel's version, whether the program is signed -- and
 //! none of them has a canonical call. The machine described is one Apple
-//! made (an M1's identifiers on arm64), running the Darwin whose system
+//! made (an M2's identifiers on arm64), running the Darwin whose system
 //! calls [`super::nr`] was generated from.
 
 use super::nr as d;
@@ -366,6 +366,18 @@ const NAMES: &[(&str, &[i32])] = &[
     ("hw.optional.arm.FEAT_CRC32", &[]),
     ("hw.optional.arm.FEAT_LRCPC", &[]),
     ("hw.optional.arm.FEAT_LRCPC2", &[]),
+    ("hw.optional.armv8_2_sha512", &[]),
+    ("hw.optional.armv8_2_sha3", &[]),
+    ("hw.optional.arm.FEAT_AES", &[]),
+    ("hw.optional.arm.FEAT_PMULL", &[]),
+    ("hw.optional.arm.FEAT_SHA1", &[]),
+    ("hw.optional.arm.FEAT_SHA256", &[]),
+    ("hw.optional.arm.FEAT_SHA512", &[]),
+    ("hw.optional.arm.FEAT_SHA3", &[]),
+    ("hw.optional.arm.FEAT_DotProd", &[]),
+    ("hw.optional.arm.FEAT_JSCVT", &[]),
+    ("hw.optional.arm.FEAT_FlagM", &[]),
+    ("hw.optional.arm.FEAT_FlagM2", &[]),
     ("hw.optional.arm.AdvSIMD", &[]),
     ("hw.optional.arm.FP_SyncExceptions", &[]),
     ("user.cs_path", &[CTL_USER, 1]),
@@ -380,26 +392,14 @@ const ABSENT: &[&str] = &[
     "hw.optional.neon_hpfp",
     "hw.optional.neon_fp16",
     "hw.optional.armv8_2_fhm",
-    "hw.optional.armv8_2_sha512",
-    "hw.optional.armv8_2_sha3",
     "hw.optional.armv8_3_compnum",
     "hw.optional.armv8_gpi",
     "hw.optional.ucnormal_mem",
-    "hw.optional.arm.FEAT_AES",
-    "hw.optional.arm.FEAT_PMULL",
-    "hw.optional.arm.FEAT_SHA1",
-    "hw.optional.arm.FEAT_SHA256",
-    "hw.optional.arm.FEAT_SHA512",
-    "hw.optional.arm.FEAT_SHA3",
     "hw.optional.arm.FEAT_FHM",
     "hw.optional.arm.FEAT_FP16",
     "hw.optional.arm.FEAT_RDM",
-    "hw.optional.arm.FEAT_DotProd",
     "hw.optional.arm.FEAT_FCMA",
-    "hw.optional.arm.FEAT_JSCVT",
     "hw.optional.arm.FEAT_LSE2",
-    "hw.optional.arm.FEAT_FlagM",
-    "hw.optional.arm.FEAT_FlagM2",
     "hw.optional.arm.FEAT_FRINTTS",
     "hw.optional.arm.FEAT_DPB",
     "hw.optional.arm.FEAT_DPB2",
@@ -632,10 +632,10 @@ impl Kernel {
             }
             "vm.pagesize" | "hw.pagesize" | "hw.pagesize32" => Quad(page),
             "hw.machine" => Str(if x86 { "x86_64" } else { "arm64" }.into()),
-            "hw.model" | "hw.product" => Str(if intel { "MacBookPro16,1" } else { "MacBookAir10,1" }.into()),
-            "hw.target" => Str(if intel { "Mac-E1008331FDC96864" } else { "J313AP" }.into()),
+            "hw.model" | "hw.product" => Str(if intel { "MacBookPro16,1" } else { "Mac14,3" }.into()),
+            "hw.target" => Str(if intel { "Mac-E1008331FDC96864" } else { "J473AP" }.into()),
             // The board without the "AP" (as a Mac's J616sAP is J616s).
-            "hw.targettype" if !intel => Str("J313".into()),
+            "hw.targettype" if !intel => Str("J473".into()),
             "hw.ncpu" | "hw.availcpu" | "hw.activecpu" | "hw.physicalcpu" | "hw.physicalcpu_max" | "hw.logicalcpu" | "hw.logicalcpu_max" => Int(cpus),
             "hw.perflevel0.physicalcpu" | "hw.perflevel0.physicalcpu_max" | "hw.perflevel0.logicalcpu" | "hw.perflevel0.logicalcpu_max" => Int(cpus),
             "hw.perflevel0.name" => Str("Performance".into()),
@@ -644,11 +644,11 @@ impl Kernel {
             // An `int`, so no more than it holds.
             "hw.physmem" | "hw.usermem" => Int(mem.min(i32::MAX as i64)),
             "hw.memsize" | "hw.memsize_usable" => Quad(mem),
-            // The family is the M1's, or Skylake's.
+            // The family is the M2's (Blizzard and Avalanche), or Skylake's.
             "hw.cputype" => Int(cputype),
             "hw.cpusubtype" => Int(cpusubtype),
             "hw.cpu64bit_capable" => Int(1),
-            "hw.cpufamily" => Int(if x86 { 0x37fc_219f } else { 0x1b58_8bb3 }),
+            "hw.cpufamily" => Int(if x86 { 0x37fc_219f } else { 0xda33_d83d }),
             "hw.cpusubfamily" => Int(if x86 { 0 } else { 2 }),
             "hw.cachelinesize" => Quad(if x86 { 64 } else { 128 }),
             "hw.l1icachesize" => Quad(if x86 { 32 << 10 } else { 128 << 10 }),
@@ -659,6 +659,10 @@ impl Kernel {
             "hw.optional.floatingpoint" => Int(1),
             "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.arm64" | "hw.optional.armv8_1_atomics" | "hw.optional.armv8_crc32" if !x86 => Int(1),
             "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_CRC32" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" | "hw.optional.arm.AdvSIMD" | "hw.optional.arm.FP_SyncExceptions" if !x86 => Int(1),
+            // What the translator carries out of the rest of an Apple processor's set: AES,
+            // the polynomial multiply, SHA-1, SHA-2 and SHA-3, the dot products, JavaScript's
+            // conversion and the flag manipulations (`gex-isa`'s decoder and its slow path).
+            "hw.optional.armv8_2_sha512" | "hw.optional.armv8_2_sha3" | "hw.optional.arm.FEAT_AES" | "hw.optional.arm.FEAT_PMULL" | "hw.optional.arm.FEAT_SHA1" | "hw.optional.arm.FEAT_SHA256" | "hw.optional.arm.FEAT_SHA512" | "hw.optional.arm.FEAT_SHA3" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_FlagM" | "hw.optional.arm.FEAT_FlagM2" if !x86 => Int(1),
             "user.cs_path" => Str("/usr/bin:/bin:/usr/sbin:/sbin".into()),
             // Under Rosetta, or not: an x86-64 program on a macOS that
             // runs on no Intel Mac is translated ([`rosetta`]).
@@ -1117,11 +1121,11 @@ pub fn rosetta(product: &str) -> bool {
 /// `kern.version`, as `uname -v` prints it: the release's kernel by its
 /// name and the date it was built, where the table knows them (else this
 /// one's, [`XNU`], and the word "gex" where the date is), and the machine
-/// it was built for: the M1's, or an Intel Mac's (or, under Rosetta, the
-/// M1's still).
+/// it was built for: the M2's, or an Intel Mac's (or, under Rosetta, the
+/// M2's still).
 pub fn darwin_version(os: &Os) -> String {
     let row = os.row.as_ref();
-    let soc = if gex_abi::X86 && !rosetta(&os.product) { "X86_64" } else { "ARM64_T8103" };
+    let soc = if gex_abi::X86 && !rosetta(&os.product) { "X86_64" } else { "ARM64_T8112" };
     let date = row.and_then(|r| r.kdate.as_deref()).unwrap_or("gex");
     let xnu = row.and_then(|r| r.xnu.as_deref()).unwrap_or(XNU);
     format!("Darwin Kernel Version {}: {date}; root:{xnu}/RELEASE_{soc}", os.release)
@@ -1184,9 +1188,9 @@ mod tests {
         let rows = Release::parse(TABLE);
         let v = |s: &str| darwin_version(&Os::from_release(Release::find(&rows, s).unwrap(), true));
         // (27 on either processor: an x86-64 program on it is under Rosetta.)
-        assert_eq!(v("27.0.1"), "Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T8103");
-        assert_eq!(v("27.0"), "Darwin Kernel Version 27.0.0: gex; root:xnu-13432/RELEASE_ARM64_T8103");
-        let intel = if gex_abi::X86 { "X86_64" } else { "ARM64_T8103" };
+        assert_eq!(v("27.0.1"), "Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T8112");
+        assert_eq!(v("27.0"), "Darwin Kernel Version 27.0.0: gex; root:xnu-13432/RELEASE_ARM64_T8112");
+        let intel = if gex_abi::X86 { "X86_64" } else { "ARM64_T8112" };
         assert_eq!(v("14"), format!("Darwin Kernel Version 23.6.0: gex; root:{XNU}/RELEASE_{intel}"));
     }
 

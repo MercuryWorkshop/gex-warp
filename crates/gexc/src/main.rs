@@ -311,6 +311,10 @@ run options:
                   write each composited screen as PATH-NNN.ppm
   --gl            give the guest /dev/gex-gl, so a program linked against the
                   guest's libGLESv2 runs its OpenGL on the host's
+  --metal PROGRAM give the guest /dev/gex-metal: each open starts PROGRAM (a
+                  Metal replayer, such as mink's mink-host) and is a byte
+                  stream to its standard input and from its standard output.
+                  GEX_METAL_HOST in gexc's environment does the same
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -431,6 +435,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
             "--gl" => opts.gl = true,
+            "--metal" => {
+                i += 1;
+                let v = args.get(i).context("--metal needs the path of a program")?;
+                opts.metal = Some(std::fs::canonicalize(v).with_context(|| format!("--metal {v}"))?);
+            }
             "--wayland-out" => {
                 i += 1;
                 opts.wayland_out =

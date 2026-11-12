@@ -200,6 +200,7 @@ const ops = {
       const bridge = await import('../../../hosts/browser/js/wl-bridge.mjs');
       const channel = bridge.makeWlChannel();
       bridge.setOutputSize(channel, wl.width, wl.height, wl.scale);
+      if (wl.menus) bridge.setMenusPresented(channel, true);
       const memories = new Map();
       const st = bridge.mirrorState();
       const memoryOf = (token) => {

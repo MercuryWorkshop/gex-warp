@@ -2032,6 +2032,114 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // FEAT_FlagM's and FEAT_FlagM2's: each flag is its own 0 or 1.
+            Inst::Flags(op) => {
+                let one = self.b.const_i32(1);
+                let zero = self.b.const_i32(0);
+                match op {
+                    gex_isa::FlagOp::Cfinv => {
+                        let c = self.b.read(GuestReg::C);
+                        let c = self.b.bin(BinOp::Xor, Ty::I32, c, one);
+                        self.b.write(GuestReg::C, c);
+                    }
+                    gex_isa::FlagOp::Axflag => {
+                        let (z, c, v) = (self.b.read(GuestReg::Z), self.b.read(GuestReg::C), self.b.read(GuestReg::V));
+                        let z = self.b.bin(BinOp::Or, Ty::I32, z, v);
+                        let not_v = self.b.bin(BinOp::Xor, Ty::I32, v, one);
+                        let c = self.b.bin(BinOp::And, Ty::I32, c, not_v);
+                        self.b.write(GuestReg::N, zero);
+                        self.b.write(GuestReg::Z, z);
+                        self.b.write(GuestReg::C, c);
+                        self.b.write(GuestReg::V, zero);
+                    }
+                    gex_isa::FlagOp::Xaflag => {
+                        let (z, c) = (self.b.read(GuestReg::Z), self.b.read(GuestReg::C));
+                        let not_c = self.b.bin(BinOp::Xor, Ty::I32, c, one);
+                        let not_z = self.b.bin(BinOp::Xor, Ty::I32, z, one);
+                        let n = self.b.bin(BinOp::And, Ty::I32, not_c, not_z);
+                        let new_z = self.b.bin(BinOp::And, Ty::I32, z, c);
+                        let new_c = self.b.bin(BinOp::Or, Ty::I32, c, z);
+                        let v = self.b.bin(BinOp::And, Ty::I32, not_c, z);
+                        self.b.write(GuestReg::N, n);
+                        self.b.write(GuestReg::Z, new_z);
+                        self.b.write(GuestReg::C, new_c);
+                        self.b.write(GuestReg::V, v);
+                    }
+                    gex_isa::FlagOp::Rmif { rn, shift, mask } => {
+                        let x = self.rd_gp(rn, Sz::X);
+                        for (bit, flag) in [(3u64, GuestReg::N), (2, GuestReg::Z), (1, GuestReg::C), (0, GuestReg::V)] {
+                            if mask >> bit & 1 == 0 {
+                                continue;
+                            }
+                            // Bit `bit` of the rotated register is bit `bit + shift` of the register.
+                            let by = self.b.const_i64((bit + shift as u64) % 64);
+                            let down = self.b.bin(BinOp::ShrU, Ty::I64, x, by);
+                            let low = self.b.def(Expr::Wrap(down));
+                            let f = self.b.bin(BinOp::And, Ty::I32, low, one);
+                            self.b.write(flag, f);
+                        }
+                    }
+                    gex_isa::FlagOp::Setf { rn, bits } => {
+                        let w = self.rd_gp(rn, Sz::W);
+                        let (msb, width, field) = (self.b.const_i32(bits as u32 - 1), self.b.const_i32(bits as u32), self.b.const_i32((1 << bits) - 1));
+                        let top = self.b.bin(BinOp::ShrU, Ty::I32, w, msb);
+                        let n = self.b.bin(BinOp::And, Ty::I32, top, one);
+                        let low = self.b.bin(BinOp::And, Ty::I32, w, field);
+                        let z = self.b.cmp(CmpOp::Eq, Ty::I32, low, zero);
+                        let above = self.b.bin(BinOp::ShrU, Ty::I32, w, width);
+                        let differ = self.b.bin(BinOp::Xor, Ty::I32, above, top);
+                        let v = self.b.bin(BinOp::And, Ty::I32, differ, one);
+                        self.b.write(GuestReg::N, n);
+                        self.b.write(GuestReg::Z, z);
+                        self.b.write(GuestReg::V, v);
+                    }
+                }
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+
+            // `fjcvtzs`, in integers so that every double has an answer: the significand
+            // moved by the exponent, the low 32 bits of that, negated for a negative. A shift
+            // of 64 or more leaves nothing (nothing below bit 32 from 32 up, but 64 is where
+            // the shift itself would wrap), and that is every infinity and NaN too. Z is
+            // whether the result converted back is the very double: so not for a fraction,
+            // a value out of range, a NaN or minus zero.
+            Inst::FpJsToInt { rd, vn } => {
+                let bits = self.rd_fp(vn, FpSz::D);
+                let c = |lift: &mut Self, v: u64| lift.b.const_i64(v);
+                let (k52, k63, kexp, kfrac, kone) = (c(self, 52), c(self, 63), c(self, 0x7ff), c(self, (1 << 52) - 1), c(self, 1 << 52));
+                let (bias, zero, top) = (c(self, 1075), c(self, 0), c(self, 64));
+                let shifted = self.b.bin(BinOp::ShrU, Ty::I64, bits, k52);
+                let exp = self.b.bin(BinOp::And, Ty::I64, shifted, kexp);
+                let frac = self.b.bin(BinOp::And, Ty::I64, bits, kfrac);
+                let sig = self.b.bin(BinOp::Or, Ty::I64, frac, kone);
+                let up = self.b.bin(BinOp::Sub, Ty::I64, exp, bias);
+                let down = self.b.bin(BinOp::Sub, Ty::I64, bias, exp);
+                let raised = self.b.bin(BinOp::Shl, Ty::I64, sig, up);
+                let lowered = self.b.bin(BinOp::ShrU, Ty::I64, sig, down);
+                let up_fits = self.b.cmp(CmpOp::LtU, Ty::I64, up, top);
+                let down_fits = self.b.cmp(CmpOp::LtU, Ty::I64, down, top);
+                let raised = self.b.def(Expr::Select { cond: up_fits, a: raised, b: zero, ty: Ty::I64 });
+                let lowered = self.b.def(Expr::Select { cond: down_fits, a: lowered, b: zero, ty: Ty::I64 });
+                let is_up = self.b.cmp(CmpOp::LeU, Ty::I64, bias, exp);
+                let mag = self.b.def(Expr::Select { cond: is_up, a: raised, b: lowered, ty: Ty::I64 });
+                let negative = self.b.bin(BinOp::ShrU, Ty::I64, bits, k63);
+                let negated = self.b.bin(BinOp::Sub, Ty::I64, zero, mag);
+                let negative = self.b.def(Expr::Wrap(negative));
+                let wide = self.b.def(Expr::Select { cond: negative, a: negated, b: mag, ty: Ty::I64 });
+                let v = self.b.def(Expr::Wrap(wide));
+                let back = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: true }, src_wide: false, dst_wide: true, a: v });
+                let exact = self.b.cmp(CmpOp::Eq, Ty::I64, back, bits);
+                let zero32 = self.b.const_i32(0);
+                self.flags = FlagSource::Unknown;
+                self.b.write(GuestReg::N, zero32);
+                self.b.write(GuestReg::Z, exact);
+                self.b.write(GuestReg::C, zero32);
+                self.b.write(GuestReg::V, zero32);
+                self.wr_gp(rd, Sz::W, v);
+                Flow::Next
+            }
+
             Inst::FpMoveGeneral {
                 sz,
                 to_vector,
@@ -2303,6 +2411,117 @@ impl<'a> Lifter<'a> {
                     });
                 }
                 self.finish_address(&a);
+                Flow::Next
+            }
+
+            // The carry-less multiply AES-GCM and the folded checksums are made of: three
+            // multiplies of 32-bit halves (Karatsuba's: the two ends, and the sums' product
+            // for the middle), each by `clmul32`.
+            Inst::VPmull { vd, vn, vm, upper } => {
+                let lane = upper as u32;
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let m = self.b.read(GuestReg::V128(vm.0));
+                let a = self.b.def(Expr::VExtract { a: n, lane, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let b = self.b.def(Expr::VExtract { a: m, lane, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let low32 = self.b.const_i64(0xffff_ffff);
+                let k32 = self.b.const_i64(32);
+                let a0 = self.b.bin(BinOp::And, Ty::I64, a, low32);
+                let a1 = self.b.bin(BinOp::ShrU, Ty::I64, a, k32);
+                let b0 = self.b.bin(BinOp::And, Ty::I64, b, low32);
+                let b1 = self.b.bin(BinOp::ShrU, Ty::I64, b, k32);
+                let lo = self.clmul32(a0, b0);
+                let hi = self.clmul32(a1, b1);
+                let asum = self.b.bin(BinOp::Xor, Ty::I64, a0, a1);
+                let bsum = self.b.bin(BinOp::Xor, Ty::I64, b0, b1);
+                let both = self.clmul32(asum, bsum);
+                let ends = self.b.bin(BinOp::Xor, Ty::I64, lo, hi);
+                let mid = self.b.bin(BinOp::Xor, Ty::I64, both, ends);
+                let mid_up = self.b.bin(BinOp::Shl, Ty::I64, mid, k32);
+                let mid_down = self.b.bin(BinOp::ShrU, Ty::I64, mid, k32);
+                let low = self.b.bin(BinOp::Xor, Ty::I64, lo, mid_up);
+                let high = self.b.bin(BinOp::Xor, Ty::I64, hi, mid_down);
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let r = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: 8, val: low });
+                let r = self.b.def(Expr::VReplace { a: r, lane: 1, lane_bytes: 8, val: high });
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
+            // AES, in the vector: Go's runtime hashes every map key with these, and a host
+            // call each (the slow path, where they were) is most of such a program's time.
+            Inst::VAes { op, vd, vn } => {
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let r = match op {
+                    gex_isa::VAesOp::Encrypt | gex_isa::VAesOp::Decrypt => {
+                        let inverse = op == gex_isa::VAesOp::Decrypt;
+                        let d = self.b.read(GuestReg::V128(vd.0));
+                        let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: d, b: n });
+                        // The rows shift first -- bytes only move, so the order is free --
+                        // and then each byte goes through the box. The state is by
+                        // column: byte `r + 4c` is row `r` of column `c`.
+                        let mut lanes = [0u8; 16];
+                        for c in 0..4 {
+                            for r in 0..4 {
+                                let (to, from) = if inverse { (r + (c + r) % 4 * 4, r + c * 4) } else { (r + c * 4, r + (c + r) % 4 * 4) };
+                                lanes[to] = from as u8;
+                            }
+                        }
+                        let moved = self.b.def(Expr::VShuffle { a: x, b: x, lanes: Box::new(lanes) });
+                        self.aes_sub_bytes(moved, inverse)
+                    }
+                    gex_isa::VAesOp::MixColumns => self.aes_mix_columns(n),
+                    gex_isa::VAesOp::InvMixColumns => {
+                        // The inverse is the mix itself of each byte plus four times its
+                        // sum with the one two rows on: 5a + 4c through 2, 3, 1, 1 is
+                        // 14, 11, 13, 9.
+                        let two_on = self.aes_rows_up(n, 2);
+                        let sum = self.b.def(Expr::VBin { op: VBinOp::Xor, a: n, b: two_on });
+                        let twice = self.aes_double(sum);
+                        let four = self.aes_double(twice);
+                        let pre = self.b.def(Expr::VBin { op: VBinOp::Xor, a: n, b: four });
+                        self.aes_mix_columns(pre)
+                    }
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
+            // FEAT_SHA3's, each a few whole-register operations: the two rotates are a
+            // pair of doubleword shifts, joined.
+            Inst::VSha3 { op, vd, vn, vm, va, rot } => {
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let m = self.b.read(GuestReg::V128(vm.0));
+                let vbin = |lift: &mut Self, op, a, b| lift.b.def(Expr::VBin { op, a, b });
+                let rotr = |lift: &mut Self, a: Value, by: u32| {
+                    if by % 64 == 0 {
+                        return a;
+                    }
+                    let (down, up) = (lift.b.const_i32(by % 64), lift.b.const_i32(64 - by % 64));
+                    let lo = lift.b.def(Expr::VShift { op: VShiftOp::ShrU, lane: VLane::I64, a, amount: down });
+                    let hi = lift.b.def(Expr::VShift { op: VShiftOp::Shl, lane: VLane::I64, a, amount: up });
+                    lift.b.def(Expr::VBin { op: VBinOp::Or, a: lo, b: hi })
+                };
+                let r = match op {
+                    gex_isa::VSha3Op::Eor3 => {
+                        let a = self.b.read(GuestReg::V128(va.0));
+                        let nm = vbin(self, VBinOp::Xor, n, m);
+                        vbin(self, VBinOp::Xor, nm, a)
+                    }
+                    gex_isa::VSha3Op::Bcax => {
+                        let a = self.b.read(GuestReg::V128(va.0));
+                        let kept = vbin(self, VBinOp::AndNot, m, a);
+                        vbin(self, VBinOp::Xor, n, kept)
+                    }
+                    gex_isa::VSha3Op::Rax1 => {
+                        let turned = rotr(self, m, 63);
+                        vbin(self, VBinOp::Xor, n, turned)
+                    }
+                    gex_isa::VSha3Op::Xar => {
+                        let nm = vbin(self, VBinOp::Xor, n, m);
+                        rotr(self, nm, rot as u32)
+                    }
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
                 Flow::Next
             }
 
@@ -2710,6 +2929,94 @@ impl<'a> Lifter<'a> {
     // -- scalar floating point ---------------------------------------------
 
     /// The lane type GIR should use for an arrangement.
+    /// The product of two 32-bit polynomials over GF(2), all 63 bits of it, out of
+    /// ordinary multiplies: each operand is split into four with only every fourth bit,
+    /// so that a column of a product sums at most eight ones, which the three empty bits
+    /// above it hold, and its lowest bit is the sum without carries; the sixteen
+    /// products are gathered by where their bits fall, and the other bits dropped.
+    fn clmul32(&mut self, x: Value, y: Value) -> Value {
+        const EVERY_FOURTH: [u64; 4] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 0x4444_4444_4444_4444, 0x8888_8888_8888_8888];
+        let masks = EVERY_FOURTH.map(|m| self.b.const_i64(m));
+        let xs = masks.map(|m| self.b.bin(BinOp::And, Ty::I64, x, m));
+        let ys = masks.map(|m| self.b.bin(BinOp::And, Ty::I64, y, m));
+        let mut out: Option<Value> = None;
+        for k in 0..4 {
+            // The products whose bits land on bits `k` mod 4.
+            let mut z: Option<Value> = None;
+            for i in 0..4 {
+                let p = self.b.bin(BinOp::Mul, Ty::I64, xs[i], ys[(k + 4 - i) % 4]);
+                z = Some(match z {
+                    None => p,
+                    Some(prev) => self.b.bin(BinOp::Xor, Ty::I64, prev, p),
+                });
+            }
+            let kept = self.b.bin(BinOp::And, Ty::I64, z.expect("four products"), masks[k]);
+            out = Some(match out {
+                None => kept,
+                Some(prev) => self.b.bin(BinOp::Or, Ty::I64, prev, kept),
+            });
+        }
+        out.expect("four residues")
+    }
+
+    /// Every byte of `x` through AES's box (or its inverse): the box is sixteen rows of
+    /// sixteen, and a swizzle is a lookup in one row that gives zero for an index past it,
+    /// so each row is asked with the byte's high nibble cancelled by the row's own -- the
+    /// one row a byte belongs to answers, the others give nothing -- and the answers joined.
+    /// No table in memory, and no time that depends on the bytes.
+    fn aes_sub_bytes(&mut self, x: Value, inverse: bool) -> Value {
+        let table = gex_isa::slow::aes_box(inverse);
+        let mut acc: Option<Value> = None;
+        for row in 0..16usize {
+            let entries: [u8; 16] = table[row * 16..row * 16 + 16].try_into().unwrap();
+            let entries = self.b.def(Expr::VConst(Box::new(entries)));
+            let idx = if row == 0 {
+                x
+            } else {
+                let high = self.b.def(Expr::VConst(Box::new([(row as u8) << 4; 16])));
+                self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: high })
+            };
+            let part = self.b.def(Expr::VSwizzle { a: entries, idx });
+            acc = Some(match acc {
+                None => part,
+                Some(prev) => self.b.def(Expr::VBin { op: VBinOp::Or, a: prev, b: part }),
+            });
+        }
+        acc.expect("sixteen rows")
+    }
+
+    /// Each byte of an AES state replaced by the one `by` rows on in its column.
+    fn aes_rows_up(&mut self, a: Value, by: usize) -> Value {
+        let mut lanes = [0u8; 16];
+        for (i, l) in lanes.iter_mut().enumerate() {
+            *l = (i / 4 * 4 + (i % 4 + by) % 4) as u8;
+        }
+        self.b.def(Expr::VShuffle { a, b: a, lanes: Box::new(lanes) })
+    }
+
+    /// Each byte doubled in AES's field: shifted left, less the field's polynomial where
+    /// the top bit went.
+    fn aes_double(&mut self, a: Value) -> Value {
+        let one = self.b.const_i32(1);
+        let shifted = self.b.def(Expr::VShift { op: VShiftOp::Shl, lane: VLane::I8, a, amount: one });
+        let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+        let top = self.b.def(Expr::VLaneBin { op: VLaneBinOp::LtS, lane: VLane::I8, a, b: zero });
+        let poly = self.b.def(Expr::VConst(Box::new([0x1b; 16])));
+        let reduce = self.b.def(Expr::VBin { op: VBinOp::And, a: top, b: poly });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: shifted, b: reduce })
+    }
+
+    /// AES's MixColumns: each byte twice itself, three times the next in its column, and
+    /// the other two -- with a, b, c, d down a column from the byte, `2(a + b) + b + c + d`.
+    fn aes_mix_columns(&mut self, a: Value) -> Value {
+        let (r1, r2, r3) = (self.aes_rows_up(a, 1), self.aes_rows_up(a, 2), self.aes_rows_up(a, 3));
+        let pair = self.b.def(Expr::VBin { op: VBinOp::Xor, a, b: r1 });
+        let doubled = self.aes_double(pair);
+        let x = self.b.def(Expr::VBin { op: VBinOp::Xor, a: doubled, b: r1 });
+        let y = self.b.def(Expr::VBin { op: VBinOp::Xor, a: r2, b: r3 });
+        self.b.def(Expr::VBin { op: VBinOp::Xor, a: x, b: y })
+    }
+
     fn lane_of(arr: VArr) -> VLane {
         match (arr.lane_bytes, arr.float) {
             (1, _) => VLane::I8,

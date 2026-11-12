@@ -151,6 +151,26 @@ enum Ev {
     DragLeave,
     /// `over TITLE`: the script's Nth title (`Input::titles`), or none.
     Over(usize),
+    /// A menu verb ([`MenuVerb`]) on the script's Nth menu path
+    /// (`Input::menus`), with `gex_menu_v1.modifiers` held.
+    Menu(MenuVerb, usize, u32),
+}
+
+/// What a script does to a published menu (`gex_menu_v1`), the shell's part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuVerb {
+    List,
+    Open,
+    Close,
+    Activate,
+}
+
+/// Whether this host presents menus (`GEX_WL_MENUS=1`): then
+/// `gex_menu_manager_v1` is advertised, a program that sees it publishes its
+/// menu bar and draws none, and a script's `menu` lines are the shell.
+fn presents_menus() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_WL_MENUS").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 /// A script of input events at times (seconds) after the compositor's Nth
@@ -176,7 +196,16 @@ enum Ev {
 /// 60    output 1000 650      # the output is resized: every client is told
 /// 70    over Some Title      # what follows is in the window titled so
 /// 71    over                 # and back to every client's focused window
+/// 61    menu                 # print every published menu (`GEX_WL_MENUS=1`)
+/// 62    menu-open Window     # about_to_open; the menu is printed when the client acks
+/// 63    menu-activate Window > Zoom mods=alt+shift   # an item chosen, modifiers held
+/// 64    menu-close Window
 /// ```
+///
+/// A menu or item is named by its number, as `menu` prints it, or by the
+/// titles down from the menu bar separated by `>` (`0`, or nothing, is the
+/// bar itself); `dock:` in front names the application's dock menu instead.
+/// What is printed starts `[wl-menu]`.
 ///
 /// `window W H` in place of `frames N` starts the clock once a placed window
 /// of W x H is on the screen: what a test waits for when a loaded machine
@@ -208,6 +237,8 @@ struct Input {
     drags: Vec<String>,
     /// Each `over` line's title.
     titles: Vec<String>,
+    /// Each `menu` line's path.
+    menus: Vec<String>,
     next: usize,
     start: Option<std::time::Instant>,
     /// Frames to see before the clock starts, and how many have been.
@@ -267,6 +298,7 @@ impl Input {
         let mut events = Vec::new();
         let mut drags = Vec::new();
         let mut titles = Vec::new();
+        let mut menus = Vec::new();
         let mut after = 1;
         let mut window = None;
         let mut clients = None;
@@ -338,6 +370,34 @@ impl Input {
                     events.push((t, Ev::Over(n), l));
                 }
                 Some("output") => outputs.push((t, num(2)?.max(1), num(3)?.max(1))),
+                Some(c @ ("menu" | "menu-open" | "menu-close" | "menu-activate")) => {
+                    let verb = match c {
+                        "menu" => MenuVerb::List,
+                        "menu-open" => MenuVerb::Open,
+                        "menu-close" => MenuVerb::Close,
+                        _ => MenuVerb::Activate,
+                    };
+                    let mut mods = 0;
+                    let mut path = Vec::new();
+                    for word in &w[2..] {
+                        match word.strip_prefix("mods=") {
+                            Some(m) => {
+                                for name in m.split('+') {
+                                    mods |= match name {
+                                        "shift" => gex_wayland::menu::SHIFT,
+                                        "control" | "ctrl" => gex_wayland::menu::CONTROL,
+                                        "alt" => gex_wayland::menu::ALT,
+                                        "logo" | "super" | "cmd" => gex_wayland::menu::LOGO,
+                                        _ => return Err(bad()),
+                                    };
+                                }
+                            }
+                            None => path.push(*word),
+                        }
+                    }
+                    menus.push(path.join(" "));
+                    events.push((t, Ev::Menu(verb, menus.len() - 1, mods), l));
+                }
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
                     events.push((t + 0.1, Ev::Key(key(2)?, false), l));
@@ -349,7 +409,7 @@ impl Input {
         outputs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
         let start = if after == 0 && window.is_none() && clients.is_none() { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, drags, titles, next: 0, start, after, seen: 0, window, clients, connected: 0, outputs })
+        Ok(Input { events, drags, titles, menus, next: 0, start, after, seen: 0, window, clients, connected: 0, outputs })
     }
 }
 
@@ -447,6 +507,11 @@ impl Wayland {
     /// The script's Nth drag's text/uri-list.
     fn drag_list(&self, n: usize) -> Option<String> {
         self.inner.input.lock().unwrap().as_ref()?.drags.get(n).cloned()
+    }
+
+    /// The script's Nth menu path.
+    fn menu_path(&self, n: usize) -> String {
+        self.inner.input.lock().unwrap().as_ref().and_then(|i| i.menus.get(n).cloned()).unwrap_or_default()
     }
 
     /// The scripted events now due (`GEX_WL_INPUT`), with their time in ms.
@@ -761,8 +826,17 @@ impl Wayland {
                     Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
                     // (the script's drag of files: `carry`)
                     Ev::Drag(..) | Ev::DragMove(..) | Ev::Drop | Ev::DragLeave | Ev::Over(_) => {}
+                    Ev::Menu(..) => {}
                 }
             }
+            // The shell's part of `gex_menu_v1`, from the script; and what
+            // the client answered.
+            for (ev, _, _) in &due {
+                if let Ev::Menu(verb, n, mods) = *ev {
+                    s.menu_script(verb, &self.menu_path(n), mods);
+                }
+            }
+            s.menu_answers();
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
                 match *ev {
                     Routed::Origin(surface, x, y) => s.client.placement_origin(surface, x, y),
@@ -1374,6 +1448,7 @@ impl Screen {
                         eprintln!("[gex] input: scroll dropped: the pointer is over no window (axis {axis}, {v}/256 px)");
                     }
                 }
+                Ev::Menu(..) => {}
                 Ev::Key(k, down) => {
                     // No client has activated a window (Wine activates its
                     // own, and a slow start can leave none active when the
@@ -1474,6 +1549,7 @@ impl HostListener for Wayland {
         let mut client = Client::new();
         let (w, h) = *self.inner.size.lock().unwrap();
         client.set_default_size(w, h);
+        client.set_presents_menus(presents_menus());
         // Frame callbacks at the paced clock's frames (`frame_hz`).
         client.set_held(frame_hz() != 0);
         let id = {
@@ -1512,6 +1588,58 @@ impl Session {
         if self.sent == self.out.len() {
             self.out.clear();
             self.sent = 0;
+        }
+    }
+
+    /// A script's menu line, if this client has the tree it names: the
+    /// menu bar's, or with `dock:` the dock menu's.
+    fn menu_script(&mut self, verb: MenuVerb, path: &str, mods: u32) {
+        use gex_wayland::menu::Scope;
+        let (scope, path) = match path.strip_prefix("dock:") {
+            Some(p) => (Scope::Dock, p.trim()),
+            None => (Scope::MenuBar, path),
+        };
+        if verb == MenuVerb::List {
+            for t in self.client.menus() {
+                eprintln!("[wl-menu] tree {}:{} {} {:?}", self.id, t.object, t.scope.name(), t.title());
+                for line in t.describe(0, true) {
+                    eprintln!("[wl-menu]   {line}");
+                }
+            }
+            return;
+        }
+        let Some(t) = self.client.menus().find(|t| t.scope == scope) else { return };
+        let tree = t.object;
+        let Some(id) = (if path.is_empty() { Some(0) } else { t.find(path) }) else {
+            eprintln!("[wl-menu] no item {path:?} in tree {}:{tree}", self.id);
+            return;
+        };
+        let title = t.item(id).map(|i| i.title.clone()).unwrap_or_default();
+        match verb {
+            MenuVerb::Open => {
+                self.client.menu_about_to_open(tree, id);
+            }
+            MenuVerb::Close => {
+                eprintln!("[wl-menu] close {id} {title:?}");
+                self.client.menu_closed(tree, id);
+            }
+            _ => {
+                eprintln!("[wl-menu] activate {id} {title:?}");
+                self.client.menu_activate(tree, id, mods);
+            }
+        }
+    }
+
+    /// A menu the client says is up to date (`ack_open`), printed: what a
+    /// shell would now show.
+    fn menu_answers(&mut self) {
+        for u in self.client.take_menu_updates() {
+            let gex_wayland::menu::Update::Opened { tree, menu, .. } = u else { continue };
+            let Some(t) = self.client.menu_tree(tree) else { continue };
+            eprintln!("[wl-menu] opened {menu} {:?}", t.item(menu).map_or(t.title(), |i| i.title.as_str()));
+            for line in t.describe(menu, false) {
+                eprintln!("[wl-menu]   {line}");
+            }
         }
     }
 
@@ -1583,6 +1711,20 @@ impl Buffers for PoolView<'_, '_> {
         drop(mm);
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
+    }
+
+    fn read(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
+        let file = self.fds.get(&fd)?;
+        let mut out = vec![0u8; size];
+        let mut at = 0;
+        while at < size {
+            match file.handle.read_at(at as u64, &mut out[at..]) {
+                Ok(n) if n > 0 => at += n as usize,
+                _ => break,
+            }
+        }
+        out.truncate(at);
+        Some(out)
     }
 }
 

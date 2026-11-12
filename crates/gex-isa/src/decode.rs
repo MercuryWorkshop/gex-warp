@@ -428,6 +428,10 @@ fn decode_system(raw: u32) -> Inst {
                 }
                 // MSR (immediate) — PSTATE field writes (DAIFSet, SSBS, …).
                 // None are observable to a correct EL0 program under gex.
+                // But cfinv, xaflag and axflag are spelled as three of them, and are.
+                (0b000, 0b0100) if op2 <= 2 => {
+                    return Inst::Flags([FlagOp::Cfinv, FlagOp::Xaflag, FlagOp::Axflag][op2 as usize]);
+                }
                 (_, 0b0100) => return Inst::Hint { imm: 0 },
                 _ => return Inst::Unknown { raw },
             }
@@ -585,6 +589,15 @@ fn decode_dp_reg(raw: u32) -> Inst {
     match bits(raw, 28, 21) {
         // Add/subtract (with carry).
         0b1101_0000 => {
+            // FEAT_FlagM's two live where `adcs` would have these bits zero: rmif
+            // `1 0 1 11010000 imm6 00001 Rn 0 mask` and setf8/setf16
+            // `0 0 1 11010000 000000 sz 0010 Rn 01101`.
+            if bits(raw, 31, 29) == 0b101 && bits(raw, 14, 10) == 0b00001 && bit(raw, 4) == 0 {
+                return Inst::Flags(FlagOp::Rmif { rn: RegSel::gp(rn), shift: bits(raw, 20, 15) as u8, mask: bits(raw, 3, 0) as u8 });
+            }
+            if bits(raw, 31, 29) == 0b001 && bits(raw, 20, 15) == 0 && bits(raw, 13, 10) == 0b0010 && bits(raw, 4, 0) == 0b01101 {
+                return Inst::Flags(FlagOp::Setf { rn: RegSel::gp(rn), bits: 8 << bit(raw, 14) });
+            }
             if bits(raw, 15, 10) != 0 {
                 return Inst::Undefined { raw };
             }
@@ -1482,6 +1495,37 @@ fn decode_simd_fp(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let u = bit(raw, 29);
 
+    // AES: `0100 1110 0010 1000 01 op 10 Rn Rd`.
+    if raw & 0xffff_cc00 == 0x4e28_4800 {
+        return Inst::VAes {
+            op: [VAesOp::Encrypt, VAesOp::Decrypt, VAesOp::MixColumns, VAesOp::InvMixColumns][bits(raw, 13, 12) as usize],
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+        };
+    }
+
+    // FEAT_SHA3, under `1100 1110`: eor3 and bcax `00 op Rm 0 Ra Rn Rd`, xar
+    // `100 Rm imm6 Rn Rd`, rax1 `011 Rm 1000 11 Rn Rd`. Its neighbours there
+    // are SHA-512's (the slow path's, `gex_isa::slow`) and SM3 and SM4, which
+    // no Apple processor has.
+    if raw >> 24 == 0xce {
+        let sha3 = |op, rot| Inst::VSha3 {
+            op,
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg(bits(raw, 20, 16) as u8),
+            va: VReg(bits(raw, 14, 10) as u8),
+            rot,
+        };
+        return match bits(raw, 23, 21) {
+            0b000 if bit(raw, 15) == 0 => sha3(VSha3Op::Eor3, 0),
+            0b001 if bit(raw, 15) == 0 => sha3(VSha3Op::Bcax, 0),
+            0b100 => sha3(VSha3Op::Xar, bits(raw, 15, 10) as u8),
+            0b011 if bits(raw, 15, 10) == 0b100011 => sha3(VSha3Op::Rax1, 0),
+            _ => Inst::Unknown { raw },
+        };
+    }
+
     // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd, and its scalar
     // sibling (bit 28 set).
     if bit(raw, 31) == 0
@@ -1989,6 +2033,15 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
 /// `Q` selects which half of the narrow sources is read (the `2` suffix), not
 /// the register width; the destination is always 128 bits.
 fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
+    // pmull and pmull2 of doublewords: opcode 1110, U clear, size 11.
+    if bits(raw, 15, 12) == 0b1110 && u == 0 && bits(raw, 23, 22) == 0b11 {
+        return Some(Inst::VPmull {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg(bits(raw, 20, 16) as u8),
+            upper: q,
+        });
+    }
     let op = match bits(raw, 15, 12) {
         0b0000 => VWidenOp::AddL,
         0b0001 => VWidenOp::AddW,
@@ -2938,6 +2991,10 @@ fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
         (0b11, 0b000 | 0b001) => Some(FpRound::Zero),
         _ => None,
     };
+    // fjcvtzs: `0 0 0 11110 01 1 11 110 000000 Rn Rd`, a double to a W register only.
+    if (rmode, opcode) == (0b11, 0b110) {
+        return if sf == 0 && sz.is_double() { Inst::FpJsToInt { rd, vn } } else { Inst::Unknown { raw } };
+    }
     if let Some(round) = round {
         return Inst::FpToInt {
             sz,
@@ -3310,6 +3367,57 @@ mod tests {
                 shift: 0
             }
         );
+    }
+
+    #[test]
+    fn pmull_of_doublewords_decodes() {
+        let v = |n: u8| VReg(n);
+        assert_eq!(d(0x0ee2e020), Inst::VPmull { vd: v(0), vn: v(1), vm: v(2), upper: false });
+        assert_eq!(d(0x4ee2e020), Inst::VPmull { vd: v(0), vn: v(1), vm: v(2), upper: true });
+        // Of bytes it is the slow path's, and there is none of halfwords or words.
+        assert!(matches!(d(0x0e22e020), Inst::Unknown { .. }));
+        assert!(matches!(d(0x0e62e020), Inst::Unknown { .. }));
+    }
+
+    #[test]
+    fn aes_decodes() {
+        let v = |n: u8| VReg(n);
+        assert_eq!(d(0x4e284820), Inst::VAes { op: VAesOp::Encrypt, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e285820), Inst::VAes { op: VAesOp::Decrypt, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e286820), Inst::VAes { op: VAesOp::MixColumns, vd: v(0), vn: v(1) });
+        assert_eq!(d(0x4e287820), Inst::VAes { op: VAesOp::InvMixColumns, vd: v(0), vn: v(1) });
+    }
+
+    #[test]
+    fn flag_manipulations_decode() {
+        assert_eq!(d(0xd500401f), Inst::Flags(FlagOp::Cfinv));
+        assert_eq!(d(0xd500403f), Inst::Flags(FlagOp::Xaflag));
+        assert_eq!(d(0xd500405f), Inst::Flags(FlagOp::Axflag));
+        // The PSTATE writes beside them stay what they were.
+        assert_eq!(d(0xd503415f), Inst::Hint { imm: 0 }); // msr dit, #1
+        assert_eq!(d(0xba0f8425), Inst::Flags(FlagOp::Rmif { rn: RegSel::gp(1), shift: 31, mask: 5 }));
+        assert_eq!(d(0x3a00082d), Inst::Flags(FlagOp::Setf { rn: RegSel::gp(1), bits: 8 }));
+        assert_eq!(d(0x3a00482d), Inst::Flags(FlagOp::Setf { rn: RegSel::gp(1), bits: 16 }));
+        // `adcs` with those bits zero is still `adcs`, and other values still nothing.
+        assert!(matches!(d(0xba020020), Inst::AddSubCarry { .. }));
+        assert!(matches!(d(0xba020820), Inst::Undefined { .. }));
+    }
+
+    #[test]
+    fn sha3_and_fjcvtzs_decode() {
+        let v = |n: u8| VReg(n);
+        assert_eq!(d(0xce020c20), Inst::VSha3 { op: VSha3Op::Eor3, vd: v(0), vn: v(1), vm: v(2), va: v(3), rot: 0 });
+        assert_eq!(d(0xce220c20), Inst::VSha3 { op: VSha3Op::Bcax, vd: v(0), vn: v(1), vm: v(2), va: v(3), rot: 0 });
+        assert!(matches!(d(0xce628c20), Inst::VSha3 { op: VSha3Op::Rax1, .. }));
+        assert!(matches!(d(0xce82fc20), Inst::VSha3 { op: VSha3Op::Xar, rot: 63, .. }));
+        // SHA-512's stay the slow path's, and SM3's nobody's.
+        for raw in [0xce628020u32, 0xce628420, 0xce628820, 0xcec08020, 0xce420c20, 0xce42a020] {
+            assert!(matches!(d(raw), Inst::Unknown { .. }), "{raw:08x}");
+        }
+        assert_eq!(d(0x1e7e0020), Inst::FpJsToInt { rd: RegSel::gp(0), vn: v(1) });
+        // No 64-bit result and no single-precision source.
+        assert!(matches!(d(0x9e7e0020), Inst::Unknown { .. }));
+        assert!(matches!(d(0x1e3e0020), Inst::Unknown { .. }));
     }
 
     #[test]

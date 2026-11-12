@@ -252,6 +252,19 @@ const C_HEAD = 4;
 const C_BYTES = 1 << 20;
 const C_WORDS = C_HEAD + C_BYTES / 4;
 
+// Menus (`gex_menu_v1`, hosts/browser/src/wl_menu.rs): whether the page's
+// shell presents them, which every process reads as its clients connect;
+// and a queue of messages from the processes to the page, each a process's
+// token, a length in bytes, and that much JSON, padded to a word. A lock, a
+// number that moves with each message, and the bytes queued.
+const N_LOCK = 0;
+const N_ON = 1;
+const N_SEQ = 2;
+const N_LEN = 3;
+const N_HEAD = 4;
+const N_BYTES = 1 << 20;
+const N_WORDS = N_HEAD + N_BYTES / 4;
+
 // A client's own drag (one at a time a page, as the pointer is): a lock, its
 // serial (moves with each new drag), whether it still has the pointer (1;
 // 0 once the page or its source ended it), the block and client that
@@ -277,10 +290,11 @@ const X_WORDS = X_TYPES + X_BYTES / 4;
 /** A client drag's serials are apart from the page's own (`PageDrag`). */
 const X_SERIAL_BIT = 0x08000000;
 
-const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS + C_WORDS + X_WORDS;
+const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS + C_WORDS + N_WORDS + X_WORDS;
 const dragBase = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
 const clipBase = dragBase + D_WORDS;
-const xBase = clipBase + C_WORDS;
+const menuBase = clipBase + C_WORDS;
+const xBase = menuBase + N_WORDS;
 
 function xLock(a) {
   while (Atomics.compareExchange(a, xBase + X_LOCK, 0, 1) !== 0) {
@@ -290,6 +304,94 @@ function xLock(a) {
 function xUnlock(a) {
   Atomics.store(a, xBase + X_LOCK, 0);
   Atomics.notify(a, xBase + X_LOCK);
+}
+
+/** The page's menu events, as `sendEvent` kinds (wl_menu.rs `EV_MENU_*`):
+ *  about to show menu `b` of tree `a` (`c` the page's number for the
+ *  asking); stopped showing it; item `b` chosen with modifiers `c`. */
+export const EV_MENU_OPEN = 32;
+export const EV_MENU_CLOSED = 33;
+export const EV_MENU_ACTIVATE = 34;
+
+function menuLock(a) {
+  while (Atomics.compareExchange(a, menuBase + N_LOCK, 0, 1) !== 0) {
+    // Held for one copy of at most a megabyte.
+    if (typeof Atomics.wait === 'function' && !globalThis.document) Atomics.wait(a, menuBase + N_LOCK, 1, 1);
+  }
+}
+function menuUnlock(a) {
+  Atomics.store(a, menuBase + N_LOCK, 0);
+  Atomics.notify(a, menuBase + N_LOCK);
+}
+
+/** One message onto the queue, from the process `token`: false when there
+ *  is no room for it now. */
+function menuPut(a, token, bytes) {
+  const need = 8 + Math.ceil(bytes.length / 4) * 4;
+  // One that could never fit is dropped, not waited for.
+  if (need > N_BYTES) {
+    console.error(`[wl] a menu message of ${bytes.length} bytes is too large to carry`);
+    return true;
+  }
+  menuLock(a);
+  const used = Atomics.load(a, menuBase + N_LEN);
+  const ok = used + need <= N_BYTES;
+  if (ok) {
+    const at = menuBase + N_HEAD + used / 4;
+    a[at] = token;
+    a[at + 1] = bytes.length;
+    if (bytes.length & 3) a[at + 1 + Math.ceil(bytes.length / 4)] = 0;
+    new Uint8Array(a.buffer, (at + 2) * 4, bytes.length).set(bytes);
+    Atomics.store(a, menuBase + N_LEN, used + need);
+    Atomics.add(a, menuBase + N_SEQ, 1);
+  }
+  menuUnlock(a);
+  return ok;
+}
+
+/** The queue's bytes, taken (the queue is then empty), or null. */
+function menuDrain(a) {
+  if (!Atomics.load(a, menuBase + N_LEN)) return null;
+  menuLock(a);
+  const used = Atomics.load(a, menuBase + N_LEN);
+  const out = new Uint8Array(used);
+  out.set(new Uint8Array(a.buffer, (menuBase + N_HEAD) * 4, used));
+  Atomics.store(a, menuBase + N_LEN, 0);
+  menuUnlock(a);
+  return out;
+}
+
+/** Say whether the page's shell presents menus: clients that connect after
+ *  this are offered `gex_menu_manager_v1`, or are not. */
+export function setMenusPresented(channel, on) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('setMenusPresented', [on]);
+  Atomics.store(new Int32Array(channel.arena), menuBase + N_ON, on ? 1 : 0);
+}
+
+/** A number that moves when a menu message is queued: cheap to poll. */
+export function menuSeq(channel) {
+  return Atomics.load(new Int32Array(channel.arena), menuBase + N_SEQ);
+}
+
+/** Every queued menu message, oldest first: `{ token, message }`, the
+ *  message as the guest's compositor wrote it (wl_menu.rs), parsed. */
+export function takeMenuMessages(channel) {
+  const bytes = menuDrain(new Int32Array(channel.arena));
+  if (!bytes) return [];
+  const words = new Int32Array(bytes.buffer, 0, bytes.length >> 2);
+  const out = [];
+  for (let at = 0; at + 2 <= words.length;) {
+    const token = words[at], n = words[at + 1] >>> 0;
+    const text = decoder.decode(bytes.subarray((at + 2) * 4, (at + 2) * 4 + n));
+    at += 2 + Math.ceil(n / 4);
+    try {
+      out.push({ token, message: JSON.parse(text) });
+    } catch (e) {
+      console.error('[wl] a menu message that does not parse', e);
+    }
+  }
+  return out;
 }
 
 function clipLock(a) {
@@ -1399,6 +1501,19 @@ export class WlProxy {
     return Atomics.load(this.#a, clipBase + C_FROM) >>> 0;
   }
 
+  /** Whether the page's shell presents menus (`wl_menus`). */
+  menus() {
+    return Atomics.load(this.#a, menuBase + N_ON);
+  }
+
+  /** A menu message for the page (`wl_menu_post`): 1 when queued, 0 when
+   *  there is no room yet. */
+  menuPost(memory, ptr, len) {
+    if (!this.#ready()) return 0;
+    // (A copy: TextDecoder and `set` across two shared buffers want one.)
+    return menuPut(this.#a, this.#token, new Uint8Array(memory.buffer, ptr, len).slice()) ? 1 : 0;
+  }
+
   /** The page's drag data, up to `max` bytes into `ptr` of `memory`: its
    *  whole length. */
   dragData(memory, ptr, max) {
@@ -1565,7 +1680,7 @@ export function mirrorChannel(post) {
 
 /** A write the page made on its mirror, made on the real `channel`. */
 export function mirrorCall(channel, fn, args) {
-  const f = { setClipboard, setOutputSize, releaseToken, ackBlock, setDragData, sendEvent }[fn];
+  const f = { setClipboard, setOutputSize, releaseToken, ackBlock, setDragData, sendEvent, setMenusPresented }[fn];
   if (f) f(channel, ...args);
 }
 
@@ -1673,17 +1788,23 @@ export function mirrorTake(channel, st, memoryOf, force = false) {
     transfer.push(clip.buffer);
     changed = true;
   }
+  // Menu messages, moved to the page's queue.
+  const menus = menuDrain(a);
+  if (menus) {
+    transfer.push(menus.buffer);
+    changed = true;
+  }
   // The heads alone (heartbeats, acks, a drag's answer) once a second.
   const now = Date.now();
   if (!changed && now - st.sent < 1000) return null;
   st.sent = now;
   transfer.push(heads.buffer);
-  return { update: { heads, blocks, pixels, gone, clip }, transfer };
+  return { update: { heads, blocks, pixels, gone, clip, menus }, transfer };
 }
 
 /** The Worker's `mirrorTake`, on the page's `channel`; `pixelsTo(token, id,
  *  buffer, replaces)` hands a surface's new buffer to the desktop. */
-export function mirrorApply(channel, { heads, blocks, pixels, gone, clip }, pixelsTo) {
+export function mirrorApply(channel, { heads, blocks, pixels, gone, clip, menus }, pixelsTo) {
   const a = new Int32Array(channel.arena);
   a.set(heads.subarray(0, M_WORDS), 0);
   for (let b = 0; b < BLOCKS; b++) a.set(heads.subarray(M_WORDS + b * B_WORDS, M_WORDS + (b + 1) * B_WORDS), blockBase(b));
@@ -1703,4 +1824,14 @@ export function mirrorApply(channel, { heads, blocks, pixels, gone, clip }, pixe
     buf.view.set(bytes.subarray(0, Math.max(0, size - offset)), offset);
   }
   if (clip) a.set(clip, clipBase);
+  // (The mirror's queue is read every frame and holds what the real one
+  // held: there is room.)
+  if (menus) {
+    const used = a[menuBase + N_LEN];
+    if (used + menus.length <= N_BYTES) {
+      new Uint8Array(a.buffer, (menuBase + N_HEAD) * 4 + used, menus.length).set(menus);
+      a[menuBase + N_LEN] = used + menus.length;
+      a[menuBase + N_SEQ]++;
+    }
+  }
 }
