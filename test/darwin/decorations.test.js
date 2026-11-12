@@ -7,8 +7,9 @@
 // asks for a borderless window) is shown bare ('client') and is given the
 // whole output: a borderless 256x256 window on a 256x256 output came out
 // 254x229 when the frame it never has was taken off. Its window geometry
-// (xdg_surface.set_window_geometry) is the page's to read. Natively, where
-// no window is framed, every window is given the whole output.
+// (xdg_surface.set_window_geometry) is the page's to read. Natively the
+// same room is given (the native host draws no frames, but what is
+// checked there is the room the page would give).
 export const meta = { hosts: ['browser', 'node'], arches: ['a64', 'x86'], images: ['darwin-root'], timeout: 300, html: '<style>html, body { margin: 0; } #desk { position: relative; width: 900px; height: 400px; }</style><div id="desk"></div>' };
 
 async function nativeLeg(t) {
@@ -24,10 +25,10 @@ async function nativeLeg(t) {
   const prog = join(d, 'window');
   const cc = await exec(['xcrun', 'clang', '-arch', x86 ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(import.meta.dirname, '..', 'fixtures', 'darwin', 'page', 'window.c')]);
   if (cc.code !== 0) t.skip(`xcrun clang: ${cc.stderr.trim().split('\n').pop()}`);
-  for (const [what, extra] of [['framed', []], ['bare', ['bare']]]) {
+  for (const [what, extra, room] of [['framed', [], '254 by 229'], ['bare', ['bare'], '256 by 256']]) {
     // Ended by its input's end (stdin is closed): it shows its window and goes.
     const r = await n.gexc(['run', '--sysroot', mac, '--wayland', `/tmp/gex-deco-${what}/wayland-0`, '--wayland-size', '256x256', '--wayland-out', 'null', prog, what, '256', '256', ...extra], { timeout: 120000 });
-    t.check(`natively, a ${what} window is given the whole 256x256 output`, /^window: bounds 256 by 256$/m.test(r.stdout), r.stdout.slice(-300));
+    t.check(`natively, a ${what} window on a 256x256 output is given ${room}`, new RegExp(`^window: bounds ${room}$`, 'm').test(r.stdout), r.stdout.slice(-300));
     t.check(`natively, a ${what} window is shown at 256 by 256`, /^window: shown, 256 by 256$/m.test(r.stdout), r.stdout.slice(-300));
   }
 }

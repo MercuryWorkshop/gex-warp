@@ -1086,17 +1086,18 @@ impl Client {
     }
 
     /// `configure_bounds` for the toplevel of `xdg_surface`: the output in
-    /// surface units, less the frame the host draws around it (a title bar
-    /// and a border, `FRAME_*`) -- only where the host frames it: not a
-    /// window that draws its own frame or wants none ([`Decorations::Client`],
-    /// a borderless window), and not on a host that frames no window. Taken
-    /// off a borderless window, the frame it never has shrank it: pyrus's
-    /// 256x256 borderless window on a 256x256 output came out 254x229.
+    /// surface units, less the frame a host draws around it (a title bar and
+    /// a border, `FRAME_*`) -- not for a window that draws its own frame or
+    /// wants none ([`Decorations::Client`], a borderless window). Taken off a
+    /// borderless window, the frame it never has shrank it: pyrus's 256x256
+    /// borderless window on a 256x256 output came out 254x229. (The same on
+    /// every host, the native one too, whose windows are shown bare: what
+    /// its tests check is the room the page's desktop would give.)
     fn bounds(&self, xdg_surface: u32) -> (i32, i32) {
         let (w, h) = self.default_size;
         let k = self.scale.max(1);
         let own = self.surface_of_xdg(xdg_surface).and_then(|s| self.surfaces.get(&s)).is_some_and(|s| s.deco == Decorations::Client);
-        if !self.host_frames || own {
+        if own {
             return ((w.max(k)) / k, (h.max(k)) / k);
         }
         ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
@@ -2445,13 +2446,12 @@ impl Client {
     /// asks), so the bounds it chooses its size within are the right ones --
     /// with the frame taken off, or not.
     fn set_decorations(&mut self, surface: u32, deco: Decorations) {
-        let frames = self.host_frames;
         let Some(s) = self.surfaces.get_mut(&surface) else { return };
         if s.deco == deco {
             return;
         }
-        // (only a change of whether the host frames it changes its bounds)
-        let framed = |d: Decorations| frames && d != Decorations::Client;
+        // (only a change of whether a frame is taken off changes its bounds)
+        let framed = |d: Decorations| d != Decorations::Client;
         let again = framed(s.deco) != framed(deco);
         s.deco = deco;
         self.dirty = true;
@@ -2848,7 +2848,8 @@ impl Client {
 
     /// Whether the host draws toplevels' frames (default yes: the page's
     /// desktops do). A host that shows windows bare (the native host) says
-    /// no, and KDE's protocol then tells clients to draw their own.
+    /// no, and KDE's protocol then tells clients to draw their own (and so
+    /// to take the whole output as their room).
     pub fn set_host_frames(&mut self, on: bool) {
         self.host_frames = on;
     }
@@ -5387,19 +5388,6 @@ mod tests {
         assert!(out.iter().any(|(id, op, b)| *id == 10 && *op == 0 && b[..4] == 1u32.to_le_bytes()), "client_side granted");
         assert_eq!(bounds(&out), Some((256, 256)), "configured again, nothing taken off");
         assert_eq!(c.surfaces[&6].deco, Decorations::Client);
-        // A host that frames nothing takes nothing off any window.
-        let mut n = Client::new();
-        n.set_default_size(256, 256);
-        n.set_host_frames(false);
-        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &pool);
-        go(&mut n, Writer::new(1, 1).new_id(2).finish());
-        for (name, iface, ver, id) in [(1u32, "wl_compositor", 4u32, 3u32), (5, "xdg_wm_base", 4, 5)] {
-            go(&mut n, Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish());
-        }
-        go(&mut n, Writer::new(3, 0).new_id(6).finish());
-        go(&mut n, Writer::new(5, 2).new_id(7).object(6).finish());
-        go(&mut n, Writer::new(7, 1).new_id(8).finish());
-        assert_eq!(bounds(&messages(&n.take_outgoing())), Some((256, 256)));
     }
 
     #[test]

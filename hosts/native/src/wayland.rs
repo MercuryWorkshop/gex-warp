@@ -1552,8 +1552,9 @@ impl HostListener for Wayland {
         client.set_presents_menus(presents_menus());
         // Frame callbacks at the paced clock's frames (`frame_hz`).
         client.set_held(frame_hz() != 0);
-        // Windows are shown bare here: no frame is taken off a window's
-        // bounds, and KDE's protocol tells clients to draw their own.
+        // Windows are shown bare here: KDE's protocol tells clients to draw
+        // their own frames (and a window that does is given the whole
+        // output as its room).
         client.set_host_frames(false);
         let id = {
             let mut n = self.inner.next_session.lock().unwrap();
