@@ -84,7 +84,8 @@ pub use syscalls::darwin;
 ///
 /// Guest virtual address equals byte offset, so the kernel needs
 /// no translation layer — just bounds checks, which are also the syscall
-/// ABI's `EFAULT` checks.
+/// ABI's `EFAULT` checks. (A Darwin process's addresses are in its window,
+/// `gex_abi::DARWIN_BASE` above the offsets: every accessor takes either.)
 ///
 /// Held as a [`gex_atomic::mem::Span`], never as a slice of the whole: in
 /// the browser the memory starts at address 0, where a Rust reference may
@@ -125,6 +126,8 @@ impl<'a> GuestMem<'a> {
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
+        // A Darwin process's address names the offset under its window.
+        let addr = gex_abi::canon(addr);
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
         if addr > usize::MAX as u64 || end > self.limit() {
@@ -215,6 +218,7 @@ impl<'a> GuestMem<'a> {
     /// [`Self::read_mut`] slice calls it when it is done.
     #[inline]
     pub fn written(&mut self, addr: u64, len: u64) {
+        let addr = gex_abi::canon(addr);
         if let Some(r) = gex_abi::write_map_range(addr, len) {
             // The bytes before their marks, for a consumer on another thread.
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -297,7 +301,7 @@ impl<'a> GuestMem<'a> {
     /// no NUL ends it within `buf` (and memory goes on), for the caller to
     /// read it whole.
     pub fn read_cstr_into(&self, addr: u64, buf: &mut [u8]) -> Result<Option<usize>, Errno> {
-        let start = addr as usize;
+        let start = gex_abi::canon(addr) as usize;
         let limit = self.limit();
         if start >= limit {
             return Err(Errno::EFAULT);
@@ -315,7 +319,7 @@ impl<'a> GuestMem<'a> {
     }
 
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
-        let start = addr as usize;
+        let start = gex_abi::canon(addr) as usize;
         let limit = self.limit();
         if start >= limit {
             return Err(Errno::EFAULT);

@@ -68,7 +68,8 @@ impl Kernel {
         if self.darwin_reclaim_ring(m).is_some() {
             return Err(mach::KERN_NO_SPACE);
         }
-        let at = self.mem.mmap_anon(m, 0, size, 3, 0, false, "[reclaim ring]").map_err(|_| mach::KERN_NO_SPACE)?;
+        // (where the task is told it is: in its window, `gex_abi::DARWIN_BASE`)
+        let at = gex_abi::guest_addr(self.mem.mmap_anon(m, 0, size, 3, 0, false, "[reclaim ring]").map_err(|_| mach::KERN_NO_SPACE)?);
         let _ = m.write_u64(at + ring::MARK, MARK);
         let _ = m.write_u64(at + ring::SELF, at);
         self.darwin_reclaim = Some(at);
@@ -82,7 +83,7 @@ impl Kernel {
         if let Some(at) = self.darwin_reclaim.filter(|at| marked(*at)) {
             return Some(at);
         }
-        let starts: Vec<u64> = self.mem.lock().vmas().iter().filter(|v| v.prot & 3 == 3 && v.end - v.start >= abi::PAGE_SIZE).map(|v| v.start).collect();
+        let starts: Vec<u64> = self.mem.lock().vmas().iter().filter(|v| v.prot & 3 == 3 && v.end - v.start >= abi::PAGE_SIZE).map(|v| gex_abi::guest_addr(v.start)).collect();
         self.darwin_reclaim = starts.into_iter().find(|at| marked(*at));
         self.darwin_reclaim
     }
@@ -91,7 +92,7 @@ impl Kernel {
     /// (`mach_vm_deferred_reclamation_buffer_query`).
     pub(super) fn darwin_reclaim_query(&mut self, m: &GuestMem<'_>) -> Option<(u64, u64)> {
         let at = self.darwin_reclaim_ring(m)?;
-        let end = self.mem.lock().vma_at(at).map(|v| v.end)?;
+        let end = self.mem.lock().vma_at(at).map(|v| gex_abi::guest_addr(v.end))?;
         Some((at, end - at))
     }
 

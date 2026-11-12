@@ -1593,8 +1593,9 @@ impl Kernel {
                             put(12, anon);
                             put(14, anon);
                             put(36, resident);
-                            put(38, abi::PAGE_SIZE);
-                            put(40, if gex_abi::mem64() { gex_abi::LIMIT64 } else { 1 << 32 });
+                            // (a process with the window has none below 4 GiB)
+                            put(38, abi::PAGE_SIZE.max(gex_abi::guest_base()));
+                            put(40, if gex_abi::mem64() { gex_abi::LIMIT64 } else { (1 << 32) + gex_abi::guest_base() });
                             put(84, self.darwin_machine().mem as u64);
                             v[2] = regions;
                             v[3] = abi::PAGE_SIZE as u32;
@@ -1624,6 +1625,8 @@ impl Kernel {
             (Kind::Task, 4813) => {
                 let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
                 let (want, size, mask, flags, from, copy) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, at(52), get32(&req.body, 60) != 0);
+                // (the source as the map has it; `want` and the answer are the task's)
+                let from = gex_abi::canon(from);
                 let source_is_this = req.ports.first().is_some_and(|(_, p, _)| p.kind == Kind::Task);
                 let len = size.next_multiple_of(abi::PAGE_SIZE);
                 let prot = self.mem.lock().vma_at(from).map(|v| v.prot & 7);
@@ -1659,7 +1662,9 @@ impl Kernel {
             (Kind::Task, 4816 | 3824) => {
                 let address = u64::from_le_bytes(req.body.get(8..16).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
                 let (flavor, room) = (get32(&req.body, 16), get32(&req.body, 20));
-                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (v.start, v.end, v.prot));
+                // (the address as the map has it, the region's as the task does)
+                let address = gex_abi::canon(address);
+                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (gex_abi::guest_addr(v.start), gex_abi::guest_addr(v.end), v.prot));
                 match found {
                     // VM_REGION_BASIC_INFO_64: its protection and the most
                     // it may be given, how a child inherits it (a copy),
@@ -1689,7 +1694,8 @@ impl Kernel {
             (Kind::Task, 4815 | 3822) => {
                 let address = u64::from_le_bytes(req.body.get(8..16).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
                 let room = get32(&req.body, 20);
-                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (v.start, v.end, v.prot));
+                let address = gex_abi::canon(address);
+                let found = self.mem.lock().vmas().iter().find(|v| v.end > address).map(|v| (gex_abi::guest_addr(v.start), gex_abi::guest_addr(v.end), v.prot));
                 match found {
                     Some((start, end, prot)) if room >= 17 => {
                         const SM_PRIVATE: u32 = 2;

@@ -183,6 +183,9 @@ impl FileHandle for GlDevice {
     }
 
     fn ioctl(&self, m: &mut GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
+        // The ring as the page reads it: an offset in the memory (a Darwin
+        // process names it in its window, `gex_abi::DARWIN_BASE`).
+        let arg = gex_abi::canon(arg);
         // The request is an `int` in the C library, so every `_IOWR` number
         // arrives sign-extended.
         match request & 0xffff_ffff {

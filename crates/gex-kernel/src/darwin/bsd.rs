@@ -873,17 +873,22 @@ impl Kernel {
             return if unix03 { Err(Errno::EINVAL) } else { Ok(0) };
         }
         let page = abi::PAGE_SIZE;
+        // The address as the map has it (a process with the window names
+        // its offset 4 GiB higher), and the answer as the process has it.
+        let (addr, asked) = (gex_abi::canon(addr), addr);
         if flags & abi::map::FIXED != 0 {
             if addr % page != 0 {
                 return Err(Errno::EINVAL);
             }
-            return self.map_io().mmap(m, [addr, len, prot_bits, kflags, fd, off]);
+            // (one asked for below the window is where it was asked for: an
+            // address gex's userland was built with)
+            return self.map_io().mmap(m, [addr, len, prot_bits, kflags, fd, off]).map(|a| if asked == a { a } else { gex_abi::guest_addr(a) });
         }
         let len = len.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
         let at = self.darwin_place(addr, len, prot_bits as u32, fd != u64::MAX, 0)?;
         // The hint is honoured: the range was free a moment ago, under the
         // same lock.
-        self.map_io().mmap(m, [at, len, prot_bits, kflags, fd, off])
+        self.map_io().mmap(m, [at, len, prot_bits, kflags, fd, off]).map(gex_abi::guest_addr)
     }
 
     /// A free range of `len` bytes on a Darwin page boundary (and on one of

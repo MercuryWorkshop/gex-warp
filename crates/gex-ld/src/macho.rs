@@ -626,6 +626,12 @@ pub struct Darwin {
     pub arm64e: bool,
     /// The main executable's `LC_UUID`.
     pub uuid: Option<[u8; 16]>,
+    /// The process has a Mac's address space: nothing below 4 GiB, every
+    /// address it is given in gex's window ([`gex_abi::DARWIN_BASE`]). Any
+    /// program gex places (a position-independent one), or one whose
+    /// `__PAGEZERO` is a Mac's 4 GiB; not one linked to run where it is,
+    /// below 4 GiB, with a smaller zero page (`-pagezero_size`).
+    pub windowed: bool,
 }
 
 /// Load a Mach-O executable, and the dynamic linker it names, as
@@ -696,6 +702,7 @@ fn darwin_of(m: &MachO, exe: &Image) -> Darwin {
         },
         arm64e: m.arm64e(),
         uuid: m.uuid,
+        windowed: gex_abi::darwin_windowed(m.segments.iter().filter(|s| s.is_pagezero()).map(|s| s.vmsize).max().unwrap_or(0), m.pie()),
     }
 }
 
@@ -821,6 +828,7 @@ impl AppleStrings {
             }
             h
         };
+        let base = gex_abi::guest_base();
         let mut v = vec![
             format!("executable_path={}", self.exe_path),
             // No preemption-free zone: there is no commpage text.
@@ -830,7 +838,7 @@ impl AppleStrings {
             format!("stack_guard=0x{:016x}", word(0) & !0xff),
             format!("malloc_entropy=0x{:016x},0x{:016x}", word(1), word(2)),
             format!("ptr_munge=0x{:016x}", word(3)),
-            format!("main_stack=0x{:x},0x{:x},0x{:x},0x{:x}", self.stack.0, self.stack.1, self.stack.0, self.stack.1),
+            format!("main_stack=0x{:x},0x{:x},0x{:x},0x{:x}", self.stack.0 + base, self.stack.1, self.stack.0 + base, self.stack.1),
             // What the kernel knows the program's file by, for the
             // allocator to keep its secrets by: twenty bytes of hash.
             // (libmalloc will not start the first process without it.)
@@ -882,16 +890,19 @@ pub fn build_stack(darwin: &Darwin, stack_top: u64, args: &[String], env: &[Stri
     }
     // Sixteen bytes are left free at the very top, as XNU leaves them.
     let blob_addr = (stack_top - 16 - blob.len() as u64) & !0xf;
+    // The pointers as the process sees them: in the window, for one that
+    // has it (the layout's addresses are offsets).
+    let base = gex_abi::guest_base();
     let mut words: Vec<u64> = Vec::new();
     if darwin.dynamic {
-        words.push(darwin.mach_header);
+        words.push(darwin.mach_header + base);
     }
     words.push(args.len() as u64);
-    words.extend(argv_at.iter().map(|o| blob_addr + *o as u64));
+    words.extend(argv_at.iter().map(|o| blob_addr + *o as u64 + base));
     words.push(0);
-    words.extend(env_at.iter().map(|o| blob_addr + *o as u64));
+    words.extend(env_at.iter().map(|o| blob_addr + *o as u64 + base));
     words.push(0);
-    words.extend(apple_at.iter().map(|o| blob_addr + *o as u64));
+    words.extend(apple_at.iter().map(|o| blob_addr + *o as u64 + base));
     words.push(0);
     let sp = (blob_addr - words.len() as u64 * 8) & !0xf;
     let mut bytes = vec![0u8; (blob_addr + blob.len() as u64 - sp) as usize];
@@ -1002,6 +1013,10 @@ mod tests {
         assert_eq!(p.exe.segments[1].mem_size, 2 * PAGE_SIZE);
         assert_eq!(p.exe.segments[1].bytes[0], 0x5a);
         assert_eq!(p.exe.brk, low + 3 * PAGE_SIZE);
+        // Linked below 4 GiB with a zero page that small: it runs where it
+        // is linked, with no window.
+        assert!(!d.windowed);
+        assert_eq!(p.guest_base(), 0);
     }
 
     #[test]
@@ -1011,8 +1026,11 @@ mod tests {
         let p = load_program(&exe, 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|path| (path == "/usr/lib/dyld").then(|| dyld.clone())).unwrap();
         let d = p.darwin.as_ref().unwrap();
         assert!(d.dynamic);
-        // The 4 GiB link address slides down to where gex puts programs.
+        // The 4 GiB link address slides down to where gex puts programs,
+        // and the process has a Mac's address space: the window.
         assert_eq!(d.mach_header, 0x2000_0000);
+        assert!(d.windowed);
+        assert_eq!(p.guest_base(), gex_abi::DARWIN_BASE);
         assert_eq!(p.exe.bias, 0x2000_0000u64.wrapping_sub(BASE));
         assert_eq!(p.exe.entry, 0x2000_0000 + 0x123);
         assert_eq!(p.entry(), 0x3000_0000 + 0x40);
@@ -1080,7 +1098,7 @@ mod tests {
 
     #[test]
     fn the_stack_is_the_one_xnu_builds() {
-        let d = Darwin { mach_header: 0x1234_0000, dynamic: true, stack_size: 0, arm64e: false, uuid: None };
+        let d = Darwin { mach_header: 0x1234_0000, dynamic: true, stack_size: 0, arm64e: false, uuid: None, windowed: false };
         let args = vec!["prog".to_string(), "one".to_string()];
         let env = vec!["A=1".to_string()];
         let apple = AppleStrings { exe_path: "/bin/prog".into(), stack: (0x8000_0000, 0x80_0000), thread_port: Some(0x103), random: [7; 16] }.strings(&d);

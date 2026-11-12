@@ -804,8 +804,8 @@ impl<'a> Emitter<'a> {
         }
         if let Some(c) = self.value_const[addr.0 as usize] {
             let ea = c.wrapping_add(offset as u64);
-            return if ea < GUEST_LIMIT && (ea >= g || !on) {
-                format!("GEX_P(0x{ea:x}u)")
+            return if ea < gex_abi::windowed_limit(GUEST_LIMIT) && (ea as u32 as u64 >= g || !on) {
+                format!("GEX_P(0x{:x}u)", ea as u32)
             } else {
                 "GEX_P(GEX_POISON_ADDR)".into()
             };

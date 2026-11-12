@@ -57,6 +57,8 @@ impl Ranges {
         const KERN_NOT_SUPPORTED: i32 = 46;
         let mut list = Vec::with_capacity(given.len());
         for &(start, len, recovery, flags) in given {
+            // (code as gex knows it: a Darwin process's pc less its window)
+            let start = gex_abi::canon(start);
             if len as u64 > OFFSET_MAX || recovery as u64 > OFFSET_MAX || flags != 0 {
                 return Err(KERN_INVALID_ARGUMENT);
             }

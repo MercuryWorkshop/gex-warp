@@ -426,6 +426,96 @@ pub fn arena_bottom() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// The Darwin window: a Mac's address space above 4 GiB
+// ---------------------------------------------------------------------------
+
+/// Where a Darwin process's addresses start: a Mac's `__PAGEZERO` is the whole
+/// first 4 GiB, and Swift (both processors' ABIs) takes every value below it
+/// for a spare bit pattern of a reference (an `Optional`'s `nil`), in every
+/// program Xcode builds as well as in its runtime.
+///
+/// The process's memory is no different: the same layout, the same offsets.
+/// What differs is the address the guest is given for an offset `o`:
+/// `o + DARWIN_BASE` ([`guest_addr`]). Inside gex -- the kernel's memory map,
+/// the loader, the dispatch directory, a block's identity, ctx::PC, every key
+/// -- an address stays the offset; it becomes the guest's where the guest
+/// sees it (an answer, a register, a word the kernel writes, a value the
+/// lifter computes from the pc) and the offset again where the guest hands
+/// one in ([`canon`]: a translated access, a kernel copy, an indirect
+/// branch's target).
+///
+/// The window is lenient: an address below it is its own offset, as before.
+/// A translated access takes the low 32 bits of any address below
+/// `DARWIN_BASE + GUEST_LIMIT` (one compare, as the bounds guard always was);
+/// so what is reached by a constant gex's userland was built with (the
+/// commpage at 0xffc000) is still there. Nothing a Darwin guest is given
+/// is below 4 GiB. The design, and what it leaves out: `darwin-window.md`
+/// beside this crate's sources.
+pub const DARWIN_BASE: u64 = 1 << 32;
+
+static GUEST_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Give this host process's guests the window ([`DARWIN_BASE`]) or none
+/// (0). Set with the Darwin personality, before anything is translated:
+/// the lifter and the bounds guard bake it in, and it is in every key.
+pub fn set_guest_base(base: u64) {
+    GUEST_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`DARWIN_BASE`] for a process with the window, 0 for every other. A
+/// memory64 guest memory ([`MemFlavor::M64`]) has none: its accesses take
+/// the guest address as it stands, and the window would need a subtraction
+/// in every one (not done: its Darwin processes keep the layout below 4 GiB).
+#[inline]
+pub fn guest_base() -> u64 {
+    if mem64() {
+        return 0;
+    }
+    GUEST_BASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a Darwin program whose `__PAGEZERO` is `pagezero` bytes, and
+/// that gex slides (`slid`) or not, gets the window: one whose zero page is
+/// a Mac's whole 4 GiB, or that is placed where gex chooses.
+/// A program linked to run at a fixed address below 4 GiB, with a zero
+/// page that small (`-pagezero_size`), runs where it is linked, as on a
+/// Mac, with no window.
+pub const fn darwin_windowed(pagezero: u64, slid: bool) -> bool {
+    slid || pagezero >= DARWIN_BASE
+}
+
+/// The offset a guest address names: less the window, for an address in
+/// it; any other as it is (an address below the window, an offset already).
+#[inline]
+pub fn canon(a: u64) -> u64 {
+    let b = guest_base();
+    if b != 0 && a.wrapping_sub(b) < (1 << 32) {
+        a - b
+    } else {
+        a
+    }
+}
+
+/// The address the guest is given for offset `o`: in the window when the
+/// process has one. 0 (no address) stays 0.
+#[inline]
+pub fn guest_addr(o: u64) -> u64 {
+    let b = guest_base();
+    if b != 0 && o != 0 && o < (1 << 32) {
+        o + b
+    } else {
+        o
+    }
+}
+
+/// The bounds guard's limit for a translated access: `limit`, raised by the
+/// window, whose addresses take their low 32 bits.
+#[inline]
+pub fn windowed_limit(limit: u64) -> u64 {
+    limit + guest_base()
+}
+
+// ---------------------------------------------------------------------------
 // Thread context
 // ---------------------------------------------------------------------------
 
@@ -1536,6 +1626,29 @@ pub const fn dispatch_index(pc: u64, page_entry: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window's two conversions: a Darwin process's address in it names
+    /// the offset 4 GiB lower and is given back as it was; an address below
+    /// it is its own offset (lenient); none is the identity without it. The
+    /// bounds guard's limit is raised by as much. (One test: the base is
+    /// a process-wide setting.)
+    #[test]
+    fn the_darwin_window_names_offsets_4_gib_higher() {
+        assert_eq!((canon(0x7e00_1230), guest_addr(0x7e00_1230), windowed_limit(GUEST_LIMIT)), (0x7e00_1230, 0x7e00_1230, GUEST_LIMIT));
+        set_guest_base(DARWIN_BASE);
+        assert_eq!(guest_addr(0x7e00_1230), 0x1_7e00_1230);
+        assert_eq!(canon(0x1_7e00_1230), 0x7e00_1230);
+        assert_eq!(canon(guest_addr(PIE_BASE)), PIE_BASE);
+        // Below the window, and past it, an address is left as it is.
+        assert_eq!(canon(0x00ff_c000), 0x00ff_c000);
+        assert_eq!(canon(0x2_0000_0000), 0x2_0000_0000);
+        // No address stays none.
+        assert_eq!(guest_addr(0), 0);
+        assert_eq!(windowed_limit(GUEST_LIMIT), DARWIN_BASE + GUEST_LIMIT);
+        assert!(darwin_windowed(DARWIN_BASE, false) && darwin_windowed(0x4000, true) && !darwin_windowed(0x4000, false));
+        set_guest_base(0);
+        assert_eq!(canon(0x1_7e00_1230), 0x1_7e00_1230);
+    }
 
     // The context layout is a compile-time contract between codegen, the
     // kernel and the host, so it is checked at compile time.

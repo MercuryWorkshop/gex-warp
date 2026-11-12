@@ -1379,7 +1379,10 @@ fn setup_frame_darwin(
     use crate::darwin::abi;
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
-    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    // The pc and a fault's address as the process has them: in its window
+    // (`gex_abi::DARWIN_BASE`), where the context's pc is an offset.
+    let pc = gex_abi::guest_addr(gex_abi::canon(m.read_u64(ctx_addr + ctx::PC as u64)?));
+    let fault_address = gex_abi::guest_addr(gex_abi::canon(fault_address));
     let mut own = signals.own();
     // On the alternate stack when the action asks, one is installed and the
     // thread is not on it already.
@@ -1471,8 +1474,9 @@ fn setup_frame_darwin(
     }
     m.write_u64(ctx_addr + ctx::SP as u64, frame)?;
     // The trampoline is the action's (`sa_tramp`, kept as its restorer).
-    m.write_u64(ctx_addr + ctx::PC as u64, action.restorer)?;
-    Ok(action.restorer)
+    let restorer = gex_abi::canon(action.restorer);
+    m.write_u64(ctx_addr + ctx::PC as u64, restorer)?;
+    Ok(restorer)
 }
 
 /// Darwin's `sigreturn(uctx, infostyle, token)` for an arm64 thread: the
@@ -1500,6 +1504,7 @@ fn sigreturn_darwin(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> R
         m.write_u64(ctx_addr + ctx::x(i as u8) as u64, *r)?;
     }
     m.write_u64(ctx_addr + ctx::SP as u64, regs[31])?;
+    regs[32] = gex_abi::canon(regs[32]);
     m.write_u64(ctx_addr + ctx::PC as u64, regs[32])?;
     write_pstate(m, ctx_addr, cpsr as u64)?;
     m.write_u32(ctx_addr + ctx::FPSR as u64, fpsr)?;
@@ -1550,7 +1555,10 @@ fn setup_frame_darwin_x86(
     use crate::darwin::abi;
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
-    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    // The pc and a fault's address as the process has them: in its window
+    // (`gex_abi::DARWIN_BASE`), where the context's pc is an offset.
+    let pc = gex_abi::guest_addr(gex_abi::canon(m.read_u64(ctx_addr + ctx::PC as u64)?));
+    let fault_address = gex_abi::guest_addr(gex_abi::canon(fault_address));
     let mut own = signals.own();
     let alt = own.alt_stack;
     let on_alt = alt.size > 0 && sp > alt.sp && sp <= alt.sp + alt.size;
@@ -1640,9 +1648,10 @@ fn setup_frame_darwin_x86(
         m.write_u64(ctx_addr + ctx::x(reg) as u64, v)?;
     }
     m.write_u64(ctx_addr + ctx::SP as u64, frame)?;
-    m.write_u64(ctx_addr + ctx::PC as u64, action.restorer)?;
+    let restorer = gex_abi::canon(action.restorer);
+    m.write_u64(ctx_addr + ctx::PC as u64, restorer)?;
     m.write_u32(ctx_addr + ctx::CS as u64, 0)?;
-    Ok(action.restorer)
+    Ok(restorer)
 }
 
 /// Darwin's `sigreturn(uctx, infostyle, token)` for an x86-64 thread.
@@ -1670,6 +1679,7 @@ fn sigreturn_darwin_x86(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) 
     for (i, reg) in dxframe::GPR_ORDER.iter().enumerate() {
         m.write_u64(ctx_addr + ctx::x(*reg) as u64, regs[i])?;
     }
+    regs[16] = gex_abi::canon(regs[16]);
     m.write_u64(ctx_addr + ctx::PC as u64, regs[16])?;
     write_rflags(m, ctx_addr, regs[17])?;
     let mut own = signals.own();

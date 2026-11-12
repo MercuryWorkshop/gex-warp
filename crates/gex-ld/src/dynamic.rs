@@ -43,6 +43,14 @@ impl Program {
         self.darwin.is_some()
     }
 
+    /// The guest base this program's process runs with
+    /// ([`gex_abi::guest_base`]): a Darwin program with a Mac's address space
+    /// gets the window ([`crate::macho::Darwin::windowed`]), every other
+    /// none.
+    pub fn guest_base(&self) -> u64 {
+        if self.darwin.as_ref().is_some_and(|d| d.windowed) && !gex_abi::mem64() { gex_abi::DARWIN_BASE } else { 0 }
+    }
+
     /// Load bias of the interpreter, for `AT_BASE`.
     pub fn interp_base(&self) -> u64 {
         self.interp.as_ref().map(|i| i.bias).unwrap_or(0)

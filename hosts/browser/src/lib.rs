@@ -6474,6 +6474,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // A Mach-O program: XNU's system-call ABI in the kernel.
     kernel.darwin = program.is_darwin();
     gex_kernel::darwin::set(program.is_darwin());
+    // And a Mac's address space above 4 GiB (`gex_abi::DARWIN_BASE`).
+    gex_abi::set_guest_base(program.guest_base());
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // The clock calls' process constants (`clock_syscall`), before the
     // process's first syscall.
@@ -6691,7 +6693,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         write_u64(&mut data, c + ctx::x(i), 0);
     }
     // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
-    write_u64(&mut data, c + ctx::sp_slot(program.compat()), layout.sp);
+    write_u64(&mut data, c + ctx::sp_slot(program.compat()), gex_abi::guest_addr(layout.sp));
     write_u64(&mut data, c + ctx::PC, program.entry());
     data.write((c + ctx::SAFEPOINT_COUNTER) as u64, &1024i32.to_le_bytes()).expect("a thread's context outside memory");
     // The x87 control word and MXCSR at their power-on defaults. (`MXCSR` is
@@ -12612,6 +12614,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         gex_xlate::set_compat(p.compat());
         h.kernel.darwin = p.is_darwin();
         gex_kernel::darwin::set(p.is_darwin());
+        gex_abi::set_guest_base(p.guest_base());
     }
     // An exec keeps the process's start (its processor time goes on).
     if h.kernel.started == 0 {
@@ -12895,7 +12898,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
     let compat = program.as_ref().is_some_and(|p| p.compat());
-    write_u64(&mut data, c + ctx::sp_slot(compat), layout.sp);
+    write_u64(&mut data, c + ctx::sp_slot(compat), gex_abi::guest_addr(layout.sp));
     let entry = match (&program, &restored) {
         (Some(p), _) => p.entry(),
         (None, Some(l)) => l.entry,
@@ -16294,10 +16297,11 @@ pub extern "C" fn gex_inst_align_shift() -> i32 {
 /// Which ABI this process speaks, for the JS side to carry to the Worker a
 /// fork child or a new thread runs in: each Worker has its own shim
 /// instance, whose decoder mode starts out 64-bit and whose kernel Linux's.
-/// Bit 0: a 32-bit (i386) process. Bit 1: a Darwin one.
+/// Bit 0: a 32-bit (i386) process. Bit 1: a Darwin one. Bit 2: one with
+/// a Mac's address space (`gex_abi::DARWIN_BASE`).
 #[no_mangle]
 pub extern "C" fn gex_compat() -> i32 {
-    compat_abi() as i32 | (gex_kernel::darwin::on() as i32) << 1
+    compat_abi() as i32 | (gex_kernel::darwin::on() as i32) << 1 | ((gex_abi::guest_base() != 0) as i32) << 2
 }
 
 /// The other half: said in the child's or thread's Worker once its kernel
@@ -16327,6 +16331,7 @@ pub extern "C" fn gex_set_compat(on: i32) {
     }
     gex_xlate::set_compat(compat);
     gex_kernel::darwin::set(darwin);
+    gex_abi::set_guest_base(if on & 4 != 0 { gex_abi::DARWIN_BASE } else { 0 });
     // What a Darwin fork leaves in its child beyond the zero
     // `gex_adopt_child` wrote, before this Worker knew its process for a
     // Darwin one: the second result, or a `posix_spawn` copy's way back
@@ -16970,6 +16975,8 @@ fn heal_dirs(start: u64) {
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     let _pc = fault_pc(_pc);
+    // (a Darwin process's address, in its window, as its offset)
+    let addr = gex_abi::canon(addr as u64) as i64;
     if op == gex_abi::cache_op::LOW_ACCESS {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
     }
@@ -17809,6 +17816,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     if gex_abi::X86 && pc == gex_kernel::x86::FAR_PAD {
         return far_switch(_ctx);
+    }
+    // An address in a Darwin process's window (`gex_abi::DARWIN_BASE`) that
+    // reached a dispatch as it is: the code is known by its offset, and the
+    // loop goes on there.
+    if gex_abi::canon(pc) != pc {
+        set_resume(gex_abi::canon(pc));
+        set_resume_ctx(my_ctx());
+        trap();
     }
     LAST_MISS_PC.with(|c| c.set(pc));
     // Code in the process's other mode (a WoW64 thread's 32-bit code): its

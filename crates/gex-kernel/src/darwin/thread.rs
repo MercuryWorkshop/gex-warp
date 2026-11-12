@@ -188,7 +188,7 @@ impl Kernel {
             m.write_u64(child + ctx::x(29) as u64, 0)?;
             m.write_u64(child + ctx::x(30) as u64, 0)?;
         }
-        m.write_u64(child + ctx::PC as u64, reg.threadstart)?;
+        m.write_u64(child + ctx::PC as u64, gex_abi::canon(reg.threadstart))?;
         Ok(req)
     }
 

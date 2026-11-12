@@ -260,7 +260,8 @@ fn t1_fold() -> bool {
 
 /// The emitter switches that change tier-1's bytes without showing in the
 /// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD,
-/// GEX_NULL_GUARD, GEX_MXCSR, page write tracking):
+/// GEX_NULL_GUARD, GEX_MXCSR, page write tracking, a Darwin process's
+/// window, `gex_abi::guest_base`, which the lifter and the bounds guard bake in):
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
 /// Write tracking's map address is in the code too: a key with the bit set
@@ -269,6 +270,7 @@ pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
         | (gex_ir::mxcsr_exact() as u8) << 4
         | (crate::wtrack::on() as u8) << 5
+        | ((gex_abi::guest_base() != 0) as u8) << 6
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -454,7 +456,9 @@ pub fn set_guard_limit(limit: u64) {
 }
 
 fn guard_limit() -> u64 {
-    let g = GUARD_LIMIT.load(Ordering::Relaxed);
+    // A Darwin process's window (`gex_abi::DARWIN_BASE`): an address below
+    // its top takes its low 32 bits, as one below the memory's end always did.
+    let g = gex_abi::windowed_limit(GUARD_LIMIT.load(Ordering::Relaxed));
     // 32-bit Wine with KUSER_SHARED_DATA folded: the old page and above fault by name.
     if gex_abi::kuser_fold() {
         g.min(gex_abi::KUSER_GUARD)

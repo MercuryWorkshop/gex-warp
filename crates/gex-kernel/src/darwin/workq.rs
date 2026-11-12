@@ -264,7 +264,8 @@ impl Kernel {
                     self.darwin_text_page(m);
                     // The stack: a guard page, the stack, the `pthread_t`.
                     let top = (reg.pthsize + PTHREAD_T_OFFSET).next_multiple_of(page);
-                    let stack = self.mem.mmap_anon(m, 0, page + STACK + top, 3, 0, false, "[workq stack]")?;
+                    // (where the thread is told it is: in a process's window, `gex_abi::DARWIN_BASE`)
+                    let stack = gex_abi::guest_addr(self.mem.mmap_anon(m, 0, page + STACK + top, 3, 0, false, "[workq stack]")?);
                     let _ = self.map_io().call(m, nr::MPROTECT, [stack, page, 0, 0, 0, 0]);
                     let me = stack + page + STACK + PTHREAD_T_OFFSET;
                     let fs = self.fs_of(self.ctx_addr);
@@ -326,8 +327,9 @@ impl Kernel {
                     let _ = m.write_u64(c + ctx::x(29) as u64, 0);
                     let _ = m.write_u64(c + ctx::x(30) as u64, 0);
                 }
-                let _ = m.write_u64(c + ctx::PC as u64, reg.wqthread);
-                Some(SyscallOutcome::Resume(reg.wqthread))
+                let start = gex_abi::canon(reg.wqthread);
+                let _ = m.write_u64(c + ctx::PC as u64, start);
+                Some(SyscallOutcome::Resume(start))
             }
         }
     }

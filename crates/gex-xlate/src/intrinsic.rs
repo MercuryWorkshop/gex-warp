@@ -221,6 +221,7 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     // An override returned (or left) itself: go where it says.
     if let Intrinsic::Override(_) = which {
         let target = b.read(GuestReg::Pc);
+        let target = gex_lift::indirect_target(&mut b, target);
         return b.finish(Term::Indirect {
             target,
             is_ret: true,
@@ -244,6 +245,8 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     } else {
         b.read(GuestReg::X(30))
     };
+    // (an address in a Darwin process's window, as the offset it names)
+    let target = gex_lift::indirect_target(&mut b, target);
     b.finish(Term::Indirect {
         target,
         is_ret: true,

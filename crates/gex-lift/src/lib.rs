@@ -58,6 +58,18 @@ pub enum FlagSource {
     Logic { v: Value, ty: Ty },
 }
 
+/// An indirect branch's target as the offset gex knows the code by: a
+/// Darwin process's addresses are in its window (`gex_abi::DARWIN_BASE`,
+/// 4 GiB above the offsets), and every pc inside gex is an offset. One `and`,
+/// for a process with the window; none for any other.
+pub fn indirect_target(b: &mut Builder, target: Value) -> Value {
+    if gex_abi::guest_base() == 0 {
+        return target;
+    }
+    let mask = b.const_i64(0xffff_ffff);
+    b.bin(BinOp::And, Ty::I64, target, mask)
+}
+
 pub struct Lifter<'a> {
     b: &'a mut Builder,
     /// What the flags mean right now. Carried in and out across the
@@ -611,7 +623,9 @@ impl<'a> Lifter<'a> {
             }
 
             Inst::Adr { rd, target } | Inst::Adrp { rd, target } => {
-                let v = self.b.const_i64(target);
+                // The address as the guest has it: in a Darwin process's
+                // window (`gex_abi::DARWIN_BASE`), whose pcs are offsets.
+                let v = self.b.const_i64(gex_abi::guest_addr(target));
                 self.wr_addr(rd, v);
                 Flow::Next
             }
@@ -900,7 +914,7 @@ impl<'a> Lifter<'a> {
             // -- control flow --------------------------------------------------
             Inst::Branch { target, link } => {
                 if link {
-                    let ret = self.b.const_i64(next);
+                    let ret = self.b.const_i64(gex_abi::guest_addr(next));
                     self.b.write(GuestReg::X(30), ret);
                     self.b.set_call_return(next);
                 }
@@ -969,8 +983,9 @@ impl<'a> Lifter<'a> {
                 // Read the target *before* clobbering x30: `blr x30` is legal
                 // and not uncommon.
                 let target = self.rd_addr(rn);
+                let target = indirect_target(self.b, target);
                 if link {
-                    let ret = self.b.const_i64(next);
+                    let ret = self.b.const_i64(gex_abi::guest_addr(next));
                     self.b.write(GuestReg::X(30), ret);
                     self.b.set_call_return(next);
                 }

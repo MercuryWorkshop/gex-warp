@@ -16,7 +16,8 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_X86 {}", gex_abi::X86 as u32);
     let _ = writeln!(w, "#define GEX_INST_ALIGN {}u", gex_abi::INST_ALIGN);
     let _ = writeln!(w, "#define GEX_SYSCALL_INST_BYTES {}u", gex_abi::SYSCALL_INST_BYTES);
-    let _ = writeln!(w, "#define GEX_GUEST_LIMIT 0x{:x}ull", gex_abi::GUEST_LIMIT);
+    // (raised by a Darwin process's window: its addresses take their low 32 bits)
+    let _ = writeln!(w, "#define GEX_GUEST_LIMIT 0x{:x}ull", gex_abi::windowed_limit(gex_abi::GUEST_LIMIT));
     let _ = writeln!(w, "#define GEX_POISON_ADDR 0x{:x}u", gex_abi::POISON_ADDR);
     if null_on() {
         let _ = writeln!(w, "#define GEX_NULL_GUARD 0x{:x}u", gex_abi::NULL_GUARD);

@@ -203,6 +203,8 @@ impl MapView {
     /// page ([`Share`]): the mapping's id and the word's offset in it.
     /// `None` for a word of the process's own (its address is its key).
     pub fn share_key(&self, addr: u64) -> Option<u64> {
+        // (a Darwin process's address, in its window, as the offset kept here)
+        let addr = gex_abi::canon(addr);
         if !self.any_shares.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
@@ -222,6 +224,8 @@ impl MapView {
     /// Whether `[addr, addr + len)` lies inside one mapping, of any
     /// protection, as [`MemoryMap::vmas`] would say.
     pub fn mapped(&self, addr: u64, len: u64) -> bool {
+        // (a Darwin process's address, in its window, as the offset kept here)
+        let addr = gex_abi::canon(addr);
         let end = addr.saturating_add(len);
         self.cur.read(crate::sync::me() as usize, |r| {
             let i = r.partition_point(|&(s, _, _)| s <= addr);
@@ -232,6 +236,8 @@ impl MapView {
     /// The protection of the mapping holding `addr`, as
     /// [`MemoryMap::vma_at`] would say; `None` where nothing is mapped.
     pub fn prot_at(&self, addr: u64) -> Option<u32> {
+        // (a Darwin process's address, in its window, as the offset kept here)
+        let addr = gex_abi::canon(addr);
         self.cur.read(crate::sync::me() as usize, |r| {
             let i = r.partition_point(|&(s, _, _)| s <= addr);
             r[..i].last().filter(|&&(_, e, _)| addr < e).map(|&(_, _, p)| p)
@@ -981,6 +987,8 @@ impl MemoryMap {
 
     /// The mapping holding `addr`, if any.
     pub fn vma_at(&self, addr: u64) -> Option<&Vma> {
+        // (a Darwin process's address, in its window, as the offset kept here)
+        let addr = gex_abi::canon(addr);
         // Sorted by start and disjoint: the last one starting at or below.
         let i = self.vmas.partition_point(|v| v.start <= addr);
         self.vmas[..i].last().filter(|v| addr < v.end)
@@ -2263,6 +2271,7 @@ impl MemoryMap {
         if len == 0 {
             return true;
         }
+        let addr = gex_abi::canon(addr);
         let Some(end) = addr.checked_add(len) else {
             return false;
         };

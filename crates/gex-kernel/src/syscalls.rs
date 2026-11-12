@@ -4854,7 +4854,14 @@ pub struct MapIo<'a> {
 
 impl MapIo<'_> {
     /// The mapping call `n` (canonical), or `None` for any other.
+    ///
+    /// Its addresses may be a Darwin process's (`gex_abi::DARWIN_BASE`
+    /// above the offsets the map keeps): each is taken as its offset here
+    /// ([`gex_abi::canon`]), and what is answered is an offset, which the
+    /// Darwin personality gives its caller as its own.
     pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        let mut a = a;
+        a[0] = gex_abi::canon(a[0]);
         Some(match n {
             nr::BRK => {
                 // Zeroed, because Linux zeroes it and libc counts on that.
@@ -4868,7 +4875,6 @@ impl MapIo<'_> {
             nr::MUNMAP => {
                 // An alias's unmap: another mapping still holds the pages;
                 // the last holder's unmaps all of them.
-                let mut a = a;
                 match self.mem.lock().log.shared_maps.unalias(a[0], crate::mem::page_align_up(a[1])) {
                     Unalias::Keep => return Some(Ok(0)),
                     Unalias::Whole(s, l) => (a[0], a[1]) = (s, l),
@@ -4901,6 +4907,8 @@ impl MapIo<'_> {
 
     /// `mprotect`.
     pub fn mprotect(&self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let mut a = a;
+        a[0] = gex_abi::canon(a[0]);
         // Losing execute retires the translations as surely as
         // unmapping does: `ld.so` applies RELRO by dropping write,
         // but a JIT in the guest flips a page from executable back to
@@ -4953,6 +4961,8 @@ impl MapIo<'_> {
     /// `mremap`. The map decides where; this moves the bytes.
     pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         const MREMAP_MAYMOVE: u64 = 1;
+        let mut a = a;
+        (a[0], a[4]) = (gex_abi::canon(a[0]), gex_abi::canon(a[4]));
         let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
         // Whole pages, as Linux moves and keeps them: an old length short
         // of a page (sqlite passes its file's size) still has the page.
@@ -5070,6 +5080,7 @@ impl MapIo<'_> {
     /// the file, which the demand path already does, so it is left alone.
     pub fn madvise(&self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
         const MADV_DONTNEED: u32 = 4;
+        let addr = gex_abi::canon(addr);
         if advice == MADV_DONTNEED {
             let end = addr.saturating_add(len);
             let anon: Vec<(u64, u64)> = self
@@ -5090,6 +5101,8 @@ impl MapIo<'_> {
     }
 
     pub fn mmap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let mut a = a;
+        a[0] = gex_abi::canon(a[0]);
         // A second mapping of a file mapped shared already is handed the
         // first one's pages (`mmap_placed`), which are a share already:
         // neither placed anew nor a share of its own.
@@ -8885,6 +8898,9 @@ impl<'a> FutexCx<'a> {
     /// key there: the system's for a word in a shared page, by the page's
     /// share and offset; else the process's own, by address.
     fn keyed(&self, addr: u64) -> (&'a Arc<futex::FutexTable>, u64) {
+        // (a Darwin process's word, in its window, by the offset it names:
+        // one word whichever name it is waited and woken by)
+        let addr = gex_abi::canon(addr);
         match self.map.or(self.shares).and_then(|v| v.share_key(addr)) {
             Some(k) => (shared_futexes(), k),
             None => (self.table, addr),
@@ -8896,6 +8912,7 @@ impl<'a> FutexCx<'a> {
     /// linear-memory offset, so reading address zero succeeds and proves
     /// nothing.
     fn mapped(&self, addr: u64) -> bool {
+        let addr = gex_abi::canon(addr);
         match (self.map, self.mapped_by) {
             (Some(v), _) => v.mapped(addr, 4),
             (None, Some(f)) => f(addr, 4),

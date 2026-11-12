@@ -22,7 +22,9 @@
 //            cross gcc), darwin-metalecho.ARCH
 //            (fixtures/darwin/metalecho.c: darwin/metal-page's program),
 //            and darwin-services.ARCH (fixtures/darwin/services.c:
-//            darwin/services-page's).
+//            darwin/services-page's), and darwin-high.ARCH with
+//            darwin-high.ARCH.mac (fixtures/darwin/high.c, and what
+//            this Mac printed: darwin/high's).
 //   mink     mink/: what darwin/metal-page runs of mink's, copied from a
 //            built checkout (GEX_TEST_MINK, default ../mink beside this
 //            repository): its Metal.framework's binary for a pyrus root,
@@ -256,6 +258,19 @@ export const images = {
         const prog = join(work, `darwin-services.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'services.c')], { stdio: 'ignore' });
+      }
+      // And darwin/high's (fixtures/darwin/high.c: where a Mac program's
+      // addresses are), with what this Mac says of them beside it
+      // (darwin-high.ARCH.mac).
+      {
+        const prog = join(work, `darwin-high.${arch}`);
+        rmSync(prog, { force: true });
+        rmSync(`${prog}.mac`, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-w', '-o', prog, join(HERE, 'darwin', 'high.c')], { stdio: 'ignore' });
+        if (existsSync(prog)) {
+          const r = arch === 'x86' ? spawnSync('arch', ['-x86_64', prog], { encoding: 'utf8' }) : spawnSync(prog, [], { encoding: 'utf8' });
+          if (r.status === 0) writeFileSync(`${prog}.mac`, r.stdout);
+        }
       }
       // And what darwin/services-bench measures with.
       {

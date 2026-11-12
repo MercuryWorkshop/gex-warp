@@ -212,6 +212,19 @@ fn ty_of(w: Width) -> Ty {
     }
 }
 
+
+/// An indirect branch's target as the offset gex knows the code by: a
+/// Darwin process's addresses are in its window (`gex_abi::DARWIN_BASE`,
+/// 4 GiB above the offsets), and every pc inside gex is an offset. One `and`,
+/// for a process with the window; none for any other.
+pub fn indirect_target(b: &mut Builder, target: Value) -> Value {
+    if gex_abi::guest_base() == 0 {
+        return target;
+    }
+    let mask = b.const_i64(0xffff_ffff);
+    b.bin(BinOp::And, Ty::I64, target, mask)
+}
+
 fn mem_sz(w: Width) -> MemSz {
     match w {
         Width::B => MemSz::B1,
@@ -404,6 +417,10 @@ impl<'a> Lifter<'a> {
             // A bare absolute address: in 32-bit code the sign-extended
             // disp32 names a 32-bit address.
             None if m.addr32 => (self.k64(disp as u64 & 0xffff_ffff), 0),
+            // A pc-relative address as the guest has it: in a Darwin
+            // process's window (`gex_abi::DARWIN_BASE`), whose pcs are
+            // offsets.
+            None if m.rip => (self.k64(gex_abi::guest_addr(disp as u64)), 0),
             None => (self.k64(disp as u64), 0),
             Some(s) if m.addr32 => {
                 // 32-bit address arithmetic wraps before the access.
@@ -1291,6 +1308,7 @@ impl<'a> Lifter<'a> {
                 Operand::Imm(t) => Flow::End(Term::Goto { target: t as u64 }),
                 o => {
                     let target = self.rd_target(o);
+                    let target = indirect_target(self.b, target);
                     Flow::End(Term::Indirect {
                         target,
                         is_ret: false,
@@ -1345,11 +1363,12 @@ impl<'a> Lifter<'a> {
                     Operand::Imm(t) => None.or(Some(t as u64)).map(|t| (t, None)),
                     o => {
                         let v = self.rd_target(o);
+                        let v = indirect_target(self.b, v);
                         Some((0, Some(v)))
                     }
                 };
                 let wa = self.wa();
-                let ret = if wa == Width::Q { self.k64(next) } else { self.k32(next as u32) };
+                let ret = if wa == Width::Q { self.k64(gex_abi::guest_addr(next)) } else { self.k32(next as u32) };
                 self.push(wa, ret);
                 self.b.set_call_return(next);
                 match target {
@@ -1365,6 +1384,7 @@ impl<'a> Lifter<'a> {
                 let wa = self.wa();
                 let target = self.pop(wa);
                 let target = if wa == Width::Q { target } else { self.b.extend(target, false) };
+                let target = indirect_target(self.b, target);
                 if let Some(Operand::Imm(n)) = i.ops[0] {
                     let sp = self.rd64(RSP);
                     let k = self.k64(n as u64);

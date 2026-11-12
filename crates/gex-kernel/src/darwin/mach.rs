@@ -207,11 +207,17 @@ impl Kernel {
 
     /// The same, the address given and answered directly (as the MIG
     /// routine has it, [`Kernel::darwin_mig`]): where the memory is.
+    /// The address is the process's, in and out (a process with the window
+    /// names offsets 4 GiB higher, `gex_abi::DARWIN_BASE`).
     pub(super) fn darwin_vm_map_at(&mut self, m: &mut GuestMem<'_>, want: u64, size: u64, mask: u64, flags: u64, prot_bits: u32) -> Result<u64, Errno> {
-        let page = abi::PAGE_SIZE;
         if size == 0 {
             return Ok(0);
         }
+        self.darwin_vm_map_offset(m, gex_abi::canon(want), size, mask, flags, prot_bits).map(gex_abi::guest_addr)
+    }
+
+    fn darwin_vm_map_offset(&mut self, m: &mut GuestMem<'_>, want: u64, size: u64, mask: u64, flags: u64, prot_bits: u32) -> Result<u64, Errno> {
+        let page = abi::PAGE_SIZE;
         let len = size.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
         if flags & VM_FLAGS_ANYWHERE != 0 {
             let at = self.darwin_place(want, len, prot_bits, false, mask)?;

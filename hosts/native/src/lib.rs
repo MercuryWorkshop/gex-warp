@@ -1159,8 +1159,10 @@ fn run_program_with(
         gex_xlate::set_compat(program.compat());
         lockstep::set_compat(program.compat());
         gex_kernel::set_compat32(program.compat() && gex_abi::X86);
-        // And a Mach-O program's is Darwin's.
+        // And a Mach-O program's is Darwin's, with a Mac's address space
+        // above 4 GiB when it is a Mac's ordinary program (`gex_abi::DARWIN_BASE`).
         gex_kernel::darwin::set(program.is_darwin());
+        gex_abi::set_guest_base(program.guest_base());
     }
     ftab::selftest_init();
 
@@ -4806,7 +4808,7 @@ fn place_image(
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
     // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
-    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), layout.sp);
+    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), gex_abi::guest_addr(layout.sp));
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
@@ -5363,6 +5365,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::DISPATCH_MISS,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
             let pc = pc as u64;
+            // An address in a Darwin process's window (`gex_abi::DARWIN_BASE`)
+            // that reached a dispatch as it is (a lifted indirect branch
+            // takes its offset; a pc the kernel was handed is one): the code
+            // is known by its offset, and the loop goes on there.
+            if gex_abi::canon(pc) != pc {
+                let state = caller.data_mut();
+                state.resume_cause = Some("windowed pc".into());
+                state.resume_at = Some(gex_abi::canon(pc));
+                return Err(StopExecution.into());
+            }
             // Returning from a signal handler with no `sa_restorer` lands
             // here: the trampoline address deliberately has no translation.
             if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
@@ -5842,6 +5854,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::CACHE_OP,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, op: i32, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+            // (a Darwin process's address, in its window, as its offset)
+            let addr = gex_abi::canon(addr as u64) as i64;
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()
