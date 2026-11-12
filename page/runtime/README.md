@@ -621,6 +621,44 @@ const gl = new MesaGl(sys);       // before boot
 | `start()` | Start Mesa now; resolves its description. A program's first GL call shares the same start. |
 | Events | `started` (`description`), `failed` (`error`), for starts through `start()`. |
 
+## Metal
+
+A Mac program's Metal needs two things the runtime does not have: a
+Metal.framework in the program's root that turns its calls into a stream
+of bytes (mink's is one), and a replayer of that stream on the page's
+WebGPU. The runtime carries the stream. Programs get `/dev/gex-metal`,
+each open of it a connection, as natively `gexc --metal PROGRAM` gives
+them one to a program it starts; the page supplies the replayer. Made
+before boot. Without a `Metal` there is no node.
+
+```js
+import { Metal } from '@gexemu/runtime/metal';
+const replayer = new Worker('/mink/mink-worker.js', { type: 'module' });   // the embedder's
+replayer.postMessage({ kind: 'init', glue: '/mink/mink_host.js' });
+new Metal(sys, {
+  replayer: (c) => replayer.postMessage({ kind: 'open', ...c }, [c.wake]),
+});
+```
+
+`replayer(connection)` is called on the page's thread for each open, with
+`{ id, pid, toHost, toGuest, wake }`. `toHost` and `toGuest` are
+SharedArrayBuffers, one ring each way: 8 Int32 words (bytes ever written,
+bytes ever read, closed, capacity), then `capacity` bytes, a power of two;
+the writer stores the first word and notifies on it, the reader the
+second. The replayer reads `toHost`, writes `toGuest`, and posts anything
+to `wake` (a MessagePort) after writing: that is what wakes a program
+waiting in `read`. When `toHost`'s closed word is set it finishes and sets
+`toGuest`'s. Everything in a connection can be posted to a Worker, which
+is where a replayer belongs: it must never make the page's thread wait.
+The runtime looks at none of the bytes.
+
+| Member | Does |
+| --- | --- |
+| `new Metal(sys, { replayer, connections })` | `replayer`: above. `connections`: how many opens at once (8). |
+| `available` | Whether programs have the node: not in the single-thread build, which has no shared memory. |
+| `close()` | Stop serving: programs with the node open see its end. |
+| Events | `open` (`id`, `pid`), as each connection is handed to the replayer. |
+
 ## Input
 
 The input a browser holds back until the page asks for it, from

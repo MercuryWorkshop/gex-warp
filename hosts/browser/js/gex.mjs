@@ -1467,7 +1467,7 @@ export class Gex {
    *  constructor is told. Per runtime, not a global: the single-thread
    *  build's processes of both flavours share one realm. */
   #wide = false;
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #d3d = false; #wl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #d3d = false; #metal = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -2492,6 +2492,15 @@ export class Gex {
             (this.#gl
               ? this.#gl.submit(this.#memory, ring, this.wlToken(), true, this.#glWaitNote)
               : -1),
+        // /dev/gex-metal (metal.rs): a connection to the page's Metal
+        // replayer, and bytes each way between this memory and its rings
+        // (metal-bridge.mjs MetalProxy). None of them waits for the replayer.
+        metal_open: (pid) => (this.#metal ? this.#metal.open(pid, this.kernelWake()) : -1),
+        metal_read: (slot, ptr, len) => (this.#metal ? this.#metal.read(this.#memory, slot, ptr, len >>> 0) : -1),
+        metal_write: (slot, ptr, len) => (this.#metal ? this.#metal.write(this.#memory, slot, ptr, len >>> 0) : -1),
+        metal_ready: (slot) => (this.#metal ? this.#metal.ready(slot) : 3),
+        metal_available: (slot) => (this.#metal ? this.#metal.available(slot) : 0),
+        metal_close: (slot) => { this.#metal?.close(slot); },
         // This pump's scene: `count` surface records at `ptr` in this memory,
         // saying where each surface's pixels are rather than carrying them. The
         // compositor reads those addresses out of this same memory, so a frame
@@ -2595,6 +2604,7 @@ export class Gex {
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
     this.#shim.exports.gex_set_d3d?.(this.#d3d ? 1 : 0);
+    this.#shim.exports.gex_set_metal?.(this.#metal ? 1 : 0);
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
@@ -3248,6 +3258,7 @@ export class Gex {
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_d3d?.(this.#d3d ? 1 : 0);
+      this.#shim.exports.gex_set_metal?.(this.#metal ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
@@ -8249,6 +8260,14 @@ export class Gex {
   useGl(gl) {
     this.#gl = gl;
     this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);
+  }
+
+  /** The page's Metal replayer, as this process reaches it (metal-bridge.mjs
+   *  `MetalProxy`): the guest then has /dev/gex-metal. Before `load`, as
+   *  `useGl`. */
+  useMetal(metal) {
+    this.#metal = metal;
+    this.#shim?.exports?.gex_set_metal?.(metal ? 1 : 0);
   }
 
   /** Say that the GL device runs D3D too (`/dev/gex-d3d`). After `useGl`,

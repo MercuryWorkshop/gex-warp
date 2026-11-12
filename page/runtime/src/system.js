@@ -251,7 +251,7 @@ export class System extends EventTarget {
       /** `fn(dev)` makes the part's device once the kernel is loaded and
        *  before any process (awaited): `dev` holds the runtime (`rt`,
        *  page/src/runtime.js), `kernel`, `term`, `say`, and what earlier
-       *  parts made (`wlChannel`, `compositor`, `dom`, `glChannel`). Stage
+       *  parts made (`wlChannel`, `compositor`, `dom`, `glChannel`, `metalChannel`). Stage
        *  0 the windows, 1 what uses them (GL), whichever part was made first. */
       devices: (fn, stage = 0) => this.#devices.push({ fn, stage }),
       /** `fn(sys)` once the system runs (`#sys`); at once if it already
@@ -455,7 +455,7 @@ export class System extends EventTarget {
     // The page's devices, each made by the part that owns it (windows: the
     // compositor and its channel; MesaGl: the GL ring), before the processes'
     // host, which hands their channels to every Worker.
-    const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null };
+    const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null, metalChannel: null };
     for (const { fn, stage } of this.#devices.sort((a, b) => a.stage - b.stage)) {
       await fn(dev);
       this.#mark(`device ${fn.name || 'at stage'} ${stage}`);
@@ -482,12 +482,14 @@ export class System extends EventTarget {
       // /dev/gex-host. Every Worker reaches the network through the page;
       // which network is the page's to set, any time (net.js).
       uid: 0, ...this.#preset.host,
-      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
+      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, metalChannel: dev.metalChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
     }, {
       onOutput: (fd, text) => this.#say(text),
       // The compositor lets go of an exited process's memory.
       onExit: (m, pid) => {
         if (typeof pid === 'number') compositor?.dropMemory?.(pid);
+        // And of what it left open on /dev/gex-metal.
+        if (typeof pid === 'number') this.#parts.get('metal')?.drop(pid);
       },
       // No program reads the page's console: each has its own pipes or pty.
       readStdin: () => new Promise(() => {}),

@@ -136,7 +136,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', metal: '$RT/src/metal.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -266,6 +266,7 @@ cat > "$OUT/package.json" <<PKG
     "./net/wisp": { "types": "./net-wisp.d.ts", "default": "./net-wisp.mjs" },
     "./audio": { "types": "./audio.d.ts", "default": "./audio.mjs" },
     "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },
+    "./metal": { "types": "./metal.d.ts", "default": "./metal.mjs" },
     "./input": { "types": "./input.d.ts", "default": "./input.mjs" },
     "./package.json": "./package.json"
   },
