@@ -3,8 +3,10 @@
 //! others are to follow -- natively, with a stand-in shell for each service
 //! a test asks for.
 //!
-//! The channel is one device node of the kernel's, for every service and
-//! every guest: each open is one connection to one service, a byte stream
+//! The channel is a device node of the kernel's, for every service and
+//! every guest (and `/dev/gex-services-bulk` beside it, the same here, which
+//! on the page is a pool of larger rings for a service's heavy streams):
+//! each open is one connection to one service, a byte stream
 //! each way, independent (a program reads its events on a thread of its own
 //! while it writes requests; a reply may take as long as a prompt the user
 //! answers). What crosses it is frames, the same for every service:
@@ -78,6 +80,10 @@ pub fn registry() -> &'static [Box<dyn Service>] {
         if crate::notify::presented() {
             v.push(Box::new(crate::notify::Notifications));
         }
+        // A synthetic service for measuring the channel (service_bench.rs).
+        if std::env::var("GEX_SERVICES_BENCH").is_ok_and(|v| v == "1") {
+            v.push(Box::new(crate::service_bench::Bench));
+        }
         v
     })
 }
@@ -92,9 +98,23 @@ impl Link {
     /// Queue a frame; false when the program has gone.
     pub fn send(&self, json: &str, data: &[u8]) -> bool {
         let Some(c) = self.conn.upgrade() else { return false };
-        lock(&c).output.extend(frame(json, data));
+        {
+            // (Straight into the queue the program reads: one copy here, its
+            // read the other.)
+            let mut c = lock(&c);
+            c.output.extend((json.len() as u32).to_le_bytes());
+            c.output.extend((data.len() as u32).to_le_bytes());
+            c.output.extend(json.as_bytes());
+            c.output.extend(data);
+        }
         crate::ready::notify();
         true
+    }
+    /// Bytes sent and not yet read by the program: what a service that
+    /// produces faster than the program reads waits on (None once it has
+    /// gone).
+    pub fn buffered(&self) -> Option<usize> {
+        self.conn.upgrade().map(|c| lock(&c).output.len())
     }
     /// End the connection: the program reads the end once it has read what
     /// was sent.
@@ -104,15 +124,6 @@ impl Link {
             crate::ready::notify();
         }
     }
-}
-
-fn frame(json: &str, data: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(8 + json.len() + data.len());
-    f.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    f.extend_from_slice(json.as_bytes());
-    f.extend_from_slice(data);
-    f
 }
 
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -208,10 +219,13 @@ impl FileHandle for ServicesDevice {
         if c.output.is_empty() {
             return if c.ended { Ok(0) } else { Err(Errno::EAGAIN) };
         }
+        // (A slice at a time: a frame of megabytes is copied as such.)
         let n = buf.len().min(c.output.len());
-        for (d, s) in buf.iter_mut().zip(c.output.drain(..n)) {
-            *d = s;
-        }
+        let (x, y) = c.output.as_slices();
+        let k = n.min(x.len());
+        buf[..k].copy_from_slice(&x[..k]);
+        buf[k..n].copy_from_slice(&y[..n - k]);
+        c.output.drain(..n);
         Ok(n as u64)
     }
 

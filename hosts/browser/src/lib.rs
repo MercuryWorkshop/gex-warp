@@ -2208,6 +2208,7 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     // connection to one (services.rs). With a global kernel only, as Metal.
     if crate::services::have_services() && unsafe { k_present() } != 0 {
         devfs.add_per_open("gex-services", Arc::new(|| Arc::new(crate::services::device())));
+        devfs.add_per_open("gex-services-bulk", Arc::new(|| Arc::new(crate::services::bulk_device())));
     }
     // `/dev/gex-host`: calls to the page, where it answers them. Each open is
     // a handle in the global kernel, so the call crosses fork and exec.

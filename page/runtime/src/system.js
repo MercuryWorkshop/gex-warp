@@ -212,10 +212,10 @@ export class System extends EventTarget {
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
-  constructor({ baseUrl, units, xcache = false, arch, bothArches = false, macos, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, bothArches = false, macos, services = {}, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'arch', 'bothArches', 'macos', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'bothArches', 'macos', 'services', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
     if (macos !== undefined && (typeof macos !== 'string' || !macos || /[\s=]/.test(macos))) throw new TypeError('System: macos is a release, as \'14\', \'14.8.9\' or \'sonoma\'');
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
@@ -232,6 +232,9 @@ export class System extends EventTarget {
       arch: arch === undefined ? undefined : ARCHES[arch],
       bothArches: !!bothArches,
       macos,
+      // The services channel's pool of large rings (services.js): `bulk`
+      // connections of `bulkCapacity` bytes each way, reserved at boot.
+      services: { bulk: Math.max(0, Math.min(64, services?.bulk | 0)), bulkCapacity: services?.bulkCapacity ?? (1 << 24) },
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the

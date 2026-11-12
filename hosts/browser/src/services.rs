@@ -7,7 +7,9 @@
 //! `services.js`), on the page's thread, over a ring channel of its own of
 //! the kind `/dev/gex-metal` uses (metal-bridge.mjs): the device is a
 //! [`RingDevice`] over this channel's imports, and the kernel looks at none
-//! of the bytes. The runtime reads the frames, answers the first with the
+//! of the bytes. `/dev/gex-services-bulk` is the same node over the
+//! channel's pool of larger rings, for a service's heavy streams. The
+//! runtime reads the frames, answers the first with the
 //! service's version (0 for one the page does not provide) and hands the
 //! rest to the page's provider.
 //!
@@ -21,6 +23,8 @@ use crate::metal::{RingDevice, RingOps};
 #[link(wasm_import_module = "gex_env")]
 extern "C" {
     fn svc_open(pid: i32) -> i32;
+    /// A connection of the channel's larger rings (/dev/gex-services-bulk).
+    fn svc_open_bulk(pid: i32) -> i32;
     fn svc_read(slot: i32, ptr: f64, len: u32) -> i32;
     fn svc_write(slot: i32, ptr: f64, len: u32) -> i32;
     fn svc_ready(slot: i32) -> i32;
@@ -29,6 +33,7 @@ extern "C" {
 }
 
 pub static SERVICES: RingOps = RingOps { open: svc_open, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close };
+pub static BULK: RingOps = RingOps { open: svc_open_bulk, read: svc_read, write: svc_write, ready: svc_ready, available: svc_available, close: svc_close };
 
 static mut HAVE: bool = false;
 
@@ -44,4 +49,11 @@ pub fn have_services() -> bool {
 
 pub fn device() -> RingDevice {
     RingDevice::over(&SERVICES)
+}
+
+/// An open of /dev/gex-services-bulk: the same, over the larger rings the
+/// page reserved for heavy streams (none, and every open fails `ENXIO`,
+/// unless it did).
+pub fn bulk_device() -> RingDevice {
+    RingDevice::over(&BULK)
 }

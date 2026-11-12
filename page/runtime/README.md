@@ -634,13 +634,15 @@ const off = sys.hostCalls.register('notify', ({ title }) => { showToast(title); 
 ## Services
 
 The services the page's shell provides to programs: a program asks, the
-shell answers, and the shell tells the program of what happens. Notifications
-are the first (below); a location, Bluetooth and others are to follow, each a
-service on the same channel. A program reaches them through one device,
-`/dev/gex-services`, each open a connection to one service (a Mac
-program's frameworks open it through pyrus's `libpyrusservices`). The page
-provides a service with `sys.services.provide(name, provider)`, before or
-after boot; a part such as `Notifications` provides its own.
+shell answers, and the shell tells the program of what happens.
+Notifications are the first (below); a location, Bluetooth, MIDI, USB and
+HID devices, and video and audio codecs are to follow, each a service on
+the same channel. A program reaches them through a device node, each open a
+connection to one service: `/dev/gex-services` for the ordinary, and
+`/dev/gex-services-bulk` for a stream that carries megabytes (a Mac
+program's frameworks open them through pyrus's `libpyrusservices`). The
+page provides a service with `sys.services.provide(name, provider)`, before
+or after boot; a part such as `Notifications` provides its own.
 
 ```js
 // A service of the page's own: `clock`, which answers `now` and says `tick` each second.
@@ -658,15 +660,20 @@ sys.services.provide('clock', {
 
 | Member | Does |
 | --- | --- |
-| `sys.services.provide(name, provider)` | Provide service `name` (lower-case letters, digits, `.` and `-`, at most 64): `provider.open(connection)` for each program's connection to it, at `provider.version` (default 1) or the lower version the program asks for. A function is `open` alone. Returns a function that stops providing it (connections made stay). A second provider of a name throws. |
-| `sys.services.names()`, `connections(name)` | The names provided; the connections open (of one service). |
-| `sys.services.available` | Whether programs have the node: not in the single-thread build, which has no shared memory to carry it (its programs find no node, which they take as every service refused). |
+| `sys.services.provide(name, provider)` | Provide service `name` (lower-case letters, digits, `.` and `-`, at most 64): `provider.open(connection)` for each program's connection to it, at `provider.version` (default 1) or the lower version the program asks for. A function is `open` alone. `provider.worker` (a Worker, or a MessagePort to one) instead serves it in that Worker (below). Returns a function that stops providing it (connections made stay). A second provider of a name throws. |
+| `sys.services.names()`, `connections(name)` | The names provided; the connections open on the page's thread (of one service). |
+| `sys.services.available` | Whether programs have the nodes: not in the single-thread build, which has no shared memory to carry them (its programs find no node, which they take as every service refused). |
+| `new System({ services: { bulk, bulkCapacity } })` | The pool `/dev/gex-services-bulk` opens from: `bulk` connections (0 by default, at most 64) with rings of `bulkCapacity` bytes each way (16 MiB by default; a power of two), reserved at boot. With none, an open of it fails (`ENXIO`). |
 
 A **connection** (`ServiceConnection`) is an EventTarget: `id`, `pid` (the
-process that opened it), `service`, `version`, `closed`; `send(message,
-data)` sends one frame and `close()` ends it (the program reads the end);
-the events are `message` (`message`, the parsed JSON object; `data`, a
-`Uint8Array` of the frame's binary data) and `close`. Everything a program
+process that opened it), `service`, `version`, `bulk` (opened on the bulk
+node), `closed`, `bufferedAmount` (bytes sent and not yet in the program's
+ring); `send(message, data)` sends one frame and `close()` ends it (the
+program reads the end); the events are `message` (`message`, the parsed
+JSON object; `data`, a `Uint8Array` of the frame's binary data), `drain`
+(everything sent has gone into the program's ring) and `close`. The bytes
+`send` is given are not copied until they go into the ring: change them
+only once `bufferedAmount` no longer counts them. Everything a program
 sends is the program's word: a provider bounds what it keeps, never
 interprets text, and checks binary data before it uses it.
 
@@ -674,7 +681,7 @@ interprets text, and checks binary data before it uses it.
 
 ```
 u32 LE  J, the JSON text's length     (at most 64 KiB)
-u32 LE  D, the data's length          (at most 4 MiB)
+u32 LE  D, the data's length          (at most 4 MiB; 64 MiB on the bulk node)
 J bytes a JSON object, UTF-8
 D bytes binary payloads, which the object names as {"at": OFFSET, "size": N, "type": "..."}
 ```
@@ -685,20 +692,106 @@ The program's first frame names the service, `{"service": "notifications",
 the page provides no such service, and then ends the stream. A page without
 the service and one that refuses it are told alike, and a program's
 framework then behaves as a Mac's where that service is denied or not there.
-Every frame after the first is the provider's. By convention a message with
-a `seq` asks for an answer, which carries the same `seq`; one without is an
-event; both directions are independent, so an answer may wait for as long as
-a prompt the user answers, and an event come at any time. A frame over the
-limits, or one that is not a JSON object, ends the connection. Natively,
-gexc's `/dev/gex-services` is the same channel with stand-in shells for
-tests (`hosts/native/src/services.rs`): notifications with `GEX_NOTIFY=1`.
+Every frame after the first is the provider's. A frame over the limits, or
+one that is not a JSON object, ends the connection.
+
+**Conventions every service's messages keep** (the runtime enforces none
+of them; a service's schema says which it uses):
+
+- *Requests and events.* A message with a `seq` (a number the sender
+  chooses, increasing) asks for an answer, which carries the same `seq`;
+  one without is an event. Either side may ask. An answer may wait as long
+  as a prompt the user answers; nothing else waits for it.
+- *Cancelling.* `{"cancel": SEQ}` withdraws a request still unanswered; its
+  answer is then `{"seq": SEQ, "cancelled": true}`, or the answer it
+  already had. A framework's blocking call (a USB transfer, a prompt) is
+  cancelled so.
+- *Ordering.* Frames on one connection arrive in the order they were sent,
+  each direction on its own; nothing is ordered between two connections. A
+  service that needs a control message not to wait behind data (a codec's
+  flush or reset behind queued frames) puts its data on a connection of
+  its own: the control connection stays short.
+- *Streams.* A service's stream is a connection of its own (the bulk node
+  for a heavy one), whose first message after the negotiation names it
+  (`{"op": "attach", "stream": TOKEN}`, the token from the control
+  connection), so its provider ties the two together.
+- *Flow control.* On a stream, credits: the receiver says how many more
+  frames (or bytes) it will take, `{"credit": N}`, and the sender sends no
+  more than it was given. The rings bound what is in flight in any case (a
+  writer whose ring is full waits, and on the page is told so by
+  `bufferedAmount`), so credits are for keeping the right amount in flight
+  rather than for safety: a decoder sends credit as it frees a buffer.
+
+**Where it runs, and what it costs.** On the page each connection is a pair
+of rings of shared memory. The program's `write` copies into one and its
+`read` copies out of the other, in its own Worker; the provider reads and
+writes them in the realm it lives in. A frame's data is copied once on each
+side: from the ring into one buffer that the provider is handed a view of,
+or from the provider's bytes into the ring. With the program's own copy,
+that is two copies of a payload on its way, either way. The page's thread is
+in the path only of providers that live there (it parses their frames and
+wakes the program's reader). A provider in a Worker (`provide(name, {
+worker })`, and `serveServices` from `@gexemu/runtime/services-worker` in the
+Worker) is handed each connection once its first frame has named the
+service, with the kernel's memory to wake the program's reader in itself,
+and the page's thread does not touch that connection again. Whatever can run
+in a Worker should: WebCodecs, and in Chromium WebUSB and WebHID, can.
+Notifications need the page (they are shown there). Natively
+(`hosts/native/src/services.rs`) a connection is a queue in gexc: a payload
+is copied into it and out of it into the program's memory. A service's
+stand-in shell for tests is a `Service` there (notifications: `GEX_NOTIFY=1`).
+
+Measured with the synthetic service `bench` (`test/darwin/services-bench`
+on the page runtime, under Node; `hosts/native/src/service_bench.rs`
+natively; the program is `test/fixtures/darwin/servicebench.c`), on a Mac
+whose load average was 40 to 60 from other work. 8 MiB frames from the host
+on a bulk connection (16 MiB rings), 120 of them; 64-byte frames, 1000 round
+trips one a millisecond, and 1000 events from the host a millisecond apart:
+
+| | 8 MiB, 60/s asked | 8 MiB, unpaced | 64 B round trip, median / p99 | 64 B events, lateness p99 |
+| --- | --- | --- | --- | --- |
+| native, arm64 | 59.7/s | 545/s (4.6 GB/s) | 0.014 / 0.49 ms | 13.8 ms |
+| native, x86-64 | 59.9/s | 616/s (5.2 GB/s) | 0.015 / 0.22 ms | 7.0 ms |
+| page thread, arm64 | 60.0/s | 277/s (2.3 GB/s) | 0.098 / 5.0 ms | 4.6 ms |
+| page Worker, arm64 | 60.1/s | 308/s (2.6 GB/s) | 0.066 / 4.6 ms | 7.8 ms |
+| page thread, x86-64 | 59.9/s | 204/s (1.7 GB/s) | 0.083 / 6.9 ms | 11.1 ms |
+| page Worker, x86-64 | 60.0/s | 333/s (2.8 GB/s) | 0.102 / 4.6 ms | 12.9 ms |
+
+Both rates are met everywhere; the tails are the load's (a timer's
+lateness, a parked thread's turn) more than the channel's.
 
 **Adding a service** needs no change to the kernel: a schema (its messages,
-written down as Notifications' are below), a provider class of the
-runtime's built on `sys.services.provide` (as `notifications.js` is), a
-`Service` of the native host's for tests (a module beside `notify.rs`, and a
-line in `services.rs`'s `registry`), and on the guest's side a framework
-over `libpyrusservices`.
+written down as Notifications' are below), a provider of the runtime's
+built on `sys.services.provide` (as `notifications.js` is), a `Service` of
+the native host's for tests (a module beside `notify.rs`, and a line in
+`services.rs`'s `registry`), and on the guest's side a framework over
+`libpyrusservices`. Two that are to come, as they would sit on it:
+
+- *Codecs* (VideoToolbox, AudioToolbox, AVFoundation's playback, ImageIO's
+  further formats, over WebCodecs). A `codec` service in a Worker. The
+  control connection creates and configures sessions (`{"op": "open",
+  "seq", "codec", "width", ...}` answered with a stream token), flushes and
+  resets them, and carries errors. Each session's samples and frames go on
+  a bulk connection of their own: compressed samples to the host, each a
+  frame with its timestamp, duration and keyframe flag; decoded frames back,
+  each a frame of NV12 or BGRA bytes (`VideoFrame.copyTo` straight into a
+  buffer that is then written to the ring) with its timestamp, in the
+  decoder's output order. Credits both ways bound the decoder's queue and
+  what waits for the program. A flush or reset is a control message: the
+  host drops what it holds of the session, answers, and the program
+  discards frames older than the answer. A 1080p BGRA frame is 8 MiB: the
+  default bulk ring of 16 MiB holds two.
+- *USB and HID* (IOKit's registry and its USB and HID interfaces, over
+  WebUSB and WebHID). A `usb` (and `hid`) service in a Worker. Events say
+  devices arrive and leave, each with a handle (a number of the service's)
+  and its descriptors, which IOKit's registry lists. Opening a device,
+  claiming an interface and each transfer are requests carrying the handle
+  (`{"op": "transfer", "seq", "device", "endpoint", "length"}`, the data
+  out as the frame's data, the data in as the answer's), cancelled with
+  `cancel` when the framework's blocking call is interrupted or times out.
+  HID input reports are events. Small frames on the control path suffice
+  (a frame is 72 bytes and more); a device with high-rate input reports may
+  have a stream of its own so that requests do not wait behind them.
 
 ## Notifications
 

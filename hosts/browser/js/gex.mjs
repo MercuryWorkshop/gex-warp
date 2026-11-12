@@ -2504,6 +2504,7 @@ export class Gex {
         // /dev/gex-services (services.rs): the same kind of channel, its
         // other end the page runtime's Services.
         svc_open: (pid) => (this.#services ? this.#services.open(pid, this.kernelWake()) : -1),
+        svc_open_bulk: (pid) => (this.#services ? this.#services.open(pid, this.kernelWake(), true) : -1),
         svc_read: (slot, ptr, len) => (this.#services ? this.#services.read(this.#memory, slot, ptr, len >>> 0) : -1),
         svc_write: (slot, ptr, len) => (this.#services ? this.#services.write(this.#memory, slot, ptr, len >>> 0) : -1),
         svc_ready: (slot) => (this.#services ? this.#services.ready(slot) : 3),

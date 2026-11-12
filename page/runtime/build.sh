@@ -136,7 +136,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', bottles: '$RT/src/bottles.js', gl: '$RT/src/gl.js', metal: '$RT/src/metal.js', notifications: '$RT/src/notifications.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', bottles: '$RT/src/bottles.js', gl: '$RT/src/gl.js', metal: '$RT/src/metal.js', notifications: '$RT/src/notifications.js', 'services-worker': '$RT/src/services-worker.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -269,6 +269,7 @@ cat > "$OUT/package.json" <<PKG
     "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },
     "./metal": { "types": "./metal.d.ts", "default": "./metal.mjs" },
     "./notifications": { "types": "./notifications.d.ts", "default": "./notifications.mjs" },
+    "./services-worker": { "types": "./services-worker.d.ts", "default": "./services-worker.mjs" },
     "./input": { "types": "./input.d.ts", "default": "./input.mjs" },
     "./package.json": "./package.json"
   },

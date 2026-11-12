@@ -59,15 +59,22 @@ const FREE = 0, OPEN = 1, SHUT = 2;
  *  toward the guest, if they are to be another size). Any channel made so
  *  is served the same way: /dev/gex-services is one too (page/runtime
  *  services.js). */
-export function makeMetalChannel({ connections = 8, capacity = 1 << 21, toGuestCapacity = capacity } = {}) {
-  if ((capacity & (capacity - 1)) || (toGuestCapacity & (toGuestCapacity - 1))) throw new Error('a ring\'s capacity is a power of two');
+export function makeMetalChannel({ connections = 8, capacity = 1 << 21, toGuestCapacity = capacity, bulk = null } = {}) {
+  const pow2 = (c) => c > 0 && !(c & (c - 1));
+  if (!pow2(capacity) || !pow2(toGuestCapacity) || (bulk && !pow2(bulk.capacity))) throw new Error('a ring\'s capacity is a power of two');
   const ring = (cap) => {
     const b = new SharedArrayBuffer(RING_HEADER_BYTES + cap);
     new Int32Array(b, 0, 8)[CAPACITY] = cap;
     return b;
   };
-  const control = new SharedArrayBuffer((SLOT_BASE + SLOT_WORDS * connections) * 4);
-  return { control, rings: Array.from({ length: connections }, () => ({ toHost: ring(capacity), toGuest: ring(toGuestCapacity) })) };
+  // A second pool of larger rings after the first (`bulk`: `{ connections,
+  // capacity }`), which an open asks for by name (MetalProxy `open`'s
+  // `bulk`): the slots from `bulkFrom` on.
+  const extra = bulk?.connections ?? 0;
+  const control = new SharedArrayBuffer((SLOT_BASE + SLOT_WORDS * (connections + extra)) * 4);
+  const rings = Array.from({ length: connections }, () => ({ toHost: ring(capacity), toGuest: ring(toGuestCapacity) }));
+  for (let i = 0; i < extra; i++) rings.push({ toHost: ring(bulk.capacity), toGuest: ring(bulk.capacity) });
+  return { control, rings, bulkFrom: connections };
 }
 
 const words = (b) => new Int32Array(b, 0, 8);
@@ -84,21 +91,25 @@ export function setMetalHost(channel, state) {
 
 /** The guest's half. Every method is called from a system call's import. */
 export class MetalProxy {
-  #ctl; #rings;
+  #ctl; #rings; #bulkFrom;
 
   constructor(channel) {
     this.#ctl = new Int32Array(channel.control);
+    this.#bulkFrom = channel.bulkFrom ?? channel.rings.length;
     this.#rings = channel.rings.map(({ toHost, toGuest }) => ({
       ow: words(toHost), ob: bytes(toHost), iw: words(toGuest), ib: bytes(toGuest),
     }));
   }
 
   /** A connection for process `pid`, whose wait queue is at `wake`
-   *  (`gex.kernelWake()`): its number, or -1 with no replayer or none free. */
-  open(pid, wake) {
+   *  (`gex.kernelWake()`): its number, or -1 with no replayer or none free.
+   *  `bulk`: one of the channel's larger rings, if it has any. */
+  open(pid, wake, bulk = false) {
     const ctl = this.#ctl;
     if (Atomics.load(ctl, HOST) !== 1 || !wake?.addr) return -1;
-    for (let i = 0; i < this.#rings.length; i++) {
+    // (A connection of the small rings, or with `bulk` of the large ones.)
+    const [from, to] = bulk ? [this.#bulkFrom, this.#rings.length] : [0, this.#bulkFrom];
+    for (let i = from; i < to; i++) {
       const at = SLOT_BASE + i * SLOT_WORDS, r = this.#rings[i];
       // Free, or closed by its last guest and finished with by the replayer.
       const state = Atomics.load(ctl, at + STATE);
@@ -224,7 +235,7 @@ export function serveMetal(channel, { replayer, kernel }) {
     live.set(i, port1);
     const { toHost, toGuest } = channel.rings[i];
     try {
-      replayer({ id: ++opened, pid: Atomics.load(ctl, at + PID), toHost, toGuest, wake: port2 });
+      replayer({ id: ++opened, pid: Atomics.load(ctl, at + PID), slot: i, queue, slots, toHost, toGuest, wake: port2 });
     } catch (e) {
       // No replayer for this one: its reader sees the end of the stream.
       const w = words(toGuest);

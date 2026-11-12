@@ -254,6 +254,12 @@ export const images = {
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'services.c')], { stdio: 'ignore' });
       }
+      // And what darwin/services-bench measures with.
+      {
+        const prog = join(work, `darwin-servicebench.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O2', '-o', prog, join(HERE, 'darwin', 'servicebench.c')], { stdio: 'ignore' });
+      }
       // And one that needs no root (darwin/both): fixtures/darwin/arches.c
       // over t.c, static, at the address the page's programs load.
       {

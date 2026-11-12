@@ -31,6 +31,8 @@ export interface SystemOptions {
    *  program the page starts as GEX_MACOS_VERSION unless its environment
    *  names one. By default the root's own. */
   macos?: string;
+  /** The pool of large rings /dev/gex-services-bulk opens from: `bulk` connections (0) of `bulkCapacity` bytes each way (16 MiB, a power of two). */
+  services?: { bulk?: number; bulkCapacity?: number };
   /** The translated architecture the tree's programs are built for. Default:
    *  read from the tree at boot. Given, the kernel and runtime load while the
    *  page lays out its files. */
@@ -99,7 +101,7 @@ export interface HostCalls {
   names(): string[];
 }
 
-/** One program's connection to a service the page provides (/dev/gex-services). Events: `message` (`message`, a parsed JSON object; `data`, the frame's bytes, which the message names as `{ at, size, type }`), `close`. */
+/** One program's connection to a service the page provides (/dev/gex-services). Events: `message` (`message`, a parsed JSON object; `data`, the frame's bytes, which the message names as `{ at, size, type }`), `drain` (all that was sent is in the program's ring), `close`. */
 export interface ServiceConnection extends EventTarget {
   /** A number of its own. */
   readonly id: number;
@@ -109,7 +111,11 @@ export interface ServiceConnection extends EventTarget {
   readonly service: string;
   readonly version: number;
   readonly closed: boolean;
-  /** One frame to the program: `message` as JSON (at most 64 KiB) and `data` (at most 4 MiB). False once closed; a RangeError over the limits. */
+  /** Opened on /dev/gex-services-bulk: its frames' data may be up to 64 MiB. */
+  readonly bulk: boolean;
+  /** Bytes sent and not yet in the program's ring. */
+  readonly bufferedAmount: number;
+  /** One frame to the program: `message` as JSON (at most 64 KiB) and `data` (at most 4 MiB; 64 MiB on a bulk connection), not copied until it goes into the ring (do not change it while `bufferedAmount` counts it). False once closed; a RangeError over the limits. */
   send(message: object, data?: Uint8Array | ArrayBuffer | null): boolean;
   /** End it: the program reads the end of the stream. */
   close(): void;
@@ -119,7 +125,9 @@ export interface ServiceProvider {
   /** The highest version of its messages it speaks (1). */
   version?: number;
   /** Each program's connection to the service. */
-  open(connection: ServiceConnection): void;
+  open?(connection: ServiceConnection): void;
+  /** Serve it in this Worker instead (which calls `serveServices` from `@gexemu/runtime/services-worker`): each connection is handed there once negotiated. */
+  worker?: Worker | MessagePort;
 }
 
 /** `sys.services`: the services the page's shell provides to programs. */
