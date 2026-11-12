@@ -27,10 +27,9 @@
 //! may begin or end inside one, and that page is the child's copy; move a
 //! shared mapping with `mremap` and keep it shared; share between the
 //! processes of the page (each a wasm memory in a Worker of its own, which
-//! cannot be made one another's); and Darwin's own process-shared locks
-//! (psynch, `__ulock` with the shared flag), whose queues are each
-//! process's: memory and atomics are shared for a Mac program, but a
-//! `PTHREAD_PROCESS_SHARED` mutex contended across processes is not.
+//! cannot be made one another's); and `__ulock` with the shared flag,
+//! whose queues are each process's. (Darwin's process-shared psynch objects
+//! are the system's, keyed by share: `gex_kernel::darwin::psynch`.)
 
 use gex_mem::GuestMemory;
 

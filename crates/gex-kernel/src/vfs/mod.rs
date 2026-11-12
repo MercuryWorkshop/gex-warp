@@ -508,6 +508,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a Darwin named semaphore (`crate::darwin::psem`),
+    /// when it is one.
+    fn as_psem(&self) -> Option<&crate::darwin::psem::Psem> {
+        None
+    }
+
     /// This handle as a signalfd (`crate::signalfd`), when it is one.
     fn as_signalfd(&self) -> Option<&crate::signalfd::SignalFd> {
         None

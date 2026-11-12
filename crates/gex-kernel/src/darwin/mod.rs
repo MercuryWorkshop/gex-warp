@@ -30,6 +30,7 @@ pub mod kqueue;
 mod mach;
 pub mod nr;
 pub mod port;
+pub mod psem;
 pub mod psynch;
 mod sock;
 mod spawn;

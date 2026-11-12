@@ -298,6 +298,13 @@ impl Kernel {
             d::FTRUNCATE if self.darwin_shm_of(x[0]).is_some() => NATIVE + code,
             d::FTRUNCATE => set(nr::FTRUNCATE, &x[..2]),
             d::SHM_OPEN | d::SHM_UNLINK => NATIVE + code,
+            // A named semaphore's wait is a read of one count from its
+            // descriptor ([`super::psem`]): it blocks as a read blocks.
+            d::SEM_WAIT | d::SEM_WAIT_NOCANCEL if self.darwin_psem(x[0]).is_ok() => {
+                self.darwin_post = Post::Zero;
+                set(nr::READ, &[x[0], self.ctx_addr + SCRATCH_SLOT as u64, 1])
+            }
+            d::SEM_OPEN | d::SEM_UNLINK | d::SEM_CLOSE | d::SEM_TRYWAIT | d::SEM_POST | d::SEM_WAIT | d::SEM_WAIT_NOCANCEL => NATIVE + code,
             // `struct stat` is Darwin's at the kernel's door (`Stat::encode_for`).
             // (A descriptor named by its number is what is open there,
             // not a file of `/dev`'s.)
@@ -705,6 +712,16 @@ impl Kernel {
             d::MMAP => self.darwin_mmap(m, x),
             d::SHM_OPEN => self.darwin_shm(m, x[0], Some((x[1], x[2]))),
             d::SHM_UNLINK => self.darwin_shm(m, x[0], None),
+            d::SEM_OPEN => self.darwin_sem_open(m, x),
+            d::SEM_UNLINK => self.darwin_sem_unlink(m, x[0]),
+            d::SEM_TRYWAIT => self.darwin_psem(x[0]).and_then(|f| f.handle.as_psem().ok_or(Errno::EINVAL)?.take()).map(|_| 0),
+            d::SEM_POST => self.darwin_psem(x[0]).and_then(|f| f.handle.as_psem().ok_or(Errno::EINVAL)?.post()).map(|_| 0),
+            d::SEM_CLOSE => {
+                self.darwin_psem(x[0])?;
+                self.dispatch(m, nr::CLOSE, [x[0], 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::EBADF))
+            }
+            // (Not a semaphore's descriptor.)
+            d::SEM_WAIT | d::SEM_WAIT_NOCANCEL => Err(Errno::EINVAL),
             d::FTRUNCATE => {
                 let shm = self.darwin_shm_of(x[0]).ok_or(Errno::EBADF)?;
                 if shm.handle.metadata()?.size != 0 {
