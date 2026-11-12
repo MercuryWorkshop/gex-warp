@@ -429,6 +429,43 @@ impl Clone for HostBase {
     }
 }
 
+/// The host's line for protecting this process's memory as its map says
+/// ([`set_protect_hook`]): `f(host_base, start, end, prot)` gives the host
+/// pages `[start, end)` the protection `prot` ([`prot`] bits), and how
+/// many of its pages the host has had to make writable again since
+/// ([`set_protect_hook`]'s second function).
+static PROTECT_HOOK: std::sync::OnceLock<(fn(u64, u64, u64, u32), fn() -> u64)> = std::sync::OnceLock::new();
+
+/// Have the host mirror each process's protections onto the memory it
+/// runs in, on whole host pages ([`share_granule`]): a store into a page
+/// mapped read-only or `PROT_NONE`, or one that was mapped and is not any
+/// more, then faults in translated code like a real one, at no cost to a
+/// store. A host page holding guest pages of different protections takes
+/// the most permissive of them -- with 16 KiB host pages and 4 KiB guest
+/// pages (an x86-64 guest on this Mac) that is the granularity: a store
+/// into a read-only 4 KiB page whose host page also holds a writable one
+/// goes through. Memory the runtime owns ([`hits_runtime`]), the host's own
+/// data and pages no mapping ever covered keep the host's protection.
+/// `lifted()` is how many pages the host made writable again behind the
+/// map's back (a fault in its own copy); when it moves, every protection is
+/// given again.
+pub fn set_protect_hook(protect: fn(u64, u64, u64, u32), lifted: fn() -> u64) {
+    let _ = PROTECT_HOOK.set((protect, lifted));
+}
+
+/// What [`MemoryMap::sync_host`] last gave the host: runs `(start, end,
+/// prot)` on host pages, sorted, disjoint; and the host's lifted count then.
+/// Not copied with the map (a fork's child is another memory, all of it
+/// readable and writable when the host makes it).
+#[derive(Debug, Default)]
+struct Applied(std::sync::Mutex<(Vec<(u64, u64, u32)>, u64)>);
+
+impl Clone for Applied {
+    fn clone(&self) -> Applied {
+        Applied::default()
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
@@ -438,6 +475,8 @@ pub struct MemoryMap {
     /// share ([`Self::set_shared_backing`]): 0 while none is backed, and in
     /// a copy (a fork's child is another memory, which the host names).
     host_base: HostBase,
+    /// The protections the host was given for it ([`Self::sync_host`]).
+    applied: Applied,
     vmas: Vec<Vma>,
     /// What readers that do not own the map see of it ([`MapView`]).
     view: ViewCell,
@@ -704,6 +743,21 @@ pub fn hits_runtime(start: u64, end: u64) -> bool {
         || (gex_abi::mem64() && start < gex_abi::high_tables_end() && end > gex_abi::dispatch_dir64())
 }
 
+/// What a host page of a mapping of protection `p` gets: readable when the
+/// mapping is readable or executable (translated code runs from the
+/// host's own copy, and reads the guest's code through the host's view),
+/// writable when it is writable.
+fn host_prot(p: u32) -> u32 {
+    let mut h = 0;
+    if p & (prot::READ | prot::EXEC) != 0 {
+        h |= prot::READ;
+    }
+    if p & prot::WRITE != 0 {
+        h |= prot::WRITE | prot::READ;
+    }
+    h
+}
+
 pub fn page_align_up(v: u64) -> u64 {
     (v + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
@@ -717,6 +771,7 @@ impl MemoryMap {
         MemoryMap {
             shares: Vec::new(),
             host_base: HostBase(0),
+            applied: Applied::default(),
             vmas: Vec::new(),
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -758,6 +813,11 @@ impl MemoryMap {
         let mut fresh = MemoryMap::new(brk_start);
         std::mem::swap(&mut fresh.view, &mut self.view);
         std::mem::swap(&mut fresh.log, &mut self.log);
+        // The same memory, as protected so far: the new image's mappings
+        // are given theirs, and what the old one had and the new one does
+        // not map is unmapped.
+        std::mem::swap(&mut fresh.host_base, &mut self.host_base);
+        std::mem::swap(&mut fresh.applied, &mut self.applied);
         // The log goes on (the host has still to retire the old code), but
         // not the old image's shared mappings: exec wrote them back already.
         fresh.log.shared_maps.clear();
@@ -969,6 +1029,98 @@ impl MemoryMap {
             let ranges = MapView::ranges(&self.vmas);
             self.view.0.cur.write(|_| (Some(ranges), ()));
         }
+        self.sync_host();
+    }
+
+    /// This process runs in the host memory `base` ([`set_protect_hook`]):
+    /// from now on its protections are that memory's too.
+    pub fn set_host_base(&mut self, base: u64) {
+        self.host_base = HostBase(base);
+        self.sync_host();
+    }
+
+    /// The protections the host should give each host page of the memory,
+    /// as runs `(start, end, prot)`: each mapping's ([`host_prot`]), a host
+    /// page of several mappings the union of theirs, the runtime's memory
+    /// and the host's data left out (they keep the host's own).
+    fn wanted_host(&self, g: u64) -> Vec<(u64, u64, u32)> {
+        let mut want: Vec<(u64, u64, u32)> = Vec::with_capacity(self.vmas.len());
+        let up = |v: u64| v.saturating_add(g - 1) & !(g - 1);
+        let mut put = |lo: u64, hi: u64, p: u32| {
+            let mut lo = lo;
+            if let Some(last) = want.last_mut() {
+                if last.1 > lo {
+                    // (a host page shared with the mapping before: the union)
+                    let ov = last.1.min(hi);
+                    if last.2 | p != last.2 {
+                        let lp = last.2;
+                        last.1 = lo;
+                        if last.0 >= last.1 {
+                            want.pop();
+                        }
+                        want.push((lo, ov, lp | p));
+                    }
+                    lo = ov;
+                }
+            }
+            if lo >= hi {
+                return;
+            }
+            match want.last_mut() {
+                Some(last) if last.1 == lo && last.2 == p => last.1 = hi,
+                _ => want.push((lo, hi, p)),
+            }
+        };
+        for v in &self.vmas {
+            if hits_runtime(v.start, v.end) || self.host_data.iter().any(|&(a, b)| a < v.end && v.start < b) {
+                put(v.start & !(g - 1), up(v.end), prot::READ | prot::WRITE);
+                continue;
+            }
+            put(v.start & !(g - 1), up(v.end), host_prot(v.prot));
+        }
+        want
+    }
+
+    /// Give the host the protections the map now asks for where they
+    /// changed ([`set_protect_hook`]): a host page in a mapping gets the
+    /// mapping's; one that was and is in none any more, none at all.
+    fn sync_host(&self) {
+        let Some(&(protect, lifted)) = PROTECT_HOOK.get() else { return };
+        let (base, g) = (self.host_base.0, share_granule());
+        if base == 0 || g == 0 {
+            return;
+        }
+        let want = self.wanted_host(g);
+        let mut applied = self.applied.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = lifted();
+        // (the host made pages writable on its own: give every one again)
+        let again = now != applied.1;
+        applied.1 = now;
+        let mut edges: Vec<u64> = want.iter().chain(applied.0.iter()).flat_map(|r| [r.0, r.1]).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        let at = |runs: &[(u64, u64, u32)], a: u64| {
+            let i = runs.partition_point(|r| r.1 <= a);
+            runs.get(i).filter(|r| r.0 <= a).map(|r| r.2)
+        };
+        let mut next: Vec<(u64, u64, u32)> = Vec::with_capacity(want.len());
+        for w in edges.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let old = at(&applied.0, a);
+            let new = match (at(&want, a), old) {
+                (Some(p), _) => p,
+                (None, Some(_)) => prot::NONE,
+                (None, None) => continue,
+            };
+            if again || old != Some(new) {
+                protect(base, a, b, new);
+            }
+            match next.last_mut() {
+                Some(last) if last.1 == a && last.2 == new => last.1 = b,
+                _ => next.push((a, b, new)),
+            }
+        }
+        applied.0 = next;
     }
 
     /// Publish the shares ([`MapView::share_key`]).

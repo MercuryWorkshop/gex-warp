@@ -1,14 +1,19 @@
 // Stores (and a load) that should fault (fixtures/darwin/storefault.c):
 // into a page unmapped, PROT_NONE, read-only; near null; a write barrier
 // that unprotects in its handler; a stack overflow caught on an alternate
-// stack. Said, not checked: gex keeps no page's protection against an
-// access (one linear memory; only an address past its end traps), so none
-// of them faults today, on either host or processor. Against this Mac and
-// against what Linux printed (fixtures/darwin/storefault.linux-*.txt,
-// Alpine in Docker). And what a check before every store would cost
-// (fixtures/darwin/storecheck.c: the check written into the program, a
-// byte per page looked at before each store), said. The harness for
-// whoever makes them fault; see the note in the commit that added it.
+// stack. Said, not checked. Natively on a Mac the guest's protections are
+// the wasm memory's host pages' (gex_mem's two views), so these fault
+// where a 16 KiB host page holds only guest pages of one protection: a Mac
+// arm64 program's (16 KiB pages) unmapped, PROT_NONE, read-only and
+// write-barrier cases do. A 4 KiB-page guest's (Linux, x86-64) one page
+// between two writable ones does not, nor a store near null (the
+// runtime's contexts and directory are there); a Mac stack overflow is
+// caught, as SIGBUS where the Mac says SIGSEGV.
+// Against this Mac and against what Linux printed
+// (fixtures/darwin/storefault.linux-*.txt, Alpine in Docker). And what a
+// check before every store would cost (fixtures/darwin/storecheck.c: the
+// check written into the program, a byte per page looked at before each
+// store), said.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';

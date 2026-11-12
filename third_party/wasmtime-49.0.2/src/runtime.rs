@@ -115,6 +115,11 @@ pub use values::*;
 #[cfg(feature = "pooling-allocator")]
 pub use vm::{PoolConcurrencyLimitError, PoolingAllocatorMetrics};
 
+// gex: the wasm address a memory fault was at, which a trap carries as
+// context (`err.downcast_ref::<WasmFault>()`): where a guest store into a
+// page its host protects faulted.
+pub use vm::WasmFault;
+
 #[cfg(feature = "profiling")]
 mod profiling;
 #[cfg(feature = "profiling")]

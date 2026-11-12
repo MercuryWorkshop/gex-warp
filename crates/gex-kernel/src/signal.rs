@@ -1576,9 +1576,10 @@ fn setup_frame_darwin_x86(
     match signal {
         // ILL_ILLOPC
         sig::SIGILL => m.write_u32(info + 8, 1)?,
-        // BUS_ADRALN, and SEGV_MAPERR.
+        // BUS_ADRALN, and SEGV_MAPERR (or the code the fault said it was,
+        // [`set_fault_code`]: a protection failure is 2).
         sig::SIGBUS | sig::SIGSEGV => {
-            m.write_u32(info + 8, 1)?;
+            m.write_u32(info + 8, fault_code(signal))?;
             m.write_u64(info + dframe::SI_ADDR as u64, fault_address)?;
         }
         sig::SIGCHLD => {
@@ -2282,8 +2283,26 @@ fn write_siginfo(
     Ok(())
 }
 
+std::thread_local! {
+    /// The `si_code` the next fault frame this thread builds reports, when
+    /// not its signal's usual one ([`set_fault_code`]).
+    static FAULT_CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Have the next synchronous fault frame on this thread report `code`: 2
+/// for a store or load its page's protection forbids (`SEGV_ACCERR` on
+/// Linux, `KERN_PROTECTION_FAILURE` on a Mac), 1 for one into a page
+/// nothing maps. Taken once.
+pub fn set_fault_code(code: u32) {
+    FAULT_CODE.with(|c| c.set(code));
+}
+
 /// The `si_code` a synchronous fault reports.
 fn fault_code(signal: u32) -> u32 {
+    let set = FAULT_CODE.with(|c| c.replace(0));
+    if set != 0 && matches!(signal, sig::SIGSEGV | sig::SIGBUS) {
+        return set;
+    }
     match signal {
         // SEGV_MAPERR: address not mapped to an object.
         sig::SIGSEGV => 1,

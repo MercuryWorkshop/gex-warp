@@ -388,6 +388,7 @@ impl ReplacementModule {
     /// not: the browser's single-Worker shim has a plain one, and a module
     /// importing a shared memory will not link to it (nor the reverse).
     pub fn inspect_for(wasm: &[u8], shared: bool) -> Result<ReplacementModule> {
+    gex_mem::install_fault_lifter();
     let engine = Engine::new(&engine_config()).context("creating a wasm engine")?;
     let module = gex_cache::compile(&engine, wasm).context("not a valid wasm module for this runtime")?;
     let mut imports_memory = false;

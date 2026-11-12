@@ -958,6 +958,8 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     if gex_abi::mem64() {
         config.wasm_memory64(true);
     }
+    // (before the engine's own handlers, which hand on what is not theirs)
+    gex_mem::install_fault_lifter();
     let engine = Engine::new(&config).context("creating the wasm engine")?;
     Module::validate(&engine, wasm).map_err(anyhow::Error::from)
 }
@@ -1128,6 +1130,8 @@ fn new_engine() -> Result<Engine> {
     if std::env::var_os("GEX_PERFMAP").is_some() {
         config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     }
+    // (before the engine's own handlers, which hand on what is not theirs)
+    gex_mem::install_fault_lifter();
     Engine::new(&config).context("creating the wasm engine")
 }
 
@@ -2649,6 +2653,38 @@ fn run_thread_loop(
                     return Ok(Stopped::Exited(Exit::Signal { signal: signo as i32, pc: at, detail, internal: false }));
                 }
                 if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
+                    // A page the guest protected, mirrored onto the host's
+                    // (`gex_mem`'s two views): the fault the guest's system
+                    // gives, at the address it was at -- on a Mac SIGBUS for
+                    // a page that is mapped, SIGSEGV for one that is not; on
+                    // Linux SIGSEGV. The context is the faulting block's as
+                    // last written back, so a handler that makes the page
+                    // writable and returns runs the block again.
+                    let at_addr = e.downcast_ref::<wasmtime::WasmFault>().map(|f| f.wasm_address);
+                    if let (Some(addr), Some(memory)) = (at_addr, store.data().memory.clone().filter(|m| m.has_view())) {
+                        if fault_hook_of(store.data()).is_none() {
+                            let (darwin, mapped) = store.data_mut().with_kernel(|k| (k.darwin, k.mem.lock().vma_at(addr).is_some()));
+                            let signo = if darwin && mapped { 7 } else { signal::SIGSEGV as u32 };
+                            gex_kernel::signal::set_fault_code(if mapped { 2 } else { 1 });
+                            let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+                            let mut gm = GuestMem::new(memory.bytes());
+                            match store.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signo, at, addr)) {
+                                gex_kernel::signal::Delivery::Resume(target) => {
+                                    note_resume(store.data_mut(), target, "protection fault");
+                                    pc = target;
+                                    continue;
+                                }
+                                _ => {
+                                    return Ok(Stopped::Exited(Exit::Signal {
+                                        signal: signo as i32,
+                                        pc: at,
+                                        detail: format!("guest store or load at {addr:#x} its protection forbids"),
+                                        internal: false,
+                                    }))
+                                }
+                            }
+                        }
+                    }
                     let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
                     // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
                     if std::env::var_os("GEX_TRACE_SEGV").is_some() {
@@ -2968,6 +3004,11 @@ impl gex_kernel::proc::PeerMem for PeerMemory {
 fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     let vm = gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(memory.clone())) };
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
+    // Its protections are this memory's from now on (`gex_mem`'s two views).
+    if memory.has_view() {
+        shmem::install();
+        k.mem.lock().set_host_base(memory.base());
+    }
 }
 
 /// Whether this store's process runs on translations another process runs

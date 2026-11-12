@@ -32,20 +32,33 @@
 //! shared mapping -- the kernel places one on whole host pages for this
 //! (`MapIo::place_shared`), but one a program placed itself (`MAP_FIXED`)
 //! may begin or end inside one, and that page is the child's copy; move a
-//! shared mapping with `mremap` and keep it shared; join a file mapped
-//! shared by no other process at the time (it is the first, and is joined
-//! by those after it); and share between the processes of the page. There
-//! each process is a wasm memory in a Worker of its own, and a memory
-//! cannot be mapped into another's: what the page can do for shared memory
-//! is copies kept in step at the points the kernel sees (`msync`, `munmap`,
-//! exit, a file lock, the shared-memory write-back it does now), not one
-//! memory -- a store is not seen by another process until then, and an
-//! atomic or a futex between two processes' copies is not one. A page whose
-//! processes are threads of one shared `WebAssembly.Memory` could, at the
-//! price of one address space for all of them; it is not built. Nor does
-//! it share `__ulock` with the shared flag, whose queues are each
-//! process's. (Darwin's process-shared psynch objects
-//! are the system's, keyed by share: `gex_kernel::darwin::psynch`.)
+//! shared mapping with `mremap` and keep it shared; and share between the
+//! processes of the page. There each process is a wasm memory in a Worker
+//! of its own, and a memory cannot be mapped into another's, so shared
+//! memory is copies kept in step at the points the kernel sees (`msync`,
+//! `munmap`, exit, a file lock), not one memory: a store is not seen by
+//! another process until then, and an atomic or a futex between two
+//! processes' copies is not one.
+//!
+//! Two ways the page could share, neither built:
+//! - A shared object as a `WebAssembly.Memory` of its own (shared, on a
+//!   `SharedArrayBuffer`), imported by every process that maps it as a
+//!   second memory. Stores, atomics and `memory.atomic.wait` are then one
+//!   memory's. But the translator emits every guest access against memory
+//!   0 by address, so an access to the object's range needs a check and a
+//!   second code path: a test on every load and store of code that cannot
+//!   know where its pointers go, or translated code specialised per range
+//!   and re-made when a mapping moves. A module also takes a fixed number
+//!   of imported memories, so the objects have to be preallocated slots.
+//! - Copies the kernel keeps in step at defined points (what it does now:
+//!   `msync`, `munmap`, exit, a file lock). This costs nothing per
+//!   access, but two processes only see each other's stores at those
+//!   points, and a lock-free protocol between them (a ring buffer, an
+//!   IOSurface's seed) does not work.
+//!
+//! Nor does it share `__ulock` with the shared flag, whose queues are each
+//! process's. (Darwin's process-shared psynch objects are the system's,
+//! keyed by share: `gex_kernel::darwin::psynch`.)
 
 use gex_mem::GuestMemory;
 
@@ -55,7 +68,15 @@ pub(crate) fn install() {
     if cfg!(target_os = "macos") {
         gex_kernel::mem::set_share_granule(gex_mem::host_page());
         gex_kernel::mem::set_unshare_hook(gex_mem::unshare_pages);
+        gex_kernel::mem::set_protect_hook(protect, gex_mem::lifted);
     }
+}
+
+/// The kernel's protection for host pages of the memory at `base`
+/// ([`gex_kernel::mem::set_protect_hook`]), as the host's.
+fn protect(base: u64, start: u64, end: u64, p: u32) {
+    use gex_kernel::mem::prot;
+    gex_mem::protect_live(base, start, end, p & prot::READ != 0, p & prot::WRITE != 0);
 }
 
 /// The part of `[start, end)` on whole host pages.
