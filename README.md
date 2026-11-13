@@ -302,8 +302,9 @@ bootstrap server but process 1) and runs its program as a user (`-u`).
 With macOS 10.14's extracted root, `defaults` writes and reads a user's
 preferences through Mojave's own cfprefsd, and `notifyutil` posts through
 its notifyd (`test/darwin/mojave.test.js`, with `GEX_TEST_MOJAVE_ROOT`).
-A name no job declares is made the service of whoever checks in for it, a
-program run as the first one is its own job's if one runs it, and a
+A name no job declares is made the service of the first program when it
+checks in for one, a program run as the first one is its own job's if one
+runs it (as WindowServer is), and a
 receive right a job gives up comes back to gexlaunchd (as launchd has its
 services' rights come back, by `MACH_NOTIFY_PORT_DESTROYED`) with what is
 queued on it. Mojave's WindowServer runs so, as far as the HID system
@@ -348,7 +349,9 @@ What does not, yet:
 - **launchd.** Apple's will be nothing but process 1; gexlaunchd
   (`guest/launchd`) stands in for its bootstrap server, and not for the
   rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
-  launchctl).
+  launchctl). It leaves out logd and coreservicesd, whose clients would
+  map memory of theirs that gex cannot share (and do without them),
+  opendirectoryd, and fseventsd, which writes into the root.
 - A file made longer by `ftruncate`
   told apart from one written to, and one renamed over from one removed
   (`EVFILT_VNODE` says `NOTE_WRITE` of the first and `NOTE_LINK` too of

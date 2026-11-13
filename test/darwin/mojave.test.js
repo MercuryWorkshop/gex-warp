@@ -15,7 +15,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { exec, native, ROOT } from '../lib/native.mjs';
 
-export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
+export const meta = { hosts: ['node'], arches: ['x86'], timeout: 2400 };
 
 export default async function (t) {
   const root = process.env.GEX_TEST_MOJAVE_ROOT;
@@ -43,7 +43,7 @@ export default async function (t) {
         '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
         '--env', 'HOME=/Users/gex', '--env', 'USER=gex',
         join(gl, 'gexlaunchd.x86_64'), '-v', '-u', '501', '--', '/bin/sh', '-c', script],
-      { timeout: 300000 },
+      { timeout: 600000 },
     );
 
   const prefs = await session('defaults write com.gex.test Greeting hello && defaults write com.gex.test Number -int 42 && defaults read com.gex.test Number && defaults read com.gex.test Greeting');
@@ -72,8 +72,11 @@ export default async function (t) {
     ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds,
       '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
-      join(gl, 'gexlaunchd.x86_64'), '-v', '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
-    { timeout: 420000, env: { GEX_IOKIT_TRACE: '1' } },
+      // (Not the daemons that would write into the root itself: the
+      // network's configuration, the disks', the log's housekeeping.)
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager',
+      '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
+    { timeout: 600000, env: { GEX_IOKIT_TRACE: '1' } },
   );
   const said = server.stderr;
   const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));

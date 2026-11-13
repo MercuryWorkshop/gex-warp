@@ -108,9 +108,13 @@ static int verbose;
 // yet share after the fact, and libdispatch stops the program when that
 // fails. Without logd it logs nowhere, as it did without a bootstrap port.
 // And the directory service, which ends at its start here (EX_OSERR):
-// without it libinfo reads /etc's files.
-static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd"};
-static int nskipped = 2;
+// without it libinfo reads /etc's files. And coreservicesd, whose clients
+// map its session's memory (a memory entry of its own memory, which gex
+// cannot share either), and abort when that fails: without it they do
+// without. And fseventsd, which keeps its log at the root of the volume
+// (/.fseventsd), in the system's root itself.
+static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd", "com.apple.coreservicesd", "com.apple.fseventsd"};
+static int nskipped = 4;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void say(const char *fmt, ...) {
@@ -312,6 +316,9 @@ static void reply_error(xpc_object_t reply, int64_t error) {
 }
 
 // The job a process is, by its pid.
+// The first program, which ends this one when it ends.
+static pid_t first;
+
 static struct job *job_by_pid(pid_t pid) {
     for (int i = 0; i < njobs; i++)
         if (jobs[i].pid == pid) return &jobs[i];
@@ -425,13 +432,18 @@ static void handle(xpc_object_t request) {
         // A name no job declares is made a service of the process that
         // checks in for it, as launchd makes one (CoreDisplay's
         // com.apple.CoreDisplay.master in WindowServer, for one), and is
-        // its process's to look up from then on.
-        if (!s) {
+        // its process's to look up from then on: for the first program
+        // only, as other daemons do without what they would register so.
+        if (!s && from == first) {
             struct job *mine = job_by_pid(from);
             services = realloc(services, (nservices + 1) * sizeof *services);
             services[nservices] = (struct service){strdup(name), (struct job *)(intptr_t)(mine ? mine - jobs : -1), MACH_PORT_NULL, MACH_PORT_NULL};
             s = &services[nservices++];
             say("%s: a service of %d's own", name, from);
+        }
+        if (!s) {
+            reply_error(reply, ESRCH);
+            break;
         }
         make_port(s);
         if (s->recv == MACH_PORT_NULL) {
@@ -522,7 +534,7 @@ int main(int argc, char **argv) {
     pthread_t back;
     pthread_create(&back, NULL, take_back, NULL);
     pthread_create(&t, NULL, serve, NULL);
-    pid_t first = start(argv + i, NULL, 1);
+    first = start(argv + i, NULL, 1);
     // A program that is a job's (WindowServer, run as the first program)
     // is that job: its services are its own to check in for, and are not
     // started again when looked up.
