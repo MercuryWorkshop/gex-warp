@@ -157,6 +157,9 @@ pub enum Kind {
     /// A voucher: what a message carries of who it is sent for. It is a
     /// name and nothing more here.
     Voucher,
+    /// A named memory entry (`mach_make_memory_entry_64`), by its handle
+    /// in [`super::mement`]'s table: memory to be mapped by whoever has it.
+    MemEntry(u32),
 }
 
 /// What `mach_port_get_attributes` says of the port a name is a right to,
@@ -258,6 +261,14 @@ struct State {
 pub struct Port {
     pub kind: Kind,
     state: Mutex<State>,
+}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        if let Kind::MemEntry(h) = self.kind {
+            super::mement::forget(h);
+        }
+    }
 }
 
 impl Port {
@@ -2609,18 +2620,71 @@ impl Kernel {
                 }
                 None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             },
-            (Kind::Task, 4811) => {
+            // mach_vm_map(target, in-out address, size, mask, flags, object,
+            // offset, copy, current and maximum protection, inheritance),
+            // and vm_map and vm_map_64, which are the same on a 64-bit
+            // task: zeroes, or a named entry's memory
+            // ([`super::mement`]). Any other port names nothing to map.
+            (Kind::Task, 4811 | 3812 | 3826) => {
                 let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
-                let (want, size, mask, flags, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, get32(&req.body, 64) & 7);
-                if get32(&req.body, 4) != 0 {
-                    plain(KERN_INVALID_ARGUMENT as i32, &[])
-                } else {
-                    match self.darwin_vm_map_at(m, want, size, mask, flags, prot) {
-                        Ok(addr) => plain(0, &addr.to_le_bytes()),
-                        Err(e) => plain(super::mach::kern(Err(e)) as i32, &[]),
-                    }
+                let (want, size, mask, flags, offset, copy, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, at(52), get32(&req.body, 60) != 0, get32(&req.body, 64) & 7);
+                let made = match req.ports.first().map(|(_, p, _)| p.kind) {
+                    None => self.darwin_vm_map_at(m, want, size, mask, flags, prot).map_err(|e| super::mach::kern(Err(e))),
+                    Some(Kind::MemEntry(h)) => match super::mement::entry(h) {
+                        Some(e) => self.darwin_map_entry(m, &e, want, size, mask, flags, offset, copy, prot),
+                        None => Err(super::mement::KERN_INVALID_OBJECT),
+                    },
+                    Some(_) => Err(super::mement::KERN_INVALID_OBJECT),
+                };
+                match made {
+                    Ok(addr) => plain(0, &addr.to_le_bytes()),
+                    Err(k) => plain(k as i32, &[]),
                 }
             }
+            // mach_make_memory_entry_64(target, in-out size, offset,
+            // permission, out entry, parent entry), and
+            // mach_make_memory_entry, the same on a 64-bit task: a port
+            // that names memory for whoever has it to map
+            // ([`super::mement`]), and its size.
+            (Kind::Task, 4817 | 3825 | 3816) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (size, offset, permission) = (at(24), at(32), get32(&req.body, 40));
+                let parent = req.ports.first().map(|(_, p, _)| p.clone());
+                match self.darwin_make_memory_entry(m, size, offset, permission, parent.as_ref()) {
+                    Ok((port, size)) => {
+                        let mut b = vec![0u8; 16];
+                        put32(&mut b, 0, 1);
+                        b[4 + 10] = disp::MOVE_SEND as u8;
+                        b.extend_from_slice(&NDR);
+                        b.extend_from_slice(&size.to_le_bytes());
+                        reply(b, vec![(4, port, disp::MOVE_SEND)])
+                    }
+                    Err(k) => plain(k as i32, &[]),
+                }
+            }
+            // mach_vm_read(target, address, size, out data): a copy of the
+            // task's memory, which arrives out of line.
+            (Kind::Task, 4804) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (address, size) = (gex_abi::canon(at(8)), at(16));
+                let readable = size <= u32::MAX as u64 && self.mem.lock().check_access(address, size, crate::mem::prot::READ);
+                match m.read(address, size as usize).map(|b| b.to_vec()) {
+                    Ok(bytes) if readable => {
+                        let mut b = vec![0u8; 20];
+                        put32(&mut b, 0, 1);
+                        b[4 + 11] = 1; // MACH_MSG_OOL_DESCRIPTOR
+                        put32(&mut b, 4 + 12, bytes.len() as u32);
+                        b.extend_from_slice(&NDR);
+                        b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        Msg { id: req.id + 100, complex: true, body: b, once: false, reply: None, ports: Vec::new(), memory: vec![(4, bytes)], port_arrays: Vec::new(), sender: [0; 8] }
+                    }
+                    _ => plain(KERN_INVALID_ADDRESS as i32, &[]),
+                }
+            }
+            // mach_memory_entry_purgable_control(entry, control, in-out
+            // state): an entry's object is never emptied, so it is what it
+            // was made, not volatile.
+            (Kind::MemEntry(_), 4900) => plain(0, &0u32.to_le_bytes()),
             // host_info(host, flavor, out info, in-out count): the flavor
             // and the room follow the NDR record. What is told is counted
             // in 32-bit words; too little room for it is a failure.
