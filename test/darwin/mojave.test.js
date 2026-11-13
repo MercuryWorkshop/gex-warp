@@ -15,7 +15,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { exec, native, ROOT } from '../lib/native.mjs';
 
-export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
+export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 
 export default async function (t) {
   const root = process.env.GEX_TEST_MOJAVE_ROOT;
@@ -54,5 +54,37 @@ export default async function (t) {
 
   const notes = await session('notifyutil -1 com.gex.ping & sleep 3; notifyutil -p com.gex.ping; wait');
   t.check('notifyutil: a post reaches a waiter through notifyd', notes.code === 0 && notes.stdout.trim() === 'com.gex.ping', `exit ${notes.code}, said ${JSON.stringify(notes.stdout.trim())}`);
+
+  // WindowServer, as far as it goes: run as its own job's program under
+  // gexlaunchd, with the directories it writes bound to the test's own. It
+  // checks CoreDisplay's service in (a name its job does not declare), opens
+  // the HID system (gex's IOKit registry: IOHIDSystem, its shared memory
+  // made), and goes on to hidd, where it stops for now: hidd cannot share
+  // its event queue's memory (mach_make_memory_entry_64). GEX_IOKIT_TRACE says each
+  // IOKit request; what it asks last is said in the check's detail.
+  const ws = join(d, 'ws');
+  const binds = [];
+  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['caches', '/Library/Caches']]) {
+    mkdirSync(join(ws, mine), { recursive: true });
+    binds.push('--bind', `${join(ws, mine)}=${theirs}`);
+  }
+  const server = await n.gexc(
+    ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds,
+      '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
+      '--env', 'OS_ACTIVITY_DT_MODE=YES',
+      join(gl, 'gexlaunchd.x86_64'), '-v', '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
+    { timeout: 420000, env: { GEX_IOKIT_TRACE: '1' } },
+  );
+  const said = server.stderr;
+  const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));
+  const last = iokit.slice(-3).join(' / ');
+  t.check('WindowServer: checks in for CoreDisplay', /check-in com\.apple\.CoreDisplay\.master/.test(said), 'never checked in');
+  t.check('WindowServer: finds the HID system', /io_service_get_matching_services_bin on master: .*IOHIDSystem.* -> 1 found/.test(said), last);
+  t.check('WindowServer: opens it and makes its shared memory', /io_service_open_extended on IOHIDSystem IOHIDSystem: type 0\n/.test(said) && /io_connect_method on connection to IOHIDSystem: selector 0 scalars \[4\] struct 0 bytes\n/.test(said), last);
+  t.check('WindowServer: gets past the HID system', !/Cannot open the HID and display\/cursor system/.test(said), 'Cannot open the HID and display/cursor system');
+  // hidd, started for it, checks its service in (and in again, its receive
+  // right come back to gexlaunchd between), and is taken for the server it
+  // is by its entitlements.
+  t.check('WindowServer: reaches hidd', /check-in com\.apple\.iohideventsystem/.test(said) && !/HID event server is not entitled/.test(said), (said.match(/.*HID event server.*|.*iohideventsystem.*/g) || []).slice(-2).join(' / '));
   n.clean();
 }

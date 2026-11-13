@@ -301,7 +301,14 @@ when it checks in. It is run as root (`--uid 0`: libxpc trusts no other
 bootstrap server but process 1) and runs its program as a user (`-u`).
 With macOS 10.14's extracted root, `defaults` writes and reads a user's
 preferences through Mojave's own cfprefsd, and `notifyutil` posts through
-its notifyd (`test/darwin/mojave.test.js`, with `GEX_TEST_MOJAVE_ROOT`):
+its notifyd (`test/darwin/mojave.test.js`, with `GEX_TEST_MOJAVE_ROOT`).
+A name no job declares is made the service of whoever checks in for it, a
+program run as the first one is its own job's if one runs it, and a
+receive right a job gives up comes back to gexlaunchd (as launchd has its
+services' rights come back, by `MACH_NOTIFY_PORT_DESTROYED`) with what is
+queued on it. Mojave's WindowServer runs so, as far as the HID system
+and hidd, which would share its event queue's memory with it (below). A
+user's defaults, for one:
 
 ```console
 $ guest/launchd/build.sh /tmp/gl x86_64
@@ -322,8 +329,22 @@ What does not, yet:
   and its rights go anywhere a message does; on the page each process
   has a kernel of its own, and a right does not leave its task. What the
   kernel's own ports would answer with ports (`task_threads`,
-  `host_processor_info`) is `MIG_BAD_ID`, as much else of theirs is, and
-  IOKit's master port has nothing in it.
+  `host_processor_info`) is `MIG_BAD_ID`, as much else of theirs is.
+- **Most of IOKit.** Its registry is gex's own small machine
+  (`crates/gex-kernel/src/darwin/iokit`): IOResources and the HID system,
+  one display (an `IONDRVFramebuffer` on a PCI device, its display connect
+  and display; `GEX_DISPLAY=WIDTHxHEIGHT`, 1024x768 by default), found by
+  matching dictionaries (class, name, properties, parent, path) in the
+  binary or XML form, walked by iterators, read by property. The HID
+  system's user clients map its shared memory (`EvGlobals`, its event
+  queue) and the framebuffer's map its pixels and a shared cursor into the
+  task that opens them, where the kernel keeps their addresses for a host to
+  read (`iokit::framebuffer`) and to post input into (`iokit::hid::post`).
+  No driver comes or goes (a matching notification is told what is there
+  and nothing more), there is no accelerator, and nothing yet draws.
+- **Memory made shareable after the fact.** A memory entry of memory a
+  task already has (`mach_make_memory_entry_64`), to be mapped by another:
+  how logd's firehose and hidd's event queues reach their clients.
 - **launchd.** Apple's will be nothing but process 1; gexlaunchd
   (`guest/launchd`) stands in for its bootstrap server, and not for the
   rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
