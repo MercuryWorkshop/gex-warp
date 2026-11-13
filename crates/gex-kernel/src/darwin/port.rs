@@ -249,6 +249,9 @@ struct State {
     /// What its receiver keeps with it (`mach_port_set_context`, or a
     /// guard it was made with), which a trailer that asks says.
     context: u64,
+    /// Whether it is guarded (`mach_port_guard`, `MPO_CONTEXT_AS_GUARD`):
+    /// its context is then the guard.
+    guarded: bool,
     /// Where the receive right goes when its holder gives it up
     /// ([`notice::PORT_DESTROYED`]), if that was asked: the port lives on,
     /// its queue with it.
@@ -852,6 +855,11 @@ impl Space {
                 if e.is_set() {
                     return Err(KERN_INVALID_RIGHT);
                 }
+                // Nothing asked and nothing to cancel: done, whatever the
+                // name is now (as XNU answers before it looks).
+                if to.is_none() && e.dead_request.is_none() {
+                    return Ok(None);
+                }
                 // (A name dead already has nothing left to die.)
                 if !e.recv && e.send == 0 && !e.once {
                     return Err(KERN_INVALID_ARGUMENT);
@@ -1294,7 +1302,8 @@ impl Kernel {
                 }
                 // (MPO_CONTEXT_AS_GUARD: the guard is its context.)
                 if flags & 0x1 != 0 {
-                    sp.names[&made].port.state().context = x[2];
+                    let mut st = sp.names[&made].port.state();
+                    (st.guarded, st.context) = (true, x[2]);
                 }
                 match m.write_u32(x[3], made) {
                     Ok(()) => KERN_SUCCESS,
@@ -1553,9 +1562,33 @@ impl Kernel {
                     Err(_) => KERN_INVALID_ADDRESS,
                 },
             }),
-            // Guards are not kept; a notification asked for is not sent
-            // (the previous registration, of which there was none, at x[6]).
-            t::MACH_PORT_GUARD | t::MACH_PORT_UNGUARD => bad_task(if sp.entry(pid, name).is_some() { KERN_SUCCESS } else { KERN_INVALID_NAME }),
+            // (task, name, guard, strict) and (task, name, guard): a
+            // receive right's guard, which is its context from then on
+            // (what a trailer and mach_port_get_context say: how libxpc
+            // finds the reply an async reply port's message is to), and
+            // taken off again by the same guard. Guarding a guarded port,
+            // or unguarding by another guard, is KERN_INVALID_ARGUMENT, as
+            // XNU answers; nothing raises an exception for it.
+            t::MACH_PORT_GUARD | t::MACH_PORT_UNGUARD => bad_task(match sp.entry(pid, name) {
+                None => KERN_INVALID_NAME,
+                Some(e) if !e.recv => KERN_INVALID_RIGHT,
+                Some(e) => {
+                    let mut st = e.port.state();
+                    if n == t::MACH_PORT_GUARD {
+                        if st.guarded {
+                            KERN_INVALID_ARGUMENT
+                        } else {
+                            (st.guarded, st.context) = (true, x[2]);
+                            KERN_SUCCESS
+                        }
+                    } else if !st.guarded || st.context != x[2] {
+                        KERN_INVALID_ARGUMENT
+                    } else {
+                        (st.guarded, st.context) = (false, 0);
+                        KERN_SUCCESS
+                    }
+                }
+            }),
             // (task, name, which, sync, notify, its disposition, previous*):
             // as `mach_port_request_notification`'s message does it. The
             // right to tell by is a send-once right, made or moved; the one
@@ -1969,7 +2002,8 @@ impl Kernel {
                         if !self.mem.lock().check_access(address, size, crate::mem::prot::READ) {
                             return MACH_SEND_INVALID_MEMORY;
                         }
-                        let Ok(bytes) = m.read(address, size as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        // (None at all, at whatever address: a null reply's data.)
+                        let Ok(bytes) = (if size == 0 { Ok(Vec::new()) } else { m.read(address, size as usize).map(|b| b.to_vec()) }) else { return MACH_SEND_INVALID_MEMORY };
                         if body[at + 8] != 0 && size != 0 {
                             gone.push((address, size));
                         }
@@ -1985,7 +2019,7 @@ impl Kernel {
                         }
                         let address = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
                         let count = get32(&body, at + 12) as u64;
-                        let Ok(raw) = m.read(address, (count * 4) as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        let Ok(raw) = (if count == 0 { Ok(Vec::new()) } else { m.read(address, (count * 4) as usize).map(|b| b.to_vec()) }) else { return MACH_SEND_INVALID_MEMORY };
                         if body[at + 8] != 0 && count != 0 {
                             gone.push((address, count * 4));
                         }

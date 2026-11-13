@@ -27,7 +27,7 @@ __asm__(".text\n.globl _t_trap8\n_t_trap8:\n"
 #endif
 
 enum {
-    TRAP_port_allocate = 16, TRAP_port_mod_refs = 19, TRAP_mach_msg = 31, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
+    TRAP_port_allocate = 16, TRAP_port_mod_refs = 19, TRAP_port_guard = 41, TRAP_port_unguard = 42, TRAP_mach_msg = 31, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
 };
 enum { RIGHT_SEND = 0, RIGHT_RECEIVE = 1 };
 enum { MOVE_SEND = 17, MOVE_SEND_ONCE = 18, COPY_SEND = 19, MAKE_SEND = 20, MAKE_SEND_ONCE = 21 };
@@ -134,6 +134,18 @@ static u32 get_special(u32 which) {
     m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = which;
     if (rpc(&m, sizeof m.h + 12) || !(m.h.bits & COMPLEX)) return 0;
     return ((struct port_desc *)(m.body + 1))->name;
+}
+
+// mach_port_get_context(task, name): 0 for a failure, as for none.
+static u64 get_context(u32 name) {
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3228;
+    m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = name;
+    if (rpc(&m, sizeof m.h + 12) || m.body[2]) return 0;
+    u64 c;
+    t_memcpy(&c, m.body + 3, 8);
+    return c;
 }
 
 // mach_port_request_notification(task, name, which, sync, notify).
@@ -258,5 +270,13 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_memset(&m, 0, sizeof m);
     m.h.bits = COPY_SEND, m.h.remote = theirs, m.h.id = 400;
     t_printf("send to it: %lx\n", msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h, 0, 0, 0));
+
+    // A guard on a receive right is its context from then on (what
+    // libxpc finds an async reply's handler by), until it is taken off.
+    u32 g = allocate(RIGHT_RECEIVE);
+    t_printf("guard: %ld\n", TRAP(TRAP_port_guard, task, g, 0x6e78, 0));
+    t_printf("its context: %s\n", get_context(g) == 0x6e78 ? "the guard" : "something else");
+    t_printf("unguard: %ld\n", TRAP(TRAP_port_unguard, task, g, 0x6e78));
+    t_printf("its context now: %s\n", get_context(g) == 0 ? "none" : "something");
     return 0;
 }
