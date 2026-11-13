@@ -16,6 +16,28 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// The host's own open flags, for those std's options cannot say (a create
+/// without write access, and the rest with it): Linux's numbers, or a
+/// Mac's, where O_CREAT is 0x200 and Linux's 0o100 is O_ASYNC.
+mod host_o {
+    #[cfg(target_os = "macos")]
+    pub const CREAT: i32 = 0x200;
+    #[cfg(target_os = "macos")]
+    pub const EXCL: i32 = 0x800;
+    #[cfg(target_os = "macos")]
+    pub const TRUNC: i32 = 0x400;
+    #[cfg(target_os = "macos")]
+    pub const NONBLOCK: i32 = 0x4;
+    #[cfg(not(target_os = "macos"))]
+    pub const CREAT: i32 = 0o100;
+    #[cfg(not(target_os = "macos"))]
+    pub const EXCL: i32 = 0o200;
+    #[cfg(not(target_os = "macos"))]
+    pub const TRUNC: i32 = 0o1000;
+    #[cfg(not(target_os = "macos"))]
+    pub const NONBLOCK: i32 = 0o4000;
+}
+
 /// A host directory presented as a guest filesystem.
 pub struct HostFs {
     root: PathBuf,
@@ -490,7 +512,7 @@ impl FileSystem for HostFs {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
-        // Linux's O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK on the host.
+        // O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK as the host spells them.
         let mut custom = 0;
         if flags & oflags::O_CREAT != 0 {
             // The guest's mode but never without owner rw: gex does not enforce
@@ -502,21 +524,21 @@ impl FileSystem for HostFs {
             } else {
                 // std refuses to create without write access; Linux creates
                 // with O_RDONLY (gnulib's open tests, `touch`-like opens)
-                custom |= 0o100;
+                custom |= host_o::CREAT;
             }
         }
         if flags & oflags::O_EXCL != 0 {
             if want_write {
                 opts.create_new(true);
             } else if flags & oflags::O_CREAT != 0 {
-                custom |= 0o200;
+                custom |= host_o::EXCL;
             }
         }
         if flags & oflags::O_TRUNC != 0 {
             if want_write {
                 opts.truncate(true);
             } else {
-                custom |= 0o1000;
+                custom |= host_o::TRUNC;
             }
         }
         if flags & oflags::O_APPEND != 0 {
@@ -524,9 +546,8 @@ impl FileSystem for HostFs {
         }
         // O_NONBLOCK reaches the host: opening a host FIFO without a writer
         // must not block (grep -D skip opens one so, to fstat and skip it).
-        // Linux's O_NONBLOCK on the host.
         if flags & oflags::O_NONBLOCK != 0 {
-            custom |= 0o4000;
+            custom |= host_o::NONBLOCK;
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
