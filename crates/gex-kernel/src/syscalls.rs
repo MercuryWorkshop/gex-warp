@@ -4574,9 +4574,11 @@ impl PathIo<'_> {
         if n == nr::CHROOT {
             return self.chroot(m, a[0]);
         }
-        // A process with a mount namespace of its own (a sandbox building
-        // its root: bubblewrap) mounts for itself: binds, read-only
-        // remounts, `pivot_root`, a detached unmount of a tree.
+        // A process mounts for itself (its table is its own, and its
+        // children's from their fork): binds, read-only remounts, `proc` and
+        // `devtmpfs` shown again. One with a mount namespace of its own (a
+        // sandbox building its root: bubblewrap) may also `pivot_root` and
+        // unmount a tree detached.
         let own = self.ns.is_own();
         if n == nr::PIVOT_ROOT {
             if !own {
@@ -4595,10 +4597,8 @@ impl PathIo<'_> {
             let target = self.at_path(m, AT_FDCWD, a[0])?;
             return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
         }
-        if own {
-            if let Some(r) = self.own_mount(m, a) {
-                return r;
-            }
+        if let Some(r) = self.bind_mount(m, a) {
+            return r;
         }
         let target = if own { self.mount_path(m, a[1])? } else { self.at_path(m, AT_FDCWD, a[1])? };
         let fstype = if a[2] == 0 {
@@ -4606,33 +4606,12 @@ impl PathIo<'_> {
         } else {
             String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
         };
-        // A remount or a bind of something already there changes nothing gex
-        // models, and reporting failure would stop an init script that is in
-        // fact fine.
-        const MS_REMOUNT: u64 = 32;
-        const MS_BIND: u64 = 4096;
-        if a[3] & (MS_REMOUNT | MS_BIND) != 0 {
-            return Ok(0);
-        }
         match fstype.as_str() {
             "tmpfs" | "ramfs" => {
-                self.view.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
+                self.view.mount_tmpfs(&target);
                 Ok(0)
             }
-            "devtmpfs" | "devfs" => {
-                self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
-                Ok(0)
-            }
-            // `/proc` needs a source of process state that only the host can
-            // build, so it cannot be created on demand -- but the host has
-            // already mounted one, and a second request for it is satisfied.
-            "proc" | "procfs" => {
-                if self.view.get().is_mount_point(&target) {
-                    Ok(0)
-                } else {
-                    Err(Errno::ENODEV)
-                }
-            }
+            // (`proc` and `devtmpfs` are `bind_mount`'s.)
             // An empty `/sys` is what most programs want from sysfs: they
             // probe for a path, do not find it, and take the other branch.
             "sysfs" | "debugfs" | "cgroup" | "cgroup2" => {
@@ -4655,14 +4634,16 @@ impl PathIo<'_> {
         Ok(p)
     }
 
-    /// `mount` in a namespace of the process's own ([`crate::vfs::Namespace::is_own`]):
-    /// a bind (`MS_BIND`, with `MS_REC` its submounts), a remount
-    /// read-only (`MS_REMOUNT | MS_BIND | MS_RDONLY`; other remounts change
-    /// nothing gex keeps), a propagation change (nothing to propagate: a
-    /// mount table here is the process's alone), and `proc` mounted again
-    /// where it is asked for. `None`: what every process's mount does
-    /// (`tmpfs`, `devtmpfs`, ...).
-    fn own_mount(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
+    /// A `mount` that shows what the system has already: a bind (`MS_BIND`,
+    /// with `MS_REC` its submounts), a remount read-only
+    /// (`MS_REMOUNT | MS_BIND | MS_RDONLY`; other remounts change nothing
+    /// gex keeps), a propagation change (nothing to propagate: a mount
+    /// table here is the process's alone), and `proc` and `devtmpfs` (there
+    /// is one of each: the system's, again where it is asked for -- in a
+    /// `chroot`, which has taken them out of sight, too). The mounts are the
+    /// process's, and its children's from their fork or exec
+    /// ([`crate::vfs::journal`]). `None`: what is not that (`tmpfs`, ...).
+    fn bind_mount(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
         const MS_RDONLY: u64 = 1;
         const MS_REMOUNT: u64 = 32;
         const MS_BIND: u64 = 4096;
@@ -4692,22 +4673,31 @@ impl PathIo<'_> {
             return Some(Ok(0));
         }
         let fstype = if a[2] == 0 { String::new() } else { String::from_utf8_lossy(&m.read_cstr(a[2], 64).ok()?).into_owned() };
-        if matches!(fstype.as_str(), "proc" | "procfs" | "devpts") {
-            // The system's `/proc` (and its pseudo-terminals) again, at the
-            // new place: there is one process table, and a sandbox's
-            // `devpts` is not a pty namespace of its own. A system with no
-            // `devpts` mounted gives an empty directory for one.
+        if matches!(fstype.as_str(), "proc" | "procfs" | "devtmpfs" | "devfs") {
             return Some((|| {
                 let dst = self.mount_path(m, a[1])?;
-                let want = if fstype == "devpts" { "devpts" } else { "proc" };
+                let want = if fstype.starts_with("dev") { "devtmpfs" } else { "proc" };
+                if self.view.mount_system(&dst, want) {
+                    Ok(0)
+                } else {
+                    Err(Errno::ENODEV)
+                }
+            })());
+        }
+        if fstype == "devpts" {
+            // The system's pseudo-terminals again, at the new place: a
+            // sandbox's `devpts` is not a pty namespace of its own. A system
+            // with no `devpts` mounted gives an empty directory for one.
+            return Some((|| {
+                let dst = self.mount_path(m, a[1])?;
+                let want = "devpts";
                 let table = self.ns.mount_table();
                 match table.iter().find(|(_, ty)| *ty == want).map(|(at, _)| at.clone()) {
                     Some(at) => self.view.bind(&at, &dst, false).map(|_| 0),
-                    None if want == "devpts" => {
-                        self.view.mount(&dst, Arc::new(crate::vfs::TmpFs::new()));
+                    None => {
+                        self.view.mount_tmpfs(&dst);
                         Ok(0)
                     }
-                    None => Err(Errno::ENODEV),
                 }
             })());
         }
@@ -6898,6 +6888,18 @@ impl Creds {
             v.extend_from_slice(&c.to_le_bytes());
         }
         v.push(self.keep_caps.load(std::sync::atomic::Ordering::Acquire) as u8);
+        v
+    }
+
+    /// [`Creds::save`] of the child of a `clone(CLONE_NEWUSER)`: the owner
+    /// of its user namespace ([`Creds::own_user_namespace`]), its ids as
+    /// they were.
+    pub fn save_owning(&self) -> Vec<u8> {
+        let mut v = self.save();
+        let [_, _, inh] = self.caps();
+        for (i, c) in [CAPS_ALL, CAPS_ALL, inh].into_iter().enumerate() {
+            v[24 + i * 8..32 + i * 8].copy_from_slice(&c.to_le_bytes());
+        }
         v
     }
 
@@ -16616,7 +16618,8 @@ mod tests {
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
-        let (mnt, tmpfs, proc_, sysfs, none) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64, 0x31400u64);
+        let (mnt, tmpfs, proc_, sysfs, none, devt) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64, 0x31400u64, 0x31500u64);
+        m.write(devt, b"devtmpfs\0").unwrap();
         m.write(mnt, b"/mnt\0").unwrap();
         m.write(tmpfs, b"tmpfs\0").unwrap();
         m.write(proc_, b"proc\0").unwrap();
@@ -16632,8 +16635,8 @@ mod tests {
             ret(m, at)
         };
         for kernel in [false, true] {
-            // proc only where something is mounted already; an unknown type
-            // is ENODEV.
+            // proc only where the system has one (this kernel has none); an
+            // unknown type is ENODEV.
             assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, proc_, 0, 0]), -(Errno::ENODEV.0 as i64));
             assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, none, 0, 0]), -(Errno::ENODEV.0 as i64));
             // A tmpfs: the view's at once, the kernel's at its next call.
@@ -16641,8 +16644,10 @@ mod tests {
             assert!(k.vfs.view().get().is_mount_point("/mnt"));
             call(&mut k, &mut m, true, nr::GETPID, &[]);
             assert!(k.vfs.is_mount_point("/mnt"), "the kernel's copy follows");
-            // And now proc there is satisfied, and sysfs keeps what is there.
-            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, proc_, 0, 0]), 0);
+            // And now devtmpfs there is the system's own /dev again, and sysfs
+            // keeps what is there.
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, devt, 0, 0]), 0);
+            assert_eq!(k.vfs.view().get().mount_table().iter().find(|(at, _)| at == "/mnt").map(|(_, ty)| *ty), Some("devtmpfs"));
             assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, sysfs, 0, 0]), 0);
             // Gone, then EINVAL: nothing is mounted there any more.
             assert_eq!(call(&mut k, &mut m, kernel, nr::UMOUNT2, &[mnt, 0]), 0);

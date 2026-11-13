@@ -10342,7 +10342,9 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     // (a program may re-exec `/proc/self/exe` from a child).
     // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
     // which a child inherits and keeps across its `execve`.
-    FORK_STATE.with(|c| *c.borrow_mut() = state_bytes(&h.kernel, false));
+    // (The namespaces its `clone` asked for are the child's, from here.)
+    let ns = h.kernel.clone_ns.swap(0, std::sync::atomic::Ordering::Relaxed);
+    FORK_STATE.with(|c| *c.borrow_mut() = state_bytes(&h.kernel, false, ns));
     let exe = std::iter::once(h.kernel.exe_path.as_str())
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
@@ -10411,7 +10413,13 @@ pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
 /// on: to a fork's child (`pending` false), or with its pending signals
 /// across an exec that starts in another Worker. The identity is the
 /// process's own, so a `setuid` before an exec holds after it.
-fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
+///
+/// `ns`: the namespaces the child's `clone` asked for
+/// (`gex_kernel::syscalls::Kernel::clone_ns`; 0 for an exec's): a mount
+/// namespace or a user namespace is its own table, and a user namespace's
+/// owner has every capability in it.
+fn state_bytes(k: &Kernel, pending: bool, ns: u64) -> Vec<u8> {
+    use gex_kernel::syscalls::clone_flags;
     let sig = k.signals.to_bytes(pending);
     let limits = k.rlimits.get();
     let mut v = Vec::with_capacity(16 + sig.len() + limits.len() * 16);
@@ -10422,7 +10430,7 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
-    v.extend_from_slice(&k.creds.save());
+    v.extend_from_slice(&if ns & clone_flags::NEWUSER != 0 { k.creds.save_owning() } else { k.creds.save() });
     // And the root a `chroot` made, the rest; and after a NUL, that it is
     // a Mac program's root, entered and to be left
     // (`gex_kernel::darwin::root`).
@@ -10430,7 +10438,16 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     // (And after another, a Darwin task's restartable ranges, which a
     // forked child has: `gex_kernel::darwin::restart`.)
     let ranges = k.darwin_restart.carry();
-    if k.vfs.entered() || !ranges.is_empty() {
+    // And, after a third, the mounts it made and the roots it took
+    // (`gex_kernel::vfs::journal`): a child's table is its parent's, as a
+    // fork's is anywhere. (A Mac program's root, entered, is told by the
+    // fields before: it is a tree of its own.)
+    let mut journal = if k.vfs.entered() { String::new() } else { k.vfs.journal_text() };
+    if ns & (clone_flags::NEWNS | clone_flags::NEWUSER) != 0 && !k.vfs.is_own() && !k.vfs.entered() {
+        // (The namespace its `clone` asked for: the child's alone.)
+        journal.push_str(if journal.is_empty() { "own" } else { "\x03own" });
+    }
+    if k.vfs.entered() || !ranges.is_empty() || !journal.is_empty() {
         v.extend_from_slice(if k.vfs.entered() { b"\0darwin" } else { b"\0" });
         // (And how it was entered, for one that is a bottle's: whether
         // sealed, and what is shared into it.)
@@ -10441,9 +10458,13 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
             }
         }
     }
-    if !ranges.is_empty() {
+    if !ranges.is_empty() || !journal.is_empty() {
         v.push(0);
         v.extend_from_slice(ranges.as_bytes());
+    }
+    if !journal.is_empty() {
+        v.push(0);
+        v.extend_from_slice(journal.as_bytes());
     }
     v
 }
@@ -10480,6 +10501,18 @@ fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
     let sealed = how.next() == Some("1");
     let shared: Vec<(String, String)> = how.filter_map(|p| p.split_once('\x02')).map(|(a, b)| (a.to_string(), b.to_string())).collect();
     k.darwin_restart.adopt(fields.next().unwrap_or(""));
+    // The mounts its parent made, in order, and the roots it took: made
+    // again on the table this kernel started with. Told apart from a
+    // Mac program's entered root, which is built from the fields above.
+    let journal = fields.next().unwrap_or("");
+    if !entered && !journal.is_empty() {
+        let cwd = if cwd.is_empty() { k.cwd() } else { cwd.to_string() };
+        k.vfs.replay(journal);
+        // (The directory came over in the terms of the table it was in,
+        // as a `chroot` below does.)
+        let _ = k.set_cwd(&cwd);
+        return;
+    }
     if !root.is_empty() && root != "/" {
         // The directory came over in the chrooted namespace's terms, and
         // was set before there was one (where it may have named nothing,

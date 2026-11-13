@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod devfs;
 pub mod evdev;
 pub mod hostcall;
+pub mod journal;
 // Passthrough to the host's own filesystem; the browser gets `opfs`/`httpfs`
 // instead.
 #[cfg(unix)]
@@ -27,6 +28,7 @@ pub mod subtree;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
+pub use journal::MountOp;
 #[cfg(unix)]
 pub use hostfs::HostFs;
 pub use procfs::{ProcFs, ProcSource, SysCpuFs};
@@ -1089,13 +1091,53 @@ impl VfsView {
 
     /// Remove the mount at exactly `path` ([`Namespace::unmount`]).
     pub fn unmount(&self, path: &str) -> bool {
-        self.change(|ns| ns.unmount(path))
+        self.change(|ns| {
+            let at = normalize(path, &ns.cwd);
+            let gone = ns.unmount(path);
+            if gone {
+                ns.journal.push(MountOp::Unmount(at));
+            }
+            gone
+        })
     }
 
     /// The process has a mount namespace of its own from now
     /// ([`Namespace::is_own`]).
     pub fn make_own(&self) {
-        self.change(|ns| !std::mem::replace(&mut ns.own, true));
+        self.change(|ns| {
+            let was = std::mem::replace(&mut ns.own, true);
+            if !was {
+                ns.journal.push(MountOp::Own);
+            }
+            !was
+        });
+    }
+
+    /// A fresh `tmpfs` at `at`, as `mount -t tmpfs` makes one.
+    pub fn mount_tmpfs(&self, at: &str) {
+        self.change(|ns| {
+            ns.mount(at, Arc::new(TmpFs::new()));
+            ns.journal.push(MountOp::Tmpfs(normalize(at, &ns.cwd)));
+            true
+        });
+    }
+
+    /// The system's own `/proc` or `/dev` (`ty`: "proc", "devtmpfs") at
+    /// `at` too, as a second `mount -t proc` or `-t devtmpfs` shows it
+    /// (there is one of each): [`Namespace::system`]. A `/dev` the system
+    /// has none of is a fresh one. False for a type the system has none of
+    /// and no fresh one to be.
+    pub fn mount_system(&self, at: &str, ty: &str) -> bool {
+        self.change(|ns| {
+            let fs = match (ns.system(ty), ty) {
+                (Some(fs), _) => fs,
+                (None, "devtmpfs") => Arc::new(DevFs::new()),
+                (None, _) => return false,
+            };
+            ns.mount(at, fs);
+            ns.journal.push(MountOp::System { at: normalize(at, &ns.cwd), ty: ty.to_string() });
+            true
+        })
     }
 
     /// [`Namespace::bind`] of the namespace as published.
@@ -1103,6 +1145,9 @@ impl VfsView {
         let mut err = Ok(());
         self.change(|ns| {
             err = ns.bind(src, dst, recursive);
+            if err.is_ok() {
+                ns.journal.push(MountOp::Bind { src: src.to_string(), dst: dst.to_string(), recursive });
+            }
             err.is_ok()
         });
         err
@@ -1110,7 +1155,13 @@ impl VfsView {
 
     /// [`Namespace::remount_readonly`] of the namespace as published.
     pub fn remount_readonly(&self, at: &str) -> bool {
-        self.change(|ns| ns.remount_readonly(at))
+        self.change(|ns| {
+            let done = ns.remount_readonly(at);
+            if done {
+                ns.journal.push(MountOp::ReadOnly(at.to_string()));
+            }
+            done
+        })
     }
 
     /// [`Namespace::pivot_root`] of the namespace as published.
@@ -1118,6 +1169,9 @@ impl VfsView {
         let mut err = Ok(());
         self.change(|ns| {
             err = ns.pivot_root(new_root, put_old);
+            if err.is_ok() {
+                ns.journal.push(MountOp::Pivot { new_root: new_root.to_string(), put_old: put_old.to_string() });
+            }
             err.is_ok()
         });
         err
@@ -1125,7 +1179,14 @@ impl VfsView {
 
     /// [`Namespace::unmount_tree`] of the namespace as published.
     pub fn unmount_tree(&self, path: &str) -> bool {
-        self.change(|ns| ns.unmount_tree(path))
+        self.change(|ns| {
+            let at = normalize(path, &ns.cwd);
+            let done = ns.unmount_tree(path);
+            if done {
+                ns.journal.push(MountOp::UnmountTree(at));
+            }
+            done
+        })
     }
 
     /// [`Namespace::chroot`] of the namespace as published.
@@ -1133,7 +1194,11 @@ impl VfsView {
         let mut err = Ok(());
         self.change(|ns| {
             err = ns.chroot(dir);
-            err.is_ok()
+            // (`chroot("/")` changes nothing and is nothing to tell.)
+            if err.is_ok() && dir != "/" {
+                ns.journal.push(MountOp::Chroot(dir.to_string()));
+            }
+            err.is_ok() && dir != "/"
         });
         err
     }
@@ -1143,6 +1208,10 @@ impl VfsView {
         let mut err = Ok(());
         self.change(|ns| {
             err = ns.enter(dir, shared, sealed);
+            if err.is_ok() && dir != "/" {
+                let shared = shared.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+                ns.journal.push(MountOp::Enter { dir: dir.to_string(), shared, sealed });
+            }
             err.is_ok()
         });
         err
@@ -1162,6 +1231,7 @@ impl VfsView {
                 return false;
             }
             ns.mount(at, fs());
+            ns.journal.push(MountOp::Bare(normalize(at, &ns.cwd)));
             true
         })
     }
@@ -1306,6 +1376,55 @@ impl Vfs {
         self.refresh();
     }
 
+    /// What the process changed in its mount table, as text for a process
+    /// built anew to be told ([`Vfs::replay`]); empty when it changed
+    /// nothing.
+    pub fn journal_text(&self) -> String {
+        journal::encode(&self.view.0.get().journal)
+    }
+
+    /// Make again the changes `text` ([`Vfs::journal_text`]) tells of, in
+    /// order, on this table as it stands: the one a process of this
+    /// system starts with. A change that does not hold here is passed over.
+    pub fn replay(&mut self, text: &str) {
+        let view = Arc::clone(&self.view.0);
+        for op in journal::decode(text) {
+            match op {
+                MountOp::Own => view.make_own(),
+                MountOp::Chroot(dir) => {
+                    let _ = view.chroot(&dir);
+                }
+                MountOp::Enter { dir, shared, sealed } => {
+                    let shared: Vec<(&str, &str)> = shared.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    let _ = view.enter(&dir, &shared, sealed);
+                }
+                MountOp::Bind { src, dst, recursive } => {
+                    let _ = view.bind(&src, &dst, recursive);
+                }
+                MountOp::ReadOnly(at) => {
+                    view.remount_readonly(&at);
+                }
+                MountOp::Pivot { new_root, put_old } => {
+                    let _ = view.pivot_root(&new_root, &put_old);
+                }
+                MountOp::Unmount(at) => {
+                    view.unmount(&at);
+                }
+                MountOp::UnmountTree(at) => {
+                    view.unmount_tree(&at);
+                }
+                MountOp::Tmpfs(at) => view.mount_tmpfs(&at),
+                MountOp::Bare(at) => {
+                    view.mount_unless_there(&at, || Arc::new(TmpFs::new()));
+                }
+                MountOp::System { at, ty } => {
+                    view.mount_system(&at, &ty);
+                }
+            }
+        }
+        self.refresh();
+    }
+
     /// Remove the mount at exactly this path ([`VfsView::unmount`]).
     pub fn unmount(&mut self, path: &str) -> bool {
         let at = normalize(path, &self.ns.cwd);
@@ -1373,6 +1492,13 @@ pub struct Namespace {
     /// A `pivot_root(".", ".")` stacked the old root on the new one: the
     /// `umount2(".", MNT_DETACH)` that follows takes it off ([`Namespace::pivot_root`]).
     stacked: bool,
+    /// What the process changed in its table, in order ([`journal`]): what
+    /// a child built anew has made again.
+    journal: Vec<MountOp>,
+    /// The system's `/proc` and `/dev` (the first of each type mounted),
+    /// kept where a `chroot` or `pivot_root` has taken them out of sight:
+    /// a process that mounts `proc` in its root is given them again.
+    system: Vec<(&'static str, Arc<dyn FileSystem>)>,
 }
 
 /// The namespace a tree was entered from ([`Namespace::enter`]): what
@@ -1410,7 +1536,14 @@ impl Namespace {
             outer: None,
             own: false,
             stacked: false,
+            journal: Vec::new(),
+            system: Vec::new(),
         }
+    }
+
+    /// The system's `/proc` or `/dev` (`ty` the [`FileSystem::fs_type`]).
+    pub fn system(&self, ty: &str) -> Option<Arc<dyn FileSystem>> {
+        self.system.iter().find(|(t, _)| *t == ty).map(|(_, fs)| fs.clone())
     }
 
     /// Whether this is a tree entered from another namespace
@@ -1610,6 +1743,10 @@ impl Namespace {
 
     fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
         let at = self.mount_point(normalize(at, "/"));
+        let ty = fs.fs_type();
+        if matches!(ty, "proc" | "devtmpfs") && !self.system.iter().any(|(t, _)| *t == ty) {
+            self.system.push((ty, fs.clone()));
+        }
         self.mounts.insert(at, fs);
         self.list_others();
     }
@@ -2827,5 +2964,53 @@ mod tests {
             }
         }
         assert!(answered > 20, "{answered}");
+    }
+
+    /// A child built anew (the page's fork: a kernel of its own, with the
+    /// system's mounts only) has what its parent mounted and the root it
+    /// took, from the journal: binds, the system's `proc` and `devtmpfs`
+    /// again in a `chroot`, a tmpfs, an unmount.
+    #[test]
+    fn a_table_is_made_again_from_its_journal() {
+        // What every process starts with.
+        let start = || {
+            let root = Arc::new(TmpFs::new());
+            for d in ["dev", "proc", "jail", "jail/dev", "jail/proc", "jail/tmp", "mnt", "mnt/a", "mnt/b"] {
+                root.add_dir(d);
+            }
+            root.add_file("jail/dev/null", b"regular".to_vec());
+            let mut v = Vfs::new();
+            v.mount("/", root);
+            v.mount("/dev", Arc::new(DevFs::new()));
+            v.mount("/proc", Arc::new(TmpFs::new()));
+            v
+        };
+        let mut parent = start();
+        let view = Arc::clone(parent.view());
+        view.bind("/dev", "/jail/dev", true).unwrap();
+        view.mount_tmpfs("/jail/tmp");
+        view.mount_tmpfs("/mnt/a");
+        assert!(view.unmount("/mnt/a"));
+        parent.refresh();
+        // (A `proc` that is not the system's here, so no `proc` type to show again.)
+        assert!(!view.mount_system("/jail/proc", "proc"));
+        parent.chroot("/jail").unwrap();
+        assert!(parent.view().mount_system("/dev2", "devtmpfs"));
+        parent.refresh();
+        let want = parent.mount_table();
+        assert_eq!(want.iter().map(|(at, _)| at.as_str()).collect::<Vec<_>>(), ["/", "/dev", "/dev2", "/tmp"]);
+        let text = parent.journal_text();
+        let mut child = start();
+        child.replay(&text);
+        assert_eq!(child.mount_table(), want);
+        assert_eq!(child.root(), "/jail");
+        // The bound `/dev` is the system's devices, and the file the root had
+        // there is hidden by it.
+        let md = child.metadata("/dev/null").unwrap();
+        assert_eq!(md.file_type, FileType::CharDevice);
+        // The journal is carried on: a grandchild has it too.
+        assert_eq!(child.journal_text(), text);
+        // And a fork's copy (a host that clones a table) has it.
+        assert_eq!(child.clone().journal_text(), text);
     }
 }

@@ -376,7 +376,7 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     let cwd = h.kernel.caller_cwd().into_bytes();
     // The capabilities the new program starts with (`Creds::exec`).
     h.kernel.creds.exec();
-    let state = state_bytes(&h.kernel, true);
+    let state = state_bytes(&h.kernel, true, 0);
     let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
     EXEC_MEM64.with(|c| c.set(mem64));
     let arch = if page_flavours() & 4 != 0 { exec_arch_of(h, path).map_or(-1, |x86| x86 as i32) } else { -1 };

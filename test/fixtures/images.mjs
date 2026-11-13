@@ -124,7 +124,7 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 'linux-gtk': ['linux-gtk.tar'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 'linux-gtk': ['linux-gtk.tar'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'mount-fork.x86', 'mount-fork.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
 export const images = {
   // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
@@ -210,12 +210,13 @@ export const images = {
     return null;
   },
 
-  // test/fixtures/programs/mount-tmpfs.c and truncate-path.c as static musl
-  // programs for each translated architecture (zig), for core/mount-tmpfs
-  // and core/truncate-path: the native ABIs' own syscall numbers.
+  // test/fixtures/programs/mount-tmpfs.c, mount-fork.c and truncate-path.c as
+  // static musl programs for each translated architecture (zig), for
+  // core/mount-tmpfs, core/mount-fork and core/truncate-path: the native
+  // ABIs' own syscall numbers.
   async 'native-progs'(work) {
     const zig = process.env.ZIG || 'zig';
-    for (const name of ['mount-tmpfs', 'truncate-path']) {
+    for (const name of ['mount-tmpfs', 'mount-fork', 'truncate-path']) {
       const src = join(HERE, `programs/${name}.c`);
       const key = createHash('sha256').update(readFileSync(src)).digest('hex');
       for (const [arch, target] of [['x86', 'x86_64-linux-musl'], ['a64', 'aarch64-linux-musl']]) {
