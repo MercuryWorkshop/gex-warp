@@ -144,6 +144,10 @@ pub enum Kind {
     Thread(i32),
     /// The system clock, likewise.
     Clock,
+    /// IOKit's master device port (`host_get_io_master`): there is no
+    /// registry here, and every service asked for is not found
+    /// ([`Kernel::darwin_iokit`]).
+    IoMaster,
     /// A semaphore, which is waited on and signalled by traps of its own.
     Semaphore,
     /// A voucher: what a message carries of who it is sent for. It is a
@@ -1863,6 +1867,43 @@ impl Kernel {
     /// A request to one of the kernel's own ports, answered as its MIG
     /// server answers: the routine by the message's number, the reply
     /// numbered a hundred more. A routine there is none of is `MIG_BAD_ID`.
+    /// A request to IOKit's master port: what it asks for is said (with
+    /// GEX_IOKIT_TRACE, or the trace), and answered as a system with no
+    /// such service would: waiting for the registry to be quiet is done at
+    /// once, and anything looked up is not found (kIOReturnNotFound).
+    fn darwin_iokit(&mut self, id: u32, body: &[u8]) -> i32 {
+        const NOT_FOUND: i32 = 0xe000_02f0_u32 as i32;
+        let name = match id {
+            2804 | 2871 | 2888 | 2889 | 2895 | 2896 => "matching services",
+            2859 | 2873 | 2883 | 2885 | 2898 | 2900 => "a notification of matching services",
+            2809 | 2903 => "a registry entry by path",
+            2833 => "the registry's root",
+            2838 => "the registry quiet",
+            _ => "",
+        };
+        if self.trace || std::env::var_os("GEX_IOKIT_TRACE").is_some() {
+            // What a matching dictionary names: its strings (the inline
+            // XML of the older calls, or the binary serialization's).
+            let mut words = Vec::new();
+            let mut run = Vec::new();
+            for &b in body.iter().chain(std::iter::once(&0)) {
+                if (0x20..0x7f).contains(&b) {
+                    run.push(b);
+                } else {
+                    if run.len() >= 3 {
+                        words.push(String::from_utf8_lossy(&run).into_owned());
+                    }
+                    run.clear();
+                }
+            }
+            eprintln!("[gex:{}] IOKit {} ({}): {}", self.pid, id, if name.is_empty() { "?" } else { name }, words.join(" "));
+        }
+        match id {
+            2838 => 0,
+            _ => NOT_FOUND,
+        }
+    }
+
     fn darwin_mig(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kind: Kind, req: &Msg) -> Msg {
         let reply = |body: Vec<u8>, ports: Vec<(usize, Arc<Port>, u32)>| Msg { id: req.id + 100, complex: !ports.is_empty(), body, once: false, reply: None, ports, memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] };
         // { NDR, RetCode }, then what the routine returns.
@@ -2425,6 +2466,12 @@ impl Kernel {
             // host_get_special_port(host, node, which, out port): none
             // that a program without privilege may have.
             (Kind::Host, 412) => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+            // host_get_io_master(host, out master): IOKit's way in.
+            (Kind::Host, 205) => with_port(Port::new(Kind::IoMaster)),
+            (Kind::IoMaster, id) => {
+                let code = self.darwin_iokit(id, &req.body);
+                plain(code, &[])
+            }
             // host_get_clock_service(host, clock id, out clock)
             (Kind::Host, 206) => with_port(Port::new(Kind::Clock)),
             // clock_get_time(clock, out mach_timespec): the system clock,
