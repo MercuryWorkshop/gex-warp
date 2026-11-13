@@ -26,6 +26,7 @@ pub mod restart;
 pub mod root;
 mod bsd;
 pub mod info;
+pub mod iokit;
 pub mod kqueue;
 pub mod kqwl;
 mod mach;

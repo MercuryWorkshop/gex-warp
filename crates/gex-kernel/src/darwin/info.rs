@@ -1052,6 +1052,21 @@ impl Kernel {
     /// names the same process): the code-signing state of a process. Every
     /// program here is as one signed ad hoc and valid: no team, no
     /// entitlements.
+    /// The entitlements blob (`CSMAGIC_EMBEDDED_ENTITLEMENTS`, its header
+    /// with it) in the code signature of process `pid`'s program: this
+    /// process's own, or another's by the path its command line begins
+    /// with.
+    fn darwin_entitlements(&self, pid: i32) -> Option<Vec<u8>> {
+        let path = if pid == 0 || pid == self.pid {
+            self.exe_path.clone()
+        } else {
+            let e = self.procs.entries().into_iter().find(|e| e.pid == pid)?;
+            let first = e.cmdline().split(|&b| b == 0).next()?.to_vec();
+            String::from_utf8(first).ok().filter(|p| p.starts_with('/'))?
+        };
+        entitlements_of(&self.read_file(&path)?)
+    }
+
     pub(super) fn darwin_csops(&mut self, m: &mut GuestMem<'_>, x: [u64; 8]) -> SysResult {
         const STATUS: u64 = 0;
         const MARKINVALID: u64 = 1;
@@ -1087,8 +1102,30 @@ impl Kernel {
                 m.zero(addr, 20)?;
                 Ok(0)
             }
-            // No entitlements: an empty blob header.
-            ENTITLEMENTS_BLOB | DER_ENTITLEMENTS_BLOB => {
+            // The entitlements the program's signature carries (its
+            // XML blob, which is what libxpc reads of a peer: hidd's
+            // com.apple.iohideventsystem.server, for one); an empty blob
+            // header for none. Too little room says how much is needed.
+            ENTITLEMENTS_BLOB => match self.darwin_entitlements(pid) {
+                Some(blob) => {
+                    if size < blob.len() as u64 {
+                        if size >= 8 {
+                            m.write(addr, &blob[..8])?;
+                        }
+                        return Err(Errno::ERANGE);
+                    }
+                    m.write(addr, &blob)?;
+                    Ok(0)
+                }
+                None => {
+                    if size < 8 {
+                        return Err(Errno::ERANGE);
+                    }
+                    m.zero(addr, 8)?;
+                    Ok(0)
+                }
+            },
+            DER_ENTITLEMENTS_BLOB => {
                 if size < 8 {
                     return Err(Errno::ERANGE);
                 }
@@ -1405,4 +1442,48 @@ fn interface_list(family: i32, only: i32) -> Vec<u8> {
         out.extend_from_slice(&inet(broadcast));
     }
     out
+}
+
+/// The entitlements blob of a Mach-O program's code signature (the slice
+/// for this guest's processor, of a universal file): `LC_CODE_SIGNATURE`'s
+/// superblob, its slot 5.
+fn entitlements_of(file: &[u8]) -> Option<Vec<u8>> {
+    let be = |b: &[u8], at: usize| b.get(at..at + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
+    let le = |b: &[u8], at: usize| b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+    let cpu: u32 = if gex_abi::X86 { 0x0100_0007 } else { 0x0100_000c };
+    let slice = if be(file, 0)? == 0xcafe_babe {
+        let n = be(file, 4)? as usize;
+        let at = (0..n.min(16)).find(|i| be(file, 8 + 20 * i) == Some(cpu))?;
+        let (off, len) = (be(file, 8 + 20 * at + 8)? as usize, be(file, 8 + 20 * at + 12)? as usize);
+        file.get(off..off + len)?
+    } else {
+        file
+    };
+    if le(slice, 0)? != 0xfeed_facf {
+        return None;
+    }
+    let ncmds = le(slice, 16)? as usize;
+    let mut at = 32;
+    let mut sig = None;
+    for _ in 0..ncmds {
+        let (cmd, size) = (le(slice, at)?, le(slice, at + 4)? as usize);
+        if cmd == 0x1d {
+            sig = Some((le(slice, at + 8)? as usize, le(slice, at + 12)? as usize));
+        }
+        at += size.max(8);
+    }
+    let (off, len) = sig?;
+    let blob = slice.get(off..off + len)?;
+    if be(blob, 0)? != 0xfade_0cc0 {
+        return None;
+    }
+    let count = be(blob, 8)? as usize;
+    (0..count.min(64)).find_map(|i| {
+        let (ty, o) = (be(blob, 12 + 8 * i)?, be(blob, 16 + 8 * i)? as usize);
+        if ty != 5 || be(blob, o)? != 0xfade_7171 {
+            return None;
+        }
+        let n = be(blob, o + 4)? as usize;
+        blob.get(o..o + n).map(|b| b.to_vec())
+    })
 }
