@@ -97,5 +97,12 @@ int main(int argc, char **argv, char **envp, char **apple) {
     u64 dt = nanotime(page) - t0;
     t_check("and counts nanoseconds", dt >= 30000000ull && dt < 2000000000ull);
 #endif
+#if defined(__arm64__)
+    // A bitmask immediate in the page's range is a mask, not the page.
+    u64 m36, m24;
+    __asm__ volatile("mov %0, #0xfffffffff" : "=r"(m36));
+    __asm__ volatile("mov %0, #0xffffff000" : "=r"(m24));
+    t_check("a mask in the page's range is its own value", m36 == 0xffffffffful && m24 == 0xffffff000ul);
+#endif
     return 0;
 }

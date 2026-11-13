@@ -716,7 +716,14 @@ impl<'a> Lifter<'a> {
                 let ty = ty_of(sz);
                 // `mov x8, #0xfffffc000` (`orr` from the zero register): XNU's
                 // commpage, by constant, is gex's (`gex_abi::fold_commpage`).
-                if let (LogOp::Orr, false, RegSel::Zr, Sz::X, Some(f)) = (op, set_flags, rn, sz, gex_abi::fold_commpage(imm)) {
+                // Only the page's own address: the other bitmask immediates
+                // in its range are masks (`#0xfffffffff`, 36 ones, is libcurl's
+                // protocol word), and an address made from the base with an
+                // offset is folded where it is used (gex-emit's constant
+                // addresses).
+                if let (LogOp::Orr, false, RegSel::Zr, Sz::X, true, Some(f)) =
+                    (op, set_flags, rn, sz, imm == gex_abi::commpage::XNU_A64, gex_abi::fold_commpage(imm))
+                {
                     let v = self.konst(ty, f);
                     self.wr_gp(rd, sz, v);
                     return Flow::Next;
