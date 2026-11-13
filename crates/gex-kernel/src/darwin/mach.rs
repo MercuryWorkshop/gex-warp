@@ -155,6 +155,18 @@ impl Kernel {
                     kern(self.map_io().call(m, nr::MPROTECT, [lo, hi - lo, x[4] & 7, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL)))
                 }
             }
+            // (target, count, activity id*): `count` activity ids, the
+            // first of them said: numbers unique in the system, which
+            // libdispatch's vouchers and os_activity name what is done by.
+            43 => {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                if x[1] as i32 <= 0 || x[1] > 100 {
+                    KERN_INVALID_ARGUMENT
+                } else {
+                    let first = NEXT.fetch_add(x[1], std::sync::atomic::Ordering::Relaxed);
+                    kern(m.write_u64(x[2], first).map(|_| 0))
+                }
+            }
             // The processor is given up for a moment.
             t::SWTCH_PRI | t::SWTCH | t::THREAD_SWITCH => {
                 std::thread::yield_now();

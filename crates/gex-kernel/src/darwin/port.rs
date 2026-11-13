@@ -27,7 +27,7 @@ use super::mach::*;
 use super::*;
 use crate::syscalls::{clock_ns, nr};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, Weak};
 
 /// `mach_port_right_t`.
 pub mod right {
@@ -92,6 +92,38 @@ const COMPLEX: u32 = 0x8000_0000;
 /// (`MACH_MSG_TRAILER_FORMAT_0`, its own length).
 const HEADER: u64 = 24;
 const TRAILER: u64 = 8;
+
+/// The trailer a receive asks for (`MACH_RCV_TRAILER_ELEMENTS` in its
+/// options): how long, of `mach_msg_max_trailer_t`'s parts in order --
+/// the type and length, a sequence number, the sender's security token,
+/// its audit token, the port's context, and two words of what a MAC
+/// policy would say.
+fn trailer_size(options: u64) -> u64 {
+    match (options >> 24) & 0xf {
+        0 => TRAILER,
+        1 => 12,
+        2 => 20,
+        3 => 52,
+        4 => 60,
+        _ => 68,
+    }
+}
+
+/// The trailer itself, for a message from `sender` received from a port
+/// whose context is `context`.
+fn trailer(options: u64, sender: &[u32; 8], context: u64) -> Vec<u8> {
+    let size = trailer_size(options);
+    let mut t = vec![0u8; 68];
+    put32(&mut t, 4, size as u32);
+    put32(&mut t, 12, sender[1]);
+    put32(&mut t, 16, sender[2]);
+    for (i, w) in sender.iter().enumerate() {
+        put32(&mut t, 20 + 4 * i, *w);
+    }
+    t[52..60].copy_from_slice(&context.to_le_bytes());
+    t.truncate(size as usize);
+    t
+}
 /// The name a right to a dead port is received under.
 const MACH_PORT_DEAD: u32 = u32::MAX;
 /// `MIG_BAD_ID`: a server's answer to a request it has no routine for.
@@ -137,6 +169,14 @@ struct Msg {
     /// the bytes, which are the receiver's at an address of its own once
     /// it has the message.
     memory: Vec<(usize, Vec<u8>)>,
+    /// Each array of ports out of line (`MACH_MSG_OOL_PORTS_DESCRIPTOR`):
+    /// its offset in the body, and each right in it (none for a null name)
+    /// with the type its receiver is told.
+    port_arrays: Vec<(usize, Vec<Option<(Arc<Port>, u32)>>)>,
+    /// Who sent it, as its audit token says (the kernel's own: zeroes):
+    /// the user and group the trailer's security token gives are its
+    /// effective ones, the second and third.
+    sender: [u32; 8],
 }
 
 #[derive(Default)]
@@ -149,6 +189,9 @@ struct State {
     /// The names whose words say this port has something: its receiver's
     /// name for it (a semaphore's own), and each port set it is in.
     wake: Vec<u32>,
+    /// The task that has the receive right, to be woken by whoever sends
+    /// ([`Rx`]); none while the right is on its way in a message.
+    rx: Option<Rx>,
     /// A timer's port (`mk_timer_create`), and the moment it is armed for
     /// on `mach_absolute_time`'s clock, if it is: a message is queued here
     /// then, by whoever next looks ([`Kernel::darwin_msg`]).
@@ -157,11 +200,24 @@ struct State {
     /// How many send rights have been made from the receive right
     /// (`MACH_MSG_TYPE_MAKE_SEND`): what a no-senders notification says.
     made: u32,
+    /// How many send rights there are, in every task and in every message
+    /// on its way (XNU's `ip_srights`): a task's references under one name
+    /// are one right.
+    srights: u32,
     /// The right to tell by when no send right to the port is left
     /// ([`notice::NO_SENDERS`]), if that was asked.
     no_senders: Option<Arc<Port>>,
+    /// The names, in whichever tasks, whose dead-name requests are for
+    /// this port ([`notice::DEAD_NAME`]).
+    dead_requests: Vec<(Weak<Mutex<Space>>, u32)>,
+    /// What its receiver keeps with it (`mach_port_set_context`, or a
+    /// guard it was made with), which a trailer that asks says.
+    context: u64,
 }
 
+/// A port: one queue of messages, whose rights any task may hold. It is
+/// the system's, not a task's: a right in a message is the port itself,
+/// and lands in the receiving task's space as it is received.
 pub struct Port {
     pub kind: Kind,
     state: Mutex<State>,
@@ -174,6 +230,179 @@ impl Port {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the port's send rights are counted, and their last going
+    /// told of: a port of a task's, not one the kernel answers.
+    fn counted(&self) -> bool {
+        self.kind == Kind::User
+    }
+}
+
+/// How a task that receives from a port is woken by a sender, whichever
+/// task that is: its futex queues, and the page its waiting threads'
+/// words are in ([`Space::words`]). A waiting receiver took its place on
+/// its word's queue before it looked for a message
+/// ([`Kernel::darwin_parked`]), so a wake that does not change the word
+/// is not lost.
+#[derive(Clone)]
+pub struct Rx {
+    futex: Arc<crate::futex::FutexTable>,
+    words: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Rx {
+    /// Wake whoever in the task waits on any of `names`.
+    fn wake(&self, names: &[u32]) {
+        let words = self.words.load(std::sync::atomic::Ordering::SeqCst);
+        if words == 0 {
+            return;
+        }
+        for &name in names {
+            self.futex.wake(gex_abi::canon(words + 4 * ((name as u64 >> 8) & 0xfff)), i32::MAX as u32);
+        }
+    }
+
+    fn is(&self, futex: &Arc<crate::futex::FutexTable>) -> bool {
+        Arc::ptr_eq(&self.futex, futex)
+    }
+}
+
+/// Queue notification `id` on `to`, with its word if it has one, and wake
+/// its receiver. The send-once right it is sent by is used up; a port that
+/// has died is told nothing.
+fn notify(to: &Arc<Port>, id: u32, word: Option<u32>) {
+    let (rx, wake) = {
+        let mut st = to.state();
+        if st.dead {
+            return;
+        }
+        let mut body = Vec::new();
+        if let Some(word) = word {
+            body.extend_from_slice(&NDR);
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        st.queue.push_back(Msg { id, body, complex: false, once: true, reply: None, ports: Vec::new(), memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] });
+        (st.rx.clone(), st.wake.clone())
+    };
+    if let Some(rx) = rx {
+        rx.wake(&wake);
+    }
+}
+
+/// One more send right to `port` (made, copied, or a reference given a
+/// right of its own as it leaves in a message).
+fn send_made(port: &Arc<Port>) {
+    if port.counted() {
+        port.state().srights += 1;
+    }
+}
+
+/// A send right to `port` is gone: if it was the last, whoever asked is
+/// told the port has no senders.
+fn send_gone(port: &Arc<Port>) {
+    if !port.counted() {
+        return;
+    }
+    let told = {
+        let mut st = port.state();
+        st.srights = st.srights.saturating_sub(1);
+        if st.srights == 0 && !st.dead {
+            st.no_senders.take().map(|to| (to, st.made))
+        } else {
+            None
+        }
+    };
+    if let Some((to, made)) = told {
+        notify(&to, notice::NO_SENDERS, Some(made));
+    }
+}
+
+/// The right a message was sent by (`got`) is used up by the sending: a
+/// send right taken to send by is no longer counted.
+fn send_gone_if(port: &Arc<Port>, got: u32) {
+    if got == disp::MOVE_SEND {
+        send_gone(port);
+    }
+}
+
+/// A right (of type `got`, as a message carries it) destroyed unused.
+fn right_gone(port: &Arc<Port>, got: u32) {
+    match got {
+        disp::MOVE_SEND => send_gone(port),
+        disp::MOVE_SEND_ONCE => notify(port, notice::SEND_ONCE, None),
+        disp::MOVE_RECEIVE => kill(port),
+        _ => {}
+    }
+}
+
+/// A message destroyed unreceived: the rights it carries go with it.
+fn destroy(msg: Msg) {
+    if let Some((port, once)) = msg.reply {
+        right_gone(&port, if once { disp::MOVE_SEND_ONCE } else { disp::MOVE_SEND });
+    }
+    for (_, port, got) in msg.ports {
+        right_gone(&port, got);
+    }
+    for (_, rights) in msg.port_arrays {
+        for (port, got) in rights.into_iter().flatten() {
+            right_gone(&port, got);
+        }
+    }
+}
+
+/// The port's receive right is gone: it is dead, what was queued on it is
+/// destroyed, its receiver's waiting threads woken, and each name with a
+/// dead-name request for it is told (by [`flush`]).
+fn kill(port: &Arc<Port>) {
+    let (queue, unused, requests, rx, wake) = {
+        let mut st = port.state();
+        if st.dead {
+            return;
+        }
+        st.dead = true;
+        (std::mem::take(&mut st.queue), st.no_senders.take(), std::mem::take(&mut st.dead_requests), st.rx.take(), std::mem::take(&mut st.wake))
+    };
+    if let Some(rx) = rx {
+        rx.wake(&wake);
+    }
+    for msg in queue {
+        destroy(msg);
+    }
+    // What its receiver asked to be told of its senders never will be:
+    // a send-once right not used.
+    if let Some(to) = unused {
+        notify(&to, notice::SEND_ONCE, None);
+    }
+    let mut later = DEAD.lock().unwrap_or_else(|e| e.into_inner());
+    for (space, name) in requests {
+        later.push((space, name, Arc::downgrade(port)));
+    }
+}
+
+/// The dead-name requests of ports that have died, to be told by [`flush`]
+/// with no space locked: the space, the name, the port.
+static DEAD: Mutex<Vec<(Weak<Mutex<Space>>, u32, Weak<Port>)>> = Mutex::new(Vec::new());
+
+/// Tell each name whose port has died and that asked to be told: it is a
+/// dead name, with a reference more for whoever is told. Called with no
+/// space locked (the end of each trap).
+pub fn flush() {
+    loop {
+        let todo = std::mem::take(&mut *DEAD.lock().unwrap_or_else(|e| e.into_inner()));
+        if todo.is_empty() {
+            return;
+        }
+        for (space, name, port) in todo {
+            let (Some(space), Some(port)) = (space.upgrade(), port.upgrade()) else { continue };
+            let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(e) = sp.names.get_mut(&name).filter(|e| Arc::ptr_eq(&e.port, &port)) else { continue };
+            let Some(to) = e.dead_request.take() else { continue };
+            e.dead += e.send + e.once as u32 + 1;
+            (e.send, e.once) = (0, false);
+            drop(sp);
+            notify(&to, notice::DEAD_NAME, Some(name));
+        }
     }
 }
 
@@ -218,12 +447,26 @@ pub struct Space {
     /// The wait queues told when a name has something, by name: those of
     /// the kqueues with a note on it ([`super::kqueue`]).
     watchers: HashMap<u32, Vec<u32>>,
-    /// The ports whose receiver asked to be told when they have no senders
-    /// ([`Space::sweep`]).
-    asked: Vec<Arc<Port>>,
-    /// The names a notification was queued under since they were last
-    /// woken ([`Kernel::darwin_told`]).
-    told: Vec<u32>,
+    /// The ports a notification was queued on since they were last woken
+    /// ([`Kernel::darwin_told`]).
+    told: Vec<Arc<Port>>,
+    /// How a sender wakes this task's threads ([`Rx`]), and the space
+    /// itself as a dead-name request names it: given by the kernel at the
+    /// space's first use ([`Kernel::darwin_space`]).
+    rx: Option<Rx>,
+    words_at: Arc<std::sync::atomic::AtomicU64>,
+    me: Weak<Mutex<Space>>,
+    /// The task's special ports (`task_set_special_port`): a send right to
+    /// each, by which; the bootstrap port among them. Passed on to a fork's
+    /// child and to the program a task runs next.
+    special: HashMap<u32, Arc<Port>>,
+}
+
+/// `task_get_special_port`'s and `task_set_special_port`'s numbers.
+pub mod special {
+    pub const KERNEL: u32 = 1;
+    pub const HOST: u32 = 2;
+    pub const BOOTSTRAP: u32 = 4;
 }
 
 /// The kernel's notifications (`mach/notify.h`): a message to a port its
@@ -265,11 +508,64 @@ impl Default for Space {
         for (name, kind) in [(names::TASK, Kind::Task), (names::HOST, Kind::Host)] {
             names.insert(name, Entry { send: 1, ..Entry::of(Port::new(kind)) });
         }
-        Space { names, next: names::FIRST_ALLOCATED, words: 0, watchers: HashMap::new(), asked: Vec::new(), told: Vec::new() }
+        Space {
+            names,
+            next: names::FIRST_ALLOCATED,
+            words: 0,
+            watchers: HashMap::new(),
+            told: Vec::new(),
+            rx: None,
+            words_at: Default::default(),
+            me: Weak::new(),
+            special: HashMap::new(),
+        }
+    }
+}
+
+/// A task that ends gives up every right it holds: its ports die, its
+/// send rights are no longer counted, its send-once rights are told of as
+/// never used.
+impl Drop for Space {
+    fn drop(&mut self) {
+        for (_, e) in self.names.drain() {
+            if e.recv {
+                kill(&e.port);
+            }
+            if e.send > 0 {
+                send_gone(&e.port);
+            }
+            if e.once {
+                notify(&e.port, notice::SEND_ONCE, None);
+            }
+            if let Some(to) = e.dead_request {
+                notify(&to, notice::SEND_ONCE, None);
+            }
+        }
+        for (_, port) in self.special.drain() {
+            send_gone(&port);
+        }
     }
 }
 
 impl Space {
+    /// The space a fork's child, or the next program, begins with: the
+    /// task's own ports, and a send right to each of this one's special
+    /// ports.
+    pub fn inherit(&self) -> Space {
+        let mut s = Space::default();
+        for (which, port) in &self.special {
+            send_made(port);
+            s.special.insert(*which, Arc::clone(port));
+        }
+        s
+    }
+
+    /// The space is this task's, woken through `rx` and named by `me`.
+    fn bind(&mut self, futex: &Arc<crate::futex::FutexTable>, me: Weak<Mutex<Space>>) {
+        self.rx = Some(Rx { futex: Arc::clone(futex), words: Arc::clone(&self.words_at) });
+        self.me = me;
+    }
+
     /// A name nothing has: XNU's are an index and a generation, and the
     /// index is what tells two apart.
     fn fresh(&mut self) -> u32 {
@@ -282,13 +578,19 @@ impl Space {
         }
     }
 
-    /// The entry under `name`. A thread's port is there for the asking.
+    /// The entry under `name`. A thread's port is there for the asking. A
+    /// right to a port that has died since is a dead name from now on.
     fn entry(&mut self, pid: i32, name: u32) -> Option<&mut Entry> {
         if !self.names.contains_key(&name) {
             let tid = port_thread(pid, name)?;
             self.names.insert(name, Entry { send: 1, ..Entry::of(Port::new(Kind::Thread(tid))) });
         }
-        self.names.get_mut(&name)
+        let e = self.names.get_mut(&name)?;
+        if (e.send > 0 || e.once) && !e.recv && e.port.counted() && e.port.state().dead {
+            e.dead += e.send + e.once as u32;
+            (e.send, e.once) = (0, false);
+        }
+        Some(e)
     }
 
     /// The ports `name` receives from: its own, or a set's members.
@@ -352,9 +654,8 @@ impl Space {
         }
     }
 
-    /// Queue notification `id` on `to`, with its word if it has one. The
-    /// right it is sent by is used up; a port that has died is told
-    /// nothing.
+    /// Queue notification `id` on `to`, with its word if it has one, its
+    /// receiver to be woken when the call ends ([`Kernel::darwin_told`]).
     fn tell(&mut self, to: &Arc<Port>, id: u32, word: Option<u32>) {
         let mut st = to.state();
         if st.dead {
@@ -365,8 +666,9 @@ impl Space {
             body.extend_from_slice(&NDR);
             body.extend_from_slice(&word.to_le_bytes());
         }
-        st.queue.push_back(Msg { id, body, complex: false, once: true, reply: None, ports: Vec::new(), memory: Vec::new() });
-        self.told.extend(st.wake.iter().copied());
+        st.queue.push_back(Msg { id, body, complex: false, once: true, reply: None, ports: Vec::new(), memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] });
+        drop(st);
+        self.told.push(Arc::clone(to));
     }
 
     /// A send-once right to `port` has gone without being used, which its
@@ -375,39 +677,20 @@ impl Space {
         self.tell(port, notice::SEND_ONCE, None);
     }
 
-    /// Whether there is a send right to `port`: under a name, or on its
-    /// way in a message that waits to be received.
-    fn senders(&self, port: &Arc<Port>) -> bool {
-        self.names.values().any(|e| {
-            (e.send > 0 && Arc::ptr_eq(&e.port, port))
-                || (e.recv
-                    && e.port.state().queue.iter().any(|q| {
-                        q.ports.iter().any(|(_, p, got)| *got == disp::MOVE_SEND && Arc::ptr_eq(p, port)) || q.reply.as_ref().is_some_and(|(p, once)| !once && Arc::ptr_eq(p, port))
-                    }))
-        })
-    }
-
-    /// Tell each receiver that asked of a port that has no senders left:
-    /// after anything that may have taken a port's last send right.
-    fn sweep(&mut self) {
-        if self.asked.is_empty() {
+    /// The send right under `name`'s references drop to `now`: the right
+    /// itself goes with the last.
+    fn send_refs(&mut self, name: u32, now: u32) {
+        let Some(e) = self.names.get_mut(&name) else { return };
+        let was = e.send;
+        if !e.port.counted() && e.port.kind != Kind::Semaphore {
             return;
         }
-        for port in std::mem::take(&mut self.asked) {
-            if port.state().dead || port.state().no_senders.is_none() {
-                continue;
-            }
-            if self.senders(&port) {
-                self.asked.push(port);
-                continue;
-            }
-            let (to, made) = {
-                let mut st = port.state();
-                (st.no_senders.take(), st.made)
-            };
-            if let Some(to) = to {
-                self.tell(&to, notice::NO_SENDERS, Some(made));
-            }
+        e.send = now;
+        let port = Arc::clone(&e.port);
+        if was > 0 && now == 0 {
+            send_gone(&port);
+        } else if was == 0 && now > 0 {
+            send_made(&port);
         }
     }
 
@@ -417,6 +700,7 @@ impl Space {
     /// name, a name without the right the notification is about, a
     /// notification there is none of.
     fn request(&mut self, pid: i32, name: u32, which: u32, sync: u32, to: Option<Arc<Port>>) -> Result<Option<Arc<Port>>, u64> {
+        let me = self.me.clone();
         let Some(e) = self.entry(pid, name) else { return Err(KERN_INVALID_NAME) };
         match which {
             notice::NO_SENDERS => {
@@ -428,14 +712,14 @@ impl Space {
                 if let Some(to) = to {
                     // None now, and no fewer made than the caller knows
                     // of: told at once.
-                    let made = port.state().made;
-                    if sync <= made && !self.senders(&port) {
+                    let (made, none) = {
+                        let st = port.state();
+                        (st.made, st.srights == 0)
+                    };
+                    if sync <= made && none {
                         self.tell(&to, notice::NO_SENDERS, Some(made));
                     } else {
                         port.state().no_senders = Some(to);
-                        if !self.asked.iter().any(|p| Arc::ptr_eq(p, &port)) {
-                            self.asked.push(port);
-                        }
                     }
                 }
                 Ok(before)
@@ -448,28 +732,46 @@ impl Space {
                 if !e.recv && e.send == 0 && !e.once {
                     return Err(KERN_INVALID_ARGUMENT);
                 }
-                Ok(std::mem::replace(&mut e.dead_request, to))
+                let port = Arc::clone(&e.port);
+                let before = std::mem::replace(&mut e.dead_request, to);
+                if e.dead_request.is_some() {
+                    let mut st = port.state();
+                    if !st.dead_requests.iter().any(|(s, n)| *n == name && Weak::ptr_eq(s, &me)) {
+                        st.dead_requests.push((me, name));
+                    }
+                }
+                Ok(before)
             }
             _ => Err(KERN_INVALID_VALUE),
         }
     }
 
     /// Take a right from under `name`, as a message being sent does:
-    /// the port, and the type its receiver will be told.
+    /// the port, and the type its receiver will be told. The right is
+    /// counted as one on its way.
     fn take(&mut self, pid: i32, name: u32, how: u32) -> Option<(Arc<Port>, u32)> {
         let e = self.entry(pid, name)?;
         let port = Arc::clone(&e.port);
         let got = match how {
-            disp::COPY_SEND if e.send > 0 => disp::MOVE_SEND,
+            disp::COPY_SEND if e.send > 0 => {
+                send_made(&port);
+                disp::MOVE_SEND
+            }
             disp::MOVE_SEND if e.send > 0 => {
-                // The kernel's own ports are not used up.
+                // The kernel's own ports are not used up. One reference of
+                // several leaves a right of its own; the last takes the
+                // name's.
                 if port.kind == Kind::User || port.kind == Kind::Semaphore {
                     e.send -= 1;
+                    if e.send > 0 {
+                        send_made(&port);
+                    }
                 }
                 disp::MOVE_SEND
             }
             disp::MAKE_SEND if e.recv => {
                 port.state().made += 1;
+                send_made(&port);
                 disp::MOVE_SEND
             }
             disp::MAKE_SEND_ONCE if e.recv => disp::MOVE_SEND_ONCE,
@@ -479,6 +781,13 @@ impl Space {
             }
             disp::MOVE_RECEIVE if e.recv => {
                 e.recv = false;
+                let mut st = port.state();
+                st.wake.clear();
+                st.rx = None;
+                drop(st);
+                for set in self.names.values_mut().filter(|e| e.is_set()) {
+                    set.members.retain(|m| *m != name);
+                }
                 disp::MOVE_RECEIVE
             }
             _ => return None,
@@ -505,8 +814,16 @@ impl Space {
                 let e = self.names.get_mut(&name).unwrap();
                 if got == disp::MOVE_RECEIVE {
                     e.recv = true;
-                    port.state().wake = vec![name];
+                    let mut st = port.state();
+                    st.wake = vec![name];
+                    st.rx = self.rx.clone();
                 } else {
+                    // (One right under one name: the one that came is
+                    // another reference to the one there.)
+                    if e.send > 0 && port.counted() {
+                        let mut st = port.state();
+                        st.srights = st.srights.saturating_sub(1);
+                    }
                     e.send += 1;
                 }
                 name
@@ -516,7 +833,9 @@ impl Space {
                 let mut e = Entry::of(Arc::clone(&port));
                 if got == disp::MOVE_RECEIVE {
                     e.recv = true;
-                    port.state().wake = vec![name];
+                    let mut st = port.state();
+                    st.wake = vec![name];
+                    st.rx = self.rx.clone();
                 } else {
                     e.send = 1;
                 }
@@ -530,7 +849,11 @@ impl Space {
     fn allocate(&mut self, kind: Kind) -> u32 {
         let name = self.fresh();
         let port = Port::new(kind);
-        port.state().wake = vec![name];
+        {
+            let mut st = port.state();
+            st.wake = vec![name];
+            st.rx = self.rx.clone();
+        }
         let mut e = Entry::of(port);
         match kind {
             Kind::Set => {}
@@ -543,37 +866,17 @@ impl Space {
 
     /// End the receive right under `name`: the port is dead, what was
     /// queued on it is gone, and every other right to it here is a dead
-    /// name. The names to wake.
+    /// name (and elsewhere, as each task next looks). The names to wake.
     fn destroy_receive(&mut self, name: u32) -> Vec<u32> {
         let Some(e) = self.names.get_mut(&name) else { return Vec::new() };
         e.recv = false;
         let port = Arc::clone(&e.port);
-        let wake = {
-            let mut st = port.state();
-            st.dead = true;
-            st.queue.clear();
-            std::mem::take(&mut st.wake)
-        };
-        let mut tell = Vec::new();
-        for (n, e) in self.names.iter_mut().filter(|(_, e)| Arc::ptr_eq(&e.port, &port)) {
+        let wake = port.state().wake.clone();
+        kill(&port);
+        for (_, e) in self.names.iter_mut().filter(|(_, e)| Arc::ptr_eq(&e.port, &port)) {
             e.dead += e.send + e.once as u32;
             e.send = 0;
             e.once = false;
-            // Whoever asked is told, and the name has a reference more
-            // for them.
-            if let Some(to) = e.dead_request.take() {
-                e.dead += 1;
-                tell.push((to, *n));
-            }
-        }
-        for (to, n) in tell {
-            self.tell(&to, notice::DEAD_NAME, Some(n));
-        }
-        // And what its receiver asked to be told of its senders never
-        // will be: a right not used.
-        let unused = port.state().no_senders.take();
-        if let Some(to) = unused {
-            self.once_gone(&to);
         }
         for set in self.names.values_mut().filter(|e| e.is_set()) {
             set.members.retain(|m| *m != name);
@@ -649,8 +952,17 @@ fn get32(b: &[u8], at: usize) -> u32 {
 }
 
 impl Kernel {
-    fn darwin_space(&self) -> Arc<Mutex<Space>> {
-        Arc::clone(&self.darwin_ports)
+    /// The task's space, told at its first use how this task is woken
+    /// and what it is called ([`Rx`]).
+    pub(super) fn darwin_space(&self) -> Arc<Mutex<Space>> {
+        let space = Arc::clone(&self.darwin_ports);
+        {
+            let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
+            if !sp.rx.as_ref().is_some_and(|rx| rx.is(&self.futexes)) {
+                sp.bind(&self.futexes, Arc::downgrade(&space));
+            }
+        }
+        space
     }
 
     /// The word a thread waiting on `name` sleeps on, in the page of words
@@ -658,8 +970,36 @@ impl Kernel {
     fn darwin_word(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, name: u32) -> Result<u64, Errno> {
         if sp.words == 0 || self.mem.lock().vma_at(sp.words).is_none() {
             sp.words = self.mem.mmap_anon(m, 0, abi::PAGE_SIZE, 3, 0, false, "[mach ports]")?;
+            sp.words_at.store(sp.words, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(sp.words + 4 * ((name as u64 >> 8) & 0xfff))
+    }
+
+    /// `port` has something: whoever waits on it is told, in this task
+    /// (its word changed, as [`Kernel::darwin_wake`]) or another (on its
+    /// futex queue, [`Rx`]; and the threads that wait on descriptors look
+    /// again, a kqueue's among them).
+    fn darwin_wake_port(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, port: &Arc<Port>) {
+        let (rx, wake) = {
+            let st = port.state();
+            (st.rx.clone(), st.wake.clone())
+        };
+        match rx {
+            Some(rx) if rx.is(&self.futexes) => self.darwin_wake(m, sp, &wake, true),
+            Some(rx) => {
+                rx.wake(&wake);
+                self.fd_activity = true;
+            }
+            None => {}
+        }
+    }
+
+    /// Take this thread's place on the queue of the word it would wait on
+    /// for `name` before looking for a message, so that a wake from
+    /// another task, which does not change the word, is not missed
+    /// between the look and the wait ([`Kernel::darwin_parked`]).
+    fn darwin_park(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, name: u32) {
+        self.darwin_parked = self.darwin_word(m, sp, name).ok().map(|at| (at, self.futexes.park(gex_abi::canon(at))));
     }
 
     /// Say that `names` have something for whoever waits on them.
@@ -691,24 +1031,23 @@ impl Kernel {
         Ok(nr::FUTEX)
     }
 
-    /// The traps that name and count rights. `None`: not one of them.
-    /// Wake whoever waits on a port a notification was queued on, having
-    /// first told of the ports that have lost their last sender
-    /// ([`Space::sweep`]): after a call that may have dropped a right.
+    /// Wake whoever waits on a port a notification was queued on: after a
+    /// call that may have dropped a right.
     fn darwin_told(&mut self, m: &mut GuestMem<'_>, sp: &mut Space) {
-        sp.sweep();
-        let told = std::mem::take(&mut sp.told);
-        if !told.is_empty() {
-            self.darwin_wake(m, sp, &told, true);
+        for port in std::mem::take(&mut sp.told) {
+            self.darwin_wake_port(m, sp, &port);
         }
     }
 
+    /// The traps that name and count rights. `None`: not one of them.
     pub(super) fn darwin_port_trap(&mut self, m: &mut GuestMem<'_>, n: u64, x: [u64; 8]) -> Option<u64> {
         let r = self.darwin_port_trap_of(m, n, x);
         if r.is_some() {
             let space = self.darwin_space();
             let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
             self.darwin_told(m, &mut sp);
+            drop(sp);
+            flush();
         }
         r
     }
@@ -815,7 +1154,12 @@ impl Kernel {
                 let flags = m.read_u32(x[1]).unwrap_or(0);
                 let made = sp.allocate(Kind::User);
                 if flags & 0x10 != 0 {
-                    sp.names.get_mut(&made).unwrap().send = 1;
+                    sp.names[&made].port.state().made += 1;
+                    sp.send_refs(made, 1);
+                }
+                // (MPO_CONTEXT_AS_GUARD: the guard is its context.)
+                if flags & 0x1 != 0 {
+                    sp.names[&made].port.state().context = x[2];
                 }
                 match m.write_u32(x[3], made) {
                     Ok(()) => KERN_SUCCESS,
@@ -826,9 +1170,9 @@ impl Kernel {
             t::MACH_PORT_DEALLOCATE => bad_task(match sp.entry(pid, name) {
                 None => KERN_INVALID_NAME,
                 Some(e) if e.send > 0 => {
-                    if matches!(e.port.kind, Kind::User | Kind::Semaphore) {
-                        e.send -= 1;
-                    }
+                    let now = e.send - 1;
+                    sp.send_refs(name, now);
+                    sp.drop_if_empty(name);
                     KERN_SUCCESS
                 }
                 Some(e) if e.once => {
@@ -853,9 +1197,7 @@ impl Kernel {
                     Some(e) => match x[2] {
                         right::SEND if e.send > 0 || (delta >= 0 && e.recv) => match e.send.checked_add_signed(delta) {
                             Some(v) => {
-                                if matches!(e.port.kind, Kind::User | Kind::Semaphore) {
-                                    e.send = v;
-                                }
+                                sp.send_refs(name, v);
                                 KERN_SUCCESS
                             }
                             None => KERN_INVALID_VALUE,
@@ -912,7 +1254,8 @@ impl Kernel {
                 None => KERN_INVALID_NAME,
                 Some(e) if !e.recv => KERN_INVALID_RIGHT,
                 Some(e) => {
-                    e.send = e.send.saturating_add_signed(x[2] as i32);
+                    let now = e.send.saturating_add_signed(x[2] as i32);
+                    sp.send_refs(name, now);
                     let wake = sp.destroy_receive(name);
                     self.darwin_wake(m, &mut sp, &wake, true);
                     KERN_SUCCESS
@@ -939,10 +1282,20 @@ impl Kernel {
                             None if sp.names.contains_key(&name) => KERN_NAME_EXISTS,
                             _ if got == disp::MOVE_SEND_ONCE => KERN_INVALID_CAPABILITY,
                             _ => {
+                                let rx = sp.rx.clone();
                                 let e = sp.names.entry(name).or_insert_with(|| Entry::of(Arc::clone(&port)));
                                 if got == disp::MOVE_RECEIVE {
                                     e.recv = true;
+                                    let mut st = port.state();
+                                    st.wake = vec![name];
+                                    st.rx = rx;
                                 } else {
+                                    // (Another reference to a right there
+                                    // already is no right of its own.)
+                                    if e.send > 0 && port.counted() {
+                                        let mut st = port.state();
+                                        st.srights = st.srights.saturating_sub(1);
+                                    }
                                     e.send += 1;
                                 }
                                 KERN_SUCCESS
@@ -1171,6 +1524,12 @@ impl Kernel {
 
     /// `mach_msg`: send, receive, or both in turn.
     fn darwin_msg(&mut self, m: &mut GuestMem<'_>, c: MsgCall, a: &mut [u64; 6]) -> Result<u64, u64> {
+        let r = self.darwin_msg_of(m, c, a);
+        flush();
+        r
+    }
+
+    fn darwin_msg_of(&mut self, m: &mut GuestMem<'_>, c: MsgCall, a: &mut [u64; 6]) -> Result<u64, u64> {
         let space = self.darwin_space();
         let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
         if c.option & opt::SEND_MSG != 0 {
@@ -1182,7 +1541,11 @@ impl Kernel {
         if c.option & opt::RCV_MSG == 0 {
             return Err(MACH_MSG_SUCCESS);
         }
-        let nearest = match self.darwin_port_receive(m, &mut sp, c.rcv_name, c.rcv_at, c.rcv_size, c.option & opt::RCV_LARGE != 0) {
+        // (Its place on the queue, before it looks.)
+        if sp.receives(c.rcv_name).is_some() {
+            self.darwin_park(m, &mut sp, c.rcv_name);
+        }
+        let nearest = match self.darwin_port_receive(m, &mut sp, c.rcv_name, c.rcv_at, c.rcv_size, c.option & opt::RCV_LARGE != 0, c.option) {
             Received::Got(_) => return Err(MACH_MSG_SUCCESS),
             Received::TooLarge { .. } => return Err(MACH_RCV_TOO_LARGE),
             Received::NoName => return Err(MACH_RCV_INVALID_NAME),
@@ -1214,7 +1577,8 @@ impl Kernel {
     /// `rcv_name` receives from, into the `rcv_size` bytes at `rcv_at`,
     /// its rights into the caller's space. One too large for the room
     /// stays queued if `large`, and is gone otherwise.
-    pub(super) fn darwin_port_receive(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, rcv_name: u32, rcv_at: u64, rcv_size: u64, large: bool) -> Received {
+    pub(super) fn darwin_port_receive(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, rcv_name: u32, rcv_at: u64, rcv_size: u64, large: bool, options: u64) -> Received {
+        let tsize = trailer_size(options);
         // What is asked of: a receive right, or a set of them.
         let Some(from) = sp.receives(rcv_name) else { return Received::NoName };
         // A timer whose moment has come has its message now (24 bytes of
@@ -1227,7 +1591,7 @@ impl Kernel {
             match st.timer {
                 Some(when) if when <= now => {
                     st.timer = None;
-                    st.queue.push_back(Msg { id: 0, body: vec![0; 24], complex: false, once: false, reply: None, ports: Vec::new(), memory: Vec::new() });
+                    st.queue.push_back(Msg { id: 0, body: vec![0; 24], complex: false, once: false, reply: None, ports: Vec::new(), memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] });
                 }
                 Some(when) => nearest = Some(nearest.map_or(when, |n| n.min(when))),
                 None => {}
@@ -1237,7 +1601,7 @@ impl Kernel {
             let mut st = port.state();
             let Some(msg) = st.queue.front() else { continue };
             let size = HEADER + msg.body.len() as u64;
-            if size + TRAILER > rcv_size {
+            if size + tsize > rcv_size {
                 // Too large: with RCV_LARGE it stays queued and its size
                 // is said; without, it is gone.
                 let mut head = [0u8; HEADER as usize];
@@ -1245,7 +1609,13 @@ impl Kernel {
                 put32(&mut head, 12, name);
                 put32(&mut head, 20, msg.id);
                 if !large {
-                    st.queue.pop_front();
+                    let gone = st.queue.pop_front();
+                    drop(st);
+                    if let Some(msg) = gone {
+                        destroy(msg);
+                    }
+                } else {
+                    drop(st);
                 }
                 if rcv_size >= HEADER {
                     let _ = m.write(rcv_at, &head);
@@ -1253,8 +1623,9 @@ impl Kernel {
                 return Received::TooLarge { size, name };
             }
             let msg = st.queue.pop_front().unwrap();
+            let context = st.context;
             drop(st);
-            let mut out = vec![0u8; (size + TRAILER) as usize];
+            let mut out = vec![0u8; (size + tsize) as usize];
             out[HEADER as usize..size as usize].copy_from_slice(&msg.body);
             let (reply_name, reply_type) = match msg.reply {
                 Some((port, once)) => {
@@ -1267,6 +1638,34 @@ impl Kernel {
                 let given = sp.give(port, got);
                 put32(&mut out, HEADER as usize + at, given);
                 out[HEADER as usize + at + 10] = got as u8;
+            }
+            // An array of ports out of line arrives as names in memory
+            // newly the receiver's.
+            for (at, rights) in msg.port_arrays {
+                let mut names = Vec::with_capacity(rights.len() * 4);
+                let mut kind = disp::MOVE_SEND;
+                for right in rights {
+                    let given = match right {
+                        Some((port, got)) => {
+                            kind = got;
+                            sp.give(port, got)
+                        }
+                        None => 0,
+                    };
+                    names.extend_from_slice(&given.to_le_bytes());
+                }
+                let address = if names.is_empty() {
+                    0
+                } else {
+                    let Ok(address) = self.darwin_vm_map_at(m, 0, names.len() as u64, 0, 1, 3) else { return Received::BadBuffer };
+                    if m.write(address, &names).is_err() {
+                        return Received::BadBuffer;
+                    }
+                    address
+                };
+                out[HEADER as usize + at..HEADER as usize + at + 8].copy_from_slice(&address.to_le_bytes());
+                out[HEADER as usize + at + 8] = 1;
+                out[HEADER as usize + at + 10] = kind as u8;
             }
             // Memory out of line arrives in memory newly the receiver's.
             for (at, bytes) in msg.memory {
@@ -1285,10 +1684,10 @@ impl Kernel {
             put32(&mut out, 8, reply_name);
             put32(&mut out, 12, name);
             put32(&mut out, 20, msg.id);
-            // The trailer: format 0, eight bytes.
-            put32(&mut out, size as usize + 4, TRAILER as u32);
+            // The trailer: format 0, as long as was asked.
+            out[size as usize..].copy_from_slice(&trailer(options, &msg.sender, context));
             return match m.write(rcv_at, &out) {
-                Ok(()) => Received::Got(size + TRAILER),
+                Ok(()) => Received::Got(size + tsize),
                 Err(_) => Received::BadBuffer,
             };
         }
@@ -1317,6 +1716,7 @@ impl Kernel {
         // message refused is one that changed nothing.
         let mut descs = Vec::new();
         let mut memory = Vec::new();
+        let mut arrays = Vec::new();
         let mut gone = Vec::new();
         if complex {
             let count = get32(&body, 0) as usize;
@@ -1355,7 +1755,22 @@ impl Kernel {
                         memory.push((at, bytes));
                         at += 16;
                     }
-                    // An array of ports out of line is not carried yet.
+                    // An array of ports out of line: an address, whether
+                    // the sender's memory goes with it, how it is carried,
+                    // the rights' disposition, the type, and how many.
+                    2 => {
+                        if at + 16 > body.len() {
+                            return MACH_SEND_MSG_TOO_SMALL;
+                        }
+                        let address = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+                        let count = get32(&body, at + 12) as u64;
+                        let Ok(raw) = m.read(address, (count * 4) as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        if body[at + 8] != 0 && count != 0 {
+                            gone.push((address, count * 4));
+                        }
+                        arrays.push((at, (0..count as usize).map(|i| get32(&raw, 4 * i)).collect::<Vec<u32>>(), body[at + 10] as u32));
+                        at += 16;
+                    }
                     _ => return MACH_SEND_INVALID_TYPE,
                 }
             }
@@ -1387,6 +1802,22 @@ impl Kernel {
                 None => return MACH_SEND_INVALID_RIGHT,
             }
         }
+        let mut port_arrays = Vec::new();
+        for (at, names, how) in arrays {
+            let mut rights = Vec::new();
+            for name in names {
+                if name == 0 || name == MACH_PORT_DEAD {
+                    rights.push(None);
+                    continue;
+                }
+                match sp.take(pid, name, how) {
+                    Some((port, got)) => rights.push(Some((port, got))),
+                    None => return MACH_SEND_INVALID_RIGHT,
+                }
+            }
+            body[at..at + 8].fill(0);
+            port_arrays.push((at, rights));
+        }
         // The sender's memory that was to go with the message goes.
         for (address, size) in gone {
             let (lo, hi) = (address & !(abi::PAGE_SIZE - 1), (address + size).next_multiple_of(abi::PAGE_SIZE));
@@ -1397,18 +1828,24 @@ impl Kernel {
             body[*at..*at + 8].fill(0);
             body[*at + 8] = 1;
         }
-        let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory };
+        let sender = [self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1];
+        let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory, port_arrays, sender };
         match dest.kind {
             Kind::User => {
-                let wake = {
+                {
                     let mut st = dest.state();
                     if st.dead {
+                        // (Its rights go with it.)
+                        drop(st);
+                        destroy(msg);
+                        send_gone_if(&dest, dest_got);
                         return MACH_SEND_INVALID_DEST;
                     }
                     st.queue.push_back(msg);
-                    st.wake.clone()
-                };
-                self.darwin_wake(m, sp, &wake, true);
+                }
+                // The right the message was sent by is used up with it.
+                send_gone_if(&dest, dest_got);
+                self.darwin_wake_port(m, sp, &dest);
             }
             Kind::Set => return MACH_SEND_INVALID_DEST,
             kind => {
@@ -1416,12 +1853,8 @@ impl Kernel {
                 // on the reply port for the receive that follows.
                 let Some((reply, once)) = msg.reply.clone() else { return MACH_MSG_SUCCESS };
                 let answer = self.darwin_mig(m, sp, kind, &msg);
-                let wake = {
-                    let mut st = reply.state();
-                    st.queue.push_back(Msg { once, reply: None, ..answer });
-                    st.wake.clone()
-                };
-                self.darwin_wake(m, sp, &wake, true);
+                reply.state().queue.push_back(Msg { once, reply: None, ..answer });
+                self.darwin_wake_port(m, sp, &reply);
             }
         }
         MACH_MSG_SUCCESS
@@ -1431,7 +1864,7 @@ impl Kernel {
     /// server answers: the routine by the message's number, the reply
     /// numbered a hundred more. A routine there is none of is `MIG_BAD_ID`.
     fn darwin_mig(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kind: Kind, req: &Msg) -> Msg {
-        let reply = |body: Vec<u8>, ports: Vec<(usize, Arc<Port>, u32)>| Msg { id: req.id + 100, complex: !ports.is_empty(), body, once: false, reply: None, ports, memory: Vec::new() };
+        let reply = |body: Vec<u8>, ports: Vec<(usize, Arc<Port>, u32)>| Msg { id: req.id + 100, complex: !ports.is_empty(), body, once: false, reply: None, ports, memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] };
         // { NDR, RetCode }, then what the routine returns.
         let plain = |code: i32, rest: &[u8]| {
             let mut b = NDR.to_vec();
@@ -1500,16 +1933,19 @@ impl Kernel {
             }
             // task_get_special_port(task, which): the task's own port
             // (TASK_KERNEL_PORT) and the host's (TASK_HOST_PORT) as
-            // task_self and host_self give them; any other, the bootstrap
-            // port among them, is none: no launchd hands this task one,
-            // as for a process started outside it. (libxpc takes a null
-            // bootstrap port; what it would look up there is not found.)
+            // task_self and host_self give them; any other is the send
+            // right the task was given (`task_set_special_port`, or from
+            // the task it was forked from), the bootstrap port among them;
+            // or none, as for a process started outside a launchd.
             (Kind::Task, 3409) => {
                 let which = get32(&req.body, 8);
                 let own = match which {
-                    1 => sp.names.get(&names::TASK).map(|e| Arc::clone(&e.port)),
-                    2 => sp.names.get(&names::HOST).map(|e| Arc::clone(&e.port)),
-                    _ => None,
+                    special::KERNEL => sp.names.get(&names::TASK).map(|e| Arc::clone(&e.port)),
+                    special::HOST => sp.names.get(&names::HOST).map(|e| Arc::clone(&e.port)),
+                    _ => sp.special.get(&which).filter(|p| !p.state().dead).map(|p| {
+                        send_made(p);
+                        Arc::clone(p)
+                    }),
                 };
                 match own {
                     Some(port) => with_port(port),
@@ -1521,9 +1957,42 @@ impl Kernel {
                     }
                 }
             }
-            // task_set_special_port(task, which, port): taken, and kept
-            // nowhere (nothing here asks for one back but the two above).
-            (Kind::Task, 3410) => plain(0, &[]),
+            // task_set_special_port(task, which, port): the send right the
+            // request carries (the port descriptor, then the NDR record and
+            // the number) is the task's from now on, in place of any it had.
+            (Kind::Task, 3410) => {
+                let which = get32(&req.body, 24);
+                let port = req.ports.first().filter(|(_, _, got)| *got == disp::MOVE_SEND).map(|(_, p, _)| Arc::clone(p));
+                if which == special::KERNEL || which == special::HOST || which == 0 || which > 16 {
+                    plain(KERN_INVALID_ARGUMENT as i32, &[])
+                } else {
+                    // (The right the request carries is the one kept: it was
+                    // counted as it was sent.)
+                    let old = match port {
+                        Some(p) => sp.special.insert(which, p),
+                        None => sp.special.remove(&which),
+                    };
+                    if let Some(old) = old {
+                        send_gone(&old);
+                    }
+                    plain(0, &[])
+                }
+            }
+            // mach_port_get_context(task, name), mach_port_set_context(task,
+            // name, context): what the receiver keeps with its port.
+            (Kind::Task, 3228 | 3229) => {
+                let name = get32(&req.body, 8);
+                let context = req.body.get(12..20).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                match sp.names.get(&name) {
+                    None => plain(KERN_INVALID_NAME as i32, &[]),
+                    Some(e) if !e.recv => plain(KERN_INVALID_RIGHT as i32, &[]),
+                    Some(e) if req.id == 3228 => plain(0, &e.port.state().context.to_le_bytes()),
+                    Some(e) => {
+                        e.port.state().context = context;
+                        plain(0, &[])
+                    }
+                }
+            }
             // semaphore_create(task, out semaphore, policy, value): the
             // value follows the NDR record and the policy.
             (Kind::Task, 3418) => {

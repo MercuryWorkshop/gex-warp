@@ -27,6 +27,7 @@ pub mod root;
 mod bsd;
 pub mod info;
 pub mod kqueue;
+pub mod kqwl;
 mod mach;
 pub mod nr;
 pub mod port;
@@ -203,6 +204,9 @@ pub enum Post {
     /// A work queue's thread that waited for work ([`workq`]): it asks
     /// again, however its wait ended.
     Workq,
+    /// A `kevent_id` that waits on a synchronous waiter's note
+    /// ([`kqwl`]): made again, unless a signal ended the wait.
+    LoopWait,
     /// `waitid`: the kernel's `siginfo_t` at `at` as Darwin's, which is
     /// shorter; `was` is what the caller had there, and past it.
     Waitid { at: u64, was: [u64; 16] },
@@ -245,6 +249,7 @@ impl Kernel {
     /// register.
     pub(super) fn darwin_translate(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &mut [u64; 6]) -> u64 {
         self.darwin_post = Post::None;
+        self.darwin_parked = None;
         if !self.darwin_commpage {
             self.darwin_commpage = true;
             self.darwin_map_commpage(m);
@@ -430,6 +435,9 @@ impl Kernel {
         if matches!(post, Post::Kevent { .. }) {
             self.darwin_kevents.remove(&self.tid);
         }
+        if post == Post::LoopWait {
+            self.darwin_loop_wait_ended();
+        }
         finish(m, self.ctx_addr, post, r)
     }
 }
@@ -546,6 +554,9 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
             let _ = m.write_u32(slot + 16, 0);
             r.and(Err(Errno::EINTR))
         }
+        // (What the thread waited for is let go of by the kernel,
+        // [`Kernel::darwin_finish`].)
+        Post::LoopWait => r.and(Err(Errno::EINTR)),
         Post::Waitid { at, was } => {
             if at != 0 {
                 let l = m.read(at, 128)?.to_vec();

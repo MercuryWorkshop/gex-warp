@@ -57,7 +57,7 @@ use crate::vfs::{FileHandle, FileType, Metadata};
 use std::sync::{Mutex, Weak};
 
 /// The filters.
-mod filt {
+pub(super) mod filt {
     pub const READ: i16 = -1;
     pub const WRITE: i16 = -2;
     pub const VNODE: i16 = -4;
@@ -73,7 +73,7 @@ mod filt {
 }
 
 /// An event's flags: what to do with a note, and what one says.
-mod ev {
+pub(super) mod ev {
     pub const ADD: u16 = 0x0001;
     pub const DELETE: u16 = 0x0002;
     pub const ENABLE: u16 = 0x0004;
@@ -132,11 +132,13 @@ mod note {
 const KEVENT_FLAG_IMMEDIATE: u64 = 0x1;
 const KEVENT_FLAG_ERROR_EVENTS: u64 = 0x2;
 const KEVENT_FLAG_WORKQ: u64 = 0x20;
-const KEVENT_FLAG_WORKLOOP: u64 = 0x100;
+/// (An older spelling of `KEVENT_FLAG_WORKQ`, from the event manager.)
+const KEVENT_FLAG_WORKQ_MANAGER: u64 = 0x200;
+const KEVENT_FLAG_WORKLOOP: u64 = 0x400;
 
 /// The three layouts an event is passed in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Form {
+pub(in crate::darwin) enum Form {
     /// `struct kevent`, 32 bytes.
     Plain,
     /// `struct kevent64_s`, with two words of the caller's.
@@ -147,7 +149,7 @@ pub(super) enum Form {
 }
 
 impl Form {
-    fn size(self) -> u64 {
+    pub(super) fn size(self) -> u64 {
         match self {
             Form::Plain => 32,
             Form::Wide => 48,
@@ -170,7 +172,7 @@ pub struct Event {
 }
 
 impl Event {
-    fn read(m: &GuestMem<'_>, at: u64, form: Form) -> Result<Event, Errno> {
+    pub(super) fn read(m: &GuestMem<'_>, at: u64, form: Form) -> Result<Event, Errno> {
         let b = m.read(at, form.size() as usize)?;
         let w = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         let h = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -190,7 +192,7 @@ impl Event {
         Ok(e)
     }
 
-    fn write(&self, m: &mut GuestMem<'_>, at: u64, form: Form) -> Result<(), Errno> {
+    pub(super) fn write(&self, m: &mut GuestMem<'_>, at: u64, form: Form) -> Result<(), Errno> {
         let mut b = [0u8; 72];
         b[0..8].copy_from_slice(&self.ident.to_le_bytes());
         b[8..10].copy_from_slice(&self.filter.to_le_bytes());
@@ -292,7 +294,7 @@ pub struct Kqueue {
 pub type Found = std::collections::HashMap<i32, u16>;
 
 /// `poll`'s events: to read, to write, an error, the other end gone.
-mod poll {
+pub(super) mod poll {
     pub const IN: u16 = 0x1;
     pub const OUT: u16 = 0x4;
     pub const ERR: u16 = 0x8;
@@ -737,6 +739,11 @@ impl Kqueue {
         }
     }
 
+    /// Whether it has no notes.
+    pub fn is_empty(&self) -> bool {
+        self.notes().is_empty()
+    }
+
     /// Whether a note has something to say.
     pub fn any_ready(&self) -> bool {
         let (mono, wall) = self.now();
@@ -902,7 +909,7 @@ const WAITING: u32 = 0x6b71_7765;
 /// pollfd`) from `FDS` on.
 const MARK: u64 = 16;
 const COUNT: u64 = 20;
-const FDS: u64 = 24;
+pub(super) const FDS: u64 = 24;
 
 /// Whether any queue has been made (by any process this host runs): a
 /// close looks for the queues that watch its descriptor only then.
@@ -919,7 +926,7 @@ impl Kernel {
     }
 
     /// Where this thread's page is, made at its first need.
-    fn darwin_kevent_slot(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
+    pub(super) fn darwin_kevent_slot(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
         if let Some(&at) = self.darwin_kevent_pages.get(&self.tid) {
             if self.mem.lock().vma_at(at).is_some() {
                 return Ok(at);
@@ -959,8 +966,17 @@ impl Kernel {
             Form::Wide => x[5],
             Form::Qos => x[7],
         };
-        if flags & (KEVENT_FLAG_WORKQ | KEVENT_FLAG_WORKLOOP) != 0 {
-            return Err(Errno::EOPNOTSUPP);
+        // The work queue's own queue ([`super::kqwl`]), whatever the
+        // descriptor; a workloop's is `kevent_id`'s.
+        if flags & (KEVENT_FLAG_WORKQ | KEVENT_FLAG_WORKQ_MANAGER) != 0 {
+            if form != Form::Qos {
+                return Err(Errno::EINVAL);
+            }
+            self.darwin_kevent_workq(m, x)?;
+            return Ok(None);
+        }
+        if flags & KEVENT_FLAG_WORKLOOP != 0 {
+            return Err(Errno::EINVAL);
         }
         let timeout = match form {
             Form::Plain => x[5],
@@ -993,35 +1009,7 @@ impl Kernel {
             None => {
                 for i in 0..nchanges as u64 {
                     let e = Event::read(m, changes + i * form.size(), form)?;
-                    // (A process to watch is opened first, while the kernel
-                    // is this call's to use: the note takes the descriptor
-                    // if it is a new one, and it is closed again if not.)
-                    let mut opened = None;
-                    if e.filter == filt::PROC && e.flags & ev::ADD != 0 {
-                        opened = Some(self.dispatch(m, nr::PIDFD_OPEN, [e.ident, 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::ESRCH)).map(|fd| fd as i32));
-                    }
-                    // (And a file to watch is watched first.)
-                    let watch = (e.filter == filt::VNODE && e.flags & ev::ADD != 0).then(|| self.darwin_vnode_watch(&kq, e.ident as i32));
-                    let fds = &self.fds;
-                    let mut taken = false;
-                    let r = kq.change(
-                        &e,
-                        &|fd| fds.get(fd),
-                        &mut |_| {
-                            let fd = opened.ok_or(Errno::ESRCH)??;
-                            taken = true;
-                            Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
-                        },
-                        &|_| watch.unwrap_or(Err(Errno::EBADF)),
-                        &|name| {
-                            self.darwin_ports.lock().unwrap_or_else(|e| e.into_inner()).watchable(self.pid, name)?;
-                            Ok(Arc::clone(&self.darwin_ports))
-                        },
-                        self.signals.process(),
-                    );
-                    if let (Some(Ok(fd)), false) = (opened, taken) {
-                        let _ = self.sys_close(fd);
-                    }
+                    let r = self.darwin_kq_apply(m, &kq, &e);
                     // A change that failed, or any that asks to be told
                     // how it went, is answered with an event of its own;
                     // with no room for it the call fails as the change did.
@@ -1100,16 +1088,52 @@ impl Kernel {
         Ok(Some(nr::PPOLL))
     }
 
+    /// One change `e` to `kq`'s notes, with what the change needs of this
+    /// process: a descriptor opened for a process to watch, a file's
+    /// watch, the task's names for a port.
+    pub(super) fn darwin_kq_apply(&mut self, m: &mut GuestMem<'_>, kq: &Arc<Kqueue>, e: &Event) -> Result<(), Errno> {
+        // (A process to watch is opened first, while the kernel is this
+        // call's to use: the note takes the descriptor if it is a new one,
+        // and it is closed again if not.)
+        let mut opened = None;
+        if e.filter == filt::PROC && e.flags & ev::ADD != 0 {
+            opened = Some(self.dispatch(m, nr::PIDFD_OPEN, [e.ident, 0, 0, 0, 0, 0]).unwrap_or(Err(Errno::ESRCH)).map(|fd| fd as i32));
+        }
+        // (And a file to watch is watched first.)
+        let watch = (e.filter == filt::VNODE && e.flags & ev::ADD != 0).then(|| self.darwin_vnode_watch(kq, e.ident as i32));
+        let fds = &self.fds;
+        let mut taken = false;
+        let r = kq.change(
+            e,
+            &|fd| fds.get(fd),
+            &mut |_| {
+                let fd = opened.ok_or(Errno::ESRCH)??;
+                taken = true;
+                Ok((fd, Arc::clone(&fds.get(fd)?.handle)))
+            },
+            &|_| watch.unwrap_or(Err(Errno::EBADF)),
+            &|name| {
+                self.darwin_ports.lock().unwrap_or_else(|e| e.into_inner()).watchable(self.pid, name)?;
+                Ok(Arc::clone(&self.darwin_ports))
+            },
+            self.signals.process(),
+        );
+        if let (Some(Ok(fd)), false) = (opened, taken) {
+            let _ = self.sys_close(fd);
+        }
+        r
+    }
+
     /// Finish the events `out` that are of Mach ports
     /// (`EVFILT_MACHPORT`), each as its note asked: told whose message
     /// waits, or the message received -- into the note's own buffer
     /// (`ext[0]`, of `ext[1]` bytes), or with none the next of `room`,
     /// what `kevent_qos` was given for the call's messages (where, and
     /// how much). How much of `room` is left, if there was any.
-    fn darwin_kevent_ports(&mut self, m: &mut GuestMem<'_>, out: &mut Vec<Event>, room: Option<(u64, u64)>) -> Option<u64> {
+    pub(super) fn darwin_kevent_ports(&mut self, m: &mut GuestMem<'_>, out: &mut Vec<Event>, room: Option<(u64, u64)>) -> Option<u64> {
         use super::port::{opt, Received, MACH_RCV_TOO_LARGE};
         let (mut at, mut left) = room.unwrap_or((0, 0));
-        let space = Arc::clone(&self.darwin_ports);
+        let space = self.darwin_space();
         let mut i = 0;
         while i < out.len() {
             let e = &mut out[i];
@@ -1131,7 +1155,7 @@ impl Kernel {
             let large = !own || options & opt::RCV_LARGE != 0;
             let got = {
                 let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
-                self.darwin_port_receive(m, &mut sp, e.ident as u32, to, size, large)
+                self.darwin_port_receive(m, &mut sp, e.ident as u32, to, size, large, options)
             };
             let e = &mut out[i];
             match got {
@@ -1153,6 +1177,7 @@ impl Kernel {
             }
             i += 1;
         }
+        super::port::flush();
         room.map(|_| left)
     }
 
@@ -1238,7 +1263,7 @@ impl Kernel {
     /// done with.
     pub(crate) fn darwin_again(&mut self, r: SysResult) -> bool {
         let again = match self.darwin_post {
-            Post::Kevent { .. } => r != Err(Errno::EINTR),
+            Post::Kevent { .. } | Post::LoopWait => r != Err(Errno::EINTR),
             Post::Workq | Post::Again => true,
             _ => false,
         };

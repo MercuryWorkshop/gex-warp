@@ -547,6 +547,7 @@ impl Kernel {
             d::KEVENT => return self.darwin_kevent(m, kqueue::Form::Plain, x, a),
             d::KEVENT64 => return self.darwin_kevent(m, kqueue::Form::Wide, x, a),
             d::KEVENT_QOS => return self.darwin_kevent(m, kqueue::Form::Qos, x, a),
+            d::KEVENT_ID => return self.darwin_kevent_id(m, x, a),
             d::PSYNCH_MUTEXWAIT
             | d::PSYNCH_MUTEXDROP
             | d::PSYNCH_CVBROAD
