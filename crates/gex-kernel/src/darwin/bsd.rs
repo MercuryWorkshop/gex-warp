@@ -600,6 +600,26 @@ impl Kernel {
             d::KDEBUG_TRACE | d::KDEBUG_TRACE64 | d::KDEBUG_TRACE_STRING | d::KDEBUG_TYPEFILTER => Ok(0),
             // PT_DENY_ATTACH: there is no debugger to deny.
             d::PTRACE if x[0] == 31 => Ok(0),
+            // The session's login name, set: by root alone, and kept by
+            // nothing (getlogin answers by who the process is).
+            d::SETLOGIN => if self.creds.uid() == 0 { Ok(0) } else { Err(Errno::EPERM) },
+            // (auditinfo_addr*, length): who the process is to the audit
+            // system: its audit user (none set), no events masked, no
+            // terminal, its session, no flags.
+            d::GETAUDIT_ADDR => {
+                if x[1] < 48 {
+                    return Err(Errno::EOVERFLOW);
+                }
+                let mut info = [0u8; 48];
+                info[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                let sid = self.procs.sid(self.pid, self.pid).unwrap_or(0);
+                info[36..40].copy_from_slice(&(sid as u32).to_le_bytes());
+                m.write(x[0], &info)?;
+                Ok(0)
+            }
+            // (start*): where the shared region is mapped, which is nowhere:
+            // dyld maps each library itself.
+            d::SHARED_REGION_CHECK_NP => Err(Errno::EINVAL),
             // The name the session was logged in under.
             d::GETLOGIN => {
                 let mut name = if self.creds.ruid() == 0 { "root" } else { "user" }.as_bytes().to_vec();
