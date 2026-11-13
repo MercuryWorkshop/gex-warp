@@ -202,7 +202,11 @@ the image low. What works is what a program can do with the kernel alone:
 - work queues: the threads XNU makes for a process that asks for work to
   be done (`workq_kernreturn`), on stacks of the kernel's laying out,
   given more when they come back and let go when there is none, which is
-  where libdispatch's threads come from;
+  where libdispatch's threads come from; and a kqueue's events told to
+  them: the work queue's own kqueue (`KEVENT_FLAG_WORKQ`) and workloops
+  (`kevent_id`, `EVFILT_WORKLOOP`: thread requests, synchronous waiters,
+  the owner a queue's state names), as XNU 4903 has them, which Apple's
+  libdispatch of 10.14 will not start without (`crates/gex-kernel/src/darwin/kqwl.rs`);
 - `kqueue` and `kevent` (and `kevent64`, `kevent_qos`): a descriptor to
   read or write, timers, events a program posts to itself, a process
   ending, a signal raised, a file or a directory changing (heard as the
@@ -257,9 +261,15 @@ the image low. What works is what a program can do with the kernel alone:
   the end of a guest's memory, so it is at `0xFFC000` (arm64's read-only
   half at `0xFF4000`), and a userland built for gex is built to look
   there;
-- Mach ports within a task: names and the rights under them, `mach_msg2`
-  between threads (a reply port, rights in the body, port sets, a receive
-  that waits), timers the kernel sends a message for (`mk_timer_create`,
+- Mach ports, which are the system's, not a task's: names and the
+  rights under them, `mach_msg2` and `mach_msg_trap` between threads and
+  between tasks (a reply port, rights in the body and in arrays out of
+  line, memory out of line, port sets, a receive that waits, the trailer
+  asked for: the sender's audit token, the port's context), special
+  ports (`task_set_special_port`, `task_get_special_port`: the bootstrap
+  port, passed to a fork's child and to the program run next), send
+  rights counted across tasks so that no-senders is told whichever task
+  gave up the last, a task's rights given up when it ends, timers the kernel sends a message for (`mk_timer_create`,
   what a run loop waits on), semaphores (and so `__semwait_signal`, which is how the
   libc sleeps), and the few MIG routines of the task's, the host's and the
   clock's ports that those and libpthread need (`host_info` among them),
@@ -283,6 +293,22 @@ the image low. What works is what a program can do with the kernel alone:
   want again: taken back when the task asks, and each time it says how
   much it holds.
 
+A Mac's own system, its daemons among them, runs under gexlaunchd, the
+bootstrap server in `guest/launchd` (`guest/launchd/build.sh OUT`): it
+reads the root's LaunchDaemons and LaunchAgents, starts a job when one of
+its Mach services is first looked up, and hands it its receive rights
+when it checks in. It is run as root (`--uid 0`: libxpc trusts no other
+bootstrap server but process 1) and runs its program as a user (`-u`).
+With macOS 10.14's extracted root, `defaults` writes and reads a user's
+preferences through Mojave's own cfprefsd, and `notifyutil` posts through
+its notifyd (`test/darwin/mojave.test.js`, with `GEX_TEST_MOJAVE_ROOT`):
+
+```console
+$ guest/launchd/build.sh /tmp/gl x86_64
+$ target/x86/release/gexc run --uid 0 --sysroot ROOT --bind /tmp/gl=/gex \
+    --bind HOME=/Users/me ... /tmp/gl/gexlaunchd.x86_64 -u 501 -- /usr/bin/defaults read
+```
+
 What does not, yet:
 
 - **Apple's own dyld and libSystem.** A dynamically linked program is
@@ -292,15 +318,17 @@ What does not, yet:
   Apple's read the commpage, which XNU maps at `0xFFFFFC000`, past the end
   of any WebAssembly memory, and a Mac's own libraries exist only in the
   dyld shared cache, which is mapped at 6 GiB.
-- **Mach between tasks.** A port's queue lives in its own process, so no
-  right crosses a `fork` or reaches another program: no bootstrap port, no
-  launchd, no XPC. Within a task, messages carry ports and memory out of
-  line but not arrays of ports, and what the kernel's own ports would
-  answer with either (`task_threads`, `host_processor_info`) is
-  `MIG_BAD_ID`, as much else of theirs is. The older `mach_msg_trap` is written
-  and untested: the tests send as libsyscall does, with `mach_msg2`.
-- A kqueue's events delivered to a work queue's threads, and workloops;
-  a file made longer by `ftruncate`
+- **Mach between tasks on the page.** Natively a port is the system's
+  and its rights go anywhere a message does; on the page each process
+  has a kernel of its own, and a right does not leave its task. What the
+  kernel's own ports would answer with ports (`task_threads`,
+  `host_processor_info`) is `MIG_BAD_ID`, as much else of theirs is, and
+  IOKit's master port has nothing in it.
+- **launchd.** Apple's will be nothing but process 1; gexlaunchd
+  (`guest/launchd`) stands in for its bootstrap server, and not for the
+  rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
+  launchctl).
+- A file made longer by `ftruncate`
   told apart from one written to, and one renamed over from one removed
   (`EVFILT_VNODE` says `NOTE_WRITE` of the first and `NOTE_LINK` too of
   the second);

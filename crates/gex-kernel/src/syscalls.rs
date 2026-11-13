@@ -748,6 +748,11 @@ pub struct Kernel {
     pub darwin_ports: Arc<std::sync::Mutex<darwin::port::Space>>,
     /// The answer of a Mach trap that was ready as the call was read.
     pub darwin_ready: Option<u64>,
+    /// The place a Mach receive took on its word's queue before it looked
+    /// for a message ([`darwin::port`]): the wait that follows starts
+    /// from it, so that a message another task sends between the look and
+    /// the wait, which wakes the queue without changing the word, wakes it.
+    pub darwin_parked: Option<(u64, crate::futex::Parked)>,
     /// The answer of a psynch call that did not wait ([`darwin::psynch`]),
     /// or of a `posix_spawn` that failed.
     pub darwin_answer: Option<SysResult>,
@@ -10881,6 +10886,7 @@ impl Kernel {
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
             darwin_ports: Default::default(),
             darwin_ready: None,
+            darwin_parked: None,
             darwin_answer: None,
             darwin_spawn_at: None,
             clone_ns: Default::default(),
@@ -11063,7 +11069,9 @@ impl Kernel {
         self.fds.close_on_exec();
         self.darwin_commpage = false;
         self.darwin_threads = Default::default();
-        self.darwin_ports = Default::default();
+        // (The task's special ports are the next program's too.)
+        let next = self.darwin_ports.lock().unwrap_or_else(|e| e.into_inner()).inherit();
+        self.darwin_ports = Arc::new(std::sync::Mutex::new(next));
         self.darwin_psynch = Default::default();
         self.darwin_kevents.clear();
         self.darwin_kevent_pages.clear();
@@ -11421,8 +11429,11 @@ impl Kernel {
             darwin_post: darwin::Post::None,
             darwin_x: [0; 8],
             darwin_port_names: Arc::new(std::sync::atomic::AtomicU32::new(darwin::FIRST_PORT_NAME)),
-            darwin_ports: Default::default(),
+            // (A fork's child has its parent's special ports, the
+            // bootstrap port among them, and no other right of its.)
+            darwin_ports: Arc::new(std::sync::Mutex::new(self.darwin_ports.lock().unwrap_or_else(|e| e.into_inner()).inherit())),
             darwin_ready: None,
+            darwin_parked: None,
             darwin_answer: None,
             darwin_spawn_at: None,
             clone_ns: Default::default(),
@@ -12200,7 +12211,15 @@ impl Kernel {
             }
             nr::FUTEX => {
                 let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
-                futex_block(&self.futex_cx(&mapped), m, a)
+                let mut op = futex_block(&self.futex_cx(&mapped), m, a);
+                // (A Mach receive's wait, from the place it took before it
+                // looked.)
+                if let (Some(BlockOp::FutexWait { parked, uaddr, .. }), Some((at, early))) = (&mut op, self.darwin_parked.take()) {
+                    if gex_abi::canon(*uaddr) == gex_abi::canon(at) {
+                        *parked = Some(early);
+                    }
+                }
+                op
             }
             nr::WAIT4 => Some(wait_child(&self.procs, self.pid, a)),
             // Its argument errors are the dispatch's (below).

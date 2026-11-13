@@ -177,6 +177,11 @@ impl Kernel {
             }
             d::RMDIR => set(nr::UNLINKAT, &[CWD, x[0], K_REMOVEDIR]),
             d::MKDIR => set(nr::MKDIRAT, &[CWD, x[0], x[1]]),
+            // (path, uid, gid, mode, access list): no file has an access list
+            // here (as `chmod_extended` says), and the owner is the
+            // caller's, as XNU's is for these: a directory or a FIFO by mode.
+            d::MKDIR_EXTENDED => set(nr::MKDIRAT, &[CWD, x[0], x[3] & 0o7777]),
+            d::MKFIFO_EXTENDED => set(nr::MKNODAT, &[CWD, x[0], x[3] & 0o7777 | 0o010000]),
             // A FIFO, by its own call or as the kind of node it is.
             d::MKFIFO => set(nr::MKNODAT, &[CWD, x[0], x[1] & 0o7777 | 0o010000]),
             d::MKFIFOAT => set(nr::MKNODAT, &[dirfd(x[0]), x[1], x[2] & 0o7777 | 0o010000]),
@@ -547,6 +552,7 @@ impl Kernel {
             d::KEVENT => return self.darwin_kevent(m, kqueue::Form::Plain, x, a),
             d::KEVENT64 => return self.darwin_kevent(m, kqueue::Form::Wide, x, a),
             d::KEVENT_QOS => return self.darwin_kevent(m, kqueue::Form::Qos, x, a),
+            d::KEVENT_ID => return self.darwin_kevent_id(m, x, a),
             d::PSYNCH_MUTEXWAIT
             | d::PSYNCH_MUTEXDROP
             | d::PSYNCH_CVBROAD
@@ -778,6 +784,26 @@ impl Kernel {
                 1 if x[2] >= 4 => m.write_u32(x[1], 0).map(|_| 0),
                 _ => Err(Errno::EINVAL),
             },
+            // A MAC policy's own calls: the sandbox's check (call 2) of
+            // whether the process may do something answers that it may, as
+            // for a process with no sandbox, which every process here is.
+            // (CoreFoundation asks whether it may look up cfprefsd, and
+            // keeps the preferences itself, slowly and alone, if not.)
+            // Any other policy or call is not there.
+            // (Its arguments begin with where the answer goes: nothing
+            // denied.)
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && x[1] == 2 => {
+                let out = m.read_u64(x[2])?;
+                m.write_u64(out, 0).map(|_| 0)
+            }
+            // And rootless_convert_to_datavault (0x104): a directory made a
+            // data vault, which nothing here protects, is taken as made one
+            // (dirhelper makes /var/folders' so, and gives up on it if not).
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && x[1] == 0x104 => Ok(0),
+            // And a profile to enter (call 0, sandbox_init and its kin):
+            // entered, and nothing denied, as above. (WindowServer will not
+            // go on outside its own.)
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && x[1] == 0 => Ok(0),
             d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
             d::GETATTRLISTBULK => self.darwin_getattrlistbulk(m, x[0] as i32, x[1], x[2], x[3], x[4]),

@@ -28,9 +28,9 @@ const PTHREAD_START_SUSPENDED: u64 = 0x0400_0000;
 /// What `bsdthread_register` answers: the features libpthread may use.
 /// Fine-grained priorities, `bsdthread_ctl` and its set-self, the
 /// maintenance and default QoS classes, and a work queue that calls
-/// libdispatch's routine ([`super::workq`]); not one that delivers a
-/// kqueue's events (0x40) or runs workloops (0x80).
-const PTHREAD_FEATURES: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x4000_0000;
+/// libdispatch's routine ([`super::workq`]), delivers a kqueue's events to
+/// its threads (0x40) and runs workloops (0x80, [`super::kqwl`]).
+const PTHREAD_FEATURES: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40 | 0x80 | 0x4000_0000;
 
 /// `ulock`'s operations and flags.
 const UL_COMPARE_AND_WAIT: u32 = 1;
@@ -109,7 +109,8 @@ impl Kernel {
     pub(in crate::syscalls) fn darwin_outcome(&mut self, m: &mut GuestMem<'_>, n: u64) -> Option<SyscallOutcome> {
         let x = self.darwin_x;
         match n.checked_sub(NATIVE)? {
-            d::WORKQ_KERNRETURN => self.darwin_workq_outcome(m),
+            // (And a `kevent` that asked for a thread of the work queue.)
+            d::WORKQ_KERNRETURN | d::KEVENT => self.darwin_workq_outcome(m),
             d::BSDTHREAD_CREATE => Some(match self.darwin_bsdthread_create(m, x) {
                 Ok(req) => {
                     // The caller's answer is the `pthread_t` it passed.
