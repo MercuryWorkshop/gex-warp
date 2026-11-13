@@ -20,6 +20,7 @@
 //! what was asked and the answer.
 
 pub mod display;
+pub mod gpuw;
 pub mod hid;
 pub mod plist;
 pub mod registry;
@@ -60,6 +61,8 @@ pub struct Connect {
 pub enum Client {
     Hid(hid::Hid),
     Fb(display::Fb),
+    /// The GPU wrangler's: the GPUs, and the framebuffer of each.
+    Gpu(gpuw::Gpu),
     /// A client with no methods of its own (a family's that nothing here
     /// drives yet): every method is unsupported.
     Plain,
@@ -501,6 +504,7 @@ impl Kernel {
                             Client::Hid(_) => "IOHIDUserClient",
                             Client::Fb(ref fb) if fb.kind == 1 => "IOFramebufferSharedUserClient",
                             Client::Fb(_) => "IOFramebufferUserClient",
+                            Client::Gpu(_) => "AppleGPUWranglerUserClient",
                             Client::Plain => "IOUserClient",
                         },
                         Obj::Iter(..) => "IOUserIterator",
@@ -804,6 +808,10 @@ impl Kernel {
                 let client = match kit.reg.entries[e].opens {
                     Opens::HidSystem if matches!(kind, 0 | 1 | 3) => Client::Hid(hid::Hid::new(kind)),
                     Opens::Framebuffer if matches!(kind, 0 | 1) => Client::Fb(display::Fb::new(kind)),
+                    Opens::GpuWrangler => {
+                        let id = |class: &str| kit.reg.entries.iter().find(|x| x.class == class).map_or(0, |x| x.id);
+                        Client::Gpu(gpuw::Gpu { device: id("IOPCIDevice"), framebuffer: id("IONDRVFramebuffer") })
+                    }
                     Opens::HidSystem | Opens::Framebuffer | Opens::Nothing => {
                         *said = format!("type {kind}: {class} has no such user client");
                         return no_port(id, Some(&UNSUPPORTED.to_le_bytes()));
@@ -887,17 +895,31 @@ impl Kernel {
                 let ool_in_size = rd.u64();
                 let inband_room = rd.u32() as usize;
                 let scalar_room = rd.u32() as usize;
+                // Room for a structure out of line, at an address of the
+                // task's: what a structure larger than a message holds
+                // (IOConnectCallMethod's past 4096 bytes) is written there.
+                let (ool_out, ool_out_room) = if id == 2865 { (rd.u64(), rd.u64()) } else { (0, 0) };
                 let inband = if ool_in != 0 && ool_in_size != 0 { m.read(ool_in, ool_in_size as usize).map(|b| b.to_vec()).unwrap_or_default() } else { inband };
                 *said = format!("selector {selector} scalars {scalars:x?} struct {} bytes", inband.len());
                 let Some(Object { obj: Obj::Connect(c), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) else { return fail(BAD_ARGUMENT) };
                 let result = match &mut c.client {
                     Client::Hid(hc) => hc.method(selector, &scalars, &inband),
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
+                    Client::Gpu(g) => gpuw::method(selector, &inband, g),
                     Client::Plain => Err(UNSUPPORTED),
                 };
                 match result {
                     Ok((mut so, mut sb)) => {
                         so.truncate(scalar_room);
+                        let mut ool_wrote = 0u64;
+                        if sb.len() > inband_room && ool_out != 0 && ool_out_room != 0 {
+                            let n = sb.len().min(ool_out_room as usize);
+                            if m.write(ool_out, &sb[..n]).is_err() {
+                                return fail(BAD_ARGUMENT);
+                            }
+                            ool_wrote = n as u64;
+                            sb.clear();
+                        }
                         sb.truncate(inband_room);
                         let mut b = inline(&sb);
                         b.extend_from_slice(&(so.len() as u32).to_le_bytes());
@@ -912,7 +934,7 @@ impl Kernel {
                             out.extend_from_slice(&0u32.to_le_bytes());
                             Msg::kernel(id + 100, out, Vec::new(), vec![(4, Vec::new())])
                         } else {
-                            b.extend_from_slice(&0u64.to_le_bytes());
+                            b.extend_from_slice(&ool_wrote.to_le_bytes());
                             simple(id, SUCCESS, &b)
                         }
                     }
