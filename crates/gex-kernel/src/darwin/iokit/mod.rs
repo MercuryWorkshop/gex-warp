@@ -146,7 +146,7 @@ impl IoKit {
 /// Kick the HID system's consumer: the notification port of each server
 /// connection to it, told there is input (a message of no body, as
 /// `IOHIDSystem::kickEventConsumer` sends). The task takes the events when
-/// it next calls the HID system ([`hid::Hid::drain`]).
+/// it next calls IOKit or receives ([`Kernel::darwin_hid_drain`]).
 pub fn kick_hid() {
     let io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(kit) = io.as_ref() else { return };
@@ -405,7 +405,51 @@ fn brief(v: &Value) -> String {
 impl Kernel {
     /// A request to IOKit's master port or to one of its objects, answered
     /// as XNU's `iokit` server answers.
+    /// What has been posted to the HID system ([`hid::post`]) and not yet
+    /// taken, into the event queue of this task's server connection to it
+    /// if it has one (WindowServer's), as `IOHIDSystem` posts each event:
+    /// done when the task next calls IOKit or receives a message (the kick
+    /// [`kick_hid`] sent it among them), since the kernel writes a task's
+    /// memory only while it runs for that task. Only the bytes the events
+    /// change are written: the task moves the queue's head meanwhile.
+    pub(crate) fn darwin_hid_drain(&mut self, m: &mut GuestMem<'_>) {
+        if !hid::pending() {
+            return;
+        }
+        let now = self.darwin_abstime();
+        let mut io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(kit) = io.as_mut() else { return };
+        for o in kit.objects.values_mut() {
+            let Obj::Connect(c) = &mut o.obj else { continue };
+            if c.pid != self.pid {
+                continue;
+            }
+            let Client::Hid(h) = &mut c.client else { continue };
+            if h.kind != 0 {
+                continue;
+            }
+            let Some(&(_, at, size)) = c.maps.iter().find(|(t, _, _)| *t == 0) else { continue };
+            let Ok(before) = m.read(at, size as usize).map(|b| b.to_vec()) else { continue };
+            let mut shm = before.clone();
+            if !h.drain(&mut shm, &hid::take(), now) {
+                return;
+            }
+            let mut i = 0;
+            while i < shm.len() {
+                if shm[i] == before[i] {
+                    i += 1;
+                    continue;
+                }
+                let j = (i..shm.len()).find(|&j| shm[j] == before[j]).unwrap_or(shm.len());
+                let _ = m.write(at + i as u64, &shm[i..j]);
+                i = j;
+            }
+            return;
+        }
+    }
+
     pub(super) fn darwin_iokit(&mut self, m: &mut GuestMem<'_>, kind: Kind, req: &Msg) -> Msg {
+        self.darwin_hid_drain(m);
         let h = match kind {
             Kind::IoObject(h) => Some(h),
             _ => None,

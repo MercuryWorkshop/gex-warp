@@ -1832,6 +1832,9 @@ impl Kernel {
     /// its rights into the caller's space. One too large for the room
     /// stays queued if `large`, and is gone otherwise.
     pub(super) fn darwin_port_receive(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, rcv_name: u32, rcv_at: u64, rcv_size: u64, large: bool, options: u64) -> Received {
+        // (Input the HID system has for this task is in its memory before
+        // it looks: the kick it may be about to take says there is.)
+        self.darwin_hid_drain(m);
         let tsize = trailer_size(options);
         // What is asked of: a receive right, or a set of them.
         let Some(from) = sp.receives(rcv_name) else { return Received::NoName };
