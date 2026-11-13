@@ -71,6 +71,9 @@ enum {
     ROUTINE_VPROC_SWAP = 301,
     ROUTINE_LOOKUP = 207,
     ROUTINE_CHECKIN = 805,
+    // bootstrap_check_in itself, of a name (the other is an XPC
+    // listener's).
+    ROUTINE_BOOTSTRAP_CHECKIN = 206,
     ROUTINE_LAUNCH_MSG = 100,
 };
 
@@ -184,6 +187,12 @@ static void add_dir(const char *dir) {
     closedir(d);
 }
 
+static struct service *find_by_send(mach_port_t name) {
+    for (int i = 0; i < nservices; i++)
+        if (services[i].send == name) return &services[i];
+    return NULL;
+}
+
 static struct service *find(const char *name) {
     for (int i = 0; i < nservices; i++)
         if (!strcmp(services[i].name, name)) return &services[i];
@@ -192,6 +201,20 @@ static struct service *find(const char *name) {
 
 // The service's port, made if it has none: the receive right kept until
 // its job checks in, and a send right for lookups.
+// Where a receive right a job gives up comes back to (below).
+static mach_port_t returned;
+
+// Have the receive right `recv` come back here when whoever holds it gives
+// it up (MACH_NOTIFY_PORT_DESTROYED), as launchd has its services' rights
+// come back: the port, and what is queued on it, outlive the job's hold on
+// it. (hidd checks its service in and lets it go before it checks it in
+// for good; a client's message sent meanwhile waits on the port.)
+static void ask_back(mach_port_t recv) {
+    mach_port_t previous = MACH_PORT_NULL;
+    mach_port_request_notification(mach_task_self(), recv, MACH_NOTIFY_PORT_DESTROYED, 0, returned, MACH_MSG_TYPE_MAKE_SEND_ONCE, &previous);
+    if (previous != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), previous);
+}
+
 static void make_port(struct service *s) {
     if (s->send != MACH_PORT_NULL) return;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &s->recv);
@@ -200,6 +223,39 @@ static void make_port(struct service *s) {
     // (A name for the send right of its own, so that the receive right can
     // go and the send right stay.)
     mach_port_mod_refs(mach_task_self(), s->send, MACH_PORT_RIGHT_SEND, 1);
+    ask_back(s->recv);
+}
+
+static struct service *find_by_send(mach_port_t name);
+
+// The receive rights that come back: each its service's again, to be
+// checked in for anew (it arrives under the name of the send right kept
+// for lookups). One no service has any more goes.
+static void *take_back(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct {
+            mach_msg_header_t h;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t port;
+            NDR_record_t ndr;
+            mach_msg_trailer_t trailer;
+        } m;
+        if (mach_msg(&m.h, MACH_RCV_MSG, 0, sizeof m, returned, 0, MACH_PORT_NULL)) continue;
+        if (m.h.msgh_id != MACH_NOTIFY_PORT_DESTROYED || !(m.h.msgh_bits & MACH_MSGH_BITS_COMPLEX)) continue;
+        mach_port_t name = m.port.name;
+        pthread_mutex_lock(&lock);
+        struct service *s = find_by_send(name);
+        if (s && s->recv == MACH_PORT_NULL) {
+            s->recv = name;
+            ask_back(name);
+            say("%s: its receive right is back", s->name);
+        } else {
+            mach_port_mod_refs(mach_task_self(), name, MACH_PORT_RIGHT_RECEIVE, -1);
+        }
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
 }
 
 // Start a process with this server as its bootstrap port.
@@ -246,8 +302,9 @@ static void start_job(struct job *j) {
     say("started %s, pid %d", j->label, j->pid);
 }
 
+// (A service checked in for without being declared has no job: -1.)
 static struct job *job_of(struct service *s) {
-    return &jobs[(intptr_t)s->job];
+    return (intptr_t)s->job < 0 ? NULL : &jobs[(intptr_t)s->job];
 }
 
 static void reply_error(xpc_object_t reply, int64_t error) {
@@ -359,14 +416,22 @@ static void handle(xpc_object_t request) {
             break;
         }
         make_port(s);
-        if (s->recv != MACH_PORT_NULL) want_job(job_of(s));
+        if (s->recv != MACH_PORT_NULL && job_of(s)) want_job(job_of(s));
         xpc_dictionary_set_mach_send(reply, "port", s->send);
         say("lookup %s: found", name);
         break;
     case ROUTINE_CHECKIN:
+    case ROUTINE_BOOTSTRAP_CHECKIN:
+        // A name no job declares is made a service of the process that
+        // checks in for it, as launchd makes one (CoreDisplay's
+        // com.apple.CoreDisplay.master in WindowServer, for one), and is
+        // its process's to look up from then on.
         if (!s) {
-            reply_error(reply, ESRCH);
-            break;
+            struct job *mine = job_by_pid(from);
+            services = realloc(services, (nservices + 1) * sizeof *services);
+            services[nservices] = (struct service){strdup(name), (struct job *)(intptr_t)(mine ? mine - jobs : -1), MACH_PORT_NULL, MACH_PORT_NULL};
+            s = &services[nservices++];
+            say("%s: a service of %d's own", name, from);
         }
         make_port(s);
         if (s->recv == MACH_PORT_NULL) {
@@ -376,7 +441,7 @@ static void handle(xpc_object_t request) {
         // The receive right goes with the reply.
         xpc_dictionary_set_mach_recv(reply, "port", s->recv);
         s->recv = MACH_PORT_NULL;
-        if (job_of(s)->pid <= 0) job_of(s)->pid = from;
+        if (job_of(s) && job_of(s)->pid <= 0) job_of(s)->pid = from;
         say("check-in %s by %d", name, from);
         break;
     default:
@@ -453,8 +518,22 @@ int main(int argc, char **argv) {
     task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bootstrap);
     if (pipe(wake)) return 1;
     pthread_t t;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &returned);
+    pthread_t back;
+    pthread_create(&back, NULL, take_back, NULL);
     pthread_create(&t, NULL, serve, NULL);
     pid_t first = start(argv + i, NULL, 1);
+    // A program that is a job's (WindowServer, run as the first program)
+    // is that job: its services are its own to check in for, and are not
+    // started again when looked up.
+    pthread_mutex_lock(&lock);
+    for (int k = 0; k < njobs; k++)
+        if (!strcmp(jobs[k].argv[0], argv[i]) && jobs[k].pid <= 0) {
+            jobs[k].pid = first;
+            say("%s is job %s", argv[i], jobs[k].label);
+            break;
+        }
+    pthread_mutex_unlock(&lock);
     int status = 0;
     for (;;) {
         // Jobs to start, and processes that have ended.
@@ -480,6 +559,6 @@ int main(int argc, char **argv) {
     }
 done:
     for (int k = 0; k < njobs; k++)
-        if (jobs[k].pid > 0) kill(jobs[k].pid, SIGTERM);
+        if (jobs[k].pid > 0 && jobs[k].pid != first) kill(jobs[k].pid, SIGTERM);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
