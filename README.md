@@ -281,6 +281,22 @@ the image low. What works is what a program can do with the kernel alone:
   and the kernel's notifications (`mach_port_request_notification`): that
   a port has no senders left, that the port a name was a right to has
   died or the name has gone, that a send-once right was never used;
+  and a receive right's guard (`mach_port_guard`, `MPO_CONTEXT_AS_GUARD`),
+  which is its context, as libxpc finds an async reply's handler by;
+- named memory (`mach_make_memory_entry_64`, and `mach_make_memory_entry`):
+  a port that names memory made for it (`MAP_MEM_NAMED_CREATE`), a range
+  of another entry's, a copy (`MAP_MEM_VM_COPY`), or memory the task has
+  already, which another task maps (`mach_vm_map` of the port) and sees
+  the same pages of: how hidd hands WindowServer its event queue, and how
+  logd's clients hand it their firehose buffers. An entry's memory is the
+  kernel's own shared memory, a `memfd` mapped shared as `shm_open`'s
+  objects are, so natively the tasks that map it have one set of host
+  pages (`MapIo::join_shared_file`), placed on the host's 16 KiB pages
+  where the object has them; memory a task already has is made a shared
+  mapping of a new object where it is, its bytes and protections kept,
+  when it is named (`crates/gex-kernel/src/darwin/mement.rs`). On the
+  page an entry stays in its task, as every port does there. And
+  `mach_vm_read`, a copy of the task's own memory, out of line;
 - restartable ranges (`task_restartable_ranges_register`, and
   `_synchronize`): code a task says a thread may be taken out of, which is
   how the Objective-C runtime knows no thread still reads a method cache it
@@ -307,8 +323,9 @@ checks in for one, a program run as the first one is its own job's if one
 runs it (as WindowServer is), and a
 receive right a job gives up comes back to gexlaunchd (as launchd has its
 services' rights come back, by `MACH_NOTIFY_PORT_DESTROYED`) with what is
-queued on it. Mojave's WindowServer runs so, as far as the HID system
-and hidd, which would share its event queue's memory with it (below). A
+queued on it. Mojave's WindowServer runs so: through the HID system,
+hidd (which hands it its event queue), launchservicesd and CoreDisplay's
+start (the GPU wrangler, below), as far as IOSurface (below). A
 user's defaults, for one:
 
 ```console
@@ -340,18 +357,22 @@ What does not, yet:
   system's user clients map its shared memory (`EvGlobals`, its event
   queue) and the framebuffer's map its pixels and a shared cursor into the
   task that opens them, where the kernel keeps their addresses for a host to
-  read (`iokit::framebuffer`) and to post input into (`iokit::hid::post`).
-  No driver comes or goes (a matching notification is told what is there
-  and nothing more), there is no accelerator, and nothing yet draws.
-- **Memory made shareable after the fact.** A memory entry of memory a
-  task already has (`mach_make_memory_entry_64`), to be mapped by another:
-  how logd's firehose and hidd's event queues reach their clients.
+  read (`iokit::framebuffer`) and to post input into (`iokit::hid::post`,
+  written into WindowServer's queue when it next calls IOKit or receives
+  the kick that says there is input). The GPU wrangler
+  (`AppleGPUWrangler`) tells CoreDisplay of one GPU, the display's PCI
+  device, driving the framebuffer. No driver comes or goes (a matching
+  notification is told what is there and nothing more), there is no
+  accelerator and no IOSurface (`IOSurfaceRoot`), which is where
+  WindowServer waits now, and nothing yet draws.
 - **launchd.** Apple's will be nothing but process 1; gexlaunchd
   (`guest/launchd`) stands in for its bootstrap server, and not for the
   rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
-  launchctl). It leaves out logd and coreservicesd, whose clients would
-  map memory of theirs that gex cannot share (and do without them),
-  opendirectoryd, and fseventsd, which writes into the root.
+  launchctl). It leaves out logd, which runs now but keeps its store in
+  the root (`-i com.apple.logd` offers it, with `/private/var/db/diagnostics`
+  and `uuidtext` bound elsewhere); coreservicesd, which refuses its
+  clients' first request (and they do without it); opendirectoryd; and
+  fseventsd, which writes into the root.
 - A file made longer by `ftruncate`
   told apart from one written to, and one renamed over from one removed
   (`EVFILT_VNODE` says `NOTE_WRITE` of the first and `NOTE_LINK` too of
