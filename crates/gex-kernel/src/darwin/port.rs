@@ -1943,6 +1943,9 @@ impl Kernel {
             put32(&mut out, 20, msg.id);
             // The trailer: format 0, as long as was asked.
             out[size as usize..].copy_from_slice(&trailer(options, &msg.sender, context));
+            if std::env::var_os("GEX_MACH_TRACE").is_some() {
+                eprintln!("[gex:{}.{}] mach: received {} on {name:#x}", self.pid, self.tid, msg.id);
+            }
             return match m.write(rcv_at, &out) {
                 Ok(()) => Received::Got(size + tsize),
                 Err(_) => Received::BadBuffer,
@@ -1956,6 +1959,9 @@ impl Kernel {
     /// destination is the kernel's, for the routine it asks for.
     fn darwin_send(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, c: &MsgCall) -> u64 {
         let r = self.darwin_send_of(m, sp, c);
+        if r != MACH_MSG_SUCCESS && std::env::var_os("GEX_MACH_TRACE").is_some() {
+            eprintln!("[gex:{}.{}] mach: send {} to {:#x} (reply {:#x}, bits {:#x}) failed: {r:#x}", self.pid, self.tid, c.id, c.remote, c.local, c.bits);
+        }
         self.darwin_told(m, sp);
         r
     }
@@ -2088,6 +2094,10 @@ impl Kernel {
         }
         let sender = [self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1];
         let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory, port_arrays, sender };
+        // `GEX_MACH_TRACE`: each message sent, by its number, to what.
+        if std::env::var_os("GEX_MACH_TRACE").is_some() {
+            eprintln!("[gex:{}.{}] mach: send {} to {:?} ({} bytes, {} rights, {} out of line)", self.pid, self.tid, msg.id, dest.kind, msg.body.len(), msg.ports.len(), msg.memory.len());
+        }
         match dest.kind {
             Kind::User => {
                 {
