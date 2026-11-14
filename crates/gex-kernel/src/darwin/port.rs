@@ -157,6 +157,9 @@ pub enum Kind {
     /// A voucher: what a message carries of who it is sent for. It is a
     /// name and nothing more here.
     Voucher,
+    /// A named memory entry (`mach_make_memory_entry_64`), by its handle
+    /// in [`super::mement`]'s table: memory to be mapped by whoever has it.
+    MemEntry(u32),
 }
 
 /// What `mach_port_get_attributes` says of the port a name is a right to,
@@ -246,6 +249,9 @@ struct State {
     /// What its receiver keeps with it (`mach_port_set_context`, or a
     /// guard it was made with), which a trailer that asks says.
     context: u64,
+    /// Whether it is guarded (`mach_port_guard`, `MPO_CONTEXT_AS_GUARD`):
+    /// its context is then the guard.
+    guarded: bool,
     /// Where the receive right goes when its holder gives it up
     /// ([`notice::PORT_DESTROYED`]), if that was asked: the port lives on,
     /// its queue with it.
@@ -258,6 +264,14 @@ struct State {
 pub struct Port {
     pub kind: Kind,
     state: Mutex<State>,
+}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        if let Kind::MemEntry(h) = self.kind {
+            super::mement::forget(h);
+        }
+    }
 }
 
 impl Port {
@@ -841,6 +855,11 @@ impl Space {
                 if e.is_set() {
                     return Err(KERN_INVALID_RIGHT);
                 }
+                // Nothing asked and nothing to cancel: done, whatever the
+                // name is now (as XNU answers before it looks).
+                if to.is_none() && e.dead_request.is_none() {
+                    return Ok(None);
+                }
                 // (A name dead already has nothing left to die.)
                 if !e.recv && e.send == 0 && !e.once {
                     return Err(KERN_INVALID_ARGUMENT);
@@ -1283,7 +1302,8 @@ impl Kernel {
                 }
                 // (MPO_CONTEXT_AS_GUARD: the guard is its context.)
                 if flags & 0x1 != 0 {
-                    sp.names[&made].port.state().context = x[2];
+                    let mut st = sp.names[&made].port.state();
+                    (st.guarded, st.context) = (true, x[2]);
                 }
                 match m.write_u32(x[3], made) {
                     Ok(()) => KERN_SUCCESS,
@@ -1542,9 +1562,33 @@ impl Kernel {
                     Err(_) => KERN_INVALID_ADDRESS,
                 },
             }),
-            // Guards are not kept; a notification asked for is not sent
-            // (the previous registration, of which there was none, at x[6]).
-            t::MACH_PORT_GUARD | t::MACH_PORT_UNGUARD => bad_task(if sp.entry(pid, name).is_some() { KERN_SUCCESS } else { KERN_INVALID_NAME }),
+            // (task, name, guard, strict) and (task, name, guard): a
+            // receive right's guard, which is its context from then on
+            // (what a trailer and mach_port_get_context say: how libxpc
+            // finds the reply an async reply port's message is to), and
+            // taken off again by the same guard. Guarding a guarded port,
+            // or unguarding by another guard, is KERN_INVALID_ARGUMENT, as
+            // XNU answers; nothing raises an exception for it.
+            t::MACH_PORT_GUARD | t::MACH_PORT_UNGUARD => bad_task(match sp.entry(pid, name) {
+                None => KERN_INVALID_NAME,
+                Some(e) if !e.recv => KERN_INVALID_RIGHT,
+                Some(e) => {
+                    let mut st = e.port.state();
+                    if n == t::MACH_PORT_GUARD {
+                        if st.guarded {
+                            KERN_INVALID_ARGUMENT
+                        } else {
+                            (st.guarded, st.context) = (true, x[2]);
+                            KERN_SUCCESS
+                        }
+                    } else if !st.guarded || st.context != x[2] {
+                        KERN_INVALID_ARGUMENT
+                    } else {
+                        (st.guarded, st.context) = (false, 0);
+                        KERN_SUCCESS
+                    }
+                }
+            }),
             // (task, name, which, sync, notify, its disposition, previous*):
             // as `mach_port_request_notification`'s message does it. The
             // right to tell by is a send-once right, made or moved; the one
@@ -1788,6 +1832,9 @@ impl Kernel {
     /// its rights into the caller's space. One too large for the room
     /// stays queued if `large`, and is gone otherwise.
     pub(super) fn darwin_port_receive(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, rcv_name: u32, rcv_at: u64, rcv_size: u64, large: bool, options: u64) -> Received {
+        // (Input the HID system has for this task is in its memory before
+        // it looks: the kick it may be about to take says there is.)
+        self.darwin_hid_drain(m);
         let tsize = trailer_size(options);
         // What is asked of: a receive right, or a set of them.
         let Some(from) = sp.receives(rcv_name) else { return Received::NoName };
@@ -1896,6 +1943,9 @@ impl Kernel {
             put32(&mut out, 20, msg.id);
             // The trailer: format 0, as long as was asked.
             out[size as usize..].copy_from_slice(&trailer(options, &msg.sender, context));
+            if std::env::var_os("GEX_MACH_TRACE").is_some() {
+                eprintln!("[gex:{}.{}] mach: received {} on {name:#x}", self.pid, self.tid, msg.id);
+            }
             return match m.write(rcv_at, &out) {
                 Ok(()) => Received::Got(size + tsize),
                 Err(_) => Received::BadBuffer,
@@ -1909,6 +1959,9 @@ impl Kernel {
     /// destination is the kernel's, for the routine it asks for.
     fn darwin_send(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, c: &MsgCall) -> u64 {
         let r = self.darwin_send_of(m, sp, c);
+        if r != MACH_MSG_SUCCESS && std::env::var_os("GEX_MACH_TRACE").is_some() {
+            eprintln!("[gex:{}.{}] mach: send {} to {:#x} (reply {:#x}, bits {:#x}) failed: {r:#x}", self.pid, self.tid, c.id, c.remote, c.local, c.bits);
+        }
         self.darwin_told(m, sp);
         r
     }
@@ -1958,7 +2011,8 @@ impl Kernel {
                         if !self.mem.lock().check_access(address, size, crate::mem::prot::READ) {
                             return MACH_SEND_INVALID_MEMORY;
                         }
-                        let Ok(bytes) = m.read(address, size as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        // (None at all, at whatever address: a null reply's data.)
+                        let Ok(bytes) = (if size == 0 { Ok(Vec::new()) } else { m.read(address, size as usize).map(|b| b.to_vec()) }) else { return MACH_SEND_INVALID_MEMORY };
                         if body[at + 8] != 0 && size != 0 {
                             gone.push((address, size));
                         }
@@ -1974,7 +2028,7 @@ impl Kernel {
                         }
                         let address = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
                         let count = get32(&body, at + 12) as u64;
-                        let Ok(raw) = m.read(address, (count * 4) as usize).map(|b| b.to_vec()) else { return MACH_SEND_INVALID_MEMORY };
+                        let Ok(raw) = (if count == 0 { Ok(Vec::new()) } else { m.read(address, (count * 4) as usize).map(|b| b.to_vec()) }) else { return MACH_SEND_INVALID_MEMORY };
                         if body[at + 8] != 0 && count != 0 {
                             gone.push((address, count * 4));
                         }
@@ -2040,6 +2094,10 @@ impl Kernel {
         }
         let sender = [self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1];
         let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory, port_arrays, sender };
+        // `GEX_MACH_TRACE`: each message sent, by its number, to what.
+        if std::env::var_os("GEX_MACH_TRACE").is_some() {
+            eprintln!("[gex:{}.{}] mach: send {} to {:?} ({} bytes, {} rights, {} out of line)", self.pid, self.tid, msg.id, dest.kind, msg.body.len(), msg.ports.len(), msg.memory.len());
+        }
         match dest.kind {
             Kind::User => {
                 {
@@ -2609,18 +2667,71 @@ impl Kernel {
                 }
                 None => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             },
-            (Kind::Task, 4811) => {
+            // mach_vm_map(target, in-out address, size, mask, flags, object,
+            // offset, copy, current and maximum protection, inheritance),
+            // and vm_map and vm_map_64, which are the same on a 64-bit
+            // task: zeroes, or a named entry's memory
+            // ([`super::mement`]). Any other port names nothing to map.
+            (Kind::Task, 4811 | 3812 | 3826) => {
                 let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
-                let (want, size, mask, flags, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, get32(&req.body, 64) & 7);
-                if get32(&req.body, 4) != 0 {
-                    plain(KERN_INVALID_ARGUMENT as i32, &[])
-                } else {
-                    match self.darwin_vm_map_at(m, want, size, mask, flags, prot) {
-                        Ok(addr) => plain(0, &addr.to_le_bytes()),
-                        Err(e) => plain(super::mach::kern(Err(e)) as i32, &[]),
-                    }
+                let (want, size, mask, flags, offset, copy, prot) = (at(24), at(32), at(40), get32(&req.body, 48) as u64, at(52), get32(&req.body, 60) != 0, get32(&req.body, 64) & 7);
+                let made = match req.ports.first().map(|(_, p, _)| p.kind) {
+                    None => self.darwin_vm_map_at(m, want, size, mask, flags, prot).map_err(|e| super::mach::kern(Err(e))),
+                    Some(Kind::MemEntry(h)) => match super::mement::entry(h) {
+                        Some(e) => self.darwin_map_entry(m, &e, want, size, mask, flags, offset, copy, prot),
+                        None => Err(super::mement::KERN_INVALID_OBJECT),
+                    },
+                    Some(_) => Err(super::mement::KERN_INVALID_OBJECT),
+                };
+                match made {
+                    Ok(addr) => plain(0, &addr.to_le_bytes()),
+                    Err(k) => plain(k as i32, &[]),
                 }
             }
+            // mach_make_memory_entry_64(target, in-out size, offset,
+            // permission, out entry, parent entry), and
+            // mach_make_memory_entry, the same on a 64-bit task: a port
+            // that names memory for whoever has it to map
+            // ([`super::mement`]), and its size.
+            (Kind::Task, 4817 | 3825 | 3816) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (size, offset, permission) = (at(24), at(32), get32(&req.body, 40));
+                let parent = req.ports.first().map(|(_, p, _)| p.clone());
+                match self.darwin_make_memory_entry(m, size, offset, permission, parent.as_ref()) {
+                    Ok((port, size)) => {
+                        let mut b = vec![0u8; 16];
+                        put32(&mut b, 0, 1);
+                        b[4 + 10] = disp::MOVE_SEND as u8;
+                        b.extend_from_slice(&NDR);
+                        b.extend_from_slice(&size.to_le_bytes());
+                        reply(b, vec![(4, port, disp::MOVE_SEND)])
+                    }
+                    Err(k) => plain(k as i32, &[]),
+                }
+            }
+            // mach_vm_read(target, address, size, out data): a copy of the
+            // task's memory, which arrives out of line.
+            (Kind::Task, 4804) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (address, size) = (gex_abi::canon(at(8)), at(16));
+                let readable = size <= u32::MAX as u64 && self.mem.lock().check_access(address, size, crate::mem::prot::READ);
+                match m.read(address, size as usize).map(|b| b.to_vec()) {
+                    Ok(bytes) if readable => {
+                        let mut b = vec![0u8; 20];
+                        put32(&mut b, 0, 1);
+                        b[4 + 11] = 1; // MACH_MSG_OOL_DESCRIPTOR
+                        put32(&mut b, 4 + 12, bytes.len() as u32);
+                        b.extend_from_slice(&NDR);
+                        b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        Msg { id: req.id + 100, complex: true, body: b, once: false, reply: None, ports: Vec::new(), memory: vec![(4, bytes)], port_arrays: Vec::new(), sender: [0; 8] }
+                    }
+                    _ => plain(KERN_INVALID_ADDRESS as i32, &[]),
+                }
+            }
+            // mach_memory_entry_purgable_control(entry, control, in-out
+            // state): an entry's object is never emptied, so it is what it
+            // was made, not volatile.
+            (Kind::MemEntry(_), 4900) => plain(0, &0u32.to_le_bytes()),
             // host_info(host, flavor, out info, in-out count): the flavor
             // and the room follow the NDR record. What is told is counted
             // in 32-bit words; too little room for it is a failure.

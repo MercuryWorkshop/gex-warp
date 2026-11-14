@@ -28,6 +28,8 @@ const CLASSES: &[(&str, &str)] = &[
     ("IOFramebufferSharedUserClient", "IOUserClient"),
     ("IOAccelerator", "IOService"),
     ("IOAccelerationUserClient", "IOUserClient"),
+    ("AppleGPUWrangler", "IOService"),
+    ("AppleGPUWranglerUserClient", "IOUserClient"),
 ];
 
 /// `class`'s superclass, if it has one (OSObject has none).
@@ -54,6 +56,7 @@ pub enum Opens {
     Nothing,
     HidSystem,
     Framebuffer,
+    GpuWrangler,
 }
 
 pub struct Entry {
@@ -133,6 +136,7 @@ impl Registry {
     /// Root
     ///   IOResources
     ///     IOHIDSystem
+    ///     AppleGPUWrangler
     ///   gex (IOPlatformExpertDevice)
     ///     display@2 (IOPCIDevice)
     ///       IONDRVFramebuffer
@@ -172,6 +176,18 @@ impl Registry {
                 ("HIDParameters", Value::Dict(Vec::new())),
             ],
             Opens::HidSystem,
+        );
+        r.add(
+            Some(resources),
+            "AppleGPUWrangler",
+            "AppleGPUWrangler",
+            "",
+            vec![
+                ("IOProviderClass", Value::str("IOResources")),
+                ("IOResourceMatch", Value::str("IOKit")),
+                ("CFBundleIdentifier", Value::str("com.apple.AppleGraphicsControl")),
+            ],
+            Opens::GpuWrangler,
         );
         let mode = mode();
         let pci = r.add(

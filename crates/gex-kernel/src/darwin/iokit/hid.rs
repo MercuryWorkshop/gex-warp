@@ -53,12 +53,23 @@ static INPUT: Mutex<VecDeque<Input>> = Mutex::new(VecDeque::new());
 /// [`Hid::drain`].)
 pub fn post(event: Input) {
     INPUT.lock().unwrap_or_else(|e| e.into_inner()).push_back(event);
+    PENDING.store(true, std::sync::atomic::Ordering::Release);
     super::kick_hid();
+}
+
+/// Whether anything is posted and not taken: what a task's every receive
+/// asks before it looks further ([`super::Kernel::darwin_hid_drain`]).
+static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pending() -> bool {
+    PENDING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The events posted and not yet taken.
 pub fn take() -> Vec<Input> {
-    INPUT.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+    let mut q = INPUT.lock().unwrap_or_else(|e| e.into_inner());
+    PENDING.store(false, std::sync::atomic::Ordering::Release);
+    q.drain(..).collect()
 }
 
 /// A connection to the HID system.

@@ -11889,7 +11889,7 @@ impl Kernel {
                         .collect();
                     eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
                 } else {
-                    eprintln!("[gex:{}.{}] {} blocking", self.pid, self.tid, syscall_name(n));
+                    eprintln!("[gex:{}.{}] {} blocking ({:#x}, {:#x}, {:#x})", self.pid, self.tid, syscall_name(n), a[0], a[1], a[2]);
                 }
             }
             self.write_blocked = matches!(op, BlockOp::WriteStream { .. });

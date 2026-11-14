@@ -20,6 +20,7 @@
 //! what was asked and the answer.
 
 pub mod display;
+pub mod gpuw;
 pub mod hid;
 pub mod plist;
 pub mod registry;
@@ -60,6 +61,8 @@ pub struct Connect {
 pub enum Client {
     Hid(hid::Hid),
     Fb(display::Fb),
+    /// The GPU wrangler's: the GPUs, and the framebuffer of each.
+    Gpu(gpuw::Gpu),
     /// A client with no methods of its own (a family's that nothing here
     /// drives yet): every method is unsupported.
     Plain,
@@ -146,7 +149,7 @@ impl IoKit {
 /// Kick the HID system's consumer: the notification port of each server
 /// connection to it, told there is input (a message of no body, as
 /// `IOHIDSystem::kickEventConsumer` sends). The task takes the events when
-/// it next calls the HID system ([`hid::Hid::drain`]).
+/// it next calls IOKit or receives ([`Kernel::darwin_hid_drain`]).
 pub fn kick_hid() {
     let io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(kit) = io.as_ref() else { return };
@@ -405,7 +408,51 @@ fn brief(v: &Value) -> String {
 impl Kernel {
     /// A request to IOKit's master port or to one of its objects, answered
     /// as XNU's `iokit` server answers.
+    /// What has been posted to the HID system ([`hid::post`]) and not yet
+    /// taken, into the event queue of this task's server connection to it
+    /// if it has one (WindowServer's), as `IOHIDSystem` posts each event:
+    /// done when the task next calls IOKit or receives a message (the kick
+    /// [`kick_hid`] sent it among them), since the kernel writes a task's
+    /// memory only while it runs for that task. Only the bytes the events
+    /// change are written: the task moves the queue's head meanwhile.
+    pub(crate) fn darwin_hid_drain(&mut self, m: &mut GuestMem<'_>) {
+        if !hid::pending() {
+            return;
+        }
+        let now = self.darwin_abstime();
+        let mut io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(kit) = io.as_mut() else { return };
+        for o in kit.objects.values_mut() {
+            let Obj::Connect(c) = &mut o.obj else { continue };
+            if c.pid != self.pid {
+                continue;
+            }
+            let Client::Hid(h) = &mut c.client else { continue };
+            if h.kind != 0 {
+                continue;
+            }
+            let Some(&(_, at, size)) = c.maps.iter().find(|(t, _, _)| *t == 0) else { continue };
+            let Ok(before) = m.read(at, size as usize).map(|b| b.to_vec()) else { continue };
+            let mut shm = before.clone();
+            if !h.drain(&mut shm, &hid::take(), now) {
+                return;
+            }
+            let mut i = 0;
+            while i < shm.len() {
+                if shm[i] == before[i] {
+                    i += 1;
+                    continue;
+                }
+                let j = (i..shm.len()).find(|&j| shm[j] == before[j]).unwrap_or(shm.len());
+                let _ = m.write(at + i as u64, &shm[i..j]);
+                i = j;
+            }
+            return;
+        }
+    }
+
     pub(super) fn darwin_iokit(&mut self, m: &mut GuestMem<'_>, kind: Kind, req: &Msg) -> Msg {
+        self.darwin_hid_drain(m);
         let h = match kind {
             Kind::IoObject(h) => Some(h),
             _ => None,
@@ -457,6 +504,7 @@ impl Kernel {
                             Client::Hid(_) => "IOHIDUserClient",
                             Client::Fb(ref fb) if fb.kind == 1 => "IOFramebufferSharedUserClient",
                             Client::Fb(_) => "IOFramebufferUserClient",
+                            Client::Gpu(_) => "AppleGPUWranglerUserClient",
                             Client::Plain => "IOUserClient",
                         },
                         Obj::Iter(..) => "IOUserIterator",
@@ -760,6 +808,10 @@ impl Kernel {
                 let client = match kit.reg.entries[e].opens {
                     Opens::HidSystem if matches!(kind, 0 | 1 | 3) => Client::Hid(hid::Hid::new(kind)),
                     Opens::Framebuffer if matches!(kind, 0 | 1) => Client::Fb(display::Fb::new(kind)),
+                    Opens::GpuWrangler => {
+                        let id = |class: &str| kit.reg.entries.iter().find(|x| x.class == class).map_or(0, |x| x.id);
+                        Client::Gpu(gpuw::Gpu { device: id("IOPCIDevice"), framebuffer: id("IONDRVFramebuffer") })
+                    }
                     Opens::HidSystem | Opens::Framebuffer | Opens::Nothing => {
                         *said = format!("type {kind}: {class} has no such user client");
                         return no_port(id, Some(&UNSUPPORTED.to_le_bytes()));
@@ -843,17 +895,31 @@ impl Kernel {
                 let ool_in_size = rd.u64();
                 let inband_room = rd.u32() as usize;
                 let scalar_room = rd.u32() as usize;
+                // Room for a structure out of line, at an address of the
+                // task's: what a structure larger than a message holds
+                // (IOConnectCallMethod's past 4096 bytes) is written there.
+                let (ool_out, ool_out_room) = if id == 2865 { (rd.u64(), rd.u64()) } else { (0, 0) };
                 let inband = if ool_in != 0 && ool_in_size != 0 { m.read(ool_in, ool_in_size as usize).map(|b| b.to_vec()).unwrap_or_default() } else { inband };
                 *said = format!("selector {selector} scalars {scalars:x?} struct {} bytes", inband.len());
                 let Some(Object { obj: Obj::Connect(c), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) else { return fail(BAD_ARGUMENT) };
                 let result = match &mut c.client {
                     Client::Hid(hc) => hc.method(selector, &scalars, &inband),
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
+                    Client::Gpu(g) => gpuw::method(selector, &inband, g),
                     Client::Plain => Err(UNSUPPORTED),
                 };
                 match result {
                     Ok((mut so, mut sb)) => {
                         so.truncate(scalar_room);
+                        let mut ool_wrote = 0u64;
+                        if sb.len() > inband_room && ool_out != 0 && ool_out_room != 0 {
+                            let n = sb.len().min(ool_out_room as usize);
+                            if m.write(ool_out, &sb[..n]).is_err() {
+                                return fail(BAD_ARGUMENT);
+                            }
+                            ool_wrote = n as u64;
+                            sb.clear();
+                        }
                         sb.truncate(inband_room);
                         let mut b = inline(&sb);
                         b.extend_from_slice(&(so.len() as u32).to_le_bytes());
@@ -868,7 +934,7 @@ impl Kernel {
                             out.extend_from_slice(&0u32.to_le_bytes());
                             Msg::kernel(id + 100, out, Vec::new(), vec![(4, Vec::new())])
                         } else {
-                            b.extend_from_slice(&0u64.to_le_bytes());
+                            b.extend_from_slice(&ool_wrote.to_le_bytes());
                             simple(id, SUCCESS, &b)
                         }
                     }

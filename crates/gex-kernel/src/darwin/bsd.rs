@@ -617,6 +617,30 @@ impl Kernel {
                 m.write(x[0], &info)?;
                 Ok(0)
             }
+            // auditon(A_GETSINFO_ADDR, auditinfo_addr*, length): what a
+            // session is, by the id the caller puts in it (`ai_asid`): one
+            // a process leads (a session's id is its leader's), as
+            // getaudit_addr tells of the caller's own; another is EINVAL.
+            // Only the superuser is told the masks (none), others all
+            // ones. The other commands are the audit daemon's, and there
+            // is none: ENOSYS.
+            d::AUDITON if x[0] == 32 => {
+                if x[2] != 48 {
+                    return Err(Errno::EINVAL);
+                }
+                let asid = m.read_u32(x[1] + 36)? as i32;
+                if asid <= 0 || self.procs.sid(self.pid, asid).ok() != Some(asid) {
+                    return Err(Errno::EINVAL);
+                }
+                let mut info = [0u8; 48];
+                info[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                if self.creds.uid() != 0 {
+                    info[4..12].fill(0xff);
+                }
+                info[36..40].copy_from_slice(&(asid as u32).to_le_bytes());
+                m.write(x[1], &info)?;
+                Ok(0)
+            }
             // (start*): where the shared region is mapped, which is nowhere:
             // dyld maps each library itself.
             d::SHARED_REGION_CHECK_NP => Err(Errno::EINVAL),

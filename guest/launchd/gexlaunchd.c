@@ -102,17 +102,19 @@ static struct job *jobs;
 static int njobs;
 static mach_port_t bootstrap;
 static int verbose;
-// Jobs not offered (-x), and by default the log daemon: a process that
-// finds logd hands it a buffer of its memory to share (the firehose,
-// made a memory entry with mach_make_memory_entry_64), which gex cannot
-// yet share after the fact, and libdispatch stops the program when that
-// fails. Without logd it logs nowhere, as it did without a bootstrap port.
+// Jobs not offered (-x), and by default the log daemon: its clients hand
+// it their firehose buffers (memory entries, which gex shares now), and it
+// keeps what they log in the system's root (/private/var/db/diagnostics
+// and uuidtext), so it is offered only when asked (-i com.apple.logd),
+// with those bound elsewhere. Without logd a process logs nowhere, as it
+// did without a bootstrap port.
 // And the directory service, which ends at its start here (EX_OSERR):
-// without it libinfo reads /etc's files. And coreservicesd, whose clients
-// map its session's memory (a memory entry of its own memory, which gex
-// cannot share either), and abort when that fails: without it they do
-// without. And fseventsd, which keeps its log at the root of the volume
-// (/.fseventsd), in the system's root itself.
+// without it libinfo reads /etc's files. And coreservicesd, which maps
+// the memory of its sessions for its clients and then answers a client's
+// first request (SCSessionUniverseInitializeConnection) with an error, at
+// which the client aborts: without it they do without. And fseventsd,
+// which keeps its log at the root of the volume (/.fseventsd), in the
+// system's root itself. -i offers one of these after all.
 static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd", "com.apple.coreservicesd", "com.apple.fseventsd"};
 static int nskipped = 4;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -504,6 +506,12 @@ int main(int argc, char **argv) {
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-x") && i + 1 < argc && nskipped < 64) skipped[nskipped++] = argv[++i];
+        // A job left out by default offered after all.
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
+            const char *in = argv[++i];
+            for (int k = 0; k < nskipped; k++)
+                if (!strcmp(skipped[k], in)) skipped[k--] = skipped[--nskipped];
+        }
         else if (!strcmp(argv[i], "-u") && i + 1 < argc) {
             char *end;
             user = (uid_t)strtoul(argv[++i], &end, 10);
@@ -516,7 +524,7 @@ int main(int argc, char **argv) {
         } else break;
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: gexlaunchd [-v] [-j DIR]... [--] PROGRAM [ARG...]\n");
+        fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-x LABEL]... [-i LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
         return 2;
     }
     if (!dirs) {
