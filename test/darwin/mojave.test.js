@@ -118,10 +118,12 @@ export default async function (t) {
   // databases locked and written as Apple's sqlite does), and the kernel
   // says the process is the code on disk (csops). Then secinitd makes its
   // container in the user's home and grants the sandbox, and Calculator
-  // goes on into AppKit. (The Dock, which AppKit looks for, and mds, which
-  // secinitd asks to leave the container's caches out of Spotlight, are
-  // among the system's protected programs: gexlaunchd offers no job of
-  // one.)
+  // goes on into AppKit. (mds, which secinitd asks to leave the
+  // container's caches out of Spotlight, is one of the system's protected
+  // programs, whose text is encrypted: gexlaunchd offers no job of one
+  // unless gex has the key for them, GEX_DSMOS_KEY, and without the job
+  // secinitd is told there is no Spotlight and does not wait. The Dock,
+  // another, is left out by name here either way.)
   //
   // All of that is slow here: lsd checks every application's signature
   // the same way before it serves WindowServer, a quarter of an hour, and
@@ -165,7 +167,7 @@ export default async function (t) {
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
       // (Not the daemons that would write into the root itself: the
       // network's configuration, the disks', the log's housekeeping.)
-      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager',
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.Dock.agent',
       '-a', '501:20', '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
     // (It serves from then on, and is stopped.)
@@ -222,7 +224,10 @@ export default async function (t) {
   // registration fails.)
   const ended = login.find((l) => /^gexloginwindow: \/Applications\/Calculator\.app\/.*: (signal|exit) \d+$/.test(l));
   t.check('Calculator: goes on with its sandbox', !ended && !/\(Calculator\) crashed/.test(said), ended || (said.match(/.*\(Calculator\) crashed.*/g) || []).join(' / '));
-  t.check('gexlaunchd: offers no job of a protected program', /com\.apple\.Dock\.agent: its program .* is a protected binary/.test(said) && /com\.apple\.metadata\.mds: its program .* is a protected binary/.test(said), (said.match(/.*protected binary.*/g) || []).slice(0, 2).join(' / '));
+  // (With the key they run, and none is left out for being one.)
+  const left = said.match(/.*is a protected binary.*/g) || [];
+  if (process.env.GEX_DSMOS_KEY) t.check('gexlaunchd: offers the protected programs\' jobs, gex having their key', left.length === 0, left.slice(0, 2).join(' / '));
+  else t.check('gexlaunchd: offers no job of a protected program, gex having no key for them', left.some((l) => /com\.apple\.metadata\.mds: /.test(l)) && left.some((l) => /com\.apple\.SystemUIServer\.agent: /.test(l)), left.slice(0, 2).join(' / ') || 'none left out');
   t.say(`Calculator's registration: ${reg.slice(-1).join('') || 'none'}`);
   // The display is the framebuffer (1024 by 768, gex's default), and
   // WindowServer's own picture of it is the window's fill.
