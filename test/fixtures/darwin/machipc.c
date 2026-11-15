@@ -10,6 +10,13 @@
 // ends, and with it its rights: the parent is told its name for the
 // child's port is a dead name, and its second port has no senders left.
 // Only the parent prints; the child says how it went by its exit status.
+//
+// `machipc task`: the child sends the parent a send right to its own task
+// port instead, as a client tells a server who it is (securityd's are told
+// so, and WindowServer's). The parent's name for it is not its own task's;
+// pid_for_task says whose task each is, and fails for a port that is no
+// task; and what is asked of the child's task port is not answered as if
+// it were asked of the parent's.
 #include "t.h"
 
 // A trap with eight arguments: mach_msg2's.
@@ -28,6 +35,7 @@ __asm__(".text\n.globl _t_trap8\n_t_trap8:\n"
 
 enum {
     TRAP_port_allocate = 16, TRAP_port_mod_refs = 19, TRAP_port_guard = 41, TRAP_port_unguard = 42, TRAP_mach_msg = 31, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
+    TRAP_pid_for_task = 46,
 };
 enum { RIGHT_SEND = 0, RIGHT_RECEIVE = 1 };
 enum { MOVE_SEND = 17, MOVE_SEND_ONCE = 18, COPY_SEND = 19, MAKE_SEND = 20, MAKE_SEND_ONCE = 21 };
@@ -103,14 +111,19 @@ static u32 type_of(u32 name) {
     return type;
 }
 
-// A MIG request to the task's port, and its reply.
-static long rpc(struct message *m, u32 size) {
+// A MIG request to a task's port, and its reply.
+static long rpc_to(u32 to, struct message *m, u32 size) {
     u32 reply = (u32)TRAP(TRAP_mach_reply_port);
     m->h.bits = (m->h.bits & COMPLEX) | COPY_SEND | MAKE_SEND_ONCE << 8;
-    m->h.remote = task, m->h.local = reply, m->h.voucher = 0;
+    m->h.remote = to, m->h.local = reply, m->h.voucher = 0;
     long r = msg2(m, SEND_MSG | RCV_MSG | KOBJECT_CALL, size, sizeof *m, reply, 0);
     TRAP(TRAP_port_mod_refs, task, reply, RIGHT_RECEIVE, -1);
     return r;
+}
+
+// To the caller's own.
+static long rpc(struct message *m, u32 size) {
+    return rpc_to(task, m, size);
 }
 
 // task_set_special_port(task, which, port), the port made a send right
@@ -194,8 +207,81 @@ static int child(void) {
     return status;
 }
 
+// `machipc task`, the child: a send right to its own task port, to the
+// bootstrap port; then it waits to be answered, so that it is there while
+// the parent asks of it.
+static int task_child(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = get_special(4);
+    if (!boot) return 1;
+    u32 mine = allocate(RIGHT_RECEIVE);
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COMPLEX | COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = boot, m.h.local = mine, m.h.id = 500;
+    m.body[0] = 1;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){task, 0, 0, COPY_SEND, 0};
+    if (msg1(&m, SEND_MSG, sizeof m.h + 16, 0, 0, 0)) return 2;
+    t_memset(&m, 0, sizeof m);
+    if (msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, mine, 10000)) return 4;
+    return m.h.id == 600 ? 0 : 8;
+}
+
+// `machipc task`, the parent.
+static int task_parent(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = allocate(RIGHT_RECEIVE);
+    if (set_special(4, boot)) return 1;
+    long me = SYS(SYS_getpid);
+    long pid = 0, child_flag = -1;
+    pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
+    if (pid < 0) return 1;
+    if (child_flag) t_exit(task_child());
+
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    long r = msg1(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, boot, 10000);
+    struct port_desc *d = (struct port_desc *)(m.body + 1);
+    t_printf("received: %ld, id %d, %u descriptors\n", r, m.h.id, (m.h.bits & COMPLEX) ? m.body[0] : 0);
+    u32 theirs = d->name, reply = m.h.remote;
+    t_printf("the child's task port: disposition %u, %s\n", d->disposition, !theirs ? "none" : theirs == task ? "the parent's own name" : "a name of its own");
+    t_printf("its type: %x\n", type_of(theirs));
+
+    // Whose task each is.
+    int whose = -1;
+    r = TRAP(TRAP_pid_for_task, task, &whose);
+    t_printf("pid_for_task of the parent's: %ld, %s\n", r, whose == me ? "the parent" : whose == pid ? "the child" : "someone else");
+    whose = -1;
+    r = TRAP(TRAP_pid_for_task, theirs, &whose);
+    t_printf("pid_for_task of the child's: %ld, %s\n", r, whose == me ? "the parent" : whose == pid ? "the child" : "someone else");
+    whose = -1;
+    r = TRAP(TRAP_pid_for_task, boot, &whose);
+    t_printf("pid_for_task of a port that is no task: %s\n", r ? "refused" : "answered");
+
+    // task_get_special_port, asked of the child's task: its bootstrap
+    // port is the parent's `boot`, which the parent has under that name.
+    // (gex answers nothing for another task yet: it is refused, not
+    // answered as the parent's own would be.)
+    t_memset(&m, 0, sizeof m);
+    m.h.id = 3409;
+    m.body[0] = ndr[0], m.body[1] = ndr[1], m.body[2] = 4;
+    r = rpc_to(theirs, &m, sizeof m.h + 12);
+    if (r) t_printf("the child's bootstrap port, asked of its task: not sent, %lx\n", r);
+    else if (m.h.bits & COMPLEX) t_printf("the child's bootstrap port, asked of its task: %s\n", ((struct port_desc *)(m.body + 1))->name == boot ? "the parent's port" : "another port");
+    else t_printf("the child's bootstrap port, asked of its task: refused, %d\n", (i32)m.body[2]);
+
+    // The child is answered, and ends.
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = MOVE_SEND_ONCE, m.h.remote = reply, m.h.id = 600;
+    t_printf("reply: %ld\n", msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h, 0, 0, 0));
+    int status = -1;
+    long got = SYS(SYS_wait4, pid, &status, 0, 0);
+    t_printf("the child: %s, status %x\n", got == pid ? "waited for" : "not waited for", status);
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
-    (void)argc, (void)argv, (void)envp, (void)apple;
+    (void)envp, (void)apple;
+    if (argc > 1 && !t_strcmp(argv[1], "task")) return task_parent();
     task = (u32)TRAP(TRAP_task_self);
     u32 boot = allocate(RIGHT_RECEIVE);
     t_printf("set the bootstrap port: %ld\n", set_special(4, boot));

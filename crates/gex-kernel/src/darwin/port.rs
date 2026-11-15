@@ -259,6 +259,10 @@ struct State {
     /// ([`notice::PORT_DESTROYED`]), if that was asked: the port lives on,
     /// its queue with it.
     port_destroyed: Option<Arc<Port>>,
+    /// Of a task's port ([`Kind::Task`]): which process it is the task of,
+    /// once its space is that process's ([`Space::bind`]). A right to it
+    /// in another task's space names that process still.
+    task: i32,
 }
 
 /// A port: one queue of messages, whose rights any task may hold. It is
@@ -690,10 +694,17 @@ impl Space {
         s
     }
 
-    /// The space is this task's, woken through `rx` and named by `me`.
-    fn bind(&mut self, futex: &Arc<crate::futex::FutexTable>, me: Weak<Mutex<Space>>) {
+    /// The space is this task's, process `pid`'s, woken through `rx` and
+    /// named by `me`; and its task port is that process's.
+    fn bind(&mut self, futex: &Arc<crate::futex::FutexTable>, me: Weak<Mutex<Space>>, pid: i32) {
         self.rx = Some(Rx { futex: Arc::clone(futex), words: Arc::clone(&self.words_at) });
         self.me = me;
+        if let Some(e) = self.names.get(&names::TASK).filter(|e| e.port.kind == Kind::Task) {
+            let mut st = e.port.state();
+            if st.task == 0 {
+                st.task = pid;
+            }
+        }
     }
 
     /// A name nothing has: XNU's are an index and a generation, and the
@@ -1116,7 +1127,7 @@ impl Kernel {
         {
             let mut sp = space.lock().unwrap_or_else(|e| e.into_inner());
             if !sp.rx.as_ref().is_some_and(|rx| rx.is(&self.futexes)) {
-                sp.bind(&self.futexes, Arc::downgrade(&space));
+                sp.bind(&self.futexes, Arc::downgrade(&space), self.pid);
             }
         }
         space
@@ -1534,11 +1545,14 @@ impl Kernel {
                     }
                 }
             }),
-            // (task port or name, out pid*): which process it is.
+            // (task port or name, out pid*): which process it is -- the
+            // caller's own, or the one whose task port it was sent (as a
+            // server is by a client that says who it is so).
             t::PID_FOR_TASK => {
-                let pid = match sp.names.get(&(x[0] as u32)).map(|e| e.port.kind) {
-                    Some(Kind::Task) => Some(self.pid),
-                    Some(Kind::TaskName(p)) => Some(p),
+                let pid = match sp.names.get(&(x[0] as u32)).map(|e| (e.port.kind, e.port.state().task)) {
+                    Some((Kind::Task, 0)) => None,
+                    Some((Kind::Task, p)) => Some(p),
+                    Some((Kind::TaskName(p), _)) => Some(p),
                     _ => None,
                 };
                 match pid {
@@ -2136,12 +2150,32 @@ impl Kernel {
                 // The kernel's: the routine is run, and its answer queued
                 // on the reply port for the receive that follows.
                 let Some((reply, once)) = msg.reply.clone() else { return MACH_MSG_SUCCESS };
-                let answer = self.darwin_mig(m, sp, kind, &msg);
+                // (A task's port is the caller's own, or another task's
+                // that it was sent: what is asked of that one is not done
+                // to this one.)
+                let other = Some(dest.state().task).filter(|p| kind == Kind::Task && *p != 0 && *p != pid);
+                let answer = match other {
+                    Some(other) => self.darwin_mig_other_task(other, &msg),
+                    None => self.darwin_mig(m, sp, kind, &msg),
+                };
                 reply.state().queue.push_back(Msg { once, reply: None, ..answer });
                 self.darwin_wake_port(m, sp, &reply);
             }
         }
         MACH_MSG_SUCCESS
+    }
+
+    /// A request to the port of another task, process `other`'s. Nothing
+    /// of another process is the caller's to read or change here, so the
+    /// routine fails (`KERN_FAILURE`) and is said, rather than be done to
+    /// the caller as if the port were its own.
+    fn darwin_mig_other_task(&mut self, other: i32, req: &Msg) -> Msg {
+        if self.trace || std::env::var_os("GEX_DARWIN_UNIMPLEMENTED").is_some() {
+            eprintln!("[gex:{}] MIG routine {} of process {other}'s task port: not one gex answers for another task", self.pid, req.id);
+        }
+        let mut body = NDR.to_vec();
+        body.extend_from_slice(&(KERN_FAILURE as i32).to_le_bytes());
+        Msg { id: req.id + 100, complex: false, body, once: false, reply: None, ports: Vec::new(), memory: Vec::new(), port_arrays: Vec::new(), sender: [0; 8] }
     }
 
     /// A request to one of the kernel's own ports, answered as its MIG
