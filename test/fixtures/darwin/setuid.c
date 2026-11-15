@@ -65,7 +65,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
         } else {
             long child_flag = -1;
             pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
-            if (pid > 0 && child_flag) {
+            if (pid >= 0 && child_flag) {
                 SYS(SYS_execve, path, args, envp);
                 t_exit(127);
             }

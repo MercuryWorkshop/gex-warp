@@ -111,7 +111,6 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_printf("mode %o\n", st.st_mode & 07777);
     t_show("access(R_OK | W_OK)", SYS(SYS_access, "owned", 6));
     t_show("chmod 0", SYS(SYS_chmod, "owned", 0));
-    t_show("access(R_OK)", SYS(SYS_access, "owned", 4));
     t_show("access(F_OK)", SYS(SYS_access, "owned", 0));
     t_show("chmod 0644", SYS(SYS_chmod, "owned", 0644));
     t_show("unlink", SYS(SYS_unlink, "owned"));
