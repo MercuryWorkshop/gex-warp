@@ -194,6 +194,7 @@ pub struct MachSegment {
     pub filesize: u64,
     pub maxprot: u32,
     pub initprot: u32,
+    pub flags: u32,
     pub sections: Vec<MachSection>,
 }
 
@@ -356,6 +357,7 @@ fn parse_head(data: &[u8], len: u64) -> Result<MachO, LoadError> {
                     filesize: r.u64(at + 48)?,
                     maxprot: r.u32(at + 56)?,
                     initprot: r.u32(at + 60)?,
+                    flags: r.u32(at + 68)?,
                     sections,
                 };
                 if seg.filesize > seg.vmsize && seg.vmsize != 0 {
@@ -599,9 +601,13 @@ fn place(m: &MachO, data: Option<&[u8]>, slide: u64) -> Result<Image, LoadError>
             }
         }
         top = top.max(end);
+        let mut bytes = data.map_or_else(Vec::new, |d| d[s.fileoff as usize..(s.fileoff + s.filesize) as usize].to_vec());
+        if !bytes.is_empty() {
+            crate::dsmos::decrypt_segment(&mut bytes, s.flags)?;
+        }
         segments.push(Segment {
             vaddr,
-            bytes: data.map_or_else(Vec::new, |d| d[s.fileoff as usize..(s.fileoff + s.filesize) as usize].to_vec()),
+            bytes,
             mem_size,
             readable: s.initprot & VM_PROT_READ != 0,
             writable: s.initprot & VM_PROT_WRITE != 0,

@@ -106,6 +106,9 @@ pub enum LoadError {
         end: u64,
     },
     Malformed(&'static str),
+    /// A Mach-O binary with `SG_PROTECTED_VERSION_1` was loaded, but no
+    /// decryption key is available (`GEX_DSMOS_KEY` not set).
+    ProtectedBinary,
 }
 
 impl fmt::Display for LoadError {
@@ -149,6 +152,11 @@ impl fmt::Display for LoadError {
                 gex_abi::STACK_TOP - gex_abi::STACK_SIZE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
+            LoadError::ProtectedBinary => write!(
+                f,
+                "this is a protected binary (SG_PROTECTED_VERSION_1) and no decryption key \
+                 is configured; set GEX_DSMOS_KEY to the 64-byte SMC OSK value"
+            ),
         }
     }
 }
