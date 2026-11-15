@@ -24,8 +24,9 @@
 // - and then, given a program, the user's session itself: the program run
 //   as the user, in the login's audit session (which a child inherits),
 //   with the user's groups, home and name, as loginwindow starts the
-//   user's applications once they have logged in. The window is then put
-//   at the desktop's level, under the program's.
+//   user's applications once they have logged in. (Its windows are
+//   ordered in above this one's: the desktop's level is WindowServer's
+//   own to draw, and shows nothing of a window put there.)
 //
 //   gexloginwindow [-u UID[:GID]] [-n NAME] [-- PROGRAM [ARG...]]
 //
@@ -151,8 +152,6 @@ int main(int argc, char **argv) {
     if (!program) for (;;) pause();
 
     // The user's session: the program, as the user.
-    e = SLSSetWindowLevel(cid, wid, CGWindowLevelForKey(kCGDesktopWindowLevelKey));
-    printf("gexloginwindow: at the desktop's level -> %d\n", (int)e);
     struct passwd *pw = getpwuid(user);
     const char *home = pw && pw->pw_dir ? pw->pw_dir : "/";
     pid_t pid = fork();
