@@ -11643,17 +11643,14 @@ impl Kernel {
     /// The effective user and group a run of the file at `path` is to have
     /// (the owner of one with the set-user-ID bit, the group of one with
     /// the set-group-ID bit and its group execute bit, as Linux has it),
-    /// where files have owners and this is a program a set-id bit is
-    /// honoured on: a regular file, not through a script's own bits.
+    /// where this is a program a set-id bit is honoured on: a regular file,
+    /// not through a script's own bits. A file that records no owner is the
+    /// machine's first user's ([`Creds::owner_of`]), so its bits make the
+    /// run that user's: a root unpacked from an archive that kept modes but
+    /// not owners, as a page's is, whose first user is root, has its `sudo`.
     fn exec_ids_of(&self, path: &str) -> (Option<u32>, Option<u32>) {
         let Ok(md) = self.path_io().ns.metadata(path) else { return (None, None) };
-        if md.owner.is_none() || md.file_type != FileType::Regular {
-            return (None, None);
-        }
-        let (owner, group) = self.creds.owner_of(md.owner);
-        let uid = (md.mode & crate::perm::S_ISUID != 0).then_some(owner);
-        let gid = (md.mode & crate::perm::S_ISGID != 0 && md.mode & 0o010 != 0).then_some(group);
-        (uid, gid)
+        exec_ids_for(&self.creds, &md)
     }
 
     /// The `execve` of the program is on: the process's ids become what the
@@ -15161,6 +15158,20 @@ fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
     (if room == 0 { len.min(MAX_RW_COUNT) } else { len.min(MAX_RW_COUNT).min(room) }) as usize
 }
 
+/// What [`Kernel::exec_ids_of`] finds for a file `md`: the effective
+/// user and group an exec of it takes from its set-id bits, if it is a
+/// regular file. Its owner is [`Creds::owner_of`]'s: the machine's first
+/// user's where it records none.
+fn exec_ids_for(creds: &Creds, md: &crate::vfs::Metadata) -> (Option<u32>, Option<u32>) {
+    if md.file_type != FileType::Regular {
+        return (None, None);
+    }
+    let (owner, group) = creds.owner_of(md.owner);
+    let uid = (md.mode & crate::perm::S_ISUID != 0).then_some(owner);
+    let gid = (md.mode & crate::perm::S_ISGID != 0 && md.mode & 0o010 != 0).then_some(group);
+    (uid, gid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16963,6 +16974,25 @@ mod tests {
         assert!(su.may(&file(0o600, (1, 1)), 6, false));
         assert!(!su.may(&file(0o600, (1, 1)), 6, true));
         assert!(su.may(&file(0o600, (502, 20)), 6, true));
+    }
+
+    /// A set-user-ID program in a tree that records no owners (a page's
+    /// root, unpacked from an archive that kept modes but not owners): an
+    /// exec of it by another user is the machine's first user's, whose the
+    /// file is; one without the bit changes nothing.
+    #[test]
+    fn an_ownerless_set_user_id_program_runs_as_the_first_user() {
+        let file = |mode: u32| crate::vfs::Metadata { mode, owner: None, ..crate::vfs::Metadata::regular(0) };
+        // The first user root, as a page's is; the process another user.
+        let user = Creds::new(0, 0);
+        user.exec_ids(Some(502), Some(20));
+        let (bu, bg) = user.base();
+        assert_ne!(user.uid(), bu);
+        assert_eq!(exec_ids_for(&user, &file(0o4511)), (Some(bu), None));
+        assert_eq!(exec_ids_for(&user, &file(0o2755)), (None, Some(bg)));
+        assert_eq!(exec_ids_for(&user, &file(0o755)), (None, None));
+        let dir = crate::vfs::Metadata { mode: 0o4755, owner: None, ..crate::vfs::Metadata::dir() };
+        assert_eq!(exec_ids_for(&user, &dir), (None, None));
     }
 
     /// A user the machine's root made, in a tree that keeps owners: what it
