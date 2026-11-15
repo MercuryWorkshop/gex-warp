@@ -3517,6 +3517,24 @@ fn program_failed(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<GuestTrap>() || c.is::<wasmtime::Trap>() || c.is::<wasmtime::ThrownException>())
 }
 
+/// The name of an instruction its architecture defines as undefined, which
+/// a program runs to end itself (`raw`: the instruction's first four bytes,
+/// as the translator reports one it has no code for): x86's `ud2`, `ud1` and
+/// `ud0`, A64's `udf` (the permanently undefined encodings, sixteen zero
+/// bits over an immediate).
+fn undefined_by_design(raw: u32) -> Option<&'static str> {
+    if gex_abi::X86 {
+        match raw & 0xffff {
+            0x0b0f => Some("ud2"),
+            0xb90f => Some("ud1"),
+            0xff0f => Some("ud0"),
+            _ => None,
+        }
+    } else {
+        (raw >> 16 == 0).then_some("udf")
+    }
+}
+
 /// The signals a crash ends a program with (those that dump core).
 fn crash_signal(sig: i32) -> bool {
     matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
@@ -5589,15 +5607,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         gm.read_u32(gex_abi::dispatch_dir() + gex_abi::dispatch_page(a) * 4)
                             .unwrap_or(0)
                     };
-                    state.exit = Some(Exit::Signal {
-                        signal: signal::SIGILL,
-                        pc,
-                        detail: format!(
-                            "instruction 0x{raw:08x} at 0x{pc:x} is not implemented (last indirect target 0x{last:x}; directory entry for its page {:#x}, for this page {:#x})",
-                            dir(last),
-                            dir(pc)
-                        ),
-                        internal: true,
+                    // An instruction that is undefined by its architecture
+                    // (`ud2`, `udf`) is the program's own trap, as a Mac's
+                    // libraries end a process that misuses them: SIGILL, a
+                    // crash of its own with where it was. Any other is one
+                    // gex has no translation for.
+                    state.exit = Some(match undefined_by_design(raw) {
+                        Some(name) => Exit::Signal { signal: signal::SIGILL, pc, detail: format!("{name} at 0x{pc:x}"), internal: false },
+                        None => Exit::Signal {
+                            signal: signal::SIGILL,
+                            pc,
+                            detail: format!(
+                                "instruction 0x{raw:08x} at 0x{pc:x} is not implemented (last indirect target 0x{last:x}; directory entry for its page {:#x}, for this page {:#x})",
+                                dir(last),
+                                dir(pc)
+                            ),
+                            internal: true,
+                        },
                     });
                 }
             }
@@ -5773,10 +5799,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // runs, from a frame whose pc is the instruction's (a host call
             // has the thread's registers in its context, so the frame is
             // exact). With none it ends the process, below.
-            if !gex_abi::X86 && fault_hook_of(caller.data()).is_none() {
+            // An x86 `int3` likewise, its frame's pc the next instruction's.
+            if fault_hook_of(caller.data()).is_none() {
                 if let Some(memory) = caller.data().memory.clone() {
                     let mut gm = GuestMem::new(memory.bytes());
-                    let d = caller.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signal::SIGTRAP as u32, pc as u64, pc as u64));
+                    let at = pc as u64 + if gex_abi::X86 { 1 } else { 0 };
+                    let d = caller.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signal::SIGTRAP as u32, at, pc as u64));
                     if let gex_kernel::signal::Delivery::Resume(target) = d {
                         caller.data_mut().resume_cause = Some("brk".into());
                         caller.data_mut().resume_at = Some(target);

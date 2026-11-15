@@ -386,16 +386,34 @@ What does not, yet:
   comes or goes (a matching notification is told what is there and
   nothing more), and there is no accelerator: WindowServer composites in
   software (SkyLight's `CompositorSW`, which it takes when there is no
-  OpenGL or Metal device). Nothing has drawn yet: no client has a session
-  to draw in. loginwindow, which makes it, is one of the system's
-  protected programs (its code is encrypted, for the kernel to decrypt as
-  it pages it in) and does not run; a client of WindowServer's without a
-  session (a program of gex's own run as a job) stops in libxpc ("XPC API
-  Misuse") as it connects.
+  OpenGL or Metal device). loginwindow, which owns the session it draws,
+  is one of the system's protected programs (its code is encrypted, for
+  the kernel to decrypt as it pages it in) and does not run: gexloginwindow
+  (`guest/loginwindow`, `build.sh OUT`) does its part. As root it makes the
+  login's audit session (below), has WindowServer take its connection as
+  loginwindow's (`SLSSetLoginwindowConnection`, for which its ad hoc
+  signature carries the entitlement WindowServer asks of the caller),
+  gives the console to the user, and puts up a window over the display
+  and draws in it; WindowServer takes each. What it composites does not
+  reach the framebuffer yet: CoreDisplay finds no hardware display online
+  when it starts (its `CGXDisplayDriverInitialize`), so WindowServer and
+  its clients are on CoreDisplay's virtual one (1280 by 1024, memory of
+  WindowServer's own), and the framebuffer gex saves stays black.
+  (IOPresentment's object for the framebuffer is not made either, for
+  want of an `AppleGraphicsDeviceControl`: "Unable to acquire map".)
+  A WindowServer logs nowhere, there being no logd, since it drops root
+  and libsystem_trace ignores `OS_ACTIVITY_DT_MODE` in a process that has
+  changed its ids: `GEX_DARWIN_UNTAINTED=1` has `issetugid` say it has
+  not, for reading what such a daemon says.
 - **launchd.** Apple's will be nothing but process 1; gexlaunchd
   (`guest/launchd`) stands in for its bootstrap server, and not for the
   rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
   launchctl; a job with no Mach services starts only when asked, `-r`).
+  It uses up the process numbers below 10 before it starts anything: no
+  program a Mac runs is numbered so low, and CoreFoundation's distributed
+  notification center makes no connection to distnoted in one that is,
+  so the first observer added there (LaunchServices' check-in adds one)
+  sent on no connection, which libxpc ends a process for.
   securityd starts, and its audit sessions' device answers it
   (`/dev/auditsessions`, where nothing logs in or out), but its Mach
   daemon state (MDS) does not install yet and it stops, which leaves lsd
@@ -458,6 +476,28 @@ process with `CAP_SETUID`/`CAP_SETGID` (root's) sets any id, another only to
 one it has. The first process is the host user, with the host user's groups
 (or `--uid`'s, with none); everything not given an owner is that first
 user's.
+
+A Darwin process is also in an audit session, which is what a Mac's login
+session is to the kernel (`crates/gex-kernel/src/darwin/audit.rs`, after
+XNU's `audit_session.c`): an id, the audit user (who logged in), and
+flags that say what the session reaches (the window server, a terminal,
+the console) and whether its user has authenticated. LaunchServices, the
+security server and WindowServer ask which one a client is in (its audit
+token carries the id) and what it may do. `setaudit_addr` makes one (the
+superuser's: the kernel chooses its id, from 100000) or moves the caller
+into one, and changes one only as XNU lets it: the audit user and
+terminal once, a flag as the `audit.session.*_sflags_mask` sysctls allow.
+`getaudit_addr`, `getauid`, `setauid` and `auditon`'s `A_GETSINFO_ADDR`,
+`A_GETSFLAGS` and `A_SETSFLAGS` read and set it; `audit_session_self` and
+`audit_session_port` give the Mach port that names a session, and
+`audit_session_join` puts whoever holds one in it. A fork's child and the
+next program are in their parent's. The machine's first process is in a
+session made for it, as launchd's is (XNU's default session, which has no
+port and no record, is one no Mac program sees, and LaunchServices ends a
+process it finds there). A session lasts as long as the machine;
+`/dev/auditsessions` tells of no change; and on the page, where each
+process has a kernel of its own, a process knows its session as it was when
+the process began.
 
 Files have owners where the filesystem keeps them: tmpfs, and a host
 directory, whose owner and group are kept in the host extended attribute

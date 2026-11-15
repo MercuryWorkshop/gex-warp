@@ -539,6 +539,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-x LABEL]... [-i LABEL]... [-r LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
         return 2;
     }
+    // No program a Mac runs is numbered below 10 but launchd: by the time it
+    // starts a job the kernel has numbered a few dozen processes. And
+    // CoreFoundation counts on it: in a process below 10 its distributed
+    // notification center makes no connection to distnoted (it takes itself
+    // to be too early in the boot for one), and the first observer added
+    // there (LaunchServices' check-in adds one) sends on no connection,
+    // which libxpc ends the process for (_xpc_api_misuse). So the numbers
+    // below 10 are used up here, by children that do nothing.
+    for (;;) {
+        pid_t used = fork();
+        if (used == 0) _exit(0);
+        if (used < 0) break;
+        waitpid(used, NULL, 0);
+        if (used >= 9) break;
+    }
     for (int k = 0; k < ndirs; k++) add_dir(dirs[k]);
     if (!ndirs) {
         add_dir("/System/Library/LaunchDaemons");

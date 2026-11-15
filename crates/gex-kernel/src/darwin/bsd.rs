@@ -609,73 +609,23 @@ impl Kernel {
                 self.procs.set_creds(self.pid, &self.creds.save_within(256));
                 Ok(0)
             }
-            // (auditinfo_addr*, length): who the process is to the audit
-            // system: its audit user (none set), no events masked, no
-            // terminal, its session, no flags.
-            d::GETAUDIT_ADDR => {
-                if x[1] < 48 {
-                    return Err(Errno::EOVERFLOW);
-                }
-                let mut info = [0u8; 48];
-                info[0..4].copy_from_slice(&self.creds.auid().to_le_bytes());
-                let sid = self.procs.sid(self.pid, self.pid).unwrap_or(0);
-                info[36..40].copy_from_slice(&(sid as u32).to_le_bytes());
-                m.write(x[0], &info)?;
-                Ok(0)
-            }
-            // (au_id_t*): the audit user id, which is all ones until a login
-            // sets it, and the superuser's to set.
+            // The audit session the process is in and its audit user, and
+            // the calls that make, change and join one ([`audit`]).
+            d::GETAUDIT_ADDR => self.darwin_getaudit_addr(m, x),
+            d::SETAUDIT_ADDR => self.darwin_setaudit_addr(m, x),
             d::GETAUID => m.write_u32(x[0], self.creds.auid()).map(|_| 0),
-            d::SETAUID => {
-                if self.creds.uid() != 0 {
-                    return Err(Errno::EPERM);
-                }
-                let id = m.read_u32(x[0])?;
-                self.creds.set_auid(id);
-                self.procs.set_creds(self.pid, &self.creds.save_within(256));
-                Ok(0)
-            }
-            // (auditinfo_addr*, length): the same, as the 48-byte record
-            // getaudit_addr gives: its audit user is what is kept.
-            d::SETAUDIT_ADDR => {
-                if self.creds.uid() != 0 {
-                    return Err(Errno::EPERM);
-                }
-                if x[1] < 48 {
-                    return Err(Errno::EOVERFLOW);
-                }
-                let id = m.read_u32(x[0])?;
-                self.creds.set_auid(id);
-                Ok(0)
-            }
+            d::SETAUID => self.darwin_setauid(m, x),
+            d::AUDIT_SESSION_SELF => self.darwin_audit_session_self(),
+            d::AUDIT_SESSION_JOIN => self.darwin_audit_session_join(x),
+            d::AUDIT_SESSION_PORT => self.darwin_audit_session_port(m, x),
             // `__initgroups(ngroups, gidset, gmuid)`: libc's `initgroups` is
             // this, which sets the groups as `setgroups` does (the membership
             // user is only what the kernel's group cache asks for).
             d::INITGROUPS => self.darwin_setgroups(m, x[0], x[1]),
-            // auditon(A_GETSINFO_ADDR, auditinfo_addr*, length): what a
-            // session is, by the id the caller puts in it (`ai_asid`): one
-            // a process leads (a session's id is its leader's), as
-            // getaudit_addr tells of the caller's own; another is EINVAL.
-            // Only the superuser is told the masks (none), others all
-            // ones. The other commands are the audit daemon's, and there
-            // is none: ENOSYS.
-            d::AUDITON if x[0] == 32 => {
-                if x[2] != 48 {
-                    return Err(Errno::EINVAL);
-                }
-                let asid = m.read_u32(x[1] + 36)? as i32;
-                if asid <= 0 || self.procs.sid(self.pid, asid).ok() != Some(asid) {
-                    return Err(Errno::EINVAL);
-                }
-                let mut info = [0u8; 48];
-                info[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-                if self.creds.uid() != 0 {
-                    info[4..12].fill(0xff);
-                }
-                info[36..40].copy_from_slice(&(asid as u32).to_le_bytes());
-                m.write(x[1], &info)?;
-                Ok(0)
-            }
+            // auditon(command, data, length): a session's record by its id,
+            // and the caller's session's flags. The other commands are
+            // the audit daemon's, and there is none: ENOSYS.
+            d::AUDITON if matches!(x[0], audit::A_GETSINFO_ADDR | audit::A_GETSFLAGS | audit::A_SETSFLAGS) => self.darwin_auditon(m, x),
             // (start*): where the shared region is mapped, which is nowhere:
             // dyld maps each library itself.
             d::SHARED_REGION_CHECK_NP => Err(Errno::EINVAL),
@@ -868,7 +818,11 @@ impl Kernel {
             d::SETGROUPS => self.darwin_setgroups(m, x[0], x[1]),
             // Whether the process is tainted: a set-user-ID or set-group-ID
             // program's, or one that has changed who it is (`P_SUGID`).
-            d::ISSETUGID => Ok(self.creds.sugid() as u64),
+            // (`GEX_DARWIN_UNTAINTED=1` says it is not: libsystem_trace
+            // ignores OS_ACTIVITY_DT_MODE in a tainted process, and a
+            // daemon that drops root, as WindowServer does, then logs
+            // nowhere without logd. For reading what one says.)
+            d::ISSETUGID => Ok((self.creds.sugid() && std::env::var_os("GEX_DARWIN_UNTAINTED").is_none()) as u64),
             // System Integrity Protection: on, and letting nothing past
             // (`csr_check` is refused, the configuration allows nothing).
             d::CSRCTL => match x[0] {
