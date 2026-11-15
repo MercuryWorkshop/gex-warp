@@ -402,6 +402,7 @@ const NAMES: &[(&str, &[i32])] = &[
     ("sysctl.proc_translated", &[]),
     ("security.mac.proc_enforce", &[]),
     ("security.mac.vnode_enforce", &[]),
+    ("security.mac.sandbox.sentinel", &[]),
 ];
 
 /// The processor features a program may ask after and this one has not:
@@ -807,6 +808,11 @@ impl Kernel {
             // runs on no Intel Mac is translated ([`rosetta`]).
             "sysctl.proc_translated" if !intel => Int((x86 && !intel) as i64),
             "security.mac.proc_enforce" | "security.mac.vnode_enforce" => Int(1),
+            // The sandbox's mark for the names of files it makes in a
+            // container (a boot's own, in XNU's), which libsandbox's
+            // `_amkrtemp` puts in its temporary names: securityd's MDS
+            // writes its databases through one.
+            "security.mac.sandbox.sentinel" => Str(".sb-67657800".into()),
             n if ABSENT.contains(&n) && !x86 => Int(0),
             _ => return None,
         })
@@ -1089,6 +1095,11 @@ impl Kernel {
     /// process's own, or another's by the path its command line begins
     /// with.
     fn darwin_entitlements(&self, pid: i32) -> Option<Vec<u8>> {
+        entitlements_of(&self.darwin_program_of(pid)?)
+    }
+
+    /// The file of process `pid`'s program (this process's own for 0).
+    fn darwin_program_of(&self, pid: i32) -> Option<Vec<u8>> {
         let path = if pid == 0 || pid == self.pid {
             self.exe_path.clone()
         } else {
@@ -1096,7 +1107,7 @@ impl Kernel {
             let first = e.cmdline().split(|&b| b == 0).next()?.to_vec();
             String::from_utf8(first).ok().filter(|p| p.starts_with('/'))?
         };
-        entitlements_of(&self.read_file(&path)?)
+        self.read_file(&path)
     }
 
     pub(super) fn darwin_csops(&mut self, m: &mut GuestMem<'_>, x: [u64; 8]) -> SysResult {
@@ -1105,6 +1116,7 @@ impl Kernel {
         const MARKHARD: u64 = 2;
         const MARKKILL: u64 = 3;
         const CDHASH: u64 = 5;
+        const PIDOFFSET: u64 = 6;
         const ENTITLEMENTS_BLOB: u64 = 7;
         const MARKRESTRICT: u64 = 8;
         const BLOB: u64 = 10;
@@ -1127,11 +1139,30 @@ impl Kernel {
                 Ok(0)
             }
             MARKINVALID | MARKHARD | MARKKILL | MARKRESTRICT => Ok(0),
+            // The hash of the code directory the kernel took the program's
+            // pages to be checked against (its best: SHA-256 over SHA-1),
+            // its first 20 bytes; what the Security framework compares with
+            // the program's file when it makes a code identity of a process
+            // (secinitd's of the application it sandboxes). Zeroes for a
+            // program with no SHA-256 directory.
             CDHASH => {
                 if size != 20 {
                     return Err(Errno::EINVAL);
                 }
-                m.zero(addr, 20)?;
+                match self.darwin_program_of(pid).as_deref().and_then(cdhash_of) {
+                    Some(h) => m.write(addr, &h)?,
+                    None => m.zero(addr, 20)?,
+                }
+                Ok(0)
+            }
+            // Where in its file the program's Mach-O begins: its slice's
+            // offset in a universal file, 0 in a thin one.
+            PIDOFFSET => {
+                if size != 8 {
+                    return Err(Errno::EINVAL);
+                }
+                let at = self.darwin_program_of(pid).as_deref().and_then(code_slice).map_or(0, |(at, _)| at);
+                m.write_u64(addr, at as u64)?;
                 Ok(0)
             }
             // The entitlements the program's signature carries (its
@@ -1187,7 +1218,11 @@ impl Kernel {
     }
 
     /// `proc_info(call, pid, flavor, arg, buffer, size)`: what libproc asks
-    /// about a process, here the caller's own.
+    /// about a process: the caller's own, or another's as it last
+    /// published itself (its ids, its parent and group, its name, and its
+    /// program by the path its command line begins with). secinitd asks
+    /// the path of the program it is to sandbox (`proc_pidpath`) to find
+    /// its code.
     pub(super) fn darwin_proc_info(&mut self, m: &mut GuestMem<'_>, x: [u64; 8]) -> SysResult {
         const CALL_LISTPIDS: u64 = 1;
         const CALL_PIDINFO: u64 = 2;
@@ -1217,34 +1252,54 @@ impl Kernel {
                 Ok(4)
             }
             CALL_PIDINFO => {
-                if pid != self.pid {
-                    return Err(Errno::ESRCH);
-                }
-                let [ruid, uid, svuid] = self.creds.uids();
-                let [rgid, gid, svgid] = self.creds.gids();
-                let (ppid, pgid) = (self.procs.ppid(self.pid) as u32, self.procs.pgid(self.pid, 0).unwrap_or(self.pid) as u32);
-                let comm = self.darwin_comm();
+                let other = if pid == self.pid {
+                    None
+                } else {
+                    Some(self.procs.entries().into_iter().find(|e| e.pid == pid && !e.zombie).ok_or(Errno::ESRCH)?)
+                };
+                let creds = crate::syscalls::Creds::new(0, 0);
+                creds.restore(&other.as_ref().map_or_else(|| self.creds.save(), |e| e.creds.clone()));
+                let [ruid, uid, svuid] = creds.uids();
+                let [rgid, gid, svgid] = creds.gids();
+                let (ppid, pgid) = match &other {
+                    Some(e) => (e.ppid as u32, e.pgid as u32),
+                    None => (self.procs.ppid(self.pid) as u32, self.procs.pgid(self.pid, 0).unwrap_or(self.pid) as u32),
+                };
+                // (Its program, and the name that is its file's.)
+                let exe = match &other {
+                    Some(e) => String::from_utf8_lossy(e.cmdline().split(|&b| b == 0).next().unwrap_or(&[])).into_owned(),
+                    None => self.exe_path.clone(),
+                };
+                let comm = match &other {
+                    Some(_) if exe.starts_with('/') => exe.rsplit('/').next().unwrap_or("").chars().take(16).collect(),
+                    Some(e) => e.comm(),
+                    None => self.darwin_comm(),
+                };
+                let (who, nfds) = match &other {
+                    Some(e) => (e.pid, 0),
+                    None => (self.pid, self.fds.list().len() as u32),
+                };
                 let w32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-                let bsdinfo = |me: &Kernel| {
+                let bsdinfo = || {
                     let mut b = vec![0u8; 136];
                     // pbi_flags: PROC_FLAG_LP64; pbi_status: SRUN.
                     w32(&mut b, 0, 0x10);
                     w32(&mut b, 4, SRUN as u32);
-                    w32(&mut b, 12, me.pid as u32);
+                    w32(&mut b, 12, who as u32);
                     w32(&mut b, 16, ppid);
                     for (at, v) in [(20, uid), (24, gid), (28, ruid), (32, rgid), (36, svuid), (40, svgid)] {
                         w32(&mut b, at, v);
                     }
                     b[48..48 + comm.len().min(15)].copy_from_slice(&comm.as_bytes()[..comm.len().min(15)]);
                     b[64..64 + comm.len()].copy_from_slice(comm.as_bytes());
-                    w32(&mut b, 96, me.fds.list().len() as u32);
+                    w32(&mut b, 96, nfds);
                     w32(&mut b, 100, pgid);
                     w32(&mut b, 108, u32::MAX);
                     b
                 };
-                let uniq = |me: &Kernel| {
+                let uniq = || {
                     let mut b = vec![0u8; 56];
-                    b[16..24].copy_from_slice(&(me.pid as u64).to_le_bytes());
+                    b[16..24].copy_from_slice(&(who as u64).to_le_bytes());
                     b[24..32].copy_from_slice(&(ppid as u64).to_le_bytes());
                     w32(&mut b, 32, 1);
                     w32(&mut b, 36, 1);
@@ -1255,7 +1310,10 @@ impl Kernel {
                         if size > 4 * MAXPATHLEN {
                             return Err(Errno::EOVERFLOW);
                         }
-                        let mut p = self.exe_path.clone().into_bytes();
+                        if !exe.starts_with('/') {
+                            return Err(Errno::ESRCH);
+                        }
+                        let mut p = exe.clone().into_bytes();
                         p.push(0);
                         if (size as usize) < p.len() {
                             return Err(Errno::ENOSPC);
@@ -1263,10 +1321,10 @@ impl Kernel {
                         m.write(buf, &p)?;
                         return Ok(0);
                     }
-                    PIDTBSDINFO => bsdinfo(self),
+                    PIDTBSDINFO => bsdinfo(),
                     PIDT_SHORTBSDINFO => {
                         let mut b = vec![0u8; 64];
-                        w32(&mut b, 0, self.pid as u32);
+                        w32(&mut b, 0, who as u32);
                         w32(&mut b, 4, ppid);
                         w32(&mut b, 8, pgid);
                         w32(&mut b, 12, SRUN as u32);
@@ -1277,10 +1335,10 @@ impl Kernel {
                         }
                         b
                     }
-                    PIDUNIQIDENTIFIERINFO => uniq(self),
+                    PIDUNIQIDENTIFIERINFO => uniq(),
                     PIDT_BSDINFOWITHUNIQID => {
-                        let mut b = bsdinfo(self);
-                        b.extend_from_slice(&uniq(self));
+                        let mut b = bsdinfo();
+                        b.extend_from_slice(&uniq());
                         b
                     }
                     _ => return Err(Errno::EINVAL),
@@ -1516,21 +1574,35 @@ fn interface_list(family: i32, only: i32) -> Vec<u8> {
 /// The entitlements blob of a Mach-O program's code signature (the slice
 /// for this guest's processor, of a universal file): `LC_CODE_SIGNATURE`'s
 /// superblob, its slot 5.
-fn entitlements_of(file: &[u8]) -> Option<Vec<u8>> {
-    let be = |b: &[u8], at: usize| b.get(at..at + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
+fn be32(b: &[u8], at: usize) -> Option<u32> {
+    b.get(at..at + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+}
+
+/// The Mach-O this processor runs of a program's file, and its offset
+/// there: its slice of a universal file, or the whole of a thin one.
+fn code_slice(file: &[u8]) -> Option<(usize, &[u8])> {
+    let be = be32;
     let le = |b: &[u8], at: usize| b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
     let cpu: u32 = if gex_abi::X86 { 0x0100_0007 } else { 0x0100_000c };
-    let slice = if be(file, 0)? == 0xcafe_babe {
+    let (start, slice) = if be(file, 0)? == 0xcafe_babe {
         let n = be(file, 4)? as usize;
         let at = (0..n.min(16)).find(|i| be(file, 8 + 20 * i) == Some(cpu))?;
         let (off, len) = (be(file, 8 + 20 * at + 8)? as usize, be(file, 8 + 20 * at + 12)? as usize);
-        file.get(off..off + len)?
+        (off, file.get(off..off + len)?)
     } else {
-        file
+        (0, file)
     };
     if le(slice, 0)? != 0xfeed_facf {
         return None;
     }
+    Some((start, slice))
+}
+
+/// The code signature's superblob (`CSMAGIC_EMBEDDED_SIGNATURE`) of a
+/// program's file, its `LC_CODE_SIGNATURE`'s.
+fn signature_of(file: &[u8]) -> Option<&[u8]> {
+    let le = |b: &[u8], at: usize| b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+    let (_, slice) = code_slice(file)?;
     let ncmds = le(slice, 16)? as usize;
     let mut at = 32;
     let mut sig = None;
@@ -1543,9 +1615,30 @@ fn entitlements_of(file: &[u8]) -> Option<Vec<u8>> {
     }
     let (off, len) = sig?;
     let blob = slice.get(off..off + len)?;
-    if be(blob, 0)? != 0xfade_0cc0 {
-        return None;
-    }
+    (be32(blob, 0)? == 0xfade_0cc0).then_some(blob)
+}
+
+/// The cdhash of a program's best code directory: of those it has (slot 0
+/// and the alternates, 0x1000 on), the one hashed with SHA-256 (hash type
+/// 2), the SHA-256 of that directory's blob, truncated to 20 bytes.
+fn cdhash_of(file: &[u8]) -> Option<[u8; 20]> {
+    let blob = signature_of(file)?;
+    let count = be32(blob, 8)? as usize;
+    (0..count.min(64)).find_map(|i| {
+        let (ty, o) = (be32(blob, 12 + 8 * i)?, be32(blob, 16 + 8 * i)? as usize);
+        if (ty != 0 && !(0x1000..0x1005).contains(&ty)) || be32(blob, o)? != 0xfade_0c02 || *blob.get(o + 37)? != 2 {
+            return None;
+        }
+        let n = be32(blob, o + 4)? as usize;
+        let mut h = gex_key::sha256::Sha256::new();
+        h.update(blob.get(o..o + n)?);
+        h.finish()[..20].try_into().ok()
+    })
+}
+
+fn entitlements_of(file: &[u8]) -> Option<Vec<u8>> {
+    let be = be32;
+    let blob = signature_of(file)?;
     let count = be(blob, 8)? as usize;
     (0..count.min(64)).find_map(|i| {
         let (ty, o) = (be(blob, 12 + 8 * i)?, be(blob, 16 + 8 * i)? as usize);

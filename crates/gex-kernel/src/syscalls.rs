@@ -12416,7 +12416,7 @@ impl Kernel {
                         .collect();
                     eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
                 } else {
-                    eprintln!("[gex:{}.{}] {} blocking ({:#x}, {:#x}, {:#x})", self.pid, self.tid, syscall_name(n), a[0], a[1], a[2]);
+                    eprintln!("[gex:{}.{}] {} blocking ({:#x}, {:#x}, {:#x}){}", self.pid, self.tid, syscall_name(n), a[0], a[1], a[2], self.traced_frames(m, pc));
                 }
             }
             self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
@@ -13270,6 +13270,48 @@ impl Kernel {
             })
             .unwrap_or_default();
         eprintln!("[gex:{}] {} at pc={pc:#x} {at} address {addr:#x}, to its handler", self.pid, signal::fault_name(signo));
+    }
+
+    /// Where a traced thread that is to wait was called from: its program
+    /// counter and the return addresses its frame pointers chain through
+    /// (at most 16), each as the file it is in and the offset there (what
+    /// a wait that never ends was waiting for).
+    fn traced_frames(&self, m: &GuestMem<'_>, pc: u64) -> String {
+        let fp_slot = if gex_abi::X86 { ctx::x(5) } else { ctx::x(29) };
+        let mem = self.mem.lock();
+        // (Each as an offset from the first mapping of its file.)
+        let vmas = mem.vmas();
+        let path_of = |v: &crate::mem::Vma| -> String {
+            if v.name.starts_with('/') {
+                return v.name.clone();
+            }
+            v.code.as_ref().or(v.origin.as_ref()).map(|(p, _)| p.clone()).unwrap_or_else(|| v.name.clone())
+        };
+        let at = |a: u64| {
+            let a = gex_abi::canon(a);
+            vmas.iter()
+                .find(|v| a >= v.start && a < v.end)
+                .map(|v| {
+                    let n = path_of(v);
+                    let base = vmas.iter().filter(|w| path_of(w) == n).map(|w| w.start).min().unwrap_or(v.start);
+                    format!("{}+{:#x}", n.rsplit('/').next().unwrap_or(&n), a - base)
+                })
+                .unwrap_or_else(|| format!("{a:#x}"))
+        };
+        let mut out = format!(" at {}", at(pc));
+        let mut fp = m.read_u64(self.ctx_addr + fp_slot as u64).unwrap_or(0);
+        for _ in 0..16 {
+            let (Ok(next), Ok(ret)) = (m.read_u64(fp), m.read_u64(fp + 8)) else { break };
+            if fp == 0 || ret == 0 {
+                break;
+            }
+            out.push_str(&format!(" < {}", at(ret)));
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        out
     }
 
     /// Restore the context a handler frame captured.

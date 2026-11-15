@@ -12,6 +12,8 @@ gex-atomic.workspace = true
 gex-f80.workspace = true
 # PE parsing and mapping for the NT personality.
 gex-ld.workspace = true
+# SHA-256, for a program's cdhash (csops).
+gex-key.workspace = true
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.
