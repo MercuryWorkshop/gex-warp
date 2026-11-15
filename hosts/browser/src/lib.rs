@@ -518,6 +518,8 @@ extern "C" {
     fn k_fs_write_now(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32;
     fn k_fs_open_now(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32;
     fn k_fs_fchmod(handle: i32, mode: u32) -> i32;
+    fn k_fs_chown(path: gex_kernel::PAddr, path_len: u32, uid: u32, gid: u32) -> i32;
+    fn k_fs_fchown(handle: i32, uid: u32, gid: u32) -> i32;
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
     fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32;
@@ -1257,6 +1259,18 @@ extern "C" fn rf_fchmod(handle: i32, mode: u32) -> i32 {
     gex_kernel::phase::mark(8);
     r
 }
+extern "C" fn rf_chown(path: gex_kernel::PAddr, path_len: u32, uid: u32, gid: u32) -> i32 {
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_chown(gex_kernel::PAddr::from(path), path_len, uid, gid) };
+    gex_kernel::phase::mark(8);
+    r
+}
+extern "C" fn rf_fchown(handle: i32, uid: u32, gid: u32) -> i32 {
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_fchown(handle, uid, gid) };
+    gex_kernel::phase::mark(8);
+    r
+}
 extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32 {
     gex_kernel::phase::mark(7);
     let r = unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) };
@@ -1981,6 +1995,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             rename_epoch: rf_rename_epoch,
             chmod: rf_chmod,
             fchmod: rf_fchmod,
+            chown: rf_chown,
+            fchown: rf_fchown,
             symlink: rf_symlink,
             link: rf_link,
             mksocket: rf_mksocket,

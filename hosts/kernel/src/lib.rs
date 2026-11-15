@@ -3673,6 +3673,23 @@ pub extern "C" fn k_fs_chmod(path: gex_kmem::PAddr, path_len: u32, mode: u32) ->
     as_unit(if link { rootfs().chmod_link(&p, mode) } else { rootfs().chmod(&p, mode) })
 }
 
+/// `fchown` on an open handle (`remote::Remote::fchown`).
+#[no_mangle]
+pub extern "C" fn k_fs_fchown(handle: i32, uid: u32, gid: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.chown(uid, gid).unwrap_or(Err(gex_kernel::errno::Errno::EOPNOTSUPP)))
+}
+
+/// `chown` of a path (`remote::Remote::chown`), links already followed.
+#[no_mangle]
+pub extern "C" fn k_fs_chown(path: gex_kmem::PAddr, path_len: u32, uid: u32, gid: u32) -> i32 {
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.chown(&rel, uid, gid));
+    }
+    as_unit(rootfs().chown(&p, uid, gid))
+}
+
 /// An extended-attribute call (`remote::Remote::xattr`): on open `handle`,
 /// or on `path` when `handle` is negative.
 #[no_mangle]

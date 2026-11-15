@@ -83,6 +83,11 @@ pub struct Remote {
     pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     /// `fchmod` on an open handle.
     pub fchmod: extern "C" fn(handle: i32, mode: u32) -> i32,
+    /// `chown` of `path`, links followed by the caller already: both ids
+    /// given ([`FileSystem::chown`]).
+    pub chown: extern "C" fn(path: crate::PAddr, path_len: u32, uid: u32, gid: u32) -> i32,
+    /// `fchown` on an open handle.
+    pub fchown: extern "C" fn(handle: i32, uid: u32, gid: u32) -> i32,
     pub symlink: extern "C" fn(target: crate::PAddr, target_len: u32, path: crate::PAddr, path_len: u32) -> i32,
     pub link: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
     /// Put a socket node at a path.
@@ -163,7 +168,7 @@ pub fn time_of(s: i64, ns: u32) -> Option<(i64, u32)> {
 
 /// Serialised [`Metadata`] size. Both modules compile this file so they agree,
 /// but they are separate wasm artefacts -- a change here means rebuilding both.
-pub const META_BYTES: usize = 72;
+pub const META_BYTES: usize = 84;
 
 /// `Metadata` as bytes, in the one layout both modules read, and the
 /// handle's [`FileHandle::changes`] (0 for a path's metadata).
@@ -181,6 +186,12 @@ pub fn encode_meta(m: &Metadata, changes: u64) -> [u8; META_BYTES] {
     out[48..52].copy_from_slice(&m.times.atime_ns.to_le_bytes());
     out[52..60].copy_from_slice(&m.times.ctime.to_le_bytes());
     out[60..64].copy_from_slice(&m.times.ctime_ns.to_le_bytes());
+    // The owner, when the file has one: 1, then its user and group.
+    if let Some((u, g)) = m.owner {
+        out[72..76].copy_from_slice(&1u32.to_le_bytes());
+        out[76..80].copy_from_slice(&u.to_le_bytes());
+        out[80..84].copy_from_slice(&g.to_le_bytes());
+    }
     out
 }
 
@@ -194,7 +205,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         u64::from_le_bytes(a)
     };
     Metadata {
-        owner: None,
+        owner: (u32at(72) == 1).then(|| (u32at(76), u32at(80))),
         file_type: file_type_of(u32at(0)),
         mode: u32at(4),
         size: u64at(8),
@@ -420,6 +431,16 @@ impl FileSystem for RemoteFs {
         ok((self.remote.chmod)(a, n, mode & 0o7777 | CHMOD_LINK)).map(|_| ())
     }
 
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        ok((self.remote.chown)(a, n, uid, gid)).map(|_| ())
+    }
+
+    /// The global kernel's tree keeps them, and says them in its metadata.
+    fn keeps_owners(&self) -> bool {
+        true
+    }
+
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
         xattr_call(&self.remote, -1, path, op)
     }
@@ -559,6 +580,10 @@ impl FileHandle for RemoteHandle {
         Some(ok((self.remote.fchmod)(self.id, mode)).map(|_| ()))
     }
 
+    fn chown(&self, uid: u32, gid: u32) -> Option<Result<(), Errno>> {
+        Some(ok((self.remote.fchown)(self.id, uid, gid)).map(|_| ()))
+    }
+
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         Some(xattr_call(&self.remote, self.id, "", op))
     }
@@ -602,5 +627,23 @@ impl FileHandle for RemoteHandle {
         ok((self.remote.truncate)(self.id, len))?;
         (self.remote.touch)(self.id, super::tmpfs::now());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file's owner crosses to the process that asks, and a file without
+    /// one stays without: a page's processes are held to its tree's owners.
+    #[test]
+    fn metadata_carries_the_owner_across() {
+        let mut m = Metadata { mode: 0o4511, owner: Some((0, 80)), ..Metadata::regular(7) };
+        let back = decode_meta(&encode_meta(&m, 3));
+        assert_eq!((back.owner, back.mode, back.size), (Some((0, 80)), 0o4511, 7));
+        m.owner = Some((super::super::BASE_ID, super::super::BASE_ID));
+        assert_eq!(decode_meta(&encode_meta(&m, 0)).owner, m.owner, "the first user's, as the tree says it");
+        m.owner = None;
+        assert_eq!(decode_meta(&encode_meta(&m, 0)).owner, None);
     }
 }
