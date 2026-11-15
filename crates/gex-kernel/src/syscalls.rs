@@ -13713,7 +13713,11 @@ impl FdIo<'_> {
             return Err(Errno::EINVAL);
         }
         let ofd = matches!(cmd, 36..=38);
-        if ofd && m.read_u32(pid_at)? != 0 {
+        // (Linux wants no process named in a lock that is an open file's.
+        // XNU does not look: Apple's sqlite names its own, and with this
+        // refused every lock of trustd's databases failed, "disk I/O
+        // error".)
+        if ofd && !mac && m.read_u32(pid_at)? != 0 {
             return Err(Errno::EINVAL);
         }
         // A lock of a kind the descriptor cannot be used for (unlocking is

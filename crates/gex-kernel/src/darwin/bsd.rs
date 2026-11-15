@@ -135,6 +135,13 @@ impl Kernel {
             d::WRITEV | d::WRITEV_NOCANCEL => set(nr::WRITEV, &x[..3]),
             d::PREAD | d::PREAD_NOCANCEL => set(nr::PREAD64, &x[..4]),
             d::PWRITE | d::PWRITE_NOCANCEL => set(nr::PWRITE64, &x[..4]),
+            // Writes to a guarded descriptor (fd, guard, then as the plain
+            // call): the guard is not checked here, as it is not kept
+            // (`guarded_open_np`). Apple's sqlite writes its databases and
+            // journals so.
+            d::GUARDED_WRITE_NP => set(nr::WRITE, &[x[0], x[2], x[3]]),
+            d::GUARDED_PWRITE_NP => set(nr::PWRITE64, &[x[0], x[2], x[3], x[4]]),
+            d::GUARDED_WRITEV_NP => set(nr::WRITEV, &[x[0], x[2], x[3]]),
             // The flags are respelled at the kernel's door
             // (`oflags::from_guest`).
             // (A descriptor opened by its number, or a file locked as it
