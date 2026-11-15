@@ -932,6 +932,7 @@ pub mod trap {
     pub const MACH_VM_PROTECT: u64 = 14;
     pub const MACH_VM_MAP: u64 = 15;
     pub const MACH_PORT_ALLOCATE: u64 = 16;
+    pub const MACH_PORT_DESTROY: u64 = 17;
     pub const MACH_PORT_DEALLOCATE: u64 = 18;
     pub const MACH_PORT_MOD_REFS: u64 = 19;
     pub const MACH_PORT_MOVE_MEMBER: u64 = 20;
@@ -998,6 +999,7 @@ pub mod trap {
             14 => "_kernelrpc_mach_vm_protect_trap",
             15 => "_kernelrpc_mach_vm_map_trap",
             16 => "_kernelrpc_mach_port_allocate_trap",
+            17 => "_kernelrpc_mach_port_destroy_trap",
             18 => "_kernelrpc_mach_port_deallocate_trap",
             19 => "_kernelrpc_mach_port_mod_refs_trap",
             20 => "_kernelrpc_mach_port_move_member_trap",

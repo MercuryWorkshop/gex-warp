@@ -1029,6 +1029,16 @@ impl Space {
         name
     }
 
+    /// The port set under `name` goes: its members are in it no longer.
+    fn destroy_set(&mut self, name: u32) {
+        let members = self.names.remove(&name).map(|e| e.members).unwrap_or_default();
+        for member in members {
+            if let Some(e) = self.names.get(&member) {
+                e.port.state().wake.retain(|w| *w != name);
+            }
+        }
+    }
+
     /// End the receive right under `name`: the port is dead, what was
     /// queued on it is gone, and every other right to it here is a dead
     /// name (and elsewhere, as each task next looks). The names to wake.
@@ -1400,12 +1410,7 @@ impl Kernel {
                         right::PORT_SET if e.is_set() => match delta {
                             0 => KERN_SUCCESS,
                             -1 => {
-                                let members = sp.names.remove(&name).map(|e| e.members).unwrap_or_default();
-                                for member in members {
-                                    if let Some(e) = sp.names.get(&member) {
-                                        e.port.state().wake.retain(|w| *w != name);
-                                    }
-                                }
+                                sp.destroy_set(name);
                                 self.darwin_wake(m, &mut sp, &[name], true);
                                 KERN_SUCCESS
                             }
@@ -1417,6 +1422,39 @@ impl Kernel {
                 };
                 sp.drop_if_empty(name);
                 r
+            }),
+            // (task, name): every right the name is goes, whichever it has
+            // and however many references -- the receive right (the port
+            // dies), the send right, a send-once right (its port told it
+            // was never used), a dead name; or a port set, its members in
+            // it no longer. `mach_port_destroy`, which the Security
+            // framework ends a thread's reply port to securityd with (and
+            // throws, from a thread's exit, if it fails). A guarded
+            // receive right is not to be destroyed so (XNU raises a guard
+            // exception besides).
+            t::MACH_PORT_DESTROY => bad_task(match sp.entry(pid, name).map(|e| (e.is_set(), e.recv, e.once, Arc::clone(&e.port))) {
+                None => KERN_INVALID_NAME,
+                Some((true, ..)) => {
+                    sp.destroy_set(name);
+                    self.darwin_wake(m, &mut sp, &[name], true);
+                    KERN_SUCCESS
+                }
+                Some((_, true, _, port)) if port.state().guarded => KERN_INVALID_RIGHT,
+                Some((_, recv, once, port)) => {
+                    sp.send_refs(name, 0);
+                    if let Some(e) = sp.names.get_mut(&name) {
+                        (e.send, e.once, e.dead) = (0, false, 0);
+                    }
+                    if once {
+                        sp.once_gone(&port);
+                    }
+                    if recv {
+                        let wake = sp.destroy_receive(name);
+                        self.darwin_wake(m, &mut sp, &wake, true);
+                    }
+                    sp.drop_if_empty(name);
+                    KERN_SUCCESS
+                }
             }),
             // (task, name, send-right delta, guard): the receive right goes.
             t::MACH_PORT_DESTRUCT => bad_task(match sp.entry(pid, name) {

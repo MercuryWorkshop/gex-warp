@@ -16,7 +16,8 @@
 // so, and WindowServer's). The parent's name for it is not its own task's;
 // pid_for_task says whose task each is, and fails for a port that is no
 // task; and what is asked of the child's task port is not answered as if
-// it were asked of the parent's.
+// it were asked of the parent's. Then mach_port_destroy, the trap, of a
+// name with two rights, of no name, and of the name for the child's task.
 #include "t.h"
 
 // A trap with eight arguments: mach_msg2's.
@@ -35,7 +36,7 @@ __asm__(".text\n.globl _t_trap8\n_t_trap8:\n"
 
 enum {
     TRAP_port_allocate = 16, TRAP_port_mod_refs = 19, TRAP_port_guard = 41, TRAP_port_unguard = 42, TRAP_mach_msg = 31, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
-    TRAP_pid_for_task = 46,
+    TRAP_pid_for_task = 46, TRAP_port_destroy = 17, TRAP_port_insert_right = 21,
 };
 enum { RIGHT_SEND = 0, RIGHT_RECEIVE = 1 };
 enum { MOVE_SEND = 17, MOVE_SEND_ONCE = 18, COPY_SEND = 19, MAKE_SEND = 20, MAKE_SEND_ONCE = 21 };
@@ -276,6 +277,17 @@ static int task_parent(void) {
     int status = -1;
     long got = SYS(SYS_wait4, pid, &status, 0, 0);
     t_printf("the child: %s, status %x\n", got == pid ? "waited for" : "not waited for", status);
+
+    // mach_port_destroy, by the trap 10.14's libSystem makes: every right
+    // a name is goes with it, and the name.
+    u32 g = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, g, g, MAKE_SEND);
+    t_printf("a receive right and a send right: type %x\n", type_of(g));
+    r = TRAP(TRAP_port_destroy, task, g);
+    t_printf("destroyed: %ld, its type now %x\n", r, type_of(g));
+    t_printf("destroyed again: %ld\n", TRAP(TRAP_port_destroy, task, g));
+    r = TRAP(TRAP_port_destroy, task, theirs);
+    t_printf("the name for the child's task port destroyed: %ld, its type now %x\n", r, type_of(theirs));
     return 0;
 }
 

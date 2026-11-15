@@ -14,9 +14,10 @@
 // tells securityd or WindowServer who it is: the receiver's name for it is
 // not its own task's, pid_for_task says whose task it is (securityd refuses
 // a client whose task port and audit token disagree), and what is asked of
-// it is not answered as the receiver's own would be. That part is not
-// asked of the Mac: its answers are 10.14's, and a Mac of today may not
-// let a task's control port leave its task.
+// it is not answered as the receiver's own would be. And mach_port_destroy
+// by its trap, which ends every right a name is. That part is not asked
+// of the Mac: its answers are 10.14's, and a Mac of today may not let a
+// task's control port leave its task, or have that trap.
 //
 // Under gexc only: on the page each process has a kernel of its own, and a
 // port does not yet leave its task there.
@@ -39,5 +40,11 @@ export default async function (t) {
   // (KERN_FAILURE: gex does not yet ask anything of another task.)
   has('the child\'s bootstrap port, asked of its task: refused, 5', 'a task port: what is asked of the child\'s is not answered as the parent\'s own');
   has('the child: waited for, status 0', 'a task port: the child ends as it should');
+  // mach_port_destroy, the trap (the Security framework ends a thread's
+  // reply port to securityd with it).
+  has('a receive right and a send right: type 30000', 'mach_port_destroy: a name with a receive right and a send right');
+  has('destroyed: 0, its type now 0', 'mach_port_destroy: both go, and the name');
+  has('destroyed again: 15', 'mach_port_destroy: no such name then');
+  has('the name for the child\'s task port destroyed: 0, its type now 0', 'mach_port_destroy: a send right to another task\'s port');
   d.n.clean();
 }
