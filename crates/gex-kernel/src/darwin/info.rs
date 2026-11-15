@@ -74,7 +74,7 @@ impl crate::vfs::FileHandle for VersionFile {
         Ok(n as u64)
     }
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
-        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Regular, size: self.0.len() as u64, mode: 0o644, ino: 0x5653, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(crate::vfs::Metadata { owner: None, file_type: crate::vfs::FileType::Regular, size: self.0.len() as u64, mode: 0o644, ino: 0x5653, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
 }
 
@@ -519,7 +519,7 @@ const TOPS: [(i32, &str); 9] = [(1, "kern"), (2, "vm"), (3, "vfs"), (4, "net"), 
 /// most), its (real, effective, saved) user and group, and its
 /// controlling terminal's device and foreground group, if it has one.
 #[allow(clippy::too_many_arguments)]
-fn kinfo_proc(pid: i32, ppid: i32, pgid: i32, zombie: bool, comm: &str, [ruid, uid, svuid]: [u32; 3], [rgid, gid, svgid]: [u32; 3], tty: Option<(u32, i32)>) -> Vec<u8> {
+fn kinfo_proc(pid: i32, ppid: i32, pgid: i32, zombie: bool, comm: &str, [ruid, uid, svuid]: [u32; 3], [rgid, gid, svgid]: [u32; 3], groups: &[u32], tty: Option<(u32, i32)>) -> Vec<u8> {
     const EPROC: usize = 296;
     const P_CONTROLT: u32 = 0x2;
     let mut b = vec![0u8; KINFO_PROC];
@@ -539,8 +539,13 @@ fn kinfo_proc(pid: i32, ppid: i32, pgid: i32, zombie: bool, comm: &str, [ruid, u
     // e_ucred: cr_ref, cr_uid, cr_ngroups, cr_groups[0].
     w32(&mut b, EPROC + 120, 1);
     w32(&mut b, EPROC + 120 + 4, uid);
-    b[EPROC + 120 + 8] = 1;
-    w32(&mut b, EPROC + 120 + 12, gid);
+    // (`cr_ngroups` is a short, with the effective group first in its
+    // 16 groups, which are `NGROUPS`.)
+    let list: Vec<u32> = std::iter::once(gid).chain(groups.iter().copied().filter(|g| *g != gid)).take(16).collect();
+    b[EPROC + 120 + 8] = list.len() as u8;
+    for (i, g) in list.iter().enumerate() {
+        w32(&mut b, EPROC + 120 + 12 + 4 * i, *g);
+    }
     w32(&mut b, EPROC + 264, ppid as u32);
     w32(&mut b, EPROC + 268, pgid as u32);
     // e_tdev and e_tpgid: the terminal, or none.
@@ -1011,7 +1016,14 @@ impl Kernel {
                     let id = (r.for_sid)(e.sid);
                     (id >= 0).then(|| (abi::dev(crate::pty::pts_rdev(id as u32)), (r.fg)(id)))
                 });
-                out.extend_from_slice(&kinfo_proc(e.pid, e.ppid, e.pgid, e.zombie, &comm, uids, gids, tty));
+                let groups = if own {
+                    self.creds.groups()
+                } else {
+                    let them = crate::syscalls::Creds::new(0, 0);
+                    them.restore(&e.creds);
+                    them.groups()
+                };
+                out.extend_from_slice(&kinfo_proc(e.pid, e.ppid, e.pgid, e.zombie, &comm, uids, gids, &groups, tty));
             }
         }
         out

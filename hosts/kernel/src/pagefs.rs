@@ -274,6 +274,7 @@ impl PageFs {
             ino = (h >> 2) | 2;
         }
         Metadata {
+            owner: None,
             file_type: ft,
             size: u64_at(b, 8),
             mode: u32_at(b, 4) & 0o7777,

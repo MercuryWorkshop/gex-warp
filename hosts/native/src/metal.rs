@@ -149,7 +149,7 @@ impl FileHandle for MetalDevice {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { owner: None, file_type: FileType::CharDevice, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
 
     fn is_stream(&self) -> bool {

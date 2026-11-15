@@ -267,10 +267,8 @@ impl Kernel {
             d::FCHMODAT if x[3] & 0x20 != 0 => NATIVE + code,
             d::FCHMODAT => set(nr::FCHMODAT, &[dirfd(x[0]), x[1], x[2]]),
             d::FCHMOD => set(nr::FCHMOD, &x[..2]),
-            // (Only the superuser gives a file away, or to a group that
-            // is not the caller's.)
-            d::CHOWN | d::LCHOWN | d::FCHOWN if self.darwin_chown_refused(x[1], x[2]) => NATIVE + code,
-            d::FCHOWNAT if self.darwin_chown_refused(x[2], x[3]) => NATIVE + code,
+            // (Only the superuser gives a file away, and its owner a group
+            // to one the owner is in: `sys_chown`.)
             d::CHOWN => set(nr::FCHOWNAT, &[CWD, x[0], x[1], x[2], 0]),
             d::LCHOWN => set(nr::FCHOWNAT, &[CWD, x[0], x[1], x[2], K_NOFOLLOW]),
             d::FCHOWNAT => set(nr::FCHOWNAT, &[dirfd(x[0]), x[1], x[2], x[3], at_flags(x[4])]),
@@ -346,7 +344,7 @@ impl Kernel {
             d::SETREUID => set(nr::SETREUID, &x[..2]),
             d::SETREGID => set(nr::SETREGID, &x[..2]),
             d::GETGROUPS => NATIVE + d::GETGROUPS,
-            d::SETGROUPS => set(nr::SETGROUPS, &x[..2]),
+            d::SETGROUPS => NATIVE + code,
             d::GETPGRP => set(nr::GETPGID, &[0]),
             d::GETPGID => set(nr::GETPGID, &x[..1]),
             d::SETPGID => set(nr::SETPGID, &x[..2]),
@@ -602,7 +600,15 @@ impl Kernel {
             d::PTRACE if x[0] == 31 => Ok(0),
             // The session's login name, set: by root alone, and kept by
             // nothing (getlogin answers by who the process is).
-            d::SETLOGIN => if self.creds.uid() == 0 { Ok(0) } else { Err(Errno::EPERM) },
+            d::SETLOGIN => {
+                if self.creds.uid() != 0 {
+                    return Err(Errno::EPERM);
+                }
+                let name = m.read_cstr(x[0], 256)?;
+                self.creds.set_login(&String::from_utf8_lossy(&name));
+                self.procs.set_creds(self.pid, &self.creds.save_within(256));
+                Ok(0)
+            }
             // (auditinfo_addr*, length): who the process is to the audit
             // system: its audit user (none set), no events masked, no
             // terminal, its session, no flags.
@@ -611,12 +617,41 @@ impl Kernel {
                     return Err(Errno::EOVERFLOW);
                 }
                 let mut info = [0u8; 48];
-                info[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                info[0..4].copy_from_slice(&self.creds.auid().to_le_bytes());
                 let sid = self.procs.sid(self.pid, self.pid).unwrap_or(0);
                 info[36..40].copy_from_slice(&(sid as u32).to_le_bytes());
                 m.write(x[0], &info)?;
                 Ok(0)
             }
+            // (au_id_t*): the audit user id, which is all ones until a login
+            // sets it, and the superuser's to set.
+            d::GETAUID => m.write_u32(x[0], self.creds.auid()).map(|_| 0),
+            d::SETAUID => {
+                if self.creds.uid() != 0 {
+                    return Err(Errno::EPERM);
+                }
+                let id = m.read_u32(x[0])?;
+                self.creds.set_auid(id);
+                self.procs.set_creds(self.pid, &self.creds.save_within(256));
+                Ok(0)
+            }
+            // (auditinfo_addr*, length): the same, as the 48-byte record
+            // getaudit_addr gives: its audit user is what is kept.
+            d::SETAUDIT_ADDR => {
+                if self.creds.uid() != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if x[1] < 48 {
+                    return Err(Errno::EOVERFLOW);
+                }
+                let id = m.read_u32(x[0])?;
+                self.creds.set_auid(id);
+                Ok(0)
+            }
+            // `__initgroups(ngroups, gidset, gmuid)`: libc's `initgroups` is
+            // this, which sets the groups as `setgroups` does (the membership
+            // user is only what the kernel's group cache asks for).
+            d::INITGROUPS => self.darwin_setgroups(m, x[0], x[1]),
             // auditon(A_GETSINFO_ADDR, auditinfo_addr*, length): what a
             // session is, by the id the caller puts in it (`ai_asid`): one
             // a process leads (a session's id is its leader's), as
@@ -646,7 +681,7 @@ impl Kernel {
             d::SHARED_REGION_CHECK_NP => Err(Errno::EINVAL),
             // The name the session was logged in under.
             d::GETLOGIN => {
-                let mut name = if self.creds.ruid() == 0 { "root" } else { "user" }.as_bytes().to_vec();
+                let mut name = self.creds.login().unwrap_or_else(|| if self.creds.ruid() == 0 { "root" } else { "user" }.to_string()).into_bytes();
                 name.push(0);
                 if (x[1] as usize) < name.len() {
                     return Err(Errno::ERANGE);
@@ -710,7 +745,6 @@ impl Kernel {
             }
             d::OPEN | d::OPEN_NOCANCEL => self.darwin_open(m, CWD, x[0], x[1], x[2]),
             d::OPENAT | d::OPENAT_NOCANCEL => self.darwin_open(m, dirfd(x[0]), x[1], x[2], x[3]),
-            d::CHOWN | d::LCHOWN | d::FCHOWN | d::FCHOWNAT => Err(Errno::EPERM),
             d::SETPRIORITY => Err(Errno::ESRCH),
             // A link's own mode, where it is kept (a tree in memory, a
             // Mac's host's files): where it is not, changing it changes
@@ -762,7 +796,6 @@ impl Kernel {
                 }
                 self.sys_dup2(x[0] as i32, x[1] as i32)
             }
-            d::ISSETUGID => Ok(0),
             d::THREAD_SELFID => Ok(self.tid as u64),
             d::MMAP => self.darwin_mmap(m, x),
             d::SHM_OPEN => self.darwin_shm(m, x[0], Some((x[1], x[2]))),
@@ -811,16 +844,31 @@ impl Kernel {
                 Ok(0)
             }
             d::GETDIRENTRIES64 => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2], x[3], false),
-            // The groups a process is in: the kernel's list, which is of
-            // the ones beside its own and empty until given; Darwin's
-            // always has the process's own group, first.
+            // The groups a process is in, its own (effective) group first as
+            // Darwin's list has it, then the ones beside it, no more than
+            // `NGROUPS_MAX`. Asked with room for none, how many; with too
+            // little room, `EINVAL`.
             d::GETGROUPS => {
-                let n = self.dispatch(m, nr::GETGROUPS, [x[0], x[1], 0, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL))?;
-                if n == 0 && x[0] as i32 > 0 {
-                    m.write_u32(x[1], self.creds.gid())?;
+                let list = self.darwin_groups();
+                if x[0] as i32 == 0 {
+                    return Ok(list.len() as u64);
                 }
-                Ok(n.max(1))
+                if (x[0] as i32) < 0 || (x[0] as usize) < list.len() {
+                    return Err(Errno::EINVAL);
+                }
+                for (i, g) in list.iter().enumerate() {
+                    m.write_u32(x[1] + 4 * i as u64, *g)?;
+                }
+                Ok(list.len() as u64)
             }
+            // The superuser's: at most `NGROUPS_MAX` groups. The list is the
+            // process's own group and those beside it; its effective group
+            // is the one `setgid` set, so a list that has it is not told
+            // twice (`initgroups` has its base group first).
+            d::SETGROUPS => self.darwin_setgroups(m, x[0], x[1]),
+            // Whether the process is tainted: a set-user-ID or set-group-ID
+            // program's, or one that has changed who it is (`P_SUGID`).
+            d::ISSETUGID => Ok(self.creds.sugid() as u64),
             // System Integrity Protection: on, and letting nothing past
             // (`csr_check` is refused, the configuration allows nothing).
             d::CSRCTL => match x[0] {
@@ -993,12 +1041,41 @@ impl Kernel {
     }
 
     /// `fcntl`: Darwin's commands, the descriptor ones as the kernel's.
-    /// Whether only the superuser may give a file to `uid` and `gid`
-    /// (each -1 for no change), and the caller is not: to another owner,
-    /// or to a group that is not the caller's own.
-    fn darwin_chown_refused(&self, uid: u64, gid: u64) -> bool {
-        let (uid, gid, me) = (uid as u32, gid as u32, self.creds.uid());
-        me != 0 && ((uid != u32::MAX && uid != me) || (gid != u32::MAX && gid != self.creds.gid() && gid != self.creds.rgid()))
+    /// `setgroups(n, list)` and `__initgroups`: the superuser's, at most
+    /// `NGROUPS_MAX` groups; a list with the effective group in it is not told
+    /// it twice.
+    fn darwin_setgroups(&mut self, m: &mut GuestMem<'_>, count: u64, at: u64) -> SysResult {
+        let n = count as i32;
+        if n < 0 || n as usize > crate::syscalls::DARWIN_NGROUPS_MAX {
+            return Err(Errno::EINVAL);
+        }
+        if !self.creds.capable(crate::syscalls::cap::SETGID) {
+            return Err(Errno::EPERM);
+        }
+        let egid = self.creds.gid();
+        let mut list = Vec::new();
+        for i in 0..n as u64 {
+            let g = m.read_u32(at + 4 * i)?;
+            if g != egid && !list.contains(&g) {
+                list.push(g);
+            }
+        }
+        if list != self.creds.groups() {
+            self.creds.set_groups(&list);
+            self.creds.set_sugid(true);
+            self.procs.set_creds(self.pid, &self.creds.save_within(256));
+        }
+        Ok(0)
+    }
+
+    /// The groups Darwin's `getgroups` lists: the effective group, then the
+    /// others, `NGROUPS_MAX` at most.
+    pub(super) fn darwin_groups(&self) -> Vec<u32> {
+        let egid = self.creds.gid();
+        let mut list = vec![egid];
+        list.extend(self.creds.groups().into_iter().filter(|g| *g != egid));
+        list.truncate(crate::syscalls::DARWIN_NGROUPS_MAX);
+        list
     }
 
     /// `open` of what [`darwin_open_is_more`] says is more than a file

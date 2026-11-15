@@ -67,8 +67,17 @@ pub const HWCAP: u64 = if gex_abi::X86 {
 /// disagreed.
 #[derive(Clone, Copy, Debug)]
 pub struct Identity {
+    /// The real user and group (`AT_UID`, `AT_GID`).
     pub uid: u32,
     pub gid: u32,
+    /// The effective ones (`AT_EUID`, `AT_EGID`), and whether the program
+    /// is to be treated as running with more than its caller's trust
+    /// (`AT_SECURE`: a set-user-ID or set-group-ID program's, whose
+    /// environment and `LD_*` variables the loader then ignores). `None`
+    /// ids are the real ones.
+    pub euid: Option<u32>,
+    pub egid: Option<u32>,
+    pub secure: bool,
     /// Load bias of the dynamic linker, or zero for a static program.
     ///
     /// The interpreter reads `AT_BASE` to locate its own relocations; a
@@ -87,6 +96,9 @@ impl Default for Identity {
         Identity {
             uid: 1000,
             gid: 1000,
+            euid: None,
+            egid: None,
+            secure: false,
             interp_base: 0,
             entry_hook: 0,
         }
@@ -209,13 +221,13 @@ pub fn build_initial_stack_execfn(
             if id.entry_hook != 0 { id.entry_hook } else { image.entry },
         ),
         (auxv::AT_UID, id.uid as u64),
-        (auxv::AT_EUID, id.uid as u64),
+        (auxv::AT_EUID, id.euid.unwrap_or(id.uid) as u64),
         (auxv::AT_GID, id.gid as u64),
-        (auxv::AT_EGID, id.gid as u64),
+        (auxv::AT_EGID, id.egid.unwrap_or(id.gid) as u64),
         (auxv::AT_HWCAP, HWCAP),
         (auxv::AT_HWCAP2, 0),
         (auxv::AT_CLKTCK, 100),
-        (auxv::AT_SECURE, 0),
+        (auxv::AT_SECURE, id.secure as u64),
         (auxv::AT_RANDOM, blob_addr + random_off as u64),
         (auxv::AT_PLATFORM, blob_addr + platform_off as u64),
         (auxv::AT_EXECFN, blob_addr + execfn_off as u64),

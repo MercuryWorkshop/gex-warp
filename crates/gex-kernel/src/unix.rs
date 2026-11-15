@@ -676,6 +676,7 @@ impl FileHandle for UnixSocket {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Socket,
             size: 0,
             mode: 0o755,
@@ -1109,6 +1110,7 @@ impl FileHandle for UnixDgram {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: crate::vfs::FileType::Socket,
             size: 0,
             mode: 0o777,
@@ -1644,6 +1646,7 @@ impl FileHandle for MemFd {
             return Ok(Metadata { mode: 0o600, ..b.metadata()? });
         }
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Regular,
             size: self.len(),
             mode: 0o600,
@@ -2002,6 +2005,7 @@ impl FileHandle for EpollSet {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Regular,
             size: 0,
             mode: 0o600,
@@ -2326,6 +2330,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
         Ok(crate::vfs::Metadata {
+            owner: None,
             file_type: crate::vfs::FileType::Socket,
             size: 0,
             mode: 0o600,
