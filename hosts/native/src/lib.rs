@@ -3904,9 +3904,10 @@ fn exec_program(
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
     note_exec(kernel.pid, &req.path, &req.argv);
-    // `GEX_STRACE_EXEC=NAME`: the system calls of a program by its file's
-    // name traced from its exec on (`--strace`, for the one program).
-    if std::env::var("GEX_STRACE_EXEC").is_ok_and(|n| req.path.rsplit('/').next() == Some(n.as_str())) {
+    // `GEX_STRACE_EXEC=NAME[,NAME...]`: the system calls of a program by
+    // its file's name traced from its exec on (`--strace`, for those
+    // programs only).
+    if std::env::var("GEX_STRACE_EXEC").is_ok_and(|n| n.split(',').any(|n| req.path.rsplit('/').next() == Some(n))) {
         kernel.trace = true;
     }
     // What the translators knew of the old image is about addresses the new

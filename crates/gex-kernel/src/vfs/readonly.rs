@@ -27,7 +27,7 @@ impl ReadOnly {
     /// (`ENOENT`, `ENOTDIR`) for one that is not.
     fn there(&self, path: &str) -> Errno {
         match self.inner.metadata_nofollow(path) {
-            Ok(_) => Errno::EROFS,
+            Ok(_) => refused(path),
             Err(e) => e,
         }
     }
@@ -36,25 +36,36 @@ impl ReadOnly {
     fn made(&self, path: &str) -> Errno {
         match self.inner.metadata_nofollow(path) {
             Ok(_) => Errno::EEXIST,
-            Err(_) => Errno::EROFS,
+            Err(_) => refused(path),
         }
     }
 
     fn refuse_open(&self, path: &str, flags: u64) -> Option<Errno> {
         let there = self.inner.metadata(path);
         if flags & oflags::O_CREAT != 0 && there.is_err() {
-            return Some(Errno::EROFS);
+            return Some(refused(path));
         }
         if super::writes(flags) || flags & oflags::O_TRUNC != 0 {
             return Some(match there {
                 // (A directory opened to be written is refused as one.)
                 Ok(md) if md.file_type == super::FileType::Directory => Errno::EISDIR,
-                Ok(_) => Errno::EROFS,
+                Ok(_) => refused(path),
                 Err(e) => e,
             });
         }
         None
     }
+}
+
+/// `EROFS`, for a write to `path` (within the filesystem) that is refused.
+/// `GEX_TRACE_EROFS` says each: what a run would have written in a root it
+/// was told not to write, and so which directories want a bind of their own.
+fn refused(path: &str) -> Errno {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("GEX_TRACE_EROFS").is_some()) {
+        eprintln!("[gex] read-only: a write to {path} refused");
+    }
+    Errno::EROFS
 }
 
 impl FileSystem for ReadOnly {
