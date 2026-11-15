@@ -92,10 +92,12 @@ export default async function (t) {
   // connection to WindowServer as loginwindow's (its signature has the
   // entitlement WindowServer asks for), which gives WindowServer's session
   // that audit session and an owner, and puts up a window over the display
-  // and draws in it. WindowServer takes all of it. What it composites is
-  // not in the framebuffer yet: CoreDisplay brings no hardware display
-  // online and WindowServer draws its virtual one (README), so the
-  // framebuffer gex saves is said, and not checked.
+  // (the framebuffer's: CoreDisplay has it online, its one mode listed)
+  // and draws in it: a fill and a white square. WindowServer composites it
+  // in software into the framebuffer's pixels, which gex saves as a PNG
+  // (GEX_FRAMEBUFFER_PNG): the picture is the window's, and so is what
+  // WindowServer says the display shows (the stand-in asks it for the
+  // display's image).
   const lw = join(d, 'lw');
   const bl = await exec(['sh', join(ROOT, 'guest/loginwindow/build.sh'), lw, 'x86_64']);
   if (bl.code !== 0) throw new Error(`guest/loginwindow/build.sh: ${bl.stderr.trim()}`);
@@ -164,10 +166,14 @@ export default async function (t) {
   t.check('loginwindow\'s stand-in: draws in it', login.some((l) => /^gexloginwindow: context 0x[0-9a-f]+$/.test(l)) && login.includes('gexloginwindow: drawn'), told);
   t.check('loginwindow\'s stand-in: has it ordered in, and stays', login.includes('gexloginwindow: SLSOrderWindow -> 0') && login.includes('gexloginwindow: up'), told);
   t.check('loginwindow\'s stand-in: does not crash', !/\(loginwindow\) crashed/.test(said), (said.match(/.*crashed.*/g) || []).join(' / '));
-  // The framebuffer as gex saved it last: black until WindowServer draws
-  // the hardware display (a row's bytes, each after its filter's, are all
-  // zero in a picture that is).
+  // The display is the framebuffer (1024 by 768, gex's default), and
+  // WindowServer's own picture of it is the window's fill.
+  t.check('the display: is the framebuffer\'s, online', login.some((l) => /^gexloginwindow: main display \d+, 1024x768 at 0,0, 1024x768 pixels$/.test(l)) && login.includes('gexloginwindow: display online 1, active 1, asleep 0'), told);
+  t.check('the display: WindowServer shows the window on it', login.some((l) => /^gexloginwindow: shown 1024x768: at 50,50 3373bf, /.test(l)), told);
+  // The framebuffer as gex saved it last (an RGB PNG, each row unfiltered):
+  // the window's fill over most of it, and the white square.
   let shown = 'not saved';
+  let [fill, white] = [0, 0];
   if (existsSync(fb)) {
     const png = readFileSync(fb);
     const idat = [];
@@ -175,11 +181,19 @@ export default async function (t) {
       if (png.toString('latin1', at + 4, at + 8) === 'IDAT') idat.push(png.subarray(at + 8, at + 8 + png.readUInt32BE(at)));
     }
     const rows = inflateSync(Buffer.concat(idat));
-    const stride = 1 + png.readUInt32BE(16) * 3;
-    let lit = 0;
-    for (let i = 0; i < rows.length; i++) if (i % stride && rows[i]) lit++;
-    shown = `${png.readUInt32BE(16)}x${png.readUInt32BE(20)}, ${lit ? `${lit} bytes of colour` : 'all black'}`;
+    const [w, h] = [png.readUInt32BE(16), png.readUInt32BE(20)];
+    const stride = 1 + w * 3;
+    for (let y = 0; y < h && rows[y * stride] === 0; y++) {
+      for (let x = 0; x < w; x++) {
+        const at = y * stride + 1 + x * 3;
+        const rgb = (rows[at] << 16) | (rows[at + 1] << 8) | rows[at + 2];
+        if (rgb === 0x3373bf) fill++;
+        else if (rgb === 0xffffff) white++;
+      }
+    }
+    shown = `${w}x${h}, ${fill} pixels of the fill, ${white} white`;
   }
+  t.check('the framebuffer: shows what WindowServer composited, the window', fill > 1024 * 768 / 2 && white > 10000, shown);
   t.say(`the framebuffer: ${shown}`);
   t.say(login.join('\n'));
   n.clean();

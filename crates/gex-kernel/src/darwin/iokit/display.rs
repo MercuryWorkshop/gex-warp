@@ -18,6 +18,9 @@ pub const VRAM_MEMORY: u32 = 110;
 /// `sizeof(StdFBShmem_t)` and `kIOFBCurrentShmemVersion`.
 const SHMEM_SIZE: usize = 5360;
 const SHMEM_VERSION: i32 = 2;
+/// `sizeof(IOFBDisplayModeDescription)`: an `IODisplayModeInformation` (36
+/// bytes) and an `IOTimingInformation` (168).
+const MODE_DESCRIPTION: usize = 204;
 /// The one mode's id and depth index.
 pub const MODE: i32 = 1;
 
@@ -99,6 +102,23 @@ impl Fb {
         b
     }
 
+    /// What `extGetInformationForDisplayMode` answers, IOGraphics's
+    /// `IOFBDisplayModeDescription`: the mode's `IODisplayModeInformation`
+    /// and then its `IOTimingInformation` (an Apple timing id, flags, and
+    /// room for a detailed timing): a fixed panel's one timing
+    /// (`timingApple_FixedRateLCD`), with no detailed timing to it. IOKit's
+    /// IOGraphics library asks for all of it (204 bytes) and takes a mode
+    /// with less for none at all; a framebuffer with no mode it can list
+    /// is unusable to it, and CoreDisplay then has no display online and
+    /// WindowServer draws its virtual one.
+    fn mode_description(&self) -> Vec<u8> {
+        const TIMING_APPLE_FIXED_RATE_LCD: u32 = 42;
+        let mut b = self.mode_information();
+        b.extend_from_slice(&TIMING_APPLE_FIXED_RATE_LCD.to_le_bytes());
+        b.resize(MODE_DESCRIPTION, 0);
+        b
+    }
+
     /// `IOFramebufferUserClient`'s methods (the shared client's are the
     /// same few that read).
     pub fn method(&mut self, selector: u32, scalars: &[u64], inband: &[u8]) -> Result<(Vec<u64>, Vec<u8>), i32> {
@@ -115,11 +135,13 @@ impl Fb {
             1 => Err(super::BAD_ARGUMENT),
             // extGetCurrentDisplayMode: the mode and its depth
             2 => Ok((vec![MODE as u64, 0], Vec::new())),
-            // extSetStartupDisplayMode, extSetDisplayMode: the one there is
-            3 | 4 if arg(0) as i32 == MODE => none,
+            // extSetStartupDisplayMode, extSetDisplayMode: the one there is,
+            // by its id or as the current one (`kIODisplayModeIDCurrent`,
+            // 0: CoreDisplay sets that on every framebuffer as it starts)
+            3 | 4 if arg(0) as i32 == MODE || arg(0) == 0 => none,
             3 | 4 => Err(super::BAD_ARGUMENT),
             // extGetInformationForDisplayMode(mode)
-            5 if arg(0) as i32 == MODE => Ok((Vec::new(), self.mode_information())),
+            5 if arg(0) as i32 == MODE => Ok((Vec::new(), self.mode_description())),
             5 => Err(super::BAD_ARGUMENT),
             // extGetDisplayModeCount, extGetDisplayModes
             6 => Ok((vec![1], Vec::new())),
@@ -159,11 +181,16 @@ mod tests {
         let mut fb = Fb { kind: 0, mode: Mode { width: 800, height: 600 }, cursor: (32, 32), cursor_at: (0, 0), cursor_visible: false };
         assert_eq!(fb.method(6, &[], &[]), Ok((vec![1], Vec::new())));
         assert_eq!(fb.method(2, &[], &[]), Ok((vec![1, 0], Vec::new())));
+        assert!(fb.method(4, &[1, 0], &[]).is_ok() && fb.method(4, &[0, 0], &[]).is_ok() && fb.method(4, &[7, 0], &[]).is_err());
         let (_, info) = fb.method(1, &[1, 0, 0], &[]).unwrap();
         assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 3200);
         assert_eq!(u32::from_le_bytes(info[156..160].try_into().unwrap()), 800);
+        // A mode's description is its information and its timing, whole.
         let (_, mode) = fb.method(5, &[1], &[]).unwrap();
+        assert_eq!(mode.len(), 204);
         assert_eq!(u32::from_le_bytes(mode[4..8].try_into().unwrap()), 600);
+        assert_eq!(u32::from_le_bytes(mode[16..20].try_into().unwrap()) & 3, 3);
+        assert_eq!((u32::from_le_bytes(mode[36..40].try_into().unwrap()), u32::from_le_bytes(mode[40..44].try_into().unwrap())), (42, 0));
         assert_eq!(fb.vram_size(), (3200 * 600u64).next_multiple_of(0x4000));
         let cursor = fb.memory(CURSOR_MEMORY).unwrap();
         assert_eq!(i32::from_le_bytes(cursor[56..60].try_into().unwrap()), 2);

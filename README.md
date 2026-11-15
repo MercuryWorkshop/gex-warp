@@ -394,13 +394,16 @@ What does not, yet:
   loginwindow's (`SLSSetLoginwindowConnection`, for which its ad hoc
   signature carries the entitlement WindowServer asks of the caller),
   gives the console to the user, and puts up a window over the display
-  and draws in it; WindowServer takes each. What it composites does not
-  reach the framebuffer yet: CoreDisplay finds no hardware display online
-  when it starts (its `CGXDisplayDriverInitialize`), so WindowServer and
-  its clients are on CoreDisplay's virtual one (1280 by 1024, memory of
-  WindowServer's own), and the framebuffer gex saves stays black.
-  (IOPresentment's object for the framebuffer is not made either, for
-  want of an `AppleGraphicsDeviceControl`: "Unable to acquire map".)
+  and draws in it; WindowServer takes each, and composites the window
+  into the framebuffer's pixels, which `GEX_FRAMEBUFFER_PNG=FILE` saves:
+  the window, and WindowServer's cursor on it. The display is the
+  framebuffer's: IOKit's IOGraphics library lists its one mode (it asks
+  for a mode's information and timing together, and a framebuffer with no
+  mode it can list is one CoreDisplay leaves offline, drawing a virtual
+  display of its own, 1280 by 1024, instead). (IOPresentment's object for
+  the framebuffer is not made, for want of an
+  `AppleGraphicsDeviceControl`: "Unable to acquire map", which CoreDisplay
+  goes on without.)
   A WindowServer logs nowhere, there being no logd, since it drops root
   and libsystem_trace ignores `OS_ACTIVITY_DT_MODE` in a process that has
   changed its ids: `GEX_DARWIN_UNTAINTED=1` has `issetugid` say it has

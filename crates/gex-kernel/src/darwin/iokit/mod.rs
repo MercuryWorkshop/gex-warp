@@ -194,20 +194,30 @@ pub fn framebuffer() -> Option<Pixels> {
     })
 }
 
-/// The framebuffer's pixels: the object WindowServer maps, its size, and
-/// the mode's width, height and bytes a row.
-static VRAM: Mutex<Option<(Arc<crate::file::OpenFile>, u64, (u32, u32, u64))>> = Mutex::new(None);
+/// The framebuffer's pixels: the object WindowServer maps, its size, the
+/// mode's width, height and bytes a row, and where a task has it mapped
+/// (the server's mapping when there is one): its memory, and the offset
+/// there.
+#[allow(clippy::type_complexity)]
+static VRAM: Mutex<Option<(Arc<crate::file::OpenFile>, u64, (u32, u32, u64), Option<(Arc<crate::proc::PeerVm>, u64)>)>> = Mutex::new(None);
 
 /// What the framebuffer shows now, as a PNG, once its server has mapped
-/// it: read from the pixels' shared memory, by any thread.
+/// it, by any thread. The pixels are read where they are, in the memory
+/// of the task that mapped them: what a task stores in a shared mapping
+/// is in its pages (and those of the tasks that share them), and in the
+/// object behind it only once it is written back, which nothing does for
+/// a framebuffer. Without a task's memory to read (a host that keeps none),
+/// the object's own bytes.
 pub fn framebuffer_png() -> Option<Vec<u8>> {
-    let (file, (w, h, row)) = {
+    let (file, (w, h, row), live) = {
         let v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
-        let (f, _, shape) = v.as_ref()?;
-        (Arc::clone(f), *shape)
+        let (f, _, shape, live) = v.as_ref()?;
+        (Arc::clone(f), *shape, live.clone())
     };
     let mut buf = vec![0u8; (row * h as u64) as usize];
-    file.handle.read_at(0, &mut buf).ok()?;
+    if !live.is_some_and(|(vm, at)| vm.mem.read(at, &mut buf)) {
+        file.handle.read_at(0, &mut buf).ok()?;
+    }
     Some(png::encode(w, h, row as usize, &buf))
 }
 
@@ -913,9 +923,9 @@ impl Kernel {
                         let size = (initial.len() as u64).next_multiple_of(crate::mem::share_granule().max(page));
                         let file = {
                             let mut v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
-                            if v.as_ref().is_none_or(|(_, s, _)| *s != size) {
+                            if v.as_ref().is_none_or(|(_, s, _, _)| *s != size) {
                                 match super::mement::new_object(size) {
-                                    Ok(f) => *v = Some((f, size, (fb.mode.width, fb.mode.height, fb.row_bytes()))),
+                                    Ok(f) => *v = Some((f, size, (fb.mode.width, fb.mode.height, fb.row_bytes()), None)),
                                     Err(_) => return fail(0xe000_02bd_u32 as i32),
                                 }
                             }
@@ -926,6 +936,16 @@ impl Kernel {
                             Ok(at) => at,
                             Err(_) => return fail(0xe000_02bd_u32 as i32),
                         };
+                        // (Where the pixels are read: the server's
+                        // mapping, or the first there is.)
+                        if let Ok(vm) = self.procs.vm(self.pid) {
+                            let mut v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some((.., live)) = v.as_mut() {
+                                if fb.kind == 0 || live.is_none() {
+                                    *live = Some((vm, gex_abi::canon(at)));
+                                }
+                            }
+                        }
                         c.maps.push((kind, at, initial.len() as u64));
                         *said = format!("{said} -> {at:#x}+{:#x} (shared)", initial.len());
                         let mut b = at.to_le_bytes().to_vec();
