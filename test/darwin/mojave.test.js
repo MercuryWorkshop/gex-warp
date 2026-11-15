@@ -33,6 +33,10 @@ export default async function (t) {
   if (b.code !== 0) throw new Error(`guest/launchd/build.sh: ${b.stderr.trim()}`);
   const home = join(d, 'home');
   mkdirSync(join(home, 'Library/Preferences'), { recursive: true });
+  // (The home is the user's: a host's file is the first user's, root's
+  // here, until it is given an owner, which gex keeps with it.)
+  const own = await n.gexc(['run', '--uid', '0', '--sysroot', root, '--bind', `${home}=/Users/gex`, join(root, 'usr/sbin/chown'), '-R', '501:20', '/Users/gex'], { timeout: 120000 });
+  if (own.code !== 0) throw new Error(`chown of the home: exit ${own.code}: ${own.stderr.trim().split('\n').slice(-2).join(' / ')}`);
   const etc = join(d, 'etc');
   mkdirSync(etc, { recursive: true });
   writeFileSync(join(etc, 'passwd'), readFileSync(join(root, 'etc/passwd'), 'utf8') + 'gex:*:501:20:gex:/Users/gex:/bin/sh\n');
