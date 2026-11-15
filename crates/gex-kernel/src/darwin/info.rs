@@ -1131,11 +1131,13 @@ impl Kernel {
             return Err(Errno::ESRCH);
         }
         match op {
+            // (One word, whatever size is said: XNU copies it out and
+            // does not look, and the Security framework's check of a
+            // process against its code on disk says none.)
             STATUS => {
-                if size < 4 {
-                    return Err(Errno::EINVAL);
+                if addr != 0 {
+                    m.write_u32(addr, CS_VALID | CS_ADHOC | CS_SIGNED)?;
                 }
-                m.write_u32(addr, CS_VALID | CS_ADHOC | CS_SIGNED)?;
                 Ok(0)
             }
             MARKINVALID | MARKHARD | MARKKILL | MARKRESTRICT => Ok(0),
