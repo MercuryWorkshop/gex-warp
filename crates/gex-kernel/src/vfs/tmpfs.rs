@@ -1093,6 +1093,14 @@ impl TmpFs {
         }
     }
 
+    /// A tmpfs for POSIX shared memory (`/dev/shm`): its root anyone's to
+    /// make a name in, sticky, as Linux's is.
+    pub fn shm() -> TmpFs {
+        let fs = TmpFs::new();
+        let _ = fs.inner.lock().unwrap().chmod("", 0o1777);
+        fs
+    }
+
     /// Keep the contents of files made from now on in the block store
     /// (`super::blocks`, once it is configured), as the root does. Any other
     /// tmpfs (`/dev/shm`, one a program mounts) keeps them in memory, as
@@ -2399,6 +2407,14 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/dev/shm` is anyone's to make a name in (a user's cfprefsd agent
+    /// makes its shared memory beside root's daemons'), and sticky.
+    #[test]
+    fn shared_memory_is_anyones_to_make_a_name_in() {
+        assert_eq!(FileSystem::metadata(&TmpFs::shm(), "").unwrap().mode & 0o7777, 0o1777);
+        assert_eq!(FileSystem::metadata(&TmpFs::new(), "").unwrap().mode & 0o7777, 0o755);
+    }
 
     /// A program making or removing a name moves its directory's time, as on
     /// Linux; seeding does not. A KService database built with the image
