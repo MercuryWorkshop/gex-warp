@@ -324,8 +324,11 @@ runs it (as WindowServer is), and a
 receive right a job gives up comes back to gexlaunchd (as launchd has its
 services' rights come back, by `MACH_NOTIFY_PORT_DESTROYED`) with what is
 queued on it. Mojave's WindowServer runs so: through the HID system,
-hidd (which hands it its event queue), launchservicesd and CoreDisplay's
-start (the GPU wrangler, below), as far as IOSurface (below). A
+hidd (which hands it its event queue), launchservicesd, CoreDisplay's
+start (the GPU wrangler, below), IOSurface (below) and lsd, to where it
+checks in `com.apple.windowserver` and serves its clients, compositing in
+software (it has no accelerator, below). `-r LABEL` starts a job along
+with the first program, as launchd starts one at load. A
 user's defaults, for one:
 
 ```console
@@ -346,8 +349,12 @@ What does not, yet:
 - **Mach between tasks on the page.** Natively a port is the system's
   and its rights go anywhere a message does; on the page each process
   has a kernel of its own, and a right does not leave its task. What the
-  kernel's own ports would answer with ports (`task_threads`,
-  `host_processor_info`) is `MIG_BAD_ID`, as much else of theirs is.
+  kernel's own ports would answer with ports (`host_processor_info`,
+  `processor_set_default`) is `MIG_BAD_ID`, as much else of theirs is.
+  `task_threads` names the task's threads; `thread_get_state` of one says
+  registers of all zeroes, its program counter in no code (a thread's
+  registers are its own while it runs translated code), which is what
+  Mojave's libobjc asks of each thread before it frees a method cache.
 - **Most of IOKit.** Its registry is gex's own small machine
   (`crates/gex-kernel/src/darwin/iokit`): IOResources and the HID system,
   one display (an `IONDRVFramebuffer` on a PCI device, its display connect
@@ -359,16 +366,40 @@ What does not, yet:
   task that opens them, where the kernel keeps their addresses for a host to
   read (`iokit::framebuffer`) and to post input into (`iokit::hid::post`,
   written into WindowServer's queue when it next calls IOKit or receives
-  the kick that says there is input). The GPU wrangler
-  (`AppleGPUWrangler`) tells CoreDisplay of one GPU, the display's PCI
-  device, driving the framebuffer. No driver comes or goes (a matching
-  notification is told what is there and nothing more), there is no
-  accelerator and no IOSurface (`IOSurfaceRoot`), which is where
-  WindowServer waits now, and nothing yet draws.
+  the kick that says there is input). The framebuffer's pixels are the
+  kernel's shared memory, mapped shared into WindowServer, which gex reads
+  whenever it likes: `GEX_FRAMEBUFFER_PNG=FILE` has `gexc` save them as a
+  PNG every two seconds. The GPU wrangler (`AppleGPUWrangler`) tells
+  CoreDisplay of one GPU, the display's PCI device, driving the
+  framebuffer, and answers its commands (its flags). `IOSurfaceRoot`
+  makes surfaces (`iokit/surface.rs`): from a dictionary of properties,
+  their rows, sizes and planes computed as IOSurface-255's driver computes
+  them; each surface's memory is the kernel's shared memory, with the
+  read-only and writable parts the driver shares with the framework (the
+  seed, the use count, the values' generation, timestamps) on a page after
+  the pixels, and every task that makes, looks up (by id: its own, a
+  global one, one it has) or is sent one (`IOSurfaceCreateMachPort`) maps
+  that memory and sees the same pixels; locks and the seed, values set,
+  copied and removed, use counts, attachments, the graphics comm page
+  (`test/darwin/iosurface.test.js`, against the Mac). The power manager's
+  root domain (`IOPMrootDomain`) is opened and registered with. No driver
+  comes or goes (a matching notification is told what is there and
+  nothing more), and there is no accelerator: WindowServer composites in
+  software (SkyLight's `CompositorSW`, which it takes when there is no
+  OpenGL or Metal device). Nothing has drawn yet: no client has a session
+  to draw in. loginwindow, which makes it, is one of the system's
+  protected programs (its code is encrypted, for the kernel to decrypt as
+  it pages it in) and does not run; a client of WindowServer's without a
+  session (a program of gex's own run as a job) stops in libxpc ("XPC API
+  Misuse") as it connects.
 - **launchd.** Apple's will be nothing but process 1; gexlaunchd
   (`guest/launchd`) stands in for its bootstrap server, and not for the
   rest of it (no sockets, no KeepAlive or RunAtLoad, no XPC events, no
-  launchctl). It leaves out logd, which runs now but keeps its store in
+  launchctl; a job with no Mach services starts only when asked, `-r`).
+  securityd starts, and its audit sessions' device answers it
+  (`/dev/auditsessions`, where nothing logs in or out), but its Mach
+  daemon state (MDS) does not install yet and it stops, which leaves lsd
+  waiting on it: WindowServer's runs leave it out (`-x`). It leaves out logd, which runs now but keeps its store in
   the root (`-i com.apple.logd` offers it, with `/private/var/db/diagnostics`
   and `uuidtext` bound elsewhere); coreservicesd, which refuses its
   clients' first request (and they do without it); opendirectoryd; and

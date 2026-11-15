@@ -11,7 +11,7 @@
 // to a waiter through its notifyd. The user is 501 with a home of the
 // test's own (the root is not written to: a passwd with that user, and the
 // home, are bound over it).
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { exec, native, ROOT } from '../lib/native.mjs';
 
@@ -63,21 +63,31 @@ export default async function (t) {
   t.check('notifyutil: a post reaches a waiter through notifyd', notes.code === 0 && notes.stdout.trim() === 'com.gex.ping', `exit ${notes.code}, said ${JSON.stringify(notes.stdout.trim())}`);
 
   // WindowServer, as far as it goes: run as its own job's program under
-  // gexlaunchd, with the directories it writes bound to the test's own. It
+  // gexlaunchd, with the directories it and the daemons it starts write
+  // bound to the test's own (copies of the root's where it has some). It
   // checks CoreDisplay's service in (a name its job does not declare), opens
   // the HID system (gex's IOKit registry: IOHIDSystem, its shared memory
   // made), and goes on to hidd, which names its event queue's memory
   // (mach_make_memory_entry_64) and hands it over, and WindowServer maps
-  // it. It goes on through launchservicesd to CoreDisplay, which finds the
-  // GPU wrangler (AppleGPUWrangler: one GPU, driving the framebuffer), and
-  // stops for now where it waits for IOSurface (IOSurfaceRoot, which gex
-  // has none of yet). GEX_IOKIT_TRACE says each IOKit request; what it asks
-  // last is said in the check's detail.
+  // it. CoreDisplay finds the GPU wrangler (AppleGPUWrangler: one GPU,
+  // driving the framebuffer) and maps the framebuffer's pixels (the
+  // kernel's shared memory, which gex reads); IOSurface opens
+  // (IOSurfaceRoot, its limits); lsd answers it; and WindowServer checks in
+  // its own services, com.apple.windowserver among them: it is up and
+  // serving. Nothing has drawn yet: no client has a session to draw in
+  // (README). securityd is left out: its Mach daemon state (MDS) does not
+  // install yet, and lsd, which WindowServer waits on, would wait on it.
+  // GEX_IOKIT_TRACE says each IOKit request; what it asks last is said in
+  // the check's detail.
   const ws = join(d, 'ws');
   const binds = [];
-  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches']]) {
+  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC']]) {
     mkdirSync(join(ws, mine), { recursive: true });
     binds.push('--bind', `${join(ws, mine)}=${theirs}`);
+  }
+  for (const [mine, theirs] of [['prefs', 'Library/Preferences'], ['root', 'private/var/root']]) {
+    cpSync(join(root, theirs), join(ws, mine), { recursive: true });
+    binds.push('--bind', `${join(ws, mine)}=/${theirs}`);
   }
   const server = await n.gexc(
     ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds,
@@ -85,10 +95,10 @@ export default async function (t) {
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
       // (Not the daemons that would write into the root itself: the
       // network's configuration, the disks', the log's housekeeping.)
-      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager',
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.securityd',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
-    // (It waits for IOSurface from then on, and is stopped.)
-    { timeout: 240000, env: { GEX_IOKIT_TRACE: '1' } },
+    // (It serves from then on, and is stopped.)
+    { timeout: 600000, env: { GEX_IOKIT_TRACE: '1' } },
   );
   const said = server.stderr;
   const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));
@@ -104,7 +114,10 @@ export default async function (t) {
   // hidd names the queue's memory and WindowServer maps it.
   t.check('WindowServer: gets its event queue from hidd', !/unable to make mach memory entry|Unable to create event queue via hidd|Unable to map event queue/.test(said), (said.match(/.*event queue.*|.*memory entry.*/g) || []).slice(-2).join(' / '));
   t.check('WindowServer: CoreDisplay finds the GPU and its framebuffer', /io_connect_method on connection to AppleGPUWrangler: selector 2684354562 /.test(said) && /IORegistryEntryID<\/key><integer size="64">0x[0-9a-f]+<\/integer><\/dict> -> 1 found/.test(said), last);
-  t.check('WindowServer: waits for IOSurface (where it stops for now)', /IONameMatch<\/key><string>IOSurfaceRoot/.test(said), last);
+  t.check('WindowServer: maps the framebuffer\'s pixels, shared', /io_connect_map_memory_into_task on connection to IONDRVFramebuffer: type 110 flags 0x1 -> 0x[0-9a-f]+\+0x[0-9a-f]+ \(shared\)/.test(said), last);
+  t.check('WindowServer: opens IOSurface', /io_service_open_extended on IOSurfaceRoot IOSurfaceRoot: type 0\n/.test(said) && /io_connect_method on connection to IOSurfaceRoot: get_limits /.test(said), last);
+  t.check('WindowServer: is answered by lsd', !/XPC error encountered talking to lsd/.test(said), (said.match(/.*talking to lsd.*/g) || []).join(' / '));
+  t.check('WindowServer: checks in its services (it is up)', /check-in com\.apple\.windowserver by \d+/.test(said) && /check-in com\.apple\.windowserver\.active by \d+/.test(said), last);
   t.check('WindowServer: does not crash', !/\(WindowServer\) crashed/.test(said), (said.match(/.*crashed.*/g) || []).join(' / '));
   n.clean();
 }
