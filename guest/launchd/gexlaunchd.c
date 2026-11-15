@@ -24,13 +24,15 @@
 // token), as launchd's do, and comes from a process running as root, which
 // libxpc insists on of a bootstrap server that is not process 1.
 //
-//   gexlaunchd [-v] [-u UID[:GID]] [-j DIR]... [-x LABEL]... [--] PROGRAM [ARG...]
+//   gexlaunchd [-v] [-u UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [--] PROGRAM [ARG...]
 //
 // starts PROGRAM with this server as its bootstrap port and exits when it
 // does, with its status, ending the jobs it started. -j adds a directory of
 // job plists (default: /System/Library/LaunchDaemons and
-// /System/Library/LaunchAgents); -x leaves a job out; -v says what is asked
-// and answered; -u is the user PROGRAM and the agents run as.
+// /System/Library/LaunchAgents); -x leaves a job out; -r starts a job along
+// with PROGRAM, as launchd starts one that is to run at load (loginwindow
+// beside WindowServer); -v says what is asked and answered; -u is the user
+// PROGRAM and the agents run as.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -117,6 +119,8 @@ static int verbose;
 // system's root itself. -i offers one of these after all.
 static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd", "com.apple.coreservicesd", "com.apple.fseventsd"};
 static int nskipped = 4;
+static const char *at_load[16];
+static int nat_load;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void say(const char *fmt, ...) {
@@ -150,7 +154,11 @@ static void add_job(const char *path) {
     if (!plist || xpc_get_type(plist) != XPC_TYPE_DICTIONARY) return;
     xpc_object_t mach = xpc_dictionary_get_value(plist, "MachServices");
     char *label = dup_string(xpc_dictionary_get_value(plist, "Label"));
-    if (!label || !mach || xpc_get_type(mach) != XPC_TYPE_DICTIONARY) return;
+    // (A job with no services is of use only when started at load, -r.)
+    int at_load_job = 0;
+    for (int i = 0; label && i < nat_load; i++) at_load_job |= !strcmp(at_load[i], label);
+    if (mach && xpc_get_type(mach) != XPC_TYPE_DICTIONARY) mach = NULL;
+    if (!label || (!mach && !at_load_job)) return;
     for (int i = 0; i < nskipped; i++)
         if (!strcmp(skipped[i], label)) return;
     // Its arguments: ProgramArguments, with Program for the file to run if
@@ -168,7 +176,7 @@ static void add_job(const char *path) {
     jobs = realloc(jobs, (njobs + 1) * sizeof *jobs);
     jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL};
     // (Each job has its own place: services point to it by index below.)
-    xpc_dictionary_apply(mach, ^bool(const char *name, xpc_object_t v) {
+    if (mach) xpc_dictionary_apply(mach, ^bool(const char *name, xpc_object_t v) {
         (void)v;
         for (int i = 0; i < nservices; i++)
             if (!strcmp(services[i].name, name)) return true;
@@ -502,7 +510,10 @@ static void ended(pid_t pid, int status) {
 }
 
 int main(int argc, char **argv) {
-    int dirs = 0, i = 1;
+    // (The directories are read once every option is known: -x and -r
+    // decide which jobs are kept.)
+    const char *dirs[16];
+    int ndirs = 0, i = 1;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-x") && i + 1 < argc && nskipped < 64) skipped[nskipped++] = argv[++i];
@@ -512,22 +523,24 @@ int main(int argc, char **argv) {
             for (int k = 0; k < nskipped; k++)
                 if (!strcmp(skipped[k], in)) skipped[k--] = skipped[--nskipped];
         }
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc && nat_load < 16) at_load[nat_load++] = argv[++i];
         else if (!strcmp(argv[i], "-u") && i + 1 < argc) {
             char *end;
             user = (uid_t)strtoul(argv[++i], &end, 10);
             group = *end == ':' ? (gid_t)strtoul(end + 1, NULL, 10) : 20;
         }
-        else if (!strcmp(argv[i], "-j") && i + 1 < argc) add_dir(argv[++i]), dirs++;
+        else if (!strcmp(argv[i], "-j") && i + 1 < argc && ndirs < 16) dirs[ndirs++] = argv[++i];
         else if (!strcmp(argv[i], "--")) {
             i++;
             break;
         } else break;
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-x LABEL]... [-i LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
+        fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-x LABEL]... [-i LABEL]... [-r LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
         return 2;
     }
-    if (!dirs) {
+    for (int k = 0; k < ndirs; k++) add_dir(dirs[k]);
+    if (!ndirs) {
         add_dir("/System/Library/LaunchDaemons");
         add_dir("/System/Library/LaunchAgents");
     }
@@ -553,6 +566,13 @@ int main(int argc, char **argv) {
             say("%s is job %s", argv[i], jobs[k].label);
             break;
         }
+    // The jobs asked to start with it.
+    for (int r = 0; r < nat_load; r++) {
+        int found = 0;
+        for (int k = 0; k < njobs; k++)
+            if (!strcmp(jobs[k].label, at_load[r])) start_job(&jobs[k]), found = 1;
+        if (!found) fprintf(stderr, "gexlaunchd: no job %s to start\n", at_load[r]);
+    }
     pthread_mutex_unlock(&lock);
     int status = 0;
     for (;;) {
