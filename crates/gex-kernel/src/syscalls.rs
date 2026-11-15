@@ -6941,9 +6941,11 @@ pub struct Creds {
     /// that changes them), so what it inherited from its environment is not
     /// to be trusted. Kept by an exec that does not undo the difference.
     sugid: std::sync::atomic::AtomicBool,
-    /// The audit user id (`setauid`): all ones, `AU_DEFAUDITID`, until a
-    /// login sets it.
-    auid: std::sync::atomic::AtomicU32,
+    /// The audit session the process is in, by its id (Darwin's
+    /// `au_asid_t`; [`crate::darwin::audit`] has the sessions): none, 0,
+    /// until one is made for it (`setaudit_addr`) or joined. A fork's
+    /// child and the next program are in it too.
+    asid: std::sync::atomic::AtomicU32,
     /// The user and group the machine's first process ran as (the host's
     /// user, or `--uid`'s): who the host's own permission checks are
     /// already made for, and who a file nobody gave an owner belongs to.
@@ -6987,7 +6989,7 @@ impl Creds {
             keep_caps: false.into(),
             groups: Default::default(),
             sugid: false.into(),
-            auid: u32::MAX.into(),
+            asid: 0.into(),
             base: [uid.into(), gid.into()],
             login: Default::default(),
         }
@@ -7128,13 +7130,19 @@ impl Creds {
         self.sugid.store(on, std::sync::atomic::Ordering::Release);
     }
 
-    /// The audit user id (`getauid`).
+    /// The audit user id (`getauid`): its audit session's, which is all
+    /// ones, `AU_DEFAUDITID`, until a login sets it.
     pub fn auid(&self) -> u32 {
-        Self::ld32(&self.auid)
+        crate::darwin::audit::auid(self.asid())
     }
 
-    pub fn set_auid(&self, id: u32) {
-        Self::st32(&self.auid, id);
+    /// The audit session's id.
+    pub fn asid(&self) -> u32 {
+        Self::ld32(&self.asid)
+    }
+
+    pub fn set_asid(&self, id: u32) {
+        Self::st32(&self.asid, id);
     }
 
     /// The login name `setlogin` set, if one was.
@@ -7149,8 +7157,9 @@ impl Creds {
     /// The ids and sets as bytes, for a process another memory goes on in
     /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte
     /// ([`Creds::SAVED`]), then the rest: the `P_SUGID` flag, the base
-    /// identity, the supplementary groups (a count and each) and the login
-    /// name (a length byte and the name).
+    /// identity, the supplementary groups (a count and each), the login
+    /// name (a length byte and the name) and the audit session's record
+    /// (Darwin's `auditinfo_addr_t`: its id, audit user and flags).
     pub fn save(&self) -> Vec<u8> {
         self.save_within(usize::MAX)
     }
@@ -7182,7 +7191,9 @@ impl Creds {
             let login = self.login().unwrap_or_default();
             v.push(login.len().min(255) as u8);
             v.extend_from_slice(&login.as_bytes()[..login.len().min(255)]);
-            v.extend_from_slice(&self.auid().to_le_bytes());
+            // The audit session, as it is (a kernel that has not heard
+            // of it, a page's child's, knows it by this).
+            v.extend_from_slice(&crate::darwin::audit::record(self.asid()));
         }
         v
     }
@@ -7234,8 +7245,9 @@ impl Creds {
             if let Some(name) = rest.get(after + 1..after + 1 + len as usize).filter(|n| !n.is_empty()) {
                 self.set_login(&String::from_utf8_lossy(name));
             }
-            if let Some(b) = rest.get(after + 1 + len as usize..after + 5 + len as usize) {
-                self.set_auid(u32::from_le_bytes(b.try_into().unwrap()));
+            let at = after + 1 + len as usize;
+            if let Some(b) = rest.get(at..at + crate::darwin::audit::INFO) {
+                self.set_asid(crate::darwin::audit::adopt(b.try_into().unwrap()));
             }
         }
     }

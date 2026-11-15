@@ -313,6 +313,10 @@ const NAMES: &[(&str, &[i32])] = &[
     ("kern.osreleasetype", &[]),
     ("kern.secure_kernel", &[]),
     ("kern.hv_vmm_present", &[]),
+    ("audit.session.superuser_set_sflags_mask", &[]),
+    ("audit.session.superuser_clear_sflags_mask", &[]),
+    ("audit.session.member_set_sflags_mask", &[]),
+    ("audit.session.member_clear_sflags_mask", &[]),
     ("kern.bootargs", &[]),
     ("kern.willshutdown", &[]),
     ("kern.uuid", &[]),
@@ -703,6 +707,7 @@ impl Kernel {
         let nofile = self.rlimits.get()[RLIMIT_NOFILE];
         Some(match name {
             "kern.ostype" => Str("Darwin".into()),
+            n if audit::MASKS.contains(&n) => Quad(self.darwin_audit_mask(audit::MASKS.iter().position(|m| *m == n)?) as i64),
             "kern.osrelease" => Str(self.darwin_os().release.clone()),
             "kern.osrevision" => Int(199506),
             "kern.version" => Str(darwin_version(self.darwin_os(), mac.row.soc.as_deref())),
@@ -915,6 +920,18 @@ impl Kernel {
     }
 
     fn darwin_sysctl_named(&mut self, m: &mut GuestMem<'_>, name: &str, old: u64, oldlenp: u64, new: u64) -> SysResult {
+        // Which of an audit session's flags may be set and cleared, by
+        // whom: the superuser's to say (as launchd does at its start).
+        if let Some(which) = audit::MASKS.iter().position(|n| *n == name) {
+            if old != 0 || oldlenp != 0 {
+                self.darwin_sysctl_out(m, old, oldlenp, Val::Quad(self.darwin_audit_mask(which) as i64))?;
+            }
+            if new != 0 {
+                let mask = m.read_u64(new)?;
+                self.darwin_audit_set_mask(which, mask)?;
+            }
+            return Ok(0);
+        }
         // The one name a task sets: whether it is shown the compatibility
         // version (by anybody: CTLFLAG_ANYBODY), the old value answered.
         if name == "kern.system_version_compat" && new != 0 {

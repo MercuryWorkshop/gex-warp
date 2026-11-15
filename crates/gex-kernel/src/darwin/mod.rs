@@ -19,6 +19,7 @@
 //! under canonical numbers of its own ([`NATIVE`], [`MACH`], [`MDEP`]).
 
 pub mod abi;
+pub mod audit;
 pub mod bottle;
 mod attr;
 mod reclaim;

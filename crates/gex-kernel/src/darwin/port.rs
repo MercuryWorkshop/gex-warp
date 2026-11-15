@@ -160,6 +160,9 @@ pub enum Kind {
     /// A named memory entry (`mach_make_memory_entry_64`), by its handle
     /// in [`super::mement`]'s table: memory to be mapped by whoever has it.
     MemEntry(u32),
+    /// An audit session's port (`audit_session_self`), by the session's
+    /// id: a name for the session, to be joined by whoever holds it.
+    AuditSession(u32),
 }
 
 /// What `mach_port_get_attributes` says of the port a name is a right to,
@@ -2103,7 +2106,7 @@ impl Kernel {
             body[*at..*at + 8].fill(0);
             body[*at + 8] = 1;
         }
-        let sender = [self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1];
+        let sender = self.darwin_audit_token();
         let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory, port_arrays, sender };
         // `GEX_MACH_TRACE`: each message sent, by its number, to what.
         if std::env::var_os("GEX_MACH_TRACE").is_some() {
@@ -2438,7 +2441,7 @@ impl Kernel {
                     // TASK_AUDIT_TOKEN: the audit user, the effective and
                     // real ids, the process, its audit session and which
                     // use of the process's number this is.
-                    15 => Some(vec![self.creds.ruid(), self.creds.uid(), self.creds.gid(), self.creds.ruid(), self.creds.rgid(), self.pid as u32, self.procs.sid(self.pid, self.pid).unwrap_or(0) as u32, 1]),
+                    15 => Some(self.darwin_audit_token().to_vec()),
                     // TASK_DYLD_INFO: where the dynamic linker's list of
                     // images is, its size and its format. The kernel is
                     // not told here: nowhere, in the 64-bit format.
