@@ -818,7 +818,11 @@ impl Kernel {
             d::SETGROUPS => self.darwin_setgroups(m, x[0], x[1]),
             // Whether the process is tainted: a set-user-ID or set-group-ID
             // program's, or one that has changed who it is (`P_SUGID`).
-            d::ISSETUGID => Ok(self.creds.sugid() as u64),
+            // (`GEX_DARWIN_UNTAINTED=1` says it is not: libsystem_trace
+            // ignores OS_ACTIVITY_DT_MODE in a tainted process, and a
+            // daemon that drops root, as WindowServer does, then logs
+            // nowhere without logd. For reading what one says.)
+            d::ISSETUGID => Ok((self.creds.sugid() && std::env::var_os("GEX_DARWIN_UNTAINTED").is_none()) as u64),
             // System Integrity Protection: on, and letting nothing past
             // (`csr_check` is refused, the configuration allows nothing).
             d::CSRCTL => match x[0] {
