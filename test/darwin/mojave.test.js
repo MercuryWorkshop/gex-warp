@@ -13,9 +13,10 @@
 // home, are bound over it).
 import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { inflateSync } from 'node:zlib';
 import { exec, native, ROOT } from '../lib/native.mjs';
 
-export const meta = { hosts: ['node'], arches: ['x86'], timeout: 2400 };
+export const meta = { hosts: ['node'], arches: ['x86'], timeout: 3600 };
 
 export default async function (t) {
   const root = process.env.GEX_TEST_MOJAVE_ROOT;
@@ -78,11 +79,36 @@ export default async function (t) {
   // kernel's shared memory, which gex reads); IOSurface opens
   // (IOSurfaceRoot, its limits); lsd answers it; and WindowServer checks in
   // its own services, com.apple.windowserver among them: it is up and
-  // serving. Nothing has drawn yet: no client has a session to draw in
-  // (README). securityd is left out: its Mach daemon state (MDS) does not
+  // serving. securityd is left out: its Mach daemon state (MDS) does not
   // install yet, and lsd, which WindowServer waits on, would wait on it.
   // GEX_IOKIT_TRACE says each IOKit request; what it asks last is said in
   // the check's detail.
+  //
+  // Beside it runs gexloginwindow (guest/loginwindow), in the place of
+  // loginwindow, which is one of the system's protected programs: a job of
+  // the test's, started with WindowServer. As root it makes the login's
+  // audit session (a new one, user 501's, with the flags that say it
+  // reaches the window server, a terminal and the console), takes its
+  // connection to WindowServer as loginwindow's (its signature has the
+  // entitlement WindowServer asks for), which gives WindowServer's session
+  // that audit session and an owner, and puts up a window over the display
+  // and draws in it. WindowServer takes all of it. What it composites is
+  // not in the framebuffer yet: CoreDisplay brings no hardware display
+  // online and WindowServer draws its virtual one (README), so the
+  // framebuffer gex saves is said, and not checked.
+  const lw = join(d, 'lw');
+  const bl = await exec(['sh', join(ROOT, 'guest/loginwindow/build.sh'), lw, 'x86_64']);
+  if (bl.code !== 0) throw new Error(`guest/loginwindow/build.sh: ${bl.stderr.trim()}`);
+  const jobs = join(d, 'jobs');
+  mkdirSync(jobs, { recursive: true });
+  writeFileSync(join(jobs, 'com.gex.loginwindow.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.gex.loginwindow</string>
+<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string></array>
+</dict></plist>
+`);
+  const fb = join(d, 'fb.png');
   const ws = join(d, 'ws');
   const binds = [];
   for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC']]) {
@@ -93,16 +119,20 @@ export default async function (t) {
     cpSync(join(root, theirs), join(ws, mine), { recursive: true });
     binds.push('--bind', `${join(ws, mine)}=/${theirs}`);
   }
+  // (It is stopped a few seconds after the window is up, for the
+  // framebuffer to be saved once more.)
+  let up = 0;
   const server = await n.gexc(
-    ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds,
+    ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds, '--bind', `${join(lw, 'x86_64')}=/gex-login`, '--bind', `${jobs}=/gex-jobs`,
       '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
       // (Not the daemons that would write into the root itself: the
       // network's configuration, the disks', the log's housekeeping.)
       join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.securityd',
+      '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
     // (It serves from then on, and is stopped.)
-    { timeout: 600000, env: { GEX_IOKIT_TRACE: '1' } },
+    { timeout: 1500000, env: { GEX_IOKIT_TRACE: '1', GEX_FRAMEBUFFER_PNG: fb }, until: (out) => /^gexloginwindow: up$/m.test(out) && ++up > 8 },
   );
   const said = server.stderr;
   const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));
@@ -123,5 +153,34 @@ export default async function (t) {
   t.check('WindowServer: is answered by lsd', !/XPC error encountered talking to lsd/.test(said), (said.match(/.*talking to lsd.*/g) || []).join(' / '));
   t.check('WindowServer: checks in its services (it is up)', /check-in com\.apple\.windowserver by \d+/.test(said) && /check-in com\.apple\.windowserver\.active by \d+/.test(said), last);
   t.check('WindowServer: does not crash', !/\(WindowServer\) crashed/.test(said), (said.match(/.*crashed.*/g) || []).join(' / '));
+  // gexloginwindow, as far as it says.
+  const login = server.stdout.split('\n').filter((l) => l.startsWith('gexloginwindow: '));
+  const told = login.slice(-4).join(' / ');
+  t.check('loginwindow\'s stand-in: starts in the system\'s audit session', login.some((l) => /^gexloginwindow: at the start: uid 0, audit session 100000 \(ok\), audit user -1, flags 0x1$/.test(l)), told);
+  t.check('loginwindow\'s stand-in: makes the login\'s, user 501\'s, with graphic access', login.some((l) => /^gexloginwindow: in the login's session: uid 0, audit session 10000[1-9] \(ok\), audit user 501, flags 0x6030$/.test(l)), told);
+  t.check('loginwindow\'s stand-in: connects to WindowServer', login.some((l) => /^gexloginwindow: connection [1-9]\d*$/.test(l)), told);
+  t.check('loginwindow\'s stand-in: WindowServer takes its connection as loginwindow\'s', login.includes('gexloginwindow: SLSSetLoginwindowConnection -> 0'), told);
+  t.check('loginwindow\'s stand-in: is given a window', login.some((l) => /^gexloginwindow: SLSNewWindow -> 0, window [1-9]\d*$/.test(l)), told);
+  t.check('loginwindow\'s stand-in: draws in it', login.some((l) => /^gexloginwindow: context 0x[0-9a-f]+$/.test(l)) && login.includes('gexloginwindow: drawn'), told);
+  t.check('loginwindow\'s stand-in: has it ordered in, and stays', login.includes('gexloginwindow: SLSOrderWindow -> 0') && login.includes('gexloginwindow: up'), told);
+  t.check('loginwindow\'s stand-in: does not crash', !/\(loginwindow\) crashed/.test(said), (said.match(/.*crashed.*/g) || []).join(' / '));
+  // The framebuffer as gex saved it last: black until WindowServer draws
+  // the hardware display (a row's bytes, each after its filter's, are all
+  // zero in a picture that is).
+  let shown = 'not saved';
+  if (existsSync(fb)) {
+    const png = readFileSync(fb);
+    const idat = [];
+    for (let at = 8; at + 8 <= png.length; at += 12 + png.readUInt32BE(at)) {
+      if (png.toString('latin1', at + 4, at + 8) === 'IDAT') idat.push(png.subarray(at + 8, at + 8 + png.readUInt32BE(at)));
+    }
+    const rows = inflateSync(Buffer.concat(idat));
+    const stride = 1 + png.readUInt32BE(16) * 3;
+    let lit = 0;
+    for (let i = 0; i < rows.length; i++) if (i % stride && rows[i]) lit++;
+    shown = `${png.readUInt32BE(16)}x${png.readUInt32BE(20)}, ${lit ? `${lit} bytes of colour` : 'all black'}`;
+  }
+  t.say(`the framebuffer: ${shown}`);
+  t.say(login.join('\n'));
   n.clean();
 }

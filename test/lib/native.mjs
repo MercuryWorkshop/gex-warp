@@ -29,9 +29,12 @@ export const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'native');
 /**
  * `argv` as a process: `{ code, signal, stdout, stderr, timedOut }`, `code`
  * as a shell gives it (128 + the signal's number for a signal). `cwd`,
- * `env` (the whole environment), `timeout` (ms, then SIGKILL).
+ * `env` (the whole environment), `timeout` (ms, then SIGKILL). `until`: a
+ * function asked every second, with what it has written to stdout so far,
+ * whether it has done what it was run for; it is ended once it has (a
+ * server, which would not end itself: `stopped`, and not `timedOut`).
  */
-export function exec(argv, { cwd = ROOT, env = process.env, timeout = 300000 } = {}) {
+export function exec(argv, { cwd = ROOT, env = process.env, timeout = 300000, until = null } = {}) {
   return new Promise((resolve) => {
     const p = spawn(argv[0], argv.slice(1), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     const out = [];
@@ -39,11 +42,19 @@ export function exec(argv, { cwd = ROOT, env = process.env, timeout = 300000 } =
     p.stdout.on('data', (d) => out.push(d));
     p.stderr.on('data', (d) => err.push(d));
     const timer = setTimeout(() => p.kill('SIGKILL'), timeout);
-    p.on('error', (e) => { clearTimeout(timer); resolve({ code: 127, signal: null, stdout: '', stderr: String(e.message) }); });
+    let stopped = false;
+    const asking = until && setInterval(() => {
+      if (!stopped && until(Buffer.concat(out).toString())) {
+        stopped = true;
+        p.kill('SIGKILL');
+      }
+    }, 1000);
+    p.on('error', (e) => { clearTimeout(timer); clearInterval(asking); resolve({ code: 127, signal: null, stdout: '', stderr: String(e.message) }); });
     p.on('close', (code, signal) => {
       clearTimeout(timer);
+      clearInterval(asking);
       const sig = { SIGABRT: 6, SIGKILL: 9, SIGSEGV: 11, SIGTERM: 15 }[signal];
-      resolve({ code: code ?? 128 + (sig ?? 0), signal, timedOut: signal === 'SIGKILL',
+      resolve({ code: code ?? 128 + (sig ?? 0), signal, timedOut: signal === 'SIGKILL' && !stopped, stopped,
         stdout: Buffer.concat(out).toString(), stderr: Buffer.concat(err).toString() });
     });
   });
