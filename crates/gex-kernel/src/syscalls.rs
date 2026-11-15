@@ -6949,9 +6949,9 @@ pub struct Creds {
     /// to be trusted. Kept by an exec that does not undo the difference.
     sugid: std::sync::atomic::AtomicBool,
     /// The audit session the process is in, by its id (Darwin's
-    /// `au_asid_t`; [`crate::darwin::audit`] has the sessions): none, 0,
-    /// until one is made for it (`setaudit_addr`) or joined. A fork's
-    /// child and the next program are in it too.
+    /// `au_asid_t`; [`crate::darwin::audit`] has the sessions): 0 for the
+    /// machine's first, until one is made for it (`setaudit_addr`) or
+    /// joined. A fork's child and the next program are in it too.
     asid: std::sync::atomic::AtomicU32,
     /// The user and group the machine's first process ran as (the host's
     /// user, or `--uid`'s): who the host's own permission checks are
@@ -7145,7 +7145,7 @@ impl Creds {
 
     /// The audit session's id.
     pub fn asid(&self) -> u32 {
-        Self::ld32(&self.asid)
+        crate::darwin::audit::session(Self::ld32(&self.asid))
     }
 
     pub fn set_asid(&self, id: u32) {

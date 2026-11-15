@@ -4,9 +4,10 @@
 // and the window server ask after. As root, since making one is the
 // superuser's; the Mac cannot be asked without it.
 //
-// The first process is in no session (XNU's default: no audit user, no
-// flags, no port). setaudit_addr makes one with an id the kernel chooses
-// (from 100000) and the caller is in it; its flags change only as the
+// The first process is in the session the machine began in (id 100000, no
+// audit user, the initial one: as launchd's is; XNU's default session, 0,
+// which is none, is never seen). setaudit_addr makes one with the next id
+// the kernel chooses and the caller is in it; its flags change only as the
 // masks the superuser sets allow (audit.session.*_sflags_mask), its audit
 // user is set once; a session has a port (audit_session_self,
 // audit_session_port), and holding it is the right to join
@@ -26,13 +27,15 @@ export default async function (t) {
   const NONE = 4294967295;
   t.check('the program completes', r.code === 0 && !lines.some((l) => l.startsWith('FAIL')), `exit ${r.code}: ${lines.filter((l) => l.startsWith('FAIL')).join(' / ')} ${r.stderr.trim().split('\n').slice(-2).join(' / ')}`);
 
-  has(`at the start: getaudit_addr 0: audit user ${NONE} session 0 flags 0x0 terminal type 4`, 'the first process is in the default session');
-  has('audit_session_self in no session = -22', 'which has no port');
-  has('flags 0x0', 'and no flags');
+  has(`at the start: getaudit_addr 0: audit user ${NONE} session 100000 flags 0x1 terminal type 4`, 'the first process is in the machine\'s first session');
+  has('ok the first session has a port', 'which has a port');
+  has('flags 0x1', 'and is the initial one');
+  has('setaudit_addr(no id) = 0', 'a session asked for by no id is a new one');
+  has('assigned session 100001', 'with the next id');
 
   has('setaudit_addr(AU_ASSIGN_ASID, initial) = 0', 'the superuser makes a session');
-  has('assigned session 100000', 'the kernel chooses its id, written back');
-  has(`in the system's session: getaudit_addr 0: audit user ${NONE} session 100000 flags 0x1 terminal type 4`, 'and the caller is in it');
+  has('assigned session 100002', 'the kernel chooses its id, written back');
+  has(`in the system's session: getaudit_addr 0: audit user ${NONE} session 100002 flags 0x1 terminal type 4`, 'and the caller is in it');
   has('setaudit_addr with no terminal type = -22', 'a terminal of no address type is refused');
 
   has('mask 0x0', 'no flag may change until the superuser says which');
@@ -41,7 +44,7 @@ export default async function (t) {
   has('set the member\'s clear mask = 0', 'and another');
 
   has('setaudit_addr(AU_ASSIGN_ASID, user 501, graphic and tty) = 0', 'a login\'s session is made');
-  has('in the login\'s session: getaudit_addr 0: audit user 501 session 100001 flags 0x30 terminal type 4', 'with the next id, its user and its flags');
+  has('in the login\'s session: getaudit_addr 0: audit user 501 session 100003 flags 0x30 terminal type 4', 'with the next id, its user and its flags');
   has('audit user 501', 'getauid is the session\'s audit user');
   has('setauid(502), once it is set = -22', 'which is set once');
   has('A_SETSFLAGS(authenticated) by the superuser = 0', 'the superuser sets a flag its mask has');
@@ -55,21 +58,21 @@ export default async function (t) {
   has('audit_session_join(a name that is no port) = -22', 'a name that is no right joins nothing');
   has('audit_session_join(the task\'s own port) = -22', 'nor a port that is no session\'s');
 
-  has('a fork\'s child: getaudit_addr 0: audit user 501 session 100001 flags 0x4030 terminal type 4', 'a fork\'s child is in its parent\'s session');
+  has('a fork\'s child: getaudit_addr 0: audit user 501 session 100003 flags 0x4030 terminal type 4', 'a fork\'s child is in its parent\'s session');
   has('audit_session_port(the system\'s) as a user = -1', 'a user is not given another session\'s port');
   has('setaudit_addr as a user = -1', 'nor may it set a session');
   has(`the system's: audit user ${NONE} flags 0x1 masks ffffffff ffffffff`, 'a user is told of a session by its id, without its masks');
   has('A_SETSFLAGS(not authenticated) by a member = 0', 'a member clears a flag the member mask has');
   has('A_SETSFLAGS(authenticated) by a member = -22', 'and cannot set it again');
-  has('the program it runs: getaudit_addr 0: audit user 501 session 100001 flags 0x30 terminal type 4', 'the program a child runs is in the session too');
+  has('the program it runs: getaudit_addr 0: audit user 501 session 100003 flags 0x30 terminal type 4', 'the program a child runs is in the session too');
   has('the login\'s: audit user 501 flags 0x30 masks 0 0', 'what a member cleared is the session\'s, for everyone');
   has('A_GETSINFO_ADDR(a session there is none of) = -22', 'no session, no record');
 
-  has('audit_session_join(the system\'s) = 100000', 'holding a session\'s port joins it');
-  has(`joined to the system's: getaudit_addr 0: audit user ${NONE} session 100000 flags 0x1 terminal type 4`, 'and the caller is in that one');
-  has('audit_session_join(the login\'s) = 100001', 'and back');
-  has('joined to the login\'s again: getaudit_addr 0: audit user 501 session 100001 flags 0x30 terminal type 4', 'in the login\'s again');
+  has('audit_session_join(the system\'s) = 100002', 'holding a session\'s port joins it');
+  has(`joined to the system's: getaudit_addr 0: audit user ${NONE} session 100002 flags 0x1 terminal type 4`, 'and the caller is in that one');
+  has('audit_session_join(the login\'s) = 100003', 'and back');
+  has('joined to the login\'s again: getaudit_addr 0: audit user 501 session 100003 flags 0x30 terminal type 4', 'in the login\'s again');
   has('setaudit_addr(the system\'s id) = 0', 'a session named by its id is moved into');
-  has(`moved to the system's: getaudit_addr 0: audit user ${NONE} session 100000 flags 0x1 terminal type 4`, 'as it is');
+  has(`moved to the system's: getaudit_addr 0: audit user ${NONE} session 100002 flags 0x1 terminal type 4`, 'as it is');
   d.n.clean();
 }

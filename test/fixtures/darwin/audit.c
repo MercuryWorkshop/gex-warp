@@ -49,15 +49,18 @@ int main(int argc, char **argv, char **envp, char **apple) {
         show(argv[2]);
         return 0;
     }
-    // The first process is in no session: XNU's default one.
+    // The first process is in the session the machine began in.
     show("at the start");
-    t_show("audit_session_self in no session", SYS(SYS_audit_session_self));
+    t_check("the first session has a port", SYS(SYS_audit_session_self) > 0);
     u64 flags = 7;
     t_show("A_GETSFLAGS", SYS(SYS_auditon, A_GETSFLAGS, &flags, sizeof flags));
     t_printf("flags 0x%llx\n", flags);
 
-    // The system's, as launchd makes it: the kernel chooses the id.
+    // Another, as launchd makes one: the kernel chooses the id. (No id,
+    // 0, asks for a new one as AU_ASSIGN_ASID does.)
     struct info i;
+    t_show("setaudit_addr(no id)", session(-1, 0, 0, &i));
+    t_printf("assigned session %u\n", i.asid);
     t_show("setaudit_addr(AU_ASSIGN_ASID, initial)", session(-1, -1, IS_INITIAL, &i));
     t_printf("assigned session %u\n", i.asid);
     u32 system = i.asid;

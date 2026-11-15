@@ -33,9 +33,13 @@
 //!   The port is the kernel's ([`Kind::AuditSession`]) and lasts while
 //!   somebody has a right to it; the next asked for is a new one.
 //!
-//! The process that is in no session (the first, until it makes one) is in
-//! XNU's default one: id 0, no audit user, no flags, and no port
-//! (`audit_session_self` is `EINVAL`).
+//! XNU's own first process is in a default session, id 0, which is none
+//! (it has no port, and nothing can be asked of it by its id), and launchd
+//! makes the system's before it starts anything, so no program a Mac runs
+//! has seen the default one; LaunchServices ends a process it finds there.
+//! So the machine's first process here is in a session made for it as
+//! launchd's is ([`session`]): the first id, 100000, no audit user, and
+//! the flag that says it is the initial one.
 //!
 //! Not kept: who is in a session (one lasts as long as the machine does,
 //! where XNU's goes with its last process), the per-credential event masks
@@ -71,6 +75,8 @@ const ASSIGNED_ASID_MAX: u32 = u32::MAX - 1;
 /// The terminal address types there are.
 const AU_IPV4: u32 = 4;
 const AU_IPV6: u32 = 16;
+/// `AU_SESSION_FLAG_IS_INITIAL`: the session the system began in.
+const IS_INITIAL: u64 = 0x1;
 /// `auditon`'s commands answered here.
 pub(super) const A_GETSINFO_ADDR: u64 = 32;
 pub(super) const A_GETSFLAGS: u64 = 39;
@@ -118,6 +124,25 @@ fn default_info() -> [u8; INFO] {
     b[AUID..AUID + 4].copy_from_slice(&AU_DEFAUDITID.to_le_bytes());
     b[TERM_TYPE..TERM_TYPE + 4].copy_from_slice(&AU_IPV4.to_le_bytes());
     b
+}
+
+/// The session a credential whose id is `asid` is in: that one, or for a
+/// credential that was never put in one (0) the machine's first, which is
+/// made when it is first asked after.
+pub fn session(asid: u32) -> u32 {
+    if asid != 0 {
+        return asid;
+    }
+    with(|t| {
+        t.sessions.entry(ASSIGNED_ASID_MIN).or_insert_with(|| {
+            let mut info = default_info();
+            info[ASID..ASID + 4].copy_from_slice(&ASSIGNED_ASID_MIN.to_le_bytes());
+            info[FLAGS..].copy_from_slice(&IS_INITIAL.to_le_bytes());
+            Session { info, port: Weak::new() }
+        });
+        t.last = t.last.max(ASSIGNED_ASID_MIN);
+    });
+    ASSIGNED_ASID_MIN
 }
 
 /// Session `asid`'s record; the default session's for an id none has.
@@ -423,5 +448,9 @@ mod tests {
         assert_eq!(auid(0), AU_DEFAUDITID);
         assert_eq!(adopt(&default_info()), 0);
         assert!(with(|t| t.port(0)).is_none());
+        // A credential never put in a session is in the machine's first.
+        let first = session(0);
+        assert_eq!((first, session(first), auid(first), flags_of(&record(first))), (ASSIGNED_ASID_MIN, ASSIGNED_ASID_MIN, AU_DEFAUDITID, IS_INITIAL));
+        assert!(with(|t| t.port(first)).is_some() && with(|t| t.assign()) > first);
     }
 }
