@@ -4269,6 +4269,9 @@ impl PathIo<'_> {
         };
         let to = self.at_path(m, a[2] as i32, a[3])?;
         self.new_name_check(m, a[3], &to)?;
+        if self.enforcing() && self.ns.metadata_nofollow(&to).is_ok() {
+            return Err(Errno::EEXIST);
+        }
         self.check_parent(&to)?;
         self.ns.link(&from, &to).map(|_| 0)
     }
@@ -4356,6 +4359,11 @@ impl PathIo<'_> {
         // "dir/." and "dir/.." exist if dir does, else ENOENT
         if Self::path_tail(m, path)?.1 != 0 {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
+        // (A name that is there is `EEXIST` whoever asks, before it is
+        // asked whether the directory may be written.)
+        if self.enforcing() && self.ns.metadata_nofollow(&p).is_ok() {
+            return Err(Errno::EEXIST);
         }
         self.check_parent(&p)?;
         self.ns.mkdir(&p, mode & !self.fs.umask())?;
@@ -4555,6 +4563,9 @@ impl PathIo<'_> {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
         self.new_name_check(m, path, &p)?;
+        if self.enforcing() && self.ns.metadata_nofollow(&p).is_ok() {
+            return Err(Errno::EEXIST);
+        }
         self.check_parent(&p)?;
         self.ns.symlink(&t, &p)?;
         self.record_new(&p);
@@ -6930,6 +6941,9 @@ pub struct Creds {
     /// that changes them), so what it inherited from its environment is not
     /// to be trusted. Kept by an exec that does not undo the difference.
     sugid: std::sync::atomic::AtomicBool,
+    /// The audit user id (`setauid`): all ones, `AU_DEFAUDITID`, until a
+    /// login sets it.
+    auid: std::sync::atomic::AtomicU32,
     /// The user and group the machine's first process ran as (the host's
     /// user, or `--uid`'s): who the host's own permission checks are
     /// already made for, and who a file nobody gave an owner belongs to.
@@ -6973,6 +6987,7 @@ impl Creds {
             keep_caps: false.into(),
             groups: Default::default(),
             sugid: false.into(),
+            auid: u32::MAX.into(),
             base: [uid.into(), gid.into()],
             login: Default::default(),
         }
@@ -7113,6 +7128,15 @@ impl Creds {
         self.sugid.store(on, std::sync::atomic::Ordering::Release);
     }
 
+    /// The audit user id (`getauid`).
+    pub fn auid(&self) -> u32 {
+        Self::ld32(&self.auid)
+    }
+
+    pub fn set_auid(&self, id: u32) {
+        Self::st32(&self.auid, id);
+    }
+
     /// The login name `setlogin` set, if one was.
     pub fn login(&self) -> Option<String> {
         self.login.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -7158,6 +7182,7 @@ impl Creds {
             let login = self.login().unwrap_or_default();
             v.push(login.len().min(255) as u8);
             v.extend_from_slice(&login.as_bytes()[..login.len().min(255)]);
+            v.extend_from_slice(&self.auid().to_le_bytes());
         }
         v
     }
@@ -7208,6 +7233,9 @@ impl Creds {
         if let Some(&len) = rest.get(after) {
             if let Some(name) = rest.get(after + 1..after + 1 + len as usize).filter(|n| !n.is_empty()) {
                 self.set_login(&String::from_utf8_lossy(name));
+            }
+            if let Some(b) = rest.get(after + 1 + len as usize..after + 5 + len as usize) {
+                self.set_auid(u32::from_le_bytes(b.try_into().unwrap()));
             }
         }
     }
@@ -16955,6 +16983,21 @@ mod tests {
         assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/home/x", &[oflags::O_CREAT | oflags::O_RDWR, 0o644]), eacces);
         assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/home/d", &[0o755, 0]), eacces);
         assert_eq!(sys(&mut k, &mut m, nr::UNLINKAT, "/secret", &[0, 0]), eacces);
+        // A name that is there is EEXIST before the directory is asked about
+        // (mkdir -p walks down a path that begins with directories it may
+        // not write), and one that is not is ENOENT to take away.
+        assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/home", &[0o755, 0]), eexist);
+        assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/secret", &[0o755, 0]), eexist);
+        put_str(&mut m, 0x21000, "/secret");
+        put_str(&mut m, 0x22000, "/home");
+        set_args(&mut m, k.ctx_addr, nr::SYMLINKAT, &[0x21000, (-100i64) as u64, 0x22000]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), eexist, "symlink onto a name there");
+        set_args(&mut m, k.ctx_addr, nr::LINKAT, &[(-100i64) as u64, 0x21000, (-100i64) as u64, 0x22000, 0]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), eexist, "link onto a name there");
+        assert_eq!(sys(&mut k, &mut m, nr::UNLINKAT, "/home/nothing", &[0, 0]), -(Errno::ENOENT.0 as i64));
+        assert_eq!(sys(&mut k, &mut m, nr::UNLINKAT, "/home/nothing", &[AT_REMOVEDIR, 0]), -(Errno::ENOENT.0 as i64));
         // A group's bits by the group the user is in beside its own.
         assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/shared", &[oflags::O_RDWR, 0]) >= 3, true);
         assert_eq!(sys(&mut k, &mut m, nr::FACCESSAT, "/shared", &[6, 0, 0]), 0);

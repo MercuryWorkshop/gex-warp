@@ -113,6 +113,15 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_show("chmod 0", SYS(SYS_chmod, "owned", 0));
     t_show("access(F_OK)", SYS(SYS_access, "owned", 0));
     t_show("chmod 0644", SYS(SYS_chmod, "owned", 0644));
+    // A name that is there is EEXIST whoever asks, before it is asked
+    // whether the directory may be written; one made in a directory that may
+    // not be, is not.
+    t_show("mkdir(/usr)", SYS(SYS_mkdir, "/usr", 0755));
+    t_show("mkdir(/usr/bin)", SYS(SYS_mkdir, "/usr/bin", 0755));
+    t_show("mkdir(/usr/gex-not-made)", SYS(SYS_mkdir, "/usr/gex-not-made", 0755));
+    t_show("symlink(/usr)", SYS(SYS_symlink, "owned", "/usr"));
+    t_show("link(owned, /usr)", SYS(SYS_link, "owned", "/usr"));
+    t_show("rmdir(/usr/gex-not-there)", SYS(SYS_rmdir, "/usr/gex-not-there"));
     t_show("unlink", SYS(SYS_unlink, "owned"));
     ids("at the end");
     return 0;

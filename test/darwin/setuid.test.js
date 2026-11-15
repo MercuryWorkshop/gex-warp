@@ -79,6 +79,14 @@ export default async function (t) {
   t.check('root opens root\'s secret', d1.lines.find((l) => l.startsWith('open the secret = '))?.match(/^open the secret = (\d+)$/) !== null, JSON.stringify(d1.stdout));
   has(d1, /^setgroups\(2\) = 0$/, 'root sets its groups');
   has(d1, /^drop after setgroups: getgroups = 2: 20 80$/, 'the effective group first, then the other');
+  has(d1, /^getauid = 0$/, 'the audit user is asked');
+  has(d1, /^audit user 4294967295$/, 'and is none until a login sets it');
+  has(d1, /^setauid\(502\) = 0$/, 'root sets it');
+  has(d1, /^audit user now 502$/, 'and it stays');
+  has(d1, /^__initgroups\(3\) = 0$/, 'root initgroups');
+  has(d1, /^drop after initgroups: getgroups = 3: 20 12 61$/, 'the list as given, the effective group first');
+  has(d1, /^setauid\(0\) as a user = -1$/, 'a user may not set the audit user');
+  has(d1, /^__initgroups as a user = -1$/, 'nor initgroups');
   has(d1, /^setgid\(20\) = 0$/, 'root sets its group');
   has(d1, /^setuid\(502\) = 0$/, 'root becomes another user');
   has(d1, /^drop after giving up root: ruid 502 euid 502 svuid 502 rgid 20 egid 20 svgid 20 issetugid 1$/, 'all of its ids are the user\'s: nothing is left to go back to');

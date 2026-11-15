@@ -16,7 +16,7 @@
 
 enum {
     SYS_setuid = 23, SYS_getgroups = 79, SYS_setgroups = 80, SYS_setgid = 181, SYS_proc_info = 336,
-    SYS_posix_spawn = 244,
+    SYS_posix_spawn = 244, SYS_initgroups = 243, SYS_getauid = 353, SYS_setauid = 354,
 };
 
 static void ids(const char *label, const char *when) {
@@ -85,10 +85,23 @@ int main(int argc, char **argv, char **envp, char **apple) {
         u32 groups[2] = {20, 80};
         t_show("setgroups(2)", SYS(SYS_setgroups, 2, groups));
         ids(label, "after setgroups");
+        u32 au = 7;
+        t_show("getauid", SYS(SYS_getauid, &au));
+        t_printf("audit user %u\n", au);
+        au = 502;
+        t_show("setauid(502)", SYS(SYS_setauid, &au));
+        au = 7;
+        SYS(SYS_getauid, &au);
+        t_printf("audit user now %u\n", au);
+        u32 three[3] = {20, 12, 61};
+        t_show("__initgroups(3)", SYS(SYS_initgroups, 3, three, 502));
+        ids(label, "after initgroups");
         t_show("setgid(20)", SYS(SYS_setgid, 20));
         t_show("setgroups(1)", SYS(SYS_setgroups, 1, groups));
         t_show("setuid(502)", SYS(SYS_setuid, 502));
         ids(label, "after giving up root");
+        t_show("setauid(0) as a user", SYS(SYS_setauid, &au));
+        t_show("__initgroups as a user", SYS(SYS_initgroups, 1, three, 502));
         t_show("setuid(0)", SYS(SYS_setuid, 0));
         t_show("setgid(0)", SYS(SYS_setgid, 0));
         t_show("setgroups(1)", SYS(SYS_setgroups, 1, groups));

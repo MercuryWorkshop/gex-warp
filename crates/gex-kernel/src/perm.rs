@@ -101,6 +101,10 @@ impl PathIo<'_> {
         if !self.enforcing() {
             return Ok(());
         }
+        // (A name that is not there is `ENOENT` whoever asks: the call says.)
+        if self.ns.metadata_nofollow(p).is_err() {
+            return Ok(());
+        }
         self.check_parent(p)?;
         let Ok(dir) = self.ns.metadata(&crate::vfs::parent_of(p)) else { return Ok(()) };
         if dir.owner.is_some() && dir.mode & S_ISVTX != 0 {
