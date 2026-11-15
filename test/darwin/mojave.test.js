@@ -9,8 +9,10 @@
 // read back through Mojave's cfprefsd (its agent and daemon started on
 // demand, checking in for their Mach services), and a notification posted
 // to a waiter through its notifyd. The user is 501 with a home of the
-// test's own (the root is not written to: a passwd with that user, and the
-// home, are bound over it).
+// test's own. The root is not written to: a passwd with that user, the
+// home, and each directory a daemon writes are bound over it, and the
+// root itself is bound read-only (--bind-ro ROOT=/), so a write the test
+// did not foresee is refused and not made.
 import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { inflateSync } from 'node:zlib';
@@ -24,8 +26,10 @@ export default async function (t) {
   if (!existsSync(join(root, 'usr/lib/dyld'))) t.skip(`${root} has no usr/lib/dyld`);
   const n = native(t);
   const d = n.dir('mojave');
+  // The root, sealed.
+  const sysroot = ['--sysroot', root, '--bind-ro', `${root}=/`];
 
-  const sw = await n.gexc(['run', '--sysroot', root, join(root, 'usr/bin/sw_vers')], { timeout: 120000 });
+  const sw = await n.gexc(['run', ...sysroot, join(root, 'usr/bin/sw_vers')], { timeout: 120000 });
   t.check('sw_vers: completes', sw.code === 0, `exit ${sw.code}: ${sw.stderr.trim().split('\n').slice(-2).join(' / ')}`);
   t.check('sw_vers: says 10.14', /^ProductVersion:\s+10\.14/m.test(sw.stdout), sw.stdout.trim());
 
@@ -36,7 +40,7 @@ export default async function (t) {
   mkdirSync(join(home, 'Library/Preferences'), { recursive: true });
   // (The home is the user's: a host's file is the first user's, root's
   // here, until it is given an owner, which gex keeps with it.)
-  const own = await n.gexc(['run', '--uid', '0', '--sysroot', root, '--bind', `${home}=/Users/gex`, join(root, 'usr/sbin/chown'), '-R', '501:20', '/Users/gex'], { timeout: 120000 });
+  const own = await n.gexc(['run', '--uid', '0', ...sysroot, '--bind', `${home}=/Users/gex`, join(root, 'usr/sbin/chown'), '-R', '501:20', '/Users/gex'], { timeout: 120000 });
   if (own.code !== 0) throw new Error(`chown of the home: exit ${own.code}: ${own.stderr.trim().split('\n').slice(-2).join(' / ')}`);
   const etc = join(d, 'etc');
   mkdirSync(etc, { recursive: true });
@@ -51,7 +55,7 @@ export default async function (t) {
   }
   const session = (script) =>
     n.gexc(
-      ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, '--bind', `${home}=/Users/gex`,
+      ['run', '--uid', '0', ...sysroot, '--bind', `${gl}=/gex`, '--bind', `${home}=/Users/gex`,
         '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`, ...sessionBinds,
         '--env', 'HOME=/Users/gex', '--env', 'USER=gex',
         join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.aslmanager', '-u', '501', '--', '/bin/sh', '-c', script],
@@ -106,9 +110,23 @@ export default async function (t) {
   // agent's for the user's processes: Calculator is sandboxed, and its
   // libsystem_secinit registers it with the user's secinitd, which makes a
   // code identity of it (its program's path by proc_pidpath, its slice
-  // and cdhash by csops). (The Dock, which AppKit looks for, is one of the
-  // protected programs, and is left out.) How far the registration gets
-  // is said: the signature's validation does not finish yet.
+  // and cdhash by csops) and checks its signature: the Security
+  // framework's module directory asks securityd first, which takes a
+  // client by the task port it sends (pid_for_task of it is the client's
+  // pid, or the client is refused), the CSP is attached and the
+  // signature's CMS digested, trustd evaluates its certificates (its
+  // databases locked and written as Apple's sqlite does), and the kernel
+  // says the process is the code on disk (csops). Then secinitd makes its
+  // container in the user's home and grants the sandbox, and Calculator
+  // goes on into AppKit. (The Dock, which AppKit looks for, and mds, which
+  // secinitd asks to leave the container's caches out of Spotlight, are
+  // among the system's protected programs: gexlaunchd offers no job of
+  // one.)
+  //
+  // All of that is slow here: lsd checks every application's signature
+  // the same way before it serves WindowServer, a quarter of an hour, and
+  // secinitd takes five minutes over Calculator's. The run is ended ten
+  // minutes after Calculator starts.
   const lw = join(d, 'lw');
   const bl = await exec(['sh', join(ROOT, 'guest/loginwindow/build.sh'), lw, 'x86_64']);
   if (bl.code !== 0) throw new Error(`guest/loginwindow/build.sh: ${bl.stderr.trim()}`);
@@ -124,7 +142,10 @@ export default async function (t) {
   const fb = join(d, 'fb.png');
   const ws = join(d, 'ws');
   const binds = [];
-  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC'], ['tokens', '/private/var/db/TokenCache']]) {
+  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC'], ['tokens', '/private/var/db/TokenCache'],
+    // (trustd's: its revocation and pinning databases, and its OCSP
+    // cache.)
+    ['keychains', '/Library/Keychains'], ['crls', '/private/var/db/crls']]) {
     mkdirSync(join(ws, mine), { recursive: true });
     binds.push('--bind', `${join(ws, mine)}=${theirs}`);
   }
@@ -138,13 +159,13 @@ export default async function (t) {
   // after it started, for the framebuffer to be saved once more.)
   let [after, since] = [0, 0];
   const server = await n.gexc(
-    ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds, '--bind', `${join(lw, 'x86_64')}=/gex-login`, '--bind', `${jobs}=/gex-jobs`,
+    ['run', '--uid', '0', ...sysroot, '--bind', `${gl}=/gex`, ...binds, '--bind', `${join(lw, 'x86_64')}=/gex-login`, '--bind', `${jobs}=/gex-jobs`,
       '--bind', `${home}=/Users/gex`,
       '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
       // (Not the daemons that would write into the root itself: the
       // network's configuration, the disks', the log's housekeeping.)
-      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.Dock.agent',
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager',
       '-a', '501:20', '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
     // (It serves from then on, and is stopped.)
@@ -189,6 +210,19 @@ export default async function (t) {
   const reg = said.split('\n').filter((l) => new RegExp(`secinitd\\[\\d+:\\d+\\] Calculator\\[${calc}\\]`).test(l));
   t.check('Calculator: the user\'s secinitd takes its registration', reg.some((l) => /root path for bundle "\/Applications\/Calculator\.app"/.test(l)) && !/does not match secinitd uid/.test(said), reg.slice(-1).join('') || (said.match(/.*secinitd.*/g) || []).slice(-1).join(''));
   t.check('Calculator: secinitd makes a code identity of it', reg.length > 0 && !reg.some((l) => /Failed to create a code identity/.test(l)), reg.slice(-1).join(''));
+  // (A failure is "registration request failed: ... The code signature is
+  // not valid", with the Security framework's error: a CSSM one when
+  // securityd refused secinitd, an errno when the kernel refused csops.)
+  t.check('Calculator: secinitd finds its code signature valid', reg.length > 0 && !reg.some((l) => /registration request failed/.test(l)), reg.slice(-1).join(''));
+  t.check('Calculator: secinitd makes its container in the user\'s home', existsSync(join(home, 'Library/Containers/com.apple.calculator/Data')), reg.slice(-1).join(''));
+  t.check('Calculator: secinitd grants its sandbox', reg.some((l) => /AppSandbox request successful/.test(l)), reg.slice(-1).join(''));
+  t.check('Calculator: secinitd does not crash', !/\(secinitd\) crashed/.test(said), (said.match(/.*\(secinitd\) crashed.*/g) || []).join(' / '));
+  // (The sandbox is on, and Calculator is in AppKit: it has not been
+  // ended by a signal, as libsystem_secinit ends a program whose
+  // registration fails.)
+  const ended = login.find((l) => /^gexloginwindow: \/Applications\/Calculator\.app\/.*: (signal|exit) \d+$/.test(l));
+  t.check('Calculator: goes on with its sandbox', !ended && !/\(Calculator\) crashed/.test(said), ended || (said.match(/.*\(Calculator\) crashed.*/g) || []).join(' / '));
+  t.check('gexlaunchd: offers no job of a protected program', /com\.apple\.Dock\.agent: its program .* is a protected binary/.test(said) && /com\.apple\.metadata\.mds: its program .* is a protected binary/.test(said), (said.match(/.*protected binary.*/g) || []).slice(0, 2).join(' / '));
   t.say(`Calculator's registration: ${reg.slice(-1).join('') || 'none'}`);
   // The display is the framebuffer (1024 by 768, gex's default), and
   // WindowServer's own picture of it is the window's fill.
