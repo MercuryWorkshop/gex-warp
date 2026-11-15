@@ -41,6 +41,49 @@ struct DevHandle {
     device: Device,
 }
 
+/// A Mac's `/dev/auditsessions`: the audit sessions' changes as they
+/// happen (`au_sdev_open`, which securityd watches from a thread of its
+/// own). No session changes here, so a read waits for ever, as one does
+/// on a Mac where nothing logs in or out; the ioctls that choose which
+/// sessions are watched are taken.
+#[derive(Debug)]
+pub struct AuditSessions(crate::wait::Queue);
+
+impl AuditSessions {
+    pub const NAME: &'static str = "auditsessions";
+
+    pub fn new() -> AuditSessions {
+        AuditSessions(crate::wait::Queue::new())
+    }
+}
+
+impl Default for AuditSessions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileHandle for AuditSessions {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EAGAIN)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o444, ino: 1, mtime: 0, nlink: 1, rdev: 0x2200_0000, times: Default::default() })
+    }
+    fn is_stream(&self) -> bool {
+        true
+    }
+    fn poll_readable(&self) -> bool {
+        false
+    }
+    fn wait_queue(&self) -> u32 {
+        self.0.id()
+    }
+    fn ioctl(&self, _m: &mut crate::GuestMem<'_>, _request: u64, _arg: u64) -> Option<SysResult> {
+        Some(Ok(0))
+    }
+}
+
 impl FileHandle for DevHandle {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         match self.device {
@@ -208,6 +251,9 @@ impl FileSystem for DevFs {
         if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
             return Ok(open());
         }
+        if path == AuditSessions::NAME && crate::darwin::on() {
+            return Ok(Arc::new(AuditSessions::new()));
+        }
         if path.is_empty() {
             return Ok(Arc::new(DevDir {
                 extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
@@ -243,6 +289,9 @@ impl FileSystem for DevFs {
         }
         if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
             return open().metadata();
+        }
+        if path == AuditSessions::NAME && crate::darwin::on() {
+            return AuditSessions::new().metadata();
         }
         if let Some(device) = Self::device_of(path) {
             return Ok(Metadata {
