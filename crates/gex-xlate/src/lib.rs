@@ -1677,16 +1677,25 @@ fn lift_one(
             _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
         })
     };
+    // Folded through memory on a scratch copy only, never in the emitted
+    // block: memory read at translation time is a guess about the future (a
+    // GOT slot bound later, a global no store has reached yet), and code that
+    // bakes it in is wrong once it changes. A64 folded into the block once,
+    // and a load at a pc-relative constant address (`ldr x0, sym`, which ld64
+    // makes of `adrp`+`ldr` near enough) read a zero-filled global as the
+    // zero it was when translated: Ruby's fiddle.bundle read its module back
+    // as `false`.
+    let probe = |block: &Block| match block.term {
+        Term::Indirect { target, .. } => {
+            let mut probe = block.clone();
+            pass::const_fold_with_memory(&mut probe, &read);
+            pass::const_value(&probe, target)
+        }
+        _ => None,
+    };
     if !gex_abi::X86 {
-        // A64: folded through memory before the ordinary passes, so a PLT's
-        // GOT load becomes a constant and its `br` becomes a target discovery
-        // can follow.
-        pass::const_fold_with_memory(&mut block, &read);
         pass::optimize(&mut block);
-        let folded = match block.term {
-            Term::Indirect { target, .. } => pass::const_value(&block, target),
-            _ => None,
-        };
+        let folded = probe(&block);
         return (block, folded);
     }
     pass::optimize(&mut block);
@@ -1706,17 +1715,7 @@ fn lift_one(
             block.guard = Some(snap[..n].to_vec());
         }
     }
-    // x86-64: folded on a scratch copy only, never in the emitted block --
-    // memory read at translation time is a guess about the future (a GOT slot
-    // bound later), and code that bakes it in is wrong once it changes.
-    let folded = match block.term {
-        Term::Indirect { target, .. } => {
-            let mut probe = block.clone();
-            pass::const_fold_with_memory(&mut probe, &read);
-            pass::const_value(&probe, target)
-        }
-        _ => None,
-    };
+    let folded = probe(&block);
     (block, folded)
 }
 
