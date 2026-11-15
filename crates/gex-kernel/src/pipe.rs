@@ -798,6 +798,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
 
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
         Ok(crate::vfs::Metadata {
+            owner: None,
             file_type: crate::vfs::FileType::Fifo,
             size: 0,
             mode: 0o600,

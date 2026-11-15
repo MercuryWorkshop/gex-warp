@@ -445,11 +445,19 @@ impl Kernel {
     /// read 4, write 2, run or search 1.
     fn darwin_user_access(&self, st: &Stat) -> u32 {
         // The superuser may read and write anything, and run what anyone
-        // may; anybody else is the file's owner here (`stat_owned`).
+        // may; anybody else by the owner, group (the caller's, and the ones
+        // beside it) or other bits.
         if self.creds.uid() == 0 {
             return 6 | (st.mode & 0o111 != 0 || st.mode & 0o170000 == 0o040000) as u32;
         }
-        (st.mode >> 6) & 7
+        let class = if st.uid == self.creds.uid() {
+            st.mode >> 6
+        } else if self.creds.in_group(st.gid) {
+            st.mode >> 3
+        } else {
+            st.mode
+        };
+        class & 7
     }
 
     /// The attributes of the one volume there is: APFS, mounted on `/`,

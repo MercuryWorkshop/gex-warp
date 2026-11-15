@@ -214,9 +214,9 @@ impl ProcSource for KernelProcSource {
         // (no peak is kept: the peaks are the current sizes)
         let (size, rss, anon) = l.mm.lock().vm_counters();
         let (size, rss, anon) = (size >> 10, rss >> 10, anon >> 10);
-        let (uid, gid, caps) = crate::vfs::procfs::status_ids(&l.creds.save());
+        let (uid, gid, caps, groups) = crate::vfs::procfs::status_ids(&l.creds.save_within(256));
         format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}{groups}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
              RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}",
             task.and_then(|t| t.own_name()).unwrap_or_else(|| l.exe.rsplit('/').next().unwrap_or("gex").to_string()),

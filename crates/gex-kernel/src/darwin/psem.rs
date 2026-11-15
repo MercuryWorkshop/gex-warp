@@ -80,7 +80,7 @@ impl FileHandle for Psem {
         Some(self)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { owner: None, file_type: FileType::Regular, size: 0, mode: 0o600, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
 }
 

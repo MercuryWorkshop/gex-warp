@@ -97,6 +97,7 @@ impl FileHandle for EventFd {
         // Anonymous inode reported as a fifo: the closest real type, and the
         // browser scheduler keys "a wait another Worker satisfies" off fifo.
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Fifo,
             size: 0,
             mode: 0o600,

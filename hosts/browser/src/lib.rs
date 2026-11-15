@@ -2122,6 +2122,7 @@ impl FileHandle for StdinQueue {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: gex_kernel::vfs::FileType::CharDevice,
             size: 0,
             mode: 0o600,
@@ -2371,6 +2372,7 @@ impl FileHandle for Tty {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: gex_kernel::vfs::FileType::CharDevice,
             size: 0,
             mode: 0o620,
@@ -2437,6 +2439,7 @@ impl FileHandle for Console {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: gex_kernel::vfs::FileType::Fifo,
             size: 0,
             mode: 0o600,
@@ -6670,8 +6673,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         &env,
         *b"gexdeterministic",
         gex_ld::Identity {
-            uid: unsafe { IDENTITY.0 },
-            gid: unsafe { IDENTITY.1 },
+            uid: kernel.creds.ruid(),
+            gid: kernel.creds.rgid(),
+            euid: Some(kernel.creds.uid()),
+            egid: Some(kernel.creds.gid()),
+            secure: (kernel.creds.uid(), kernel.creds.gid()) != (kernel.creds.ruid(), kernel.creds.rgid()),
             // Where the interpreter ended up, which is how it finds itself.
             interp_base: program.interp_base(),
             entry_hook: hook,
@@ -10430,7 +10436,10 @@ fn state_bytes(k: &Kernel, pending: bool, ns: u64) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
-    v.extend_from_slice(&if ns & clone_flags::NEWUSER != 0 { k.creds.save_owning() } else { k.creds.save() });
+    // (Its length first: the groups and the login name make it vary.)
+    let creds = if ns & clone_flags::NEWUSER != 0 { k.creds.save_owning() } else { k.creds.save() };
+    v.extend_from_slice(&(creds.len() as u32).to_le_bytes());
+    v.extend_from_slice(&creds);
     // And the root a `chroot` made, the rest; and after a NUL, that it is
     // a Mac program's root, entered and to be left
     // (`gex_kernel::darwin::root`).
@@ -10478,7 +10487,12 @@ fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
     let rest = &b[4 + n..];
     let mut limits = k.rlimits.get();
     let ids = 4 + limits.len() * 16;
-    if rest.len() < ids + gex_kernel::syscalls::Creds::SAVED {
+    if rest.len() < ids + 4 {
+        return;
+    }
+    let creds_len = u32::from_le_bytes(rest[ids..ids + 4].try_into().unwrap()) as usize;
+    let ids = ids + 4;
+    if creds_len < gex_kernel::syscalls::Creds::SAVED || rest.len() < ids + creds_len {
         return;
     }
     k.signals = sig;
@@ -10491,7 +10505,7 @@ fn apply_state(k: &mut Kernel, b: &[u8], cwd: &str) {
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
     k.rlimits.set(limits);
-    let saved = ids + gex_kernel::syscalls::Creds::SAVED;
+    let saved = ids + creds_len;
     k.creds.restore(&rest[ids..saved]);
     let root = String::from_utf8_lossy(&rest[saved..]);
     let mut fields = root.split('\0');
@@ -12751,7 +12765,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // answer and the stub is not armed.
     let hook = if restored.is_some() { 0 } else { hook };
     // The process's ids, which a `setuid` before the exec changed.
-    let id = gex_ld::Identity { uid: h.kernel.creds.uid(), gid: h.kernel.creds.gid(), interp_base, entry_hook: hook };
+    let c = &h.kernel.creds;
+    let id = gex_ld::Identity { uid: c.ruid(), gid: c.rgid(), euid: Some(c.uid()), egid: Some(c.gid()), secure: (c.uid(), c.gid()) != (c.ruid(), c.rgid()), interp_base, entry_hook: hook };
     let layout = match program.as_ref().filter(|p| p.is_darwin()) {
         // A Mach-O program's stack is XNU's.
         Some(p) => gex_ld::build_program_stack(

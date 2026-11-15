@@ -83,7 +83,7 @@ impl FileHandle for PidFd {
     fn metadata(&self) -> Result<Metadata, Errno> {
         // An anonymous inode, reported as a fifo like eventfd's: the browser
         // scheduler keys "a wait another Worker satisfies" off fifo.
-        Ok(Metadata { file_type: FileType::Fifo, size: 0, mode: 0o600, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { owner: None, file_type: FileType::Fifo, size: 0, mode: 0o600, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
 
     fn is_stream(&self) -> bool {

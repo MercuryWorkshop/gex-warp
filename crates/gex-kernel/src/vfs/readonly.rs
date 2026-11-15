@@ -118,6 +118,9 @@ impl FileSystem for ReadOnly {
     fn chmod_link(&self, path: &str, _mode: u32) -> Result<(), Errno> {
         Err(self.there(path))
     }
+    fn chown(&self, path: &str, _uid: u32, _gid: u32) -> Result<(), Errno> {
+        Err(self.there(path))
+    }
     fn set_mtime(&self, path: &str, _secs: i64) -> Result<(), Errno> {
         Err(self.there(path))
     }

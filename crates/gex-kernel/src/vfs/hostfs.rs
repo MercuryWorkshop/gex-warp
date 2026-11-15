@@ -164,8 +164,43 @@ fn entry_type(t: std::fs::FileType) -> FileType {
     }
 }
 
+/// The host extended attribute that keeps who owns a file here (`uid:gid`,
+/// in decimal): the host's own owner is the user running gex, so what a
+/// guest user it gave a file to is kept beside it. Hidden from the guest's
+/// own extended-attribute calls.
+pub const OWNER_XATTR: &str = "user.gex.owner";
+
+/// [`convert`], with who owns the file at host path `host`.
+pub(crate) fn convert_at(md: &std::fs::Metadata, host: &Path) -> Metadata {
+    let mut m = convert(md);
+    m.owner = host_owner(md, host_xattr::On::Path(host));
+    m
+}
+
+/// [`convert`], with who owns the file open as `fd`.
+pub(crate) fn convert_fd(md: &std::fs::Metadata, fd: i32) -> Metadata {
+    let mut m = convert(md);
+    m.owner = host_owner(md, host_xattr::On::Fd(fd));
+    m
+}
+
+/// Who owns a host file: the owner kept for it ([`OWNER_XATTR`]), else its
+/// host owner and group, the ones of the user running gex being
+/// [`super::BASE_ID`] (the machine's first user, wherever that is told
+/// from).
+fn host_owner(md: &std::fs::Metadata, on: host_xattr::On<'_>) -> Option<(u32, u32)> {
+    if let Some(kept) = host_xattr::owner(on) {
+        return Some(kept);
+    }
+    let ids = host_ids();
+    let map = |host: u32, mine: u32| if host == mine { super::BASE_ID } else { host };
+    let owner = (map(md.uid(), ids.uid), map(md.gid(), ids.gid));
+    Some(owner)
+}
+
 pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     Metadata {
+        owner: None,
         file_type: file_type_of(md),
         size: md.len(),
         mode: md.mode() & 0o7777,
@@ -334,10 +369,17 @@ impl FileHandle for HostHandle {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
+        use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap();
         f.metadata()
-            .map(|m| convert(&m))
+            .map(|m| convert_fd(&m, f.as_raw_fd()))
             .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn chown(&self, uid: u32, gid: u32) -> Option<Result<(), Errno>> {
+        use std::os::unix::io::AsRawFd;
+        let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        Some(host_xattr::set_owner(host_xattr::On::Fd(f.as_raw_fd()), uid, gid))
     }
 }
 
@@ -375,7 +417,18 @@ impl FileHandle for HostDir {
             Some((f, _, _)) => f.metadata(),
             None => std::fs::metadata(&self.host),
         };
-        Ok(now.map(|m| convert(&m)).unwrap_or_else(|_| self.md.clone()))
+        use std::os::unix::io::AsRawFd;
+        Ok(match (&self.held, now) {
+            (Some((f, _, _)), Ok(m)) => convert_fd(&m, f.as_raw_fd()),
+            (None, Ok(m)) => convert_at(&m, &self.host),
+            _ => self.md.clone(),
+        })
+    }
+
+    fn chown(&self, uid: u32, gid: u32) -> Option<Result<(), Errno>> {
+        use std::os::unix::io::AsRawFd;
+        let (f, _, _) = self.held.as_ref()?;
+        Some(host_xattr::set_owner(host_xattr::On::Fd(f.as_raw_fd()), uid, gid))
     }
     /// Listed when asked, not at the open, as Linux reads a directory at
     /// `getdents`: an open for `fstatfs` or an ioctl lists nothing. The
@@ -496,8 +549,8 @@ impl FileSystem for HostFs {
                 let f = File::open(&host).map_err(|e| Errno::from_io(&e))?;
                 let held = self.canon.get_or_init(|| self.root.canonicalize().ok()).clone().map(|root| (f, path.to_string(), root));
                 return Ok(Arc::new(HostDir {
+                    md: convert_at(md, &host),
                     host,
-                    md: convert(md),
                     held,
                     gate: Arc::clone(&self.gate),
                 }));
@@ -573,8 +626,22 @@ impl FileSystem for HostFs {
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let host = self.host_path(path)?;
         std::fs::metadata(&host)
-            .map(|m| convert(&m))
+            .map(|m| convert_at(&m, &host))
             .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn keeps_owners(&self) -> bool {
+        true
+    }
+
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let host = self.host_path(path)?;
+        host_xattr::set_owner(host_xattr::On::Path(&host), uid, gid)?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
     }
 
     /// The host's answer: a guest that believes it owns everything (stat
@@ -595,7 +662,7 @@ impl FileSystem for HostFs {
     fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         let host = self.host_path(path)?;
         match std::fs::symlink_metadata(&host) {
-            Ok(md) if md.is_symlink() => Ok(convert(&md)),
+            Ok(md) if md.is_symlink() => Ok(convert_at(&md, &host)),
             _ => self.metadata(path),
         }
     }
@@ -901,9 +968,33 @@ pub mod host_xattr {
         let _ = CALLS.set(calls);
     }
 
+    /// Who owns the node, as [`super::OWNER_XATTR`] keeps it, if it says.
+    pub fn owner(on: On<'_>) -> Option<(u32, u32)> {
+        let calls = CALLS.get()?;
+        let mut buf = [0u8; 32];
+        let n = calls(&on, XattrOp::Get { name: super::OWNER_XATTR, buf: &mut buf }).ok()?;
+        let text = std::str::from_utf8(buf.get(..n)?).ok()?;
+        let (u, g) = text.split_once(':')?;
+        Some((u.parse().ok()?, g.parse().ok()?))
+    }
+
+    /// Keep `uid` and `gid` as the node's owner ([`super::OWNER_XATTR`]):
+    /// `EOPNOTSUPP` where the host keeps no attributes.
+    pub fn set_owner(on: On<'_>, uid: u32, gid: u32) -> Result<(), Errno> {
+        let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
+        let value = format!("{uid}:{gid}");
+        calls(&on, XattrOp::Set { name: super::OWNER_XATTR, value: value.as_bytes(), flags: 0 }).map(|_| ())
+    }
+
     pub fn call(on: On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
         let not_user = |e: Errno| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e };
+        // The one that keeps owners is the kernel's: no name of the guest's.
+        match &op {
+            XattrOp::Get { name, .. } | XattrOp::Remove { name } if *name == super::OWNER_XATTR => return Err(Errno::ENODATA),
+            XattrOp::Set { name, .. } if *name == super::OWNER_XATTR => return Err(Errno::EPERM),
+            _ => {}
+        }
         match op {
             XattrOp::Get { name, buf } => {
                 xattr_name(name).map_err(not_user)?;
@@ -924,7 +1015,7 @@ pub mod host_xattr {
                 let got = calls(&on, XattrOp::List { buf: &mut all })?;
                 all.truncate(got);
                 let mut mine = Vec::new();
-                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.")) {
+                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.") && *n != super::OWNER_XATTR.as_bytes()) {
                     mine.extend_from_slice(name);
                     mine.push(0);
                 }
@@ -1094,6 +1185,20 @@ static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
 #[cfg(unix)]
 pub fn set_host_ids(uid: u32, gid: u32, groups: Vec<u32>) {
     let _ = IDS.set(HostIds { uid, gid, groups });
+}
+
+/// The groups the host user is in beside its own, as the host reports
+/// them ([`set_host_ids`], or `/proc/self/status`): the guest's, when it
+/// is that user.
+#[cfg(unix)]
+pub fn host_groups() -> Vec<u32> {
+    let ids = host_ids();
+    ids.groups.iter().copied().filter(|g| *g != ids.gid).take(crate::syscalls::MAX_GROUPS).collect()
+}
+
+#[cfg(not(unix))]
+pub fn host_groups() -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(unix)]

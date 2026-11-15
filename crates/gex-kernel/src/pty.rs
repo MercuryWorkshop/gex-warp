@@ -392,6 +392,7 @@ impl crate::vfs::FileHandle for RemotePty {
         let n = (self.remote.ptn)(self.id).max(0) as u32;
         let (ino, rdev, mode) = if self.master { (PTMX_INO, PTMX_RDEV, 0o666) } else { (pts_ino(n), pts_rdev(n), 0o620) };
         Ok(crate::vfs::Metadata {
+            owner: None,
             file_type: crate::vfs::FileType::CharDevice,
             size: 0,
             mode,

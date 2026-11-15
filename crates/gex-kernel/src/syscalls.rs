@@ -646,6 +646,10 @@ pub struct Kernel {
     /// `user.gex.mem64` attribute (the learned record). The shim takes it
     /// when it places the exec.
     pub exec_mem64: Option<bool>,
+    /// The user and group an `execve` that was admitted makes the effective
+    /// ones (the file's set-user-ID and set-group-ID bits), once it is past
+    /// recall ([`Kernel::exec_commit`]).
+    pub exec_setid: (Option<u32>, Option<u32>),
     /// The Windows program the running image is Wine's loader for (the
     /// exec's `WINEGEX_IMAGE`, or the DOS path Wine was started on by
     /// hand): where its memory flavour is recorded ([`outgrow_ending`]).
@@ -3641,25 +3645,7 @@ impl PathIo<'_> {
             // installers and build systems moving.
             nr::FCHMOD | nr::FCHMODAT => self.sys_chmod(m, n, a),
             nr::SETXATTR..=nr::FREMOVEXATTR => self.sys_xattr(m, n, a),
-            // Ownership is not modelled: there is one user and the guest is
-            // it. Refusing would be worse than accepting -- tar treats a
-            // failed chown while unpacking as a failure to unpack.
-            // Ownership is not kept, but the file must be there.
-            nr::FCHOWN => self.map.fds.get(a[0] as i32).map(|_| 0),
-            nr::FCHOWNAT => {
-                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
-                if empty && a[4] & AT_EMPTY_PATH != 0 {
-                    self.map.fds.get(a[0] as i32).map(|_| 0)
-                } else {
-                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
-                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
-                            self.ns.metadata_nofollow(&p).map(|_| 0)
-                        } else {
-                            self.ns.metadata(&p).map(|_| 0)
-                        }
-                    })
-                }
-            }
+            nr::FCHOWN | nr::FCHOWNAT => self.sys_chown(m, n, a),
             _ => return None,
         })
     }
@@ -3836,6 +3822,36 @@ impl PathIo<'_> {
             }
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
+            // A process that is not the machine's first user may open what
+            // its permissions say, or make a name in a directory it may
+            // write.
+            let made = if self.enforcing() {
+                let acc = flags & oflags::ACCMODE;
+                let want = match acc {
+                    oflags::O_WRONLY => crate::perm::W,
+                    oflags::O_RDWR => crate::perm::R | crate::perm::W,
+                    _ => crate::perm::R,
+                } | if flags & (oflags::O_TRUNC | oflags::O_APPEND) != 0 { crate::perm::W } else { 0 };
+                match self.ns.metadata(&p) {
+                    Ok(md) => {
+                        if flags & (oflags::O_CREAT | oflags::O_EXCL) == oflags::O_CREAT | oflags::O_EXCL {
+                            return Err(Errno::EEXIST);
+                        }
+                        // (A directory opened to read it, or to search it.)
+                        if !self.creds.may(&md, want, false) {
+                            return Err(Errno::EACCES);
+                        }
+                        false
+                    }
+                    Err(_) if flags & oflags::O_CREAT != 0 && self.ns.metadata_nofollow(&p).is_err() => {
+                        self.check_parent(&p)?;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             // O_CREAT's mode, less the umask, as Linux makes the file.
             let h = match self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask()) {
                 // What a filesystem will not open may be a FIFO, which is
@@ -3843,6 +3859,9 @@ impl PathIo<'_> {
                 Err(Errno::ENXIO) if self.ns.metadata(&p).is_ok_and(|md| md.file_type == FileType::Fifo) => return self.open_fifo(p, flags),
                 h => h?,
             };
+            if made {
+                self.record_new(&p);
+            }
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
@@ -4018,8 +4037,9 @@ impl PathIo<'_> {
         put64(&mut out, 144, mnt_id);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
-        put32(&mut out, 20, self.creds.uid());
-        put32(&mut out, 24, self.creds.gid());
+        let (uid, gid) = self.creds.owner_of(md.owner);
+        put32(&mut out, 20, uid);
+        put32(&mut out, 24, gid);
         out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
@@ -4053,7 +4073,8 @@ impl PathIo<'_> {
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
+        let (uid, gid) = self.creds.owner_of(md.owner);
+        Stat { uid, gid, ..Kernel::stat_from(md) }
     }
 
     pub fn fstatat(
@@ -4101,6 +4122,18 @@ impl PathIo<'_> {
         // A root guest (`--uid 0`) may read and write anything; execute
         // still needs an execute bit, which the host checks.
         let mode = if self.creds.ruid() == 0 { mode & 1 } else { mode & 7 };
+        // By the real ids, and the groups, of a process that is not the
+        // first user (whose own the host checks).
+        // (A file given another owner than the host's is the host's no
+        // more to say of, whoever asks.)
+        if mode != 0 {
+            if let Ok(md) = self.ns.metadata(&p) {
+                let given = md.owner.is_some_and(|(u, g)| u != crate::vfs::BASE_ID || g != crate::vfs::BASE_ID);
+                if (self.enforcing() || given) && !self.creds.may(&md, mode, true) {
+                    return Err(Errno::EACCES);
+                }
+            }
+        }
         self.ns.access(&p, mode).map(|_| 0)
     }
 
@@ -4236,6 +4269,7 @@ impl PathIo<'_> {
         };
         let to = self.at_path(m, a[2] as i32, a[3])?;
         self.new_name_check(m, a[3], &to)?;
+        self.check_parent(&to)?;
         self.ns.link(&from, &to).map(|_| 0)
     }
 
@@ -4248,13 +4282,20 @@ impl PathIo<'_> {
             return Err(Errno::EEXIST);
         }
         let perm = mode & 0o7777 & !self.fs.umask();
-        match mode & 0o170000 {
+        if mode & 0o170000 != 0o020000 && mode & 0o170000 != 0o060000 {
+            self.check_parent(&p)?;
+        }
+        let r = match mode & 0o170000 {
             0o010000 => self.ns.mkfifo(&p, perm).map(|_| 0),
             0 | 0o100000 => self.ns.open_mode(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm).map(|_| 0),
             0o140000 => self.ns.mksocket(&p).map(|_| 0),
             0o020000 | 0o060000 => Err(Errno::EPERM),
             _ => Err(Errno::EINVAL),
+        };
+        if r.is_ok() {
+            self.record_new(&p);
         }
+        r
     }
 
     /// `open` of the FIFO at `p`: the pipe it names, to read or to write
@@ -4316,7 +4357,10 @@ impl PathIo<'_> {
         if Self::path_tail(m, path)?.1 != 0 {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
         }
-        self.ns.mkdir(&p, mode & !self.fs.umask()).map(|_| 0)
+        self.check_parent(&p)?;
+        self.ns.mkdir(&p, mode & !self.fs.umask())?;
+        self.record_new(&p);
+        Ok(0)
     }
 
     pub fn sys_unlinkat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
@@ -4329,9 +4373,11 @@ impl PathIo<'_> {
                 2 => return Err(Errno::ENOTEMPTY),
                 _ => {}
             }
+            self.check_remove(&p)?;
             self.ns.rmdir(&p).map(|_| 0)
         } else {
             let sock = self.is_socket_file(&p);
+            self.check_remove(&p)?;
             self.ns.unlink(&p)?;
             if sock {
                 self.socket_renamed(&self.ns.socket_name(&p), None);
@@ -4422,6 +4468,8 @@ impl PathIo<'_> {
             let _ = RENAME_EXCHANGE;
             return Err(Errno::EINVAL);
         }
+        self.check_remove(&from)?;
+        self.check_parent(&to)?;
         let from_moves = self.ns.metadata_nofollow(&from).is_ok_and(|md| matches!(md.file_type, FileType::Socket | FileType::Directory));
         let to_sock = self.is_socket_file(&to);
         self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0)?;
@@ -4507,7 +4555,10 @@ impl PathIo<'_> {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
         self.new_name_check(m, path, &p)?;
-        self.ns.symlink(&t, &p).map(|_| 0)
+        self.check_parent(&p)?;
+        self.ns.symlink(&t, &p)?;
+        self.record_new(&p);
+        Ok(0)
     }
 
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
@@ -4545,9 +4596,83 @@ impl PathIo<'_> {
         x.run(m, |op| Some(self.ns.xattr(&path, form == 0, op))).unwrap_or(Err(Errno::EOPNOTSUPP))
     }
 
+    /// `fchown` and `fchownat` (-1, the high half too, leaves an id as it
+    /// is). Where files have owners ([`crate::vfs::Metadata::owner`]):
+    /// giving a file to another user is for `CAP_CHOWN`, a group is for its
+    /// owner, to one the owner is in, and a file whose owner or group
+    /// changes loses its set-user-ID and set-group-ID bits unless the caller
+    /// has `CAP_FSETID`. Where they have none the call only finds the file
+    /// there, as it always has.
+    pub fn sys_chown(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let (uid, gid, args) = if n == nr::FCHOWN { (a[1], a[2], None) } else { (a[2], a[3], Some(a[4])) };
+        let want = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
+        let (uid, gid) = (want(uid), want(gid));
+        // What it is done to: an open file, or a name (a final link not
+        // followed when asked, else followed).
+        let empty = args.is_some_and(|f| f & AT_EMPTY_PATH != 0) && m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
+        let (file, path) = if n == nr::FCHOWN || empty {
+            (Some(self.map.fds.get(a[0] as i32)?), String::new())
+        } else {
+            let p = self.at_path(m, a[0] as i32, a[1])?;
+            let p = if args.is_some_and(|f| f & AT_SYMLINK_NOFOLLOW != 0) { p } else { self.ns.canonical(&p) };
+            (None, p)
+        };
+        let md = match &file {
+            Some(f) => f.handle.metadata()?,
+            None => self.ns.metadata_nofollow(&path)?,
+        };
+        let at = file.as_ref().map(|f| f.path.clone()).filter(|p| p.starts_with('/')).unwrap_or(path);
+        if md.owner.is_none() {
+            return Ok(0);
+        }
+        let privileged = self.creds.capable(cap::CHOWN);
+        // The machine's first user, unprivileged, on Linux: what it has
+        // always been given, that the file is there and nothing changes
+        // (tar treats a refused chown as a failure to unpack). Darwin's
+        // refuses what XNU does.
+        if !privileged && self.creds.is_base() && !crate::darwin::on() {
+            return Ok(0);
+        }
+        let (cur_uid, cur_gid) = self.creds.owner_of(md.owner);
+        let (new_uid, new_gid) = (uid.unwrap_or(cur_uid), gid.unwrap_or(cur_gid));
+        let mine = self.creds.uid() == cur_uid;
+        if new_uid != cur_uid && !privileged {
+            return Err(Errno::EPERM);
+        }
+        if new_gid != cur_gid && !privileged && !(mine && self.creds.in_group(new_gid)) {
+            return Err(Errno::EPERM);
+        }
+        if (uid.is_some() || gid.is_some()) && !privileged && !mine {
+            return Err(Errno::EPERM);
+        }
+        if (new_uid, new_gid) == (cur_uid, cur_gid) {
+            return Ok(0);
+        }
+        let done = match file.as_ref().and_then(|f| f.handle.chown(new_uid, new_gid)) {
+            Some(r) => r,
+            None => self.ns.chown(&at, new_uid, new_gid),
+        };
+        match done {
+            // A host that keeps no attributes keeps no owners: as for a
+            // filesystem that has none, the call is accepted.
+            Err(Errno::EOPNOTSUPP) | Err(Errno::ENODATA) => return Ok(0),
+            r => r?,
+        }
+        if md.file_type == FileType::Regular && md.mode & (crate::perm::S_ISUID | crate::perm::S_ISGID) != 0 && !self.creds.capable(cap::FSETID) {
+            let _ = match &file {
+                Some(f) => f.handle.chmod(md.mode & !(crate::perm::S_ISUID | crate::perm::S_ISGID)).unwrap_or(Ok(())),
+                None => self.ns.chmod(&at, md.mode & !(crate::perm::S_ISUID | crate::perm::S_ISGID)),
+            };
+        }
+        Ok(0)
+    }
+
     pub fn sys_chmod(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
         let (path, mode, flags) = if n == nr::FCHMOD {
             let f = self.map.fds.get(a[0] as i32)?;
+            if self.enforcing() && f.handle.metadata().is_ok_and(|md| !self.creds.owns(&md)) {
+                return Err(Errno::EPERM);
+            }
             // The handle, when it can: no walk of the name it kept, and
             // what it is open on is not a symlink.
             if let Some(r) = f.handle.chmod(a[1] as u32) {
@@ -4568,6 +4693,19 @@ impl PathIo<'_> {
             && (flags & AT_SYMLINK_NOFOLLOW != 0 || n == nr::FCHMOD)
         {
             return Err(Errno::EOPNOTSUPP);
+        }
+        // Only the file's owner changes its mode; and a set-group-ID bit it
+        // is not in the group of is not its to set.
+        let mut mode = mode;
+        if self.enforcing() {
+            if let Ok(md) = self.ns.metadata(&path) {
+                if !self.creds.owns(&md) {
+                    return Err(Errno::EPERM);
+                }
+                if mode & crate::perm::S_ISGID != 0 && md.owner.is_some() && !self.creds.capable(cap::FSETID) && !self.creds.in_group(self.creds.owner_of(md.owner).1) {
+                    mode &= !crate::perm::S_ISGID;
+                }
+            }
         }
         self.ns.chmod(&path, mode).map(|_| 0)
     }
@@ -6708,8 +6846,6 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
             | nr::SCHED_GET_PRIORITY_MIN
             | nr::GETCPU
             | nr::MEMBARRIER
-            | nr::GETGROUPS
-            | nr::SETGROUPS
             | nr::GETPPID
             | nr::MLOCK
             | nr::MUNLOCK
@@ -6786,7 +6922,39 @@ pub struct Creds {
     /// `PR_SET_KEEPCAPS`: a uid change away from root keeps the permitted
     /// set (it clears at exec).
     keep_caps: std::sync::atomic::AtomicBool,
+    /// The supplementary groups, in the order they were set (`setgroups`).
+    /// Not the effective gid: Darwin's `getgroups` puts that first itself.
+    groups: std::sync::Mutex<Vec<u32>>,
+    /// Darwin's `P_SUGID`, what `issetugid` answers: the process's ids were
+    /// changed (by a set-user-ID or set-group-ID program's exec, or a call
+    /// that changes them), so what it inherited from its environment is not
+    /// to be trusted. Kept by an exec that does not undo the difference.
+    sugid: std::sync::atomic::AtomicBool,
+    /// The user and group the machine's first process ran as (the host's
+    /// user, or `--uid`'s): who the host's own permission checks are
+    /// already made for, and who a file nobody gave an owner belongs to.
+    base: [std::sync::atomic::AtomicU32; 2],
+    /// The session's login name, as `setlogin` set it: none until it is.
+    login: std::sync::Mutex<Option<String>>,
 }
+
+/// The capabilities the credential and permission checks ask for.
+pub mod cap {
+    pub const CHOWN: u64 = 1 << 0;
+    pub const DAC_OVERRIDE: u64 = 1 << 1;
+    pub const DAC_READ_SEARCH: u64 = 1 << 2;
+    pub const FOWNER: u64 = 1 << 3;
+    pub const FSETID: u64 = 1 << 4;
+    pub const KILL: u64 = 1 << 5;
+    pub const SETGID: u64 = 1 << 6;
+    pub const SETUID: u64 = 1 << 7;
+}
+
+/// How many supplementary groups a process may have: Linux's limit is 65536;
+/// this is as many as a process's saved credentials keep for a fork's
+/// child in a page. Darwin's `NGROUPS_MAX` is 16.
+pub const MAX_GROUPS: usize = 256;
+pub const DARWIN_NGROUPS_MAX: usize = 16;
 
 /// Every capability Linux 6.x has (`CAP_LAST_CAP` 40): root's sets.
 pub const CAPS_ALL: u64 = (1 << 41) - 1;
@@ -6803,6 +6971,10 @@ impl Creds {
             gid: [gid.into(), gid.into(), gid.into()],
             caps: [0.into(), 0.into(), 0.into()],
             keep_caps: false.into(),
+            groups: Default::default(),
+            sugid: false.into(),
+            base: [uid.into(), gid.into()],
+            login: Default::default(),
         }
     }
 
@@ -6873,6 +7045,7 @@ impl Creds {
         for a in &self.uid {
             Self::st32(a, uid);
         }
+        Self::st32(&self.base[0], uid);
         self.exec();
     }
 
@@ -6880,12 +7053,89 @@ impl Creds {
         for a in &self.gid {
             Self::st32(a, gid);
         }
+        Self::st32(&self.base[1], gid);
+    }
+
+    /// The identity the machine's first process had: the user and group
+    /// whose permissions the host's own checks are made for, and who owns
+    /// what nobody has given an owner.
+    pub fn base(&self) -> (u32, u32) {
+        (Self::ld32(&self.base[0]), Self::ld32(&self.base[1]))
+    }
+
+    /// The owner and group a file with `owner` ([`crate::vfs::Metadata::owner`])
+    /// has: the machine's first user's where it says none, or a half of it
+    /// that is the base's ([`crate::vfs::BASE_ID`]).
+    pub fn owner_of(&self, owner: Option<(u32, u32)>) -> (u32, u32) {
+        let (bu, bg) = self.base();
+        match owner {
+            None => (bu, bg),
+            Some((u, g)) => (if u == crate::vfs::BASE_ID { bu } else { u }, if g == crate::vfs::BASE_ID { bg } else { g }),
+        }
+    }
+
+    /// Whether the process is still the machine's first user: its real
+    /// and effective ids are the [`Creds::base`] ones. What the host
+    /// already checks permissions for, so what needs no check of ours.
+    pub fn is_base(&self) -> bool {
+        let (u, g) = self.base();
+        self.uids()[..2] == [u, u] && self.gids()[..2] == [g, g]
+    }
+
+    /// Whether the process has capability `cap` ([`cap`]) in its effective
+    /// set.
+    pub fn capable(&self, cap: u64) -> bool {
+        self.caps()[0] & cap != 0
+    }
+
+    /// The supplementary groups.
+    pub fn groups(&self) -> Vec<u32> {
+        self.groups.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the supplementary groups.
+    pub fn set_groups(&self, groups: &[u32]) {
+        *self.groups.lock().unwrap_or_else(|e| e.into_inner()) = groups.to_vec();
+    }
+
+    /// Whether the process is in group `gid` for a permission check: its
+    /// effective gid, or one of its supplementary groups.
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.gid() == gid || self.groups.lock().unwrap_or_else(|e| e.into_inner()).contains(&gid)
+    }
+
+    /// Darwin's `P_SUGID` ([`Creds::sugid`] says what it is).
+    pub fn sugid(&self) -> bool {
+        self.sugid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_sugid(&self, on: bool) {
+        self.sugid.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The login name `setlogin` set, if one was.
+    pub fn login(&self) -> Option<String> {
+        self.login.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_login(&self, name: &str) {
+        *self.login.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
     }
 
     /// The ids and sets as bytes, for a process another memory goes on in
-    /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte.
+    /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte
+    /// ([`Creds::SAVED`]), then the rest: the `P_SUGID` flag, the base
+    /// identity, the supplementary groups (a count and each) and the login
+    /// name (a length byte and the name).
     pub fn save(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(Self::SAVED);
+        self.save_within(usize::MAX)
+    }
+
+    /// [`Creds::save`], as much of it as fits `room` bytes: the groups a
+    /// table of processes keeps for another's `/proc/<pid>/status` are
+    /// the first that fit, and no login name.
+    pub fn save_within(&self, room: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(Self::SAVED + 16);
         for id in self.uids().into_iter().chain(self.gids()) {
             v.extend_from_slice(&id.to_le_bytes());
         }
@@ -6893,6 +7143,22 @@ impl Creds {
             v.extend_from_slice(&c.to_le_bytes());
         }
         v.push(self.keep_caps.load(std::sync::atomic::Ordering::Acquire) as u8);
+        v.push(self.sugid() as u8);
+        let (bu, bg) = self.base();
+        v.extend_from_slice(&bu.to_le_bytes());
+        v.extend_from_slice(&bg.to_le_bytes());
+        let mut groups = self.groups();
+        let fits = room.saturating_sub(v.len() + 4) / 4;
+        groups.truncate(fits);
+        v.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        for g in groups {
+            v.extend_from_slice(&g.to_le_bytes());
+        }
+        if room == usize::MAX {
+            let login = self.login().unwrap_or_default();
+            v.push(login.len().min(255) as u8);
+            v.extend_from_slice(&login.as_bytes()[..login.len().min(255)]);
+        }
         v
     }
 
@@ -6908,12 +7174,14 @@ impl Creds {
         v
     }
 
-    /// The length of [`Creds::save`]'s bytes.
+    /// The length of the head of [`Creds::save`]'s bytes: what an older
+    /// one had, and all the ids and sets of.
     pub const SAVED: usize = 6 * 4 + 3 * 8 + 1;
 
-    /// [`Creds::save`]'s bytes back; anything else changes nothing.
+    /// [`Creds::save`]'s bytes back; a head alone gives the ids and sets
+    /// and leaves the rest, and anything shorter changes nothing.
     pub fn restore(&self, b: &[u8]) {
-        if b.len() != Self::SAVED {
+        if b.len() < Self::SAVED {
             return;
         }
         let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
@@ -6924,6 +7192,51 @@ impl Creds {
         let c = |i: usize| u64::from_le_bytes(b[24 + i * 8..32 + i * 8].try_into().unwrap());
         self.set_caps([c(0), c(1), c(2)]);
         self.keep_caps.store(b[48] != 0, std::sync::atomic::Ordering::Release);
+        // The rest, as far as it is there.
+        let rest = &b[Self::SAVED..];
+        if rest.len() < 13 {
+            return;
+        }
+        self.set_sugid(rest[0] != 0);
+        let r32 = |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().unwrap());
+        Self::st32(&self.base[0], r32(1));
+        Self::st32(&self.base[1], r32(5));
+        let n = (r32(9) as usize).min(MAX_GROUPS).min((rest.len() - 13) / 4);
+        let groups: Vec<u32> = (0..n).map(|i| r32(13 + i * 4)).collect();
+        self.set_groups(&groups);
+        let after = 13 + r32(9) as usize * 4;
+        if let Some(&len) = rest.get(after) {
+            if let Some(name) = rest.get(after + 1..after + 1 + len as usize).filter(|n| !n.is_empty()) {
+                self.set_login(&String::from_utf8_lossy(name));
+            }
+        }
+    }
+
+    /// The effective user and group made the real ones
+    /// (`POSIX_SPAWN_RESETIDS`).
+    pub fn reset_ids(&self) {
+        let old = self.uids();
+        Self::st32(&self.uid[EF], self.ruid());
+        Self::st32(&self.gid[EF], self.rgid());
+        self.after_uid_change(old);
+    }
+
+    /// What an `execve` does to the ids: the effective user and group become
+    /// the file's, where it has set-id bits (`uid`, `gid`), the saved ids
+    /// the effective ones, the capabilities as [`Creds::exec`] has them;
+    /// and `P_SUGID` is on for a process whose effective ids are not its
+    /// real ones, or that a set-id bit has changed, and off for any other
+    /// (a fresh program: nothing it inherited was changed).
+    pub fn exec_ids(&self, uid: Option<u32>, gid: Option<u32>) {
+        let changed = uid.is_some_and(|u| u != self.uid()) || gid.is_some_and(|g| g != self.gid());
+        if let Some(u) = uid {
+            Self::st32(&self.uid[EF], u);
+        }
+        if let Some(g) = gid {
+            Self::st32(&self.gid[EF], g);
+        }
+        self.exec();
+        self.set_sugid(changed || self.uid() != self.ruid() || self.gid() != self.rgid());
     }
 
     /// The capabilities an `execve` leaves, as Linux computes them for a
@@ -6932,6 +7245,9 @@ impl Creds {
     /// nothing otherwise. The inheritable set stays; `PR_SET_KEEPCAPS`
     /// clears.
     pub fn exec(&self) {
+        // The saved ids are the effective ones the new program starts with.
+        Self::st32(&self.uid[SV], self.uid());
+        Self::st32(&self.gid[SV], self.gid());
         let [r, e, _] = self.uids();
         let [_, _, inh] = self.caps();
         let permitted = if r == 0 || e == 0 { CAPS_ALL } else { 0 };
@@ -6976,17 +7292,11 @@ impl Creds {
         if old[1] != 0 && new[1] == 0 {
             eff = perm;
         }
-        // A process that was not root at all and is now (every change is
-        // granted, [`cred_call`]): root's sets, as a set-user-ID-root
-        // program's exec would have given it.
-        if !old.contains(&0) && new[1] == 0 {
-            (eff, perm) = (CAPS_ALL, CAPS_ALL);
-        }
         self.set_caps([eff, perm, inh]);
     }
 
     /// `setresuid`/`setresgid` and the calls made of it: each id `None`
-    /// to keep.
+    /// to keep, the rest set whole.
     fn set_res(ids: &[std::sync::atomic::AtomicU32; 3], want: [Option<u32>; 3]) {
         for (a, v) in ids.iter().zip(want) {
             if let Some(v) = v {
@@ -6995,19 +7305,57 @@ impl Creds {
         }
     }
 
-    /// `setuid(id)` (`gid`: `setgid`), as root's: every id.
-    fn setid(&self, gid: bool, id: u32) {
-        Self::set_res(if gid { &self.gid } else { &self.uid }, [Some(id); 3]);
+    /// The capability a change of user ids (`gid`: group ids) needs.
+    fn setid_cap(&self, gid: bool) -> bool {
+        self.capable(if gid { cap::SETGID } else { cap::SETUID })
     }
 
-    /// `setreuid(r, e)` (`gid`: `setregid`). When the real id is set, or
-    /// the effective one set to other than the old real, the saved id
-    /// becomes the new effective.
-    fn setreid(&self, gid: bool, r: Option<u32>, e: Option<u32>) {
+    /// Whether `id` is one of the three the process has already.
+    fn has_id(ids: &[std::sync::atomic::AtomicU32; 3], id: u32) -> bool {
+        ids.iter().any(|a| Self::ld32(a) == id)
+    }
+
+    /// `setuid(id)` (`gid`: `setgid`): with the capability, every id;
+    /// without, only the effective one, and only to the real or the saved.
+    fn setid(&self, gid: bool, id: u32) -> Result<(), Errno> {
+        let ids = if gid { &self.gid } else { &self.uid };
+        if self.setid_cap(gid) {
+            Self::set_res(ids, [Some(id); 3]);
+        } else if id == Self::ld32(&ids[RE]) || id == Self::ld32(&ids[SV]) {
+            Self::st32(&ids[EF], id);
+        } else {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    /// `setreuid(r, e)` (`gid`: `setregid`). The real id may be set to the
+    /// real or effective one, the effective to any of the three, unless
+    /// there is the capability. When the real id is set, or the effective
+    /// one set to other than the old real, the saved id becomes the new
+    /// effective.
+    fn setreid(&self, gid: bool, r: Option<u32>, e: Option<u32>) -> Result<(), Errno> {
         let ids = if gid { &self.gid } else { &self.uid };
         let (or, oe) = (Self::ld32(&ids[RE]), Self::ld32(&ids[EF]));
+        if !self.setid_cap(gid) {
+            if r.is_some_and(|r| r != or && r != oe) || e.is_some_and(|e| !Self::has_id(ids, e)) {
+                return Err(Errno::EPERM);
+            }
+        }
         let saved = (r.is_some() || e.is_some_and(|e| e != or)).then_some(e.unwrap_or(oe));
         Self::set_res(ids, [r, e, saved]);
+        Ok(())
+    }
+
+    /// `setresuid(r, e, s)` (`gid`: `setresgid`): each is one of the
+    /// three the process has, or there is the capability.
+    fn setres(&self, gid: bool, want: [Option<u32>; 3]) -> Result<(), Errno> {
+        let ids = if gid { &self.gid } else { &self.uid };
+        if !self.setid_cap(gid) && want.iter().flatten().any(|id| !Self::has_id(ids, *id)) {
+            return Err(Errno::EPERM);
+        }
+        Self::set_res(ids, want);
+        Ok(())
     }
 
     /// `capget`'s answer for this process.
@@ -7557,6 +7905,8 @@ pub fn is_cred(n: u64) -> bool {
             | nr::GETRESGID
             | nr::SETFSUID
             | nr::SETFSGID
+            | nr::GETGROUPS
+            | nr::SETGROUPS
             | nr::CAPGET
             | nr::CAPSET
             | nr::SETSID
@@ -7569,20 +7919,18 @@ pub fn is_cred(n: u64) -> bool {
 /// A call [`is_cred`] admits, made, for the kernel's arms and
 /// [`free_call`] alike, as process `pid`.
 ///
-/// There is no privilege check on the id changes: the guest is the whole
-/// system, and there are no set-user-ID programs (a file's owner is the
-/// process's own), so a request to become another user is recorded and
-/// granted, as root's would be. Refusing would be the less honest answer,
-/// since nothing gex does is protected by the uid in the first place. The
-/// real, effective and saved ids are each kept, set as Linux sets them for
-/// root, and the capability sets follow a uid change as Linux's do
-/// ([`Creds::after_uid_change`]): what peer credentials, `getuid` and
-/// `geteuid` report is what Linux's would. All ones means "leave alone".
+/// The id changes are checked as Linux checks them, and as Darwin's
+/// do for the superuser's: a process with `CAP_SETUID` (`CAP_SETGID`) -- a
+/// root one has -- sets any id, and any other may set an id only to one of
+/// its three already (real, effective, saved), or `EPERM`. `setgroups` is
+/// the superuser's alone. The real, effective and saved ids are each kept,
+/// set as Linux sets them, and the capability sets follow a uid change as
+/// Linux's do ([`Creds::after_uid_change`]). All ones means "leave alone".
 pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
     let r = cred_change(creds, procs, pid, m, n, a);
     // A change the other processes' `/proc/<pid>/status` shows.
     if r.is_ok() && !matches!(n, nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::GETRESUID | nr::GETRESGID | nr::CAPGET | nr::SETFSUID | nr::SETFSGID | nr::SETSID | nr::GETSID | nr::GETPGID | nr::SETPGID) {
-        procs.set_creds(pid, &creds.save());
+        procs.set_creds(pid, &creds.save_within(256));
     }
     r
 }
@@ -7599,10 +7947,21 @@ fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>,
         }
         Ok(0)
     };
-    let uid_change = |f: &dyn Fn()| {
-        let old = creds.uids();
-        f();
+    let uid_change = |f: &dyn Fn() -> Result<(), Errno>| {
+        let (old, was) = (creds.uids(), creds.gids());
+        f()?;
         creds.after_uid_change(old);
+        if creds.uids() != old || creds.gids() != was {
+            creds.set_sugid(true);
+        }
+        Ok(0)
+    };
+    let gid_change = |f: &dyn Fn() -> Result<(), Errno>| {
+        let was = creds.gids();
+        f()?;
+        if creds.gids() != was {
+            creds.set_sugid(true);
+        }
         Ok(0)
     };
     match n {
@@ -7615,13 +7974,45 @@ fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>,
             None => Err(Errno::EINVAL),
         },
         nr::SETGID => match id(a[0]) {
-            Some(v) => Ok(creds.setid(true, v)).map(|_| 0),
+            Some(v) => gid_change(&|| creds.setid(true, v)),
             None => Err(Errno::EINVAL),
         },
         nr::SETREUID => uid_change(&|| creds.setreid(false, id(a[0]), id(a[1]))),
-        nr::SETREGID => Ok(creds.setreid(true, id(a[0]), id(a[1]))).map(|_| 0),
-        nr::SETRESUID => uid_change(&|| Creds::set_res(&creds.uid, [id(a[0]), id(a[1]), id(a[2])])),
-        nr::SETRESGID => Ok(Creds::set_res(&creds.gid, [id(a[0]), id(a[1]), id(a[2])])).map(|_| 0),
+        nr::SETREGID => gid_change(&|| creds.setreid(true, id(a[0]), id(a[1]))),
+        nr::SETRESUID => uid_change(&|| creds.setres(false, [id(a[0]), id(a[1]), id(a[2])])),
+        nr::SETRESGID => gid_change(&|| creds.setres(true, [id(a[0]), id(a[1]), id(a[2])])),
+        // The supplementary groups: `getgroups(size, list)` answers how
+        // many (`size` 0) or writes them, sorted, `EINVAL` when they do
+        // not fit; `setgroups(n, list)` is for `CAP_SETGID`.
+        nr::GETGROUPS => {
+            let groups = creds.groups();
+            if a[0] as i32 == 0 {
+                return Ok(groups.len() as u64);
+            }
+            if (a[0] as i32) < 0 || (a[0] as usize) < groups.len() {
+                return Err(Errno::EINVAL);
+            }
+            for (i, g) in groups.iter().enumerate() {
+                m.write_u32(a[1] + 4 * i as u64, *g)?;
+            }
+            Ok(groups.len() as u64)
+        }
+        nr::SETGROUPS => {
+            if !creds.capable(cap::SETGID) {
+                return Err(Errno::EPERM);
+            }
+            let count = a[0] as i64;
+            if !(0..=MAX_GROUPS as i64).contains(&count) {
+                return Err(Errno::EINVAL);
+            }
+            let mut groups = (0..count as u64).map(|i| m.read_u32(a[1] + 4 * i)).collect::<Result<Vec<u32>, _>>()?;
+            groups.sort_unstable();
+            if groups != creds.groups() {
+                creds.set_groups(&groups);
+                creds.set_sugid(true);
+            }
+            Ok(0)
+        }
         nr::GETRESUID => getres(m, creds.uids()),
         nr::GETRESGID => getres(m, creds.gids()),
         // The filesystem ids are the effective ones: the old one back, and
@@ -7798,6 +8189,14 @@ pub struct KillTo<'a> {
 /// waiting elsewhere wakes them after (a signal for one is raised on its
 /// own pending word, which it sees when it looks).
 pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    if n == nr::KILL {
+        kill_permitted(to, a[0] as i32)?;
+    } else if n == nr::TKILL || n == nr::TGKILL {
+        let tid = a[if n == nr::TKILL { 0 } else { 1 }] as i32;
+        if let Some(owner) = to.procs.task_owner(tid) {
+            kill_permitted(to, owner)?;
+        }
+    }
     {
         let (pid, tid, signo) = match n {
             nr::KILL => (a[0] as i32, 0, a[1] as u32),
@@ -7858,6 +8257,39 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         }
     }
     Ok(0)
+}
+
+/// `EPERM` unless the caller may signal `target` (`kill`'s pid argument):
+/// one it has the capability for (`CAP_KILL`, which root has), or whose
+/// real or saved user is the caller's real or effective. The machine's first
+/// user's own are the host's to allow, as they were. A group or everyone
+/// is refused if any of it is not the caller's to signal.
+fn kill_permitted(to: &KillTo<'_>, target: i32) -> Result<(), Errno> {
+    if to.creds.capable(cap::KILL) || to.creds.is_base() {
+        return Ok(());
+    }
+    let entries = to.procs.entries();
+    let caller_group = entries.iter().find(|e| e.pid == to.pid).map_or(to.pid, |e| e.pgid);
+    let theirs = |e: &crate::proc::ProcEntry| match target {
+        -1 => e.pid != crate::proc::INIT_PID,
+        0 => e.pgid == caller_group,
+        n if n < 0 => e.pgid == -n,
+        n => e.pid == n,
+    };
+    let me = [to.creds.ruid(), to.creds.uid()];
+    for e in entries.iter().filter(|e| theirs(e) && e.pid != to.pid) {
+        // (A process that has published no ids is not told of.)
+        if e.creds.len() < Creds::SAVED {
+            continue;
+        }
+        let them = Creds::new(0, 0);
+        them.restore(&e.creds);
+        let [ruid, _, svuid] = them.uids();
+        if !me.iter().any(|u| *u == ruid || *u == svuid) {
+            return Err(Errno::EPERM);
+        }
+    }
+    Ok(())
 }
 
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
@@ -7981,8 +8413,6 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             Ok(0)
         }
         nr::MEMBARRIER => Ok(0),
-        // No supplementary groups. `getgroups(0, _)` asks for the count.
-        nr::GETGROUPS | nr::SETGROUPS => Ok(0),
         nr::GETPPID => Ok(procs.ppid(io.pid) as u64),
         nr::ARCH_PRCTL => arch_prctl(m, ctx_addr, a[0], a[1]),
         nr::NOOP_OK => Ok(0),
@@ -10846,6 +11276,7 @@ impl Kernel {
             tid: 1,
             exe_path,
             exec_mem64: None,
+            exec_setid: (None, None),
             exec_image: None,
             argv: Vec::new(),
             envp: Vec::new(),
@@ -11129,7 +11560,13 @@ impl Kernel {
         if crate::darwin::on() && self.nobody_may_execute(&path) {
             return Err(Errno::EACCES);
         }
+        // May the caller run it? (Its own permission checks are the host's
+        // for the machine's first user, as they always were.) A script is
+        // run through an interpreter that is another file to be run.
+        self.exec_permitted(&path)?;
         let (path, argv) = self.resolve_interpreter_as(path, argv, given)?;
+        self.exec_permitted(&path)?;
+        self.exec_setid = self.exec_ids_of(&path);
         // Its head only: the loader reads the whole file once it is past the
         // point of no return (apt's methods are one 14 MB program, read
         // three times over per exec while every check read all of it).
@@ -11139,6 +11576,47 @@ impl Kernel {
             return Err(Errno::ENOEXEC);
         }
         Ok((path, argv, envp))
+    }
+
+    /// `EACCES` unless the process may run the file at `path`: where the file
+    /// has an owner, an execute bit its owner, group or others have for the
+    /// process, as ours to check ([`PathIo::enforcing`]).
+    fn exec_permitted(&self, path: &str) -> Result<(), Errno> {
+        let io = self.path_io();
+        if !io.enforcing() {
+            return Ok(());
+        }
+        match io.ns.metadata(path) {
+            Ok(md) if md.file_type == FileType::Directory => Err(Errno::EACCES),
+            Ok(md) if !self.creds.may(&md, crate::perm::X, false) => Err(Errno::EACCES),
+            _ => Ok(()),
+        }
+    }
+
+    /// The effective user and group a run of the file at `path` is to have
+    /// (the owner of one with the set-user-ID bit, the group of one with
+    /// the set-group-ID bit and its group execute bit, as Linux has it),
+    /// where files have owners and this is a program a set-id bit is
+    /// honoured on: a regular file, not through a script's own bits.
+    fn exec_ids_of(&self, path: &str) -> (Option<u32>, Option<u32>) {
+        let Ok(md) = self.path_io().ns.metadata(path) else { return (None, None) };
+        if md.owner.is_none() || md.file_type != FileType::Regular {
+            return (None, None);
+        }
+        let (owner, group) = self.creds.owner_of(md.owner);
+        let uid = (md.mode & crate::perm::S_ISUID != 0).then_some(owner);
+        let gid = (md.mode & crate::perm::S_ISGID != 0 && md.mode & 0o010 != 0).then_some(group);
+        (uid, gid)
+    }
+
+    /// The `execve` of the program is on: the process's ids become what the
+    /// file's set-id bits make them, the saved ids follow, and the process is
+    /// marked as one whose environment is not to be trusted ([`Creds::sugid`])
+    /// when its effective ids are not its real ones.
+    fn exec_commit(&mut self) {
+        let (uid, gid) = std::mem::take(&mut self.exec_setid);
+        self.creds.exec_ids(uid, gid);
+        self.procs.set_creds(self.pid, &self.creds.save_within(256));
     }
 
     /// Whether `path` is a file whose mode lets nobody execute it. Where
@@ -11380,6 +11858,7 @@ impl Kernel {
             tid: self.tid,
             exe_path: self.exe_path.clone(),
             exec_mem64: None,
+            exec_setid: (None, None),
             exec_image: self.exec_image.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -11710,6 +12189,7 @@ impl Kernel {
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, mut envp)) => {
+                    self.exec_commit();
                     self.exec_mem64 = self.exec_flavour(&path, &argv, &mut envp);
                     self.map_io().flush_all_shared(m);
                     if self.trace {
@@ -16171,14 +16651,18 @@ mod tests {
         set_args(&mut m, at, nr::GETSID, &[0]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, at), if made < 0 { sid } else { made });
-        // A uid set without the kernel is the owner the kernel's stat reports.
+        // A uid set without the kernel is what the kernel's `getuid` reports,
+        // and a file whose filesystem keeps no owners is still the machine's
+        // first user's, whoever the process has become.
+        k.creds.set_uid(0);
         set_args(&mut m, at, nr::SETUID, &[4321]);
         assert!(done(free(&k, &mut m, at)));
+        assert_eq!(k.creds.uid(), 4321);
         set_args(&mut m, at, nr::FSTAT, &[1, buf_at]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, at), 0);
         let uid_at = if gex_abi::X86 { 28 } else { 24 };
-        assert_eq!(m.read_u32(buf_at + uid_at).unwrap(), 4321);
+        assert_eq!(m.read_u32(buf_at + uid_at).unwrap(), 0);
         // A fork's ids are its own from then on.
         let child = k.fork_kernel();
         assert_eq!(child.creds.uid(), 4321);
@@ -16193,27 +16677,37 @@ mod tests {
         let all = CAPS_ALL;
         let c = Creds::new(0, 0);
         assert_eq!(c.caps(), [all, all, 0]);
-        let run = |c: &Creds, n: u64, a: [u64; 3]| {
+        let try_run = |c: &Creds, n: u64, a: [u64; 3]| {
             let mut buf = [0u8; 64];
             let mut m = GuestMem::new(&mut buf);
-            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0]).unwrap();
+            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0])
+        };
+        let run = |c: &Creds, n: u64, a: [u64; 3]| {
+            try_run(c, n, a).unwrap();
         };
         let keep = u32::MAX as u64;
         run(&c, nr::SETRESUID, [keep, 997, keep]);
         assert_eq!(c.uids(), [0, 997, 0]);
         assert_eq!(c.caps(), [0, all, 0]);
+        // The saved id is the way back.
         run(&c, nr::SETRESUID, [keep, 0, keep]);
         assert_eq!(c.caps(), [all, all, 0]);
         run(&c, nr::SETREUID, [keep, 998, 0]);
         assert_eq!(c.uids(), [0, 998, 998]);
-        // The real id alone: no root id left, so no capabilities.
+        // The real id alone, with the capability once more: no root id left,
+        // so no capabilities.
+        run(&c, nr::SETRESUID, [keep, 0, keep]);
         run(&c, nr::SETREUID, [995, keep, 0]);
-        assert_eq!(c.uids(), [995, 998, 998]);
+        // (The saved id is the new effective one, as Linux sets it.)
+        assert_eq!(c.uids(), [995, 0, 0]);
+        assert_eq!(c.caps(), [all, all, 0]);
+        run(&c, nr::SETRESUID, [995, 995, 995]);
         assert_eq!(c.caps(), [0, 0, 0]);
         // From root, the real id alone: the effective root keeps them.
         let d = Creds::new(0, 0);
         run(&d, nr::SETREUID, [995, keep, 0]);
         assert_eq!((d.uids(), d.caps()), ([995, 0, 0], [all, all, 0]));
+        let c = Creds::new(0, 0);
         run(&c, nr::SETUID, [996, 0, 0]);
         assert_eq!(c.uids(), [996, 996, 996]);
         assert_eq!(c.caps(), [0, 0, 0]);
@@ -16222,9 +16716,10 @@ mod tests {
         assert_eq!((f.uids(), f.caps()), ([996; 3], [0; 3]));
         f.exec();
         assert_eq!(f.caps(), [0; 3]);
-        // Granted, as root's would be, with root's sets.
-        run(&f, nr::SETUID, [0, 0, 0]);
-        assert_eq!((f.uids(), f.caps()), ([0; 3], [all, all, 0]));
+        // Not granted: there is no root id to go back to, and nothing to
+        // say it may.
+        assert_eq!(try_run(&f, nr::SETUID, [0, 0, 0]), Err(Errno::EPERM));
+        assert_eq!(f.uids(), [996; 3]);
         // PR_SET_KEEPCAPS keeps the permitted set across leaving root.
         let k = Creds::new(0, 0);
         k.set_keep_caps(true);
@@ -16240,6 +16735,259 @@ mod tests {
         let b = Creds::new(0, 0);
         b.restore(&c.save());
         assert_eq!((b.uids(), b.gids(), b.caps()), (c.uids(), c.gids(), c.caps()));
+    }
+
+    /// An unprivileged process changes its ids to ones it has, and no
+    /// others (Linux's rules, which Darwin's `setuid` family follows for
+    /// the ids it may change), and `setgroups` is the superuser's.
+    #[test]
+    fn an_unprivileged_process_changes_only_to_the_ids_it_has() {
+        let run = |c: &Creds, n: u64, a: [u64; 3]| {
+            let mut buf = [0u8; 64];
+            let mut m = GuestMem::new(&mut buf);
+            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0])
+        };
+        let keep = u32::MAX as u64;
+        // Real 501, effective 0, saved 0: what a set-user-ID-root program has.
+        let c = Creds::new(501, 20);
+        c.exec_ids(Some(0), None);
+        assert_eq!((c.uids(), c.caps()[0] != 0, c.sugid()), ([501, 0, 0], true, true));
+        // With the capability, any id; the effective one given up, only
+        // the real or the saved.
+        assert_eq!(run(&c, nr::SETRESUID, [keep, 501, keep]), Ok(0));
+        assert_eq!((c.uids(), c.caps()[0]), ([501, 501, 0], 0));
+        assert_eq!(run(&c, nr::SETUID, [502, 0, 0]), Err(Errno::EPERM));
+        assert_eq!(run(&c, nr::SETREUID, [502, keep, 0]), Err(Errno::EPERM));
+        assert_eq!(run(&c, nr::SETRESUID, [keep, 502, keep]), Err(Errno::EPERM));
+        assert_eq!(run(&c, nr::SETGID, [0, 0, 0]), Err(Errno::EPERM));
+        assert_eq!(run(&c, nr::SETRESGID, [0, keep, keep]), Err(Errno::EPERM));
+        // The saved id is the way back to the root a program is run with.
+        assert_eq!(run(&c, nr::SETRESUID, [keep, 0, keep]), Ok(0));
+        assert_eq!(c.uids(), [501, 0, 0]);
+        // Root drops to a user all at once, and cannot come back.
+        assert_eq!(run(&c, nr::SETUID, [502, 0, 0]), Ok(0));
+        assert_eq!(c.uids(), [502; 3]);
+        assert_eq!(c.caps(), [0; 3]);
+        assert_eq!(run(&c, nr::SETUID, [0, 0, 0]), Err(Errno::EPERM));
+        // Groups: set by root, read by anyone, sorted, and not past the limit.
+        let mut buf = [0u8; 4096];
+        let mut m = GuestMem::new(&mut buf);
+        for (i, g) in [80u32, 20, 12].iter().enumerate() {
+            m.write_u32(0x100 + 4 * i as u64, *g).unwrap();
+        }
+        let root = Creds::new(0, 0);
+        let call = |c: &Creds, m: &mut GuestMem<'_>, n: u64, a: [u64; 3]| cred_call(c, &ProcTable::new(), 1, m, n, [a[0], a[1], a[2], 0, 0, 0]);
+        assert_eq!(call(&root, &mut m, nr::SETGROUPS, [3, 0x100, 0]), Ok(0));
+        assert_eq!(root.groups(), vec![12, 20, 80]);
+        assert_eq!(call(&root, &mut m, nr::GETGROUPS, [0, 0, 0]), Ok(3));
+        assert_eq!(call(&root, &mut m, nr::GETGROUPS, [2, 0x200, 0]), Err(Errno::EINVAL));
+        assert_eq!(call(&root, &mut m, nr::GETGROUPS, [8, 0x200, 0]), Ok(3));
+        assert_eq!([m.read_u32(0x200).unwrap(), m.read_u32(0x204).unwrap(), m.read_u32(0x208).unwrap()], [12, 20, 80]);
+        assert_eq!(call(&root, &mut m, nr::SETGROUPS, [MAX_GROUPS as u64 + 1, 0x100, 0]), Err(Errno::EINVAL));
+        let user = Creds::new(501, 20);
+        assert_eq!(call(&user, &mut m, nr::SETGROUPS, [3, 0x100, 0]), Err(Errno::EPERM));
+        assert!(user.groups().is_empty());
+        // They go with a fork, and through the bytes a page saves.
+        let child = root.fork();
+        assert_eq!(child.groups(), vec![12, 20, 80]);
+        root.set_login("fish");
+        let again = Creds::new(7, 7);
+        again.restore(&root.save());
+        assert_eq!((again.groups(), again.login(), again.base()), (vec![12, 20, 80], Some("fish".to_string()), (0, 0)));
+        // (What a table of processes keeps for another's /proc is the head,
+        // and the groups that fit.)
+        let small = Creds::new(7, 7);
+        small.restore(&root.save_within(Creds::SAVED + 13 + 8));
+        assert_eq!(small.groups(), vec![12, 20]);
+        assert_eq!(small.login(), None);
+        // A head alone (what an older saver wrote) leaves the rest.
+        let old = Creds::new(7, 7);
+        old.set_groups(&[1]);
+        old.restore(&root.save()[..Creds::SAVED]);
+        assert_eq!((old.uids(), old.groups()), ([0; 3], vec![1]));
+    }
+
+    /// An exec's set-user-ID and set-group-ID bits make the effective ids
+    /// the file's, the saved ids the effective ones, and mark the process
+    /// (`P_SUGID`) as one that has them; a program run after is not one,
+    /// unless its ids still differ.
+    #[test]
+    fn an_exec_takes_the_files_set_ids() {
+        let c = Creds::new(501, 20);
+        c.exec_ids(None, None);
+        assert!(!c.sugid());
+        c.exec_ids(Some(0), None);
+        assert_eq!((c.uids(), c.gids(), c.sugid(), c.caps()[0] == CAPS_ALL), ([501, 0, 0], [20; 3], true, true));
+        // An ordinary program run by it keeps what it has, with root's
+        // sets, and is still marked (its ids differ).
+        c.exec_ids(None, None);
+        assert_eq!((c.uids(), c.sugid()), ([501, 0, 0], true));
+        c.exec_ids(None, Some(80));
+        assert_eq!((c.gids(), c.sugid()), ([20, 80, 80], true));
+        // A program that makes the ids its own again starts clean.
+        c.reset_ids();
+        assert_eq!((c.uids()[..2].to_vec(), c.gids()[..2].to_vec(), c.caps()[0]), (vec![501, 501], vec![20, 20], 0));
+        c.exec_ids(None, None);
+        assert_eq!((c.uids(), c.gids(), c.sugid()), ([501; 3], [20; 3], false));
+    }
+
+    /// Who may use a file: the owner, group (the process's own and the ones
+    /// beside it) or other bits, and the capabilities that override them.
+    #[test]
+    fn permission_by_owner_group_other_and_supplementary_groups() {
+        let file = |mode: u32, owner: (u32, u32)| crate::vfs::Metadata { mode, owner: Some(owner), ..crate::vfs::Metadata::regular(0) };
+        let user = Creds::new(502, 20);
+        user.set_groups(&[80, 12]);
+        // Other, owner, the process's group, a supplementary group.
+        assert!(user.may(&file(0o604, (0, 0)), 4, false));
+        assert!(!user.may(&file(0o600, (0, 0)), 4, false));
+        assert!(user.may(&file(0o600, (502, 0)), 6, false));
+        assert!(!user.may(&file(0o070, (502, 0)), 4, false), "the owner's bits, not the group's");
+        assert!(user.may(&file(0o070, (0, 20)), 7, false));
+        assert!(user.may(&file(0o060, (0, 80)), 6, false));
+        assert!(!user.may(&file(0o060, (0, 81)), 4, false));
+        assert!(!user.may(&file(0o060, (0, 80)), 1, false));
+        // A file whose owner the filesystem does not know is anyone's.
+        assert!(user.may(&crate::vfs::Metadata::regular(0), 7, false));
+        // The first user's files are the base's, whoever the process is.
+        let first = crate::vfs::Metadata { mode: 0o600, owner: Some((crate::vfs::BASE_ID, crate::vfs::BASE_ID)), ..crate::vfs::Metadata::regular(0) };
+        assert!(user.may(&first, 6, false), "its own, as the first user");
+        user.set_uid(502);
+        let other = Creds::new(503, 20);
+        other.restore(&{
+            let mut b = user.save();
+            b[4..8].copy_from_slice(&503u32.to_le_bytes());
+            b
+        });
+        assert!(!other.may(&first, 4, false), "not another's");
+        // Root overrides all but an execute bit nobody has; a directory is
+        // always searched.
+        let root = Creds::new(0, 0);
+        assert!(root.may(&file(0o000, (502, 20)), 6, false));
+        assert!(!root.may(&file(0o644, (502, 20)), 1, false));
+        assert!(root.may(&file(0o700, (502, 20)), 1, false));
+        assert!(root.may(&crate::vfs::Metadata { mode: 0, owner: Some((1, 1)), ..crate::vfs::Metadata::dir() }, 1, false));
+        // By the real ids when asked (`access`): a set-user-ID-root process
+        // is a user's to `access`.
+        let su = Creds::new(502, 20);
+        su.exec_ids(Some(0), None);
+        assert!(su.may(&file(0o600, (1, 1)), 6, false));
+        assert!(!su.may(&file(0o600, (1, 1)), 6, true));
+        assert!(su.may(&file(0o600, (502, 20)), 6, true));
+    }
+
+    /// A user the machine's root made, in a tree that keeps owners: what it
+    /// may open, make, give away and run is its permissions', the group
+    /// ones its supplementary groups' too; a file's set-user-ID bit is what
+    /// an exec of it takes the owner from.
+    #[test]
+    fn a_user_in_a_tree_with_owners_is_held_to_its_permissions() {
+        let (_buf, mut k) = setup();
+        let mut mem = vec![0u8; 0x40000];
+        let mut m = GuestMem::new(&mut mem);
+        k.creds.set_uid(0);
+        k.creds.set_gid(0);
+        fn sys(k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, path: &str, a: &[u64]) -> i64 {
+            let cwd = (-100i64) as u64;
+            let a = [a[0], a.get(1).copied().unwrap_or(0)];
+            put_str(m, 0x20000, path);
+            let args = match n {
+                nr::OPENAT | nr::MKDIRAT => [cwd, 0x20000, a[0], a[1]],
+                nr::FCHMODAT | nr::FACCESSAT | nr::UNLINKAT => [cwd, 0x20000, a[0], 0],
+                nr::FCHOWNAT => [cwd, 0x20000, a[0], a[1]],
+                _ => unreachable!(),
+            };
+            let mut full = args.to_vec();
+            if n == nr::FCHOWNAT {
+                full.push(0);
+            }
+            set_args(m, k.ctx_addr, n, &full);
+            k.syscall(m, 0);
+            ret(m, k.ctx_addr)
+        }
+        let (eacces, eperm, eexist) = (-(Errno::EACCES.0 as i64), -(Errno::EPERM.0 as i64), -(Errno::EEXIST.0 as i64));
+        let keep = u32::MAX as u64;
+        // The root makes the system: a program that sets its user's id, a
+        // secret, a home and a place the user may not make names in.
+        let su = sys(&mut k, &mut m, nr::OPENAT, "/su", &[oflags::O_CREAT | oflags::O_RDWR, 0o755]);
+        assert!(su >= 3);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/su", &[0o4755, 0, 0]), 0);
+        let secret = sys(&mut k, &mut m, nr::OPENAT, "/secret", &[oflags::O_CREAT | oflags::O_RDWR, 0o600]);
+        assert!(secret >= 3);
+        assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/home", &[0o755, 0]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/home/u", &[0o700, 0]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/home/u", &[502, 20]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/shared", &[oflags::O_CREAT | oflags::O_RDWR, 0o060]) >= 3, true);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/shared", &[0, 80]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/shared", &[0o060, 0, 0]), 0);
+        // A program that is root's and sets the id: an exec of it is root's.
+        k.creds.set_uid(0);
+        assert_eq!(k.exec_ids_of("/su"), (Some(0), None));
+        assert_eq!(k.exec_ids_of("/secret"), (None, None));
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/su", &[keep, 80]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/su", &[0o6755, 0, 0]), 0);
+        assert_eq!(k.exec_ids_of("/su"), (Some(0), Some(80)));
+        // ... and another's, if it is given away by root, who keeps the bits.
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/su", &[502, keep]), 0);
+        assert_eq!(k.exec_ids_of("/su"), (Some(502), Some(80)));
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/su", &[0, 0]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/su", &[0o4755, 0, 0]), 0);
+        // The user: not the first (the root's), 502 in groups 20 and 80.
+        let user = |k: &mut Kernel| {
+            k.creds.restore(&{
+                let mut b = k.creds.save();
+                for (i, v) in [502u32, 502, 502, 20, 20, 20].iter().enumerate() {
+                    b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                b[24..48].fill(0);
+                b
+            });
+            k.creds.set_groups(&[80, 12]);
+        };
+        user(&mut k);
+        assert!(!k.creds.is_base());
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/secret", &[oflags::O_RDONLY, 0]), eacces);
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/home/u/mine", &[oflags::O_CREAT | oflags::O_RDWR, 0o644]) >= 3, true);
+        // (Its own, by the group of the directory on a Mac, its own group
+        // on Linux; the owner is the user's either way.)
+        let md = k.vfs.metadata("/home/u/mine").unwrap();
+        assert_eq!(md.owner.map(|o| o.0), Some(502));
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/home/x", &[oflags::O_CREAT | oflags::O_RDWR, 0o644]), eacces);
+        assert_eq!(sys(&mut k, &mut m, nr::MKDIRAT, "/home/d", &[0o755, 0]), eacces);
+        assert_eq!(sys(&mut k, &mut m, nr::UNLINKAT, "/secret", &[0, 0]), eacces);
+        // A group's bits by the group the user is in beside its own.
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/shared", &[oflags::O_RDWR, 0]) >= 3, true);
+        assert_eq!(sys(&mut k, &mut m, nr::FACCESSAT, "/shared", &[6, 0, 0]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FACCESSAT, "/shared", &[1, 0, 0]), eacces);
+        assert_eq!(sys(&mut k, &mut m, nr::FACCESSAT, "/secret", &[4, 0, 0]), eacces);
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/shared", &[oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL, 0]), eexist);
+        // Its own file: its mode to change, and a group of its own to give
+        // it; another's is not its to change, nor a user to give it to.
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/home/u/mine", &[0o600, 0, 0]), 0);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/home/u/mine", &[keep, 80]), 0);
+        assert_eq!(k.vfs.metadata("/home/u/mine").unwrap().owner.map(|o| o.1), Some(80));
+        // (A file that is given another group is no set-id program any
+        // more, when it is not root that does it.)
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/home/u/mine", &[0o4755, 0, 0]), 0);
+        assert_eq!(k.vfs.metadata("/home/u/mine").unwrap().mode, 0o4755);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/home/u/mine", &[keep, 12]), 0);
+        assert_eq!(k.vfs.metadata("/home/u/mine").unwrap().mode, 0o755);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/home/u/mine", &[keep, 99]), eperm);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/home/u/mine", &[0, keep]), eperm);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHMODAT, "/secret", &[0o666, 0, 0]), eperm);
+        assert_eq!(sys(&mut k, &mut m, nr::FCHOWNAT, "/secret", &[502, keep]), eperm);
+        // Running what it may not.
+        assert_eq!(k.exec_permitted("/secret"), Err(Errno::EACCES));
+        assert_eq!(k.exec_permitted("/su"), Ok(()));
+        // An exec of the set-user-ID program: the ids the call takes.
+        let ids = k.exec_ids_of("/su");
+        assert_eq!(ids, (Some(0), None));
+        k.exec_setid = ids;
+        k.exec_commit();
+        assert_eq!((k.creds.uids(), k.creds.caps()[0] == CAPS_ALL, k.creds.sugid(), k.creds.groups()), ([502, 0, 0], true, true, vec![80, 12]));
+        // Root again by that: it may make a user's names where the user may not.
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/home/x", &[oflags::O_CREAT | oflags::O_RDWR, 0o644]) >= 3, true);
+        assert_eq!(sys(&mut k, &mut m, nr::OPENAT, "/secret", &[oflags::O_RDONLY, 0]) >= 3, true);
     }
 
     /// `kill`, `tkill` and `tgkill` answer as the kernel's arms do,

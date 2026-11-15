@@ -616,8 +616,10 @@ pub fn translate(
         x::GETRESUID => nr::GETRESUID,
         x::SETRESGID => nr::SETRESGID,
         x::GETRESGID => nr::GETRESGID,
-        x::GETGROUPS | x::GETGROUPS16 => nr::GETGROUPS,
-        x::SETGROUPS | x::SETGROUPS16 => nr::SETGROUPS,
+        // (The 32-bit group calls: the 16-bit ones keep their lists in
+        // another width, and libc has not made them since 2.1.)
+        x::GETGROUPS => nr::GETGROUPS,
+        x::SETGROUPS => nr::SETGROUPS,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
         x::PIVOT_ROOT => nr::PIVOT_ROOT,

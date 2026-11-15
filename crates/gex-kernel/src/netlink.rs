@@ -303,6 +303,7 @@ impl FileHandle for NetlinkRoute {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Fifo,
             size: 0,
             mode: 0o600,

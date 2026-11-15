@@ -171,6 +171,7 @@ impl FileHandle for GlDevice {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: FileType::CharDevice,
             size: 0,
             mode: 0o666,
