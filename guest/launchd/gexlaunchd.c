@@ -24,7 +24,7 @@
 // token), as launchd's do, and comes from a process running as root, which
 // libxpc insists on of a bootstrap server that is not process 1.
 //
-//   gexlaunchd [-v] [-u UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [--] PROGRAM [ARG...]
+//   gexlaunchd [-v] [-u UID[:GID]] [-a UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [--] PROGRAM [ARG...]
 //
 // starts PROGRAM with this server as its bootstrap port and exits when it
 // does, with its status, ending the jobs it started. -j adds a directory of
@@ -32,13 +32,16 @@
 // /System/Library/LaunchAgents); -x leaves a job out; -r starts a job along
 // with PROGRAM, as launchd starts one that is to run at load (loginwindow
 // beside WindowServer); -v says what is asked and answered; -u is the user
-// PROGRAM and the agents run as.
+// PROGRAM and the agents run as; -a the agents' user alone, the program
+// staying root (WindowServer, with the console user's agents beside it).
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
+#include <grp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -85,6 +88,10 @@ struct service {
     // The receive right while the job does not have it, and a send right
     // to give whoever looks it up.
     mach_port_t recv, send;
+    // An agent's: the user's domain's, where a name is looked up before
+    // the system's (a name may be both, as com.apple.secinitd and lsd's
+    // are, a job of each).
+    int user;
 };
 
 struct job {
@@ -179,9 +186,9 @@ static void add_job(const char *path) {
     if (mach) xpc_dictionary_apply(mach, ^bool(const char *name, xpc_object_t v) {
         (void)v;
         for (int i = 0; i < nservices; i++)
-            if (!strcmp(services[i].name, name)) return true;
+            if (!strcmp(services[i].name, name) && services[i].user == jobs[njobs].agent) return true;
         services = realloc(services, (nservices + 1) * sizeof *services);
-        services[nservices++] = (struct service){strdup(name), (struct job *)(intptr_t)njobs, MACH_PORT_NULL, MACH_PORT_NULL};
+        services[nservices++] = (struct service){strdup(name), (struct job *)(intptr_t)njobs, MACH_PORT_NULL, MACH_PORT_NULL, jobs[njobs].agent};
         return true;
     });
     njobs++;
@@ -207,10 +214,18 @@ static struct service *find_by_send(mach_port_t name) {
     return NULL;
 }
 
-static struct service *find(const char *name) {
-    for (int i = 0; i < nservices; i++)
-        if (!strcmp(services[i].name, name)) return &services[i];
-    return NULL;
+// A name as a process in the user's domain (`user`) or the system's sees
+// it: its own domain's service first, then the other's. (launchd's system
+// domain sees no user's; here a daemon is let find an agent's name too,
+// there being only the one user.)
+static struct service *find(const char *name, int user) {
+    struct service *other = NULL;
+    for (int i = 0; i < nservices; i++) {
+        if (strcmp(services[i].name, name)) continue;
+        if (services[i].user == user) return &services[i];
+        if (!other) other = &services[i];
+    }
+    return other;
 }
 
 // The service's port, made if it has none: the receive right kept until
@@ -274,15 +289,27 @@ static void *take_back(void *arg) {
 
 // Start a process with this server as its bootstrap port.
 // The user the first program and the agents (LaunchAgents' jobs) run as
-// (-u); daemons run as root, as this does.
-static uid_t user;
-static gid_t group;
+// (-u), and the agents alone (-a); daemons run as root, as this does. An
+// agent is the user's as launchd's per-user domain makes it: in the
+// user's groups, with the user's home, name and shell in its environment.
+static uid_t user, agent_user;
+static gid_t group, agent_group;
+static int agents_own;
 
 static pid_t start(char **argv, const char *file, int as_user) {
     pid_t pid = fork();
     if (pid == 0) {
-        if (as_user && user) {
-            if (setgid(group) || setuid(user)) _exit(126);
+        uid_t u = as_user == 2 && agents_own ? agent_user : as_user ? user : 0;
+        gid_t g = as_user == 2 && agents_own ? agent_group : group;
+        if (u) {
+            struct passwd *pw = getpwuid(u);
+            if (setgid(g) || (pw && initgroups(pw->pw_name, (int)g)) || setuid(u)) _exit(126);
+            if (pw) {
+                setenv("HOME", pw->pw_dir, 1);
+                setenv("USER", pw->pw_name, 1);
+                setenv("LOGNAME", pw->pw_name, 1);
+                setenv("SHELL", pw->pw_shell, 1);
+            }
         }
         execv(file ? file : argv[0], argv);
         fprintf(stderr, "gexlaunchd: %s: %s\n", file ? file : argv[0], strerror(errno));
@@ -311,7 +338,7 @@ static void start_job(struct job *j) {
     while (j->argv[n]) n++;
     // (A Program kept past the arguments, after the null that ends them.)
     const char *file = j->argv[n + 1];
-    j->pid = start(j->argv, file, j->agent);
+    j->pid = start(j->argv, file, j->agent ? 2 : 0);
     j->started++;
     say("started %s, pid %d", j->label, j->pid);
 }
@@ -383,7 +410,9 @@ static void handle(xpc_object_t request) {
     xpc_dictionary_set_uint64(reply, "req_pid", token.val[5]);
     xpc_dictionary_set_uint64(reply, "rec_execcnt", token.val[7]);
     pthread_mutex_lock(&lock);
-    struct service *s = name ? find(name) : NULL;
+    // (A job checks in for its own job's service, of its own domain.)
+    struct job *caller = job_by_pid(from);
+    struct service *s = name ? find(name, aqua(caller, token)) : NULL;
     uint64_t subsystem = xpc_dictionary_get_uint64(request, "subsystem");
     if (subsystem == SUBSYSTEM_XPC && routine == ROUTINE_ENDPOINT_LOOKUP) routine = ROUTINE_LOOKUP;
     if (subsystem == SUBSYSTEM_VPROC && routine == ROUTINE_VPROC_SWAP) {
@@ -447,7 +476,7 @@ static void handle(xpc_object_t request) {
         if (!s && from == first) {
             struct job *mine = job_by_pid(from);
             services = realloc(services, (nservices + 1) * sizeof *services);
-            services[nservices] = (struct service){strdup(name), (struct job *)(intptr_t)(mine ? mine - jobs : -1), MACH_PORT_NULL, MACH_PORT_NULL};
+            services[nservices] = (struct service){strdup(name), (struct job *)(intptr_t)(mine ? mine - jobs : -1), MACH_PORT_NULL, MACH_PORT_NULL, mine ? mine->agent : 0};
             s = &services[nservices++];
             say("%s: a service of %d's own", name, from);
         }
@@ -529,6 +558,12 @@ int main(int argc, char **argv) {
             user = (uid_t)strtoul(argv[++i], &end, 10);
             group = *end == ':' ? (gid_t)strtoul(end + 1, NULL, 10) : 20;
         }
+        else if (!strcmp(argv[i], "-a") && i + 1 < argc) {
+            char *end;
+            agent_user = (uid_t)strtoul(argv[++i], &end, 10);
+            agent_group = *end == ':' ? (gid_t)strtoul(end + 1, NULL, 10) : 20;
+            agents_own = 1;
+        }
         else if (!strcmp(argv[i], "-j") && i + 1 < argc && ndirs < 16) dirs[ndirs++] = argv[++i];
         else if (!strcmp(argv[i], "--")) {
             i++;
@@ -536,7 +571,7 @@ int main(int argc, char **argv) {
         } else break;
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-x LABEL]... [-i LABEL]... [-r LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
+        fprintf(stderr, "usage: gexlaunchd [-v] [-u UID[:GID]] [-a UID[:GID]] [-x LABEL]... [-i LABEL]... [-r LABEL]... [-j DIR]... [--] PROGRAM [ARG...]\n");
         return 2;
     }
     // No program a Mac runs is numbered below 10 but launchd: by the time it

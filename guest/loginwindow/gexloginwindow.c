@@ -21,16 +21,25 @@
 //   a square in it, which WindowServer composites to the framebuffer; and
 //   what WindowServer says the display then shows (its image of it).
 //
-//   gexloginwindow [-u UID[:GID]] [-n NAME]
+// - and then, given a program, the user's session itself: the program run
+//   as the user, in the login's audit session (which a child inherits),
+//   with the user's groups, home and name, as loginwindow starts the
+//   user's applications once they have logged in. The window is then put
+//   at the desktop's level, under the program's.
+//
+//   gexloginwindow [-u UID[:GID]] [-n NAME] [-- PROGRAM [ARG...]]
 //
 // It says what it does on stdout, a line each, and then stays, as
 // loginwindow does: the session ends with it.
 #include <ApplicationServices/ApplicationServices.h>
 #include <bsm/audit.h>
 #include <errno.h>
+#include <grp.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // SkyLight's own interface (not in the SDK's headers).
@@ -61,7 +70,13 @@ int main(int argc, char **argv) {
     uid_t user = 501;
     gid_t group = 20;
     const char *name = "gex";
-    for (int i = 1; i + 1 < argc; i += 2) {
+    char **program = NULL;
+    for (int i = 1; i < argc; i += 2) {
+        if (!strcmp(argv[i], "--")) {
+            if (i + 1 < argc) program = argv + i + 1;
+            break;
+        }
+        if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-u")) {
             char *end;
             user = (uid_t)strtoul(argv[i + 1], &end, 10);
@@ -133,5 +148,34 @@ int main(int argc, char **argv) {
         printf("gexloginwindow: shown: no image (%p)\n", (void *)shown);
     }
     printf("gexloginwindow: up\n");
+    if (!program) for (;;) pause();
+
+    // The user's session: the program, as the user.
+    e = SLSSetWindowLevel(cid, wid, CGWindowLevelForKey(kCGDesktopWindowLevelKey));
+    printf("gexloginwindow: at the desktop's level -> %d\n", (int)e);
+    struct passwd *pw = getpwuid(user);
+    const char *home = pw && pw->pw_dir ? pw->pw_dir : "/";
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setgid(group) || initgroups(name, (int)group) || setuid(user)) {
+            printf("gexloginwindow: becoming %d: %s\n", (int)user, strerror(errno));
+            _exit(126);
+        }
+        setenv("HOME", home, 1);
+        setenv("USER", name, 1);
+        setenv("LOGNAME", name, 1);
+        setenv("SHELL", pw && pw->pw_shell ? pw->pw_shell : "/bin/sh", 1);
+        if (chdir(home)) (void)!chdir("/");
+        execv(program[0], program);
+        printf("gexloginwindow: %s: %s\n", program[0], strerror(errno));
+        _exit(127);
+    }
+    printf("gexloginwindow: started %s as %d, pid %d\n", program[0], (int)user, (int)pid);
+    int status;
+    while (pid > 0 && waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (pid > 0) {
+        if (WIFSIGNALED(status)) printf("gexloginwindow: %s: signal %d\n", program[0], WTERMSIG(status));
+        else printf("gexloginwindow: %s: exit %d\n", program[0], WEXITSTATUS(status));
+    }
     for (;;) pause();
 }
