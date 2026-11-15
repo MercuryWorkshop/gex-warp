@@ -4171,7 +4171,10 @@ fn mount_filesystems(
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
-    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+    // Anyone's to make a name in, as Linux's is (1777) and as XNU's
+    // namespace, which has no directory, is: cfprefsd's agent, a user's,
+    // makes its own beside root's daemons'.
+    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::shm()));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
