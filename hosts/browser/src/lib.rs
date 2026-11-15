@@ -2266,7 +2266,7 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         }
         None => {
             static SHM: std::sync::OnceLock<Arc<gex_kernel::vfs::TmpFs>> = std::sync::OnceLock::new();
-            kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::shm())).clone());
+            kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::sticky())).clone());
         }
     }
     // The Wayland compositor: bound only when the page

@@ -4174,7 +4174,7 @@ fn mount_filesystems(
     // Anyone's to make a name in, as Linux's is (1777) and as XNU's
     // namespace, which has no directory, is: cfprefsd's agent, a user's,
     // makes its own beside root's daemons'.
-    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::shm()));
+    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::sticky()));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
@@ -4186,8 +4186,8 @@ fn mount_filesystems(
     // Wine's topology read them.
     kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
     if opts.sysroot.is_some() {
-        // A sysroot has no host /tmp behind it, so give the guest one:
-        // where the root's own is, which for a Mac's root is
+        // A sysroot has no host /tmp behind it, so give the guest one,
+        // anyone's to make a file in (1777): where the root's own is, which for a Mac's root is
         // /private/tmp, its /tmp a link there (and a directory in it
         // is named so, as on a Mac).
         let at = match kernel.vfs.read_link("/tmp") {
@@ -4195,7 +4195,7 @@ fn mount_filesystems(
             Ok(to) => format!("/{to}"),
             Err(_) => "/tmp".to_string(),
         };
-        kernel.vfs.mount(at.trim_end_matches('/'), Arc::new(TmpFs::new()));
+        kernel.vfs.mount(at.trim_end_matches('/'), Arc::new(TmpFs::sticky()));
     }
     // Start where the host process is, so relative paths on the command line
     // mean what the user typed.

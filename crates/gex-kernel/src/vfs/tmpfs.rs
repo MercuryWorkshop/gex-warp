@@ -1093,9 +1093,10 @@ impl TmpFs {
         }
     }
 
-    /// A tmpfs for POSIX shared memory (`/dev/shm`): its root anyone's to
-    /// make a name in, sticky, as Linux's is.
-    pub fn shm() -> TmpFs {
+    /// A tmpfs whose root is anyone's to make a name in, sticky (1777): a
+    /// guest's `/tmp` (a Mac's `/private/tmp`) and POSIX shared memory's
+    /// `/dev/shm`, as Linux's and a Mac's are.
+    pub fn sticky() -> TmpFs {
         let fs = TmpFs::new();
         let _ = fs.inner.lock().unwrap().chmod("", 0o1777);
         fs
@@ -2412,7 +2413,7 @@ mod tests {
     /// makes its shared memory beside root's daemons'), and sticky.
     #[test]
     fn shared_memory_is_anyones_to_make_a_name_in() {
-        assert_eq!(FileSystem::metadata(&TmpFs::shm(), "").unwrap().mode & 0o7777, 0o1777);
+        assert_eq!(FileSystem::metadata(&TmpFs::sticky(), "").unwrap().mode & 0o7777, 0o1777);
         assert_eq!(FileSystem::metadata(&TmpFs::new(), "").unwrap().mode & 0o7777, 0o755);
     }
 
