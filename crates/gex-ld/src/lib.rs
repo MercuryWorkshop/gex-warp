@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod closure;
+pub mod dsmos;
 pub mod dynamic;
 pub mod elf;
 pub mod link;
