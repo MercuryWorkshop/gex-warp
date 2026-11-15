@@ -80,6 +80,11 @@ pub fn anon_ino(p: *const u8) -> u64 {
     (1 << 62) | (p as usize as u64 >> 3)
 }
 
+/// In [`Metadata::owner`], the owner or group that is the machine's first
+/// user's (or group's), whatever number that is
+/// ([`crate::syscalls::Creds::base`]).
+pub const BASE_ID: u32 = u32::MAX;
+
 /// Metadata about a path, independent of any open file.
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -98,6 +103,11 @@ pub struct Metadata {
     /// The other times and the nanoseconds, where the filesystem keeps
     /// them (the host's). All zero: every time is `mtime`, whole seconds.
     pub times: Times,
+    /// Its owner and group, where the filesystem keeps them; either may be
+    /// [`BASE_ID`]. `None`: the filesystem keeps no owners, so the file is
+    /// the machine's first user's ([`crate::syscalls::Creds::base`]), as
+    /// every file once was, and no permission is checked against it here.
+    pub owner: Option<(u32, u32)>,
 }
 
 /// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`.
@@ -121,6 +131,7 @@ impl Metadata {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         }
     }
     pub fn dir() -> Metadata {
@@ -133,6 +144,7 @@ impl Metadata {
             nlink: 2,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         }
     }
 }
@@ -362,6 +374,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         let _ = mode;
+        None
+    }
+    /// Give the file an owner and a group (`fchown`, both given), for a
+    /// handle that can; `None` for one that keeps no owners.
+    fn chown(&self, uid: u32, gid: u32) -> Option<Result<(), Errno>> {
+        let _ = (uid, gid);
         None
     }
 
@@ -840,6 +858,7 @@ pub trait FileSystem: Send + Sync {
     fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         if let Ok(target) = self.read_link(path) {
             return Ok(Metadata {
+                owner: None,
                 file_type: FileType::Symlink,
                 size: target.len() as u64,
                 mode: 0o777,
@@ -916,6 +935,20 @@ pub trait FileSystem: Send + Sync {
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let _ = (path, mode);
         Ok(())
+    }
+    /// Give a file an owner and a group (`chown`: the kernel has worked out
+    /// which of the two a call left alone). Filesystems that keep no
+    /// owners ([`FileSystem::keeps_owners`]) accept it and do nothing, as
+    /// they do for a mode.
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let _ = (path, uid, gid);
+        Ok(())
+    }
+    /// Whether this filesystem keeps owners ([`Metadata::owner`], and
+    /// [`FileSystem::chown`] that means it). The ones that do not have every
+    /// file the machine's first user's.
+    fn keeps_owners(&self) -> bool {
+        false
     }
     /// Change the mode of the symlink `path` itself, which a Mac's link
     /// has and Linux's has not (`lchmod`, `chmod -h`). `EOPNOTSUPP` where
@@ -2206,6 +2239,18 @@ impl Namespace {
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.chmod(&rel, mode)
+    }
+
+    /// `chown` of `path` (symlinks already followed or not by the caller):
+    /// the filesystem's, if it keeps owners.
+    pub fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.chown(&rel, uid, gid)
+    }
+
+    /// Whether the filesystem `path` is in keeps owners.
+    pub fn keeps_owners(&self, path: &str) -> bool {
+        self.resolve(path).is_ok_and(|(fs, _)| fs.keeps_owners())
     }
 
     /// An extended-attribute call on `path`, following a final symlink when

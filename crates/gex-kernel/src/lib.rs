@@ -48,6 +48,7 @@ pub mod net;
 pub mod nt;
 /// The older name, which the Wine code in other crates still uses.
 pub use nt as win;
+pub mod perm;
 pub mod pipe;
 pub mod phase;
 pub mod pidfd;

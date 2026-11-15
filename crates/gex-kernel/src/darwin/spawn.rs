@@ -24,6 +24,7 @@ use crate::syscalls::nr;
 const SETPGROUP: u32 = 0x0002;
 const SETSIGDEF: u32 = 0x0004;
 const SETSIGMASK: u32 = 0x0008;
+const RESETIDS: u32 = 0x0010;
 const SETEXEC: u32 = 0x0040;
 const SETSID: u32 = 0x0400;
 const CLOEXEC_DEFAULT: u32 = 0x4000;
@@ -199,6 +200,11 @@ impl Kernel {
         let flags = self.darwin_spawn_flags(m, adesc)?;
         // (flags, the signals to reset, the signals to block, the group.)
         let attrp = m.read_u64(adesc + 8)?;
+        // The effective user and group made the real ones, as the program
+        // is run with: `POSIX_SPAWN_RESETIDS`.
+        if flags & RESETIDS != 0 {
+            self.creds.reset_ids();
+        }
         if flags & SETSID != 0 {
             call(self, m, nr::SETSID, [0; 6])?;
         }

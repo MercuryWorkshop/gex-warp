@@ -638,6 +638,10 @@ pub(crate) fn now_ns() -> u64 {
     secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
 }
 
+/// Whose a name is that was never given an owner: the machine's first
+/// user's, and that user's group.
+const NO_OWNER: (u32, u32) = (super::BASE_ID, super::BASE_ID);
+
 #[derive(Debug)]
 enum Node {
     File(Arc<FileNode>),
@@ -662,6 +666,10 @@ struct Inner {
     /// few hundred binaries in a rootfs differ. Needed because dpkg rejects a
     /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
+    /// Owner and group of the names given one (`chown`, or a creator who is
+    /// not the machine's first user), sparse like `modes`. Without one a
+    /// name belongs to that first user ([`Metadata::owner`]).
+    owners: BTreeMap<String, (u32, u32)>,
     /// Modification times of the nodes that are not files (a file keeps its
     /// own, see `FileNode`), set by `utimensat`, a program's `mkdir` and
     /// seeding; sparse like `modes`, and a path without one reports 0.
@@ -785,6 +793,7 @@ impl Inner {
     /// Remove name `path` and what it keeps beside the node.
     fn forget(&mut self, path: &str) {
         let mode = self.modes.remove(path);
+        self.owners.remove(path);
         if let Some(Node::File(f)) = self.nodes.remove(path) {
             f.gone_mode.store(mode.unwrap_or(0o644), Ordering::Relaxed);
         }
@@ -846,6 +855,7 @@ impl Inner {
         rekey(&mut self.nodes, from, to);
         rekey(&mut self.inos, from, to);
         rekey(&mut self.modes, from, to);
+        rekey(&mut self.owners, from, to);
         rekey(&mut self.mtimes, from, to);
     }
 }
@@ -1012,6 +1022,9 @@ impl TmpFs {
         // saying the program does not exist.
         if let Some(m) = inner.modes.remove(from) {
             inner.modes.insert(to.to_string(), m);
+        }
+        if let Some(o) = inner.owners.remove(from) {
+            inner.owners.insert(to.to_string(), o);
         }
         if let Some(t) = inner.mtimes.remove(from) {
             inner.mtimes.insert(to.to_string(), t);
@@ -1396,6 +1409,7 @@ impl TmpFs {
         let mtime = || inner.mtimes.get(path).copied().unwrap_or(0);
         match node {
             Node::File(f) => Ok(Metadata {
+                owner: Some(inner.owners.get(path).copied().unwrap_or(NO_OWNER)),
                 file_type: FileType::Regular,
                 size: f.size(),
                 mode: inner.modes.get(path).copied().unwrap_or(0o644),
@@ -1415,10 +1429,12 @@ impl TmpFs {
                     nlink,
                     size: TmpFs::dir_size(entries),
                     mode: inner.modes.get(path).copied().unwrap_or(d.mode),
+                    owner: Some(inner.owners.get(path).copied().unwrap_or(NO_OWNER)),
                     ..d
                 })
             }
             Node::Symlink(t) => Ok(Metadata {
+                owner: Some(inner.owners.get(path).copied().unwrap_or(NO_OWNER)),
                 file_type: FileType::Symlink,
                 size: t.len() as u64,
                 mode: inner.modes.get(path).copied().unwrap_or(0o777),
@@ -1429,6 +1445,7 @@ impl TmpFs {
                 times: Default::default(),
             }),
             Node::Fifo(mode) => Ok(Metadata {
+                owner: Some(inner.owners.get(path).copied().unwrap_or(NO_OWNER)),
                 file_type: FileType::Fifo,
                 size: 0,
                 mode: *mode,
@@ -1439,6 +1456,7 @@ impl TmpFs {
                 times: Default::default(),
             }),
             Node::Socket => Ok(Metadata {
+                owner: Some(inner.owners.get(path).copied().unwrap_or(NO_OWNER)),
                 file_type: FileType::Socket,
                 size: 0,
                 mode: 0o755,
@@ -1689,15 +1707,17 @@ impl FileHandle for TmpHandle {
             // names it, else by any name it has now, else the last one's.
             // (And as many names as it has now: none, once the last is
             // removed, which is how a program holding it open finds out.)
-            let (mode, nlink) = {
+            let (mode, nlink, owner) = {
                 let inner = self.inner.read().unwrap();
-                let mode = match self.here(&inner) {
-                    Some(p) => inner.modes.get(&p).copied().unwrap_or(0o644),
+                let here = self.here(&inner);
+                let mode = match &here {
+                    Some(p) => inner.modes.get(p).copied().unwrap_or(0o644),
                     None => file.gone_mode.load(Ordering::Relaxed),
                 };
-                (mode, inner.nlink(file.ino))
+                (mode, inner.nlink(file.ino), here.and_then(|p| inner.owners.get(&p).copied()).unwrap_or(NO_OWNER))
             };
             return Ok(Metadata {
+                owner: Some(owner),
                 file_type: FileType::Regular,
                 size: file.size(),
                 mode,
@@ -1862,6 +1882,18 @@ impl FileHandle for TmpHandle {
             note_path(&inner, fs_key(&self.inner), &path, crate::inotify::mask::ATTRIB);
         }
         Some(r)
+    }
+
+    /// By the name it has now, as `chown` on it; a file with no name left
+    /// keeps no owner and the call succeeds.
+    fn chown(&self, uid: u32, gid: u32) -> Option<Result<(), Errno>> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(path) = self.here(&inner) else {
+            return Some(if self.file.is_some() { Ok(()) } else { Err(Errno::ENOENT) });
+        };
+        inner.owners.insert(path.clone(), (uid, gid));
+        note_path(&inner, fs_key(&self.inner), &path, crate::inotify::mask::ATTRIB);
+        Some(Ok(()))
     }
 
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
@@ -2070,6 +2102,22 @@ impl FileSystem for TmpFs {
         self.metadata(path)
     }
 
+    /// Give `path` an owner and a group. Kept sparsely, by name as modes
+    /// are.
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.nodes.contains_key(path) {
+            return Err(Errno::ENOENT);
+        }
+        inner.owners.insert(path.to_string(), (uid, gid));
+        note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
+        Ok(())
+    }
+
+    fn keeps_owners(&self) -> bool {
+        true
+    }
+
     fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {
@@ -2202,6 +2250,7 @@ impl FileSystem for TmpFs {
         inner.nodes.remove(path);
         inner.drop_ino(path);
         inner.modes.remove(path);
+        inner.owners.remove(path);
         inner.mtimes.remove(path);
         inner.inferred.remove(path);
         inner.entries_changed(path, now());
@@ -2253,11 +2302,15 @@ impl FileSystem for TmpFs {
         // Two names for one inode, so one mode: `/usr/bin/perl` is a hard
         // link and has to be as executable as `perl5.36.0` is.
         let mode = inner.modes.get(from).copied();
+        let owner = inner.owners.get(from).copied();
         inner.nodes.insert(to.to_string(), node);
         inner.set_ino(to.to_string(), ino);
         inner.entries_changed(to, now());
         if let Some(m) = mode {
             inner.modes.insert(to.to_string(), m);
+        }
+        if let Some(o) = owner {
+            inner.owners.insert(to.to_string(), o);
         }
         if crate::inotify::any() {
             let fs = fs_key(&self.inner);

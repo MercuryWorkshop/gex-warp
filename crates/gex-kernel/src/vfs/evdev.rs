@@ -162,6 +162,7 @@ pub fn names() -> Vec<String> {
 pub fn metadata(pad: usize) -> Option<Metadata> {
     snapshot(pad)?;
     Some(Metadata {
+        owner: None,
         file_type: FileType::CharDevice,
         size: 0,
         mode: 0o666,
@@ -467,6 +468,7 @@ impl FileHandle for JoyHandle {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(metadata(self.pad).unwrap_or(Metadata {
+            owner: None,
             file_type: FileType::CharDevice,
             size: 0,
             mode: 0o666,

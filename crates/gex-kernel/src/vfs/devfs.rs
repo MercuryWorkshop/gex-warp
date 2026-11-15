@@ -111,6 +111,7 @@ impl FileHandle for DevHandle {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
+            owner: None,
             file_type: FileType::CharDevice,
             size: 0,
             mode: 0o666,
@@ -173,6 +174,7 @@ impl DevFs {
             (crate::pty::pts_ino(n), crate::pty::pts_rdev(n), modes.get(&n).copied().unwrap_or(0o620))
         };
         Some(Metadata {
+            owner: None,
             file_type: FileType::CharDevice,
             size: 0,
             mode,
@@ -295,6 +297,7 @@ impl FileSystem for DevFs {
         }
         if let Some(device) = Self::device_of(path) {
             return Ok(Metadata {
+                owner: None,
                 file_type: FileType::CharDevice,
                 size: 0,
                 mode: 0o666,
@@ -327,6 +330,7 @@ impl FileSystem for DevFs {
         }
         if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
             return Ok(Metadata {
+                owner: None,
                 file_type: FileType::Symlink,
                 size: 0,
                 mode: 0o777,
@@ -620,6 +624,7 @@ mod tests {
             }
             fn metadata(&self) -> Result<Metadata, Errno> {
                 Ok(Metadata {
+                    owner: None,
                     file_type: FileType::CharDevice,
                     size: 0,
                     mode: 0o666,

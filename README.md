@@ -446,6 +446,56 @@ x86-64 programs' reference is Rosetta, which answers a few things for the
 Mac under it (the page size, the processor, Mach's clock in the host's
 ticks), and those the x86-64 tests do not ask.
 
+#### Users and groups
+
+A process has a real, effective and saved user and group, a list of
+supplementary groups (Darwin's `getgroups` puts the effective group first
+and lists 16 at most; Linux's has up to 256), and its capabilities; all of
+it is inherited by a fork and kept by an exec, which makes the saved ids the
+effective ones. `setuid`, `setgid` and their kin, and `setgroups`, are held
+to what Linux holds them to and Darwin's superuser-only ones follow: a
+process with `CAP_SETUID`/`CAP_SETGID` (root's) sets any id, another only to
+one it has. The first process is the host user, with the host user's groups
+(or `--uid`'s, with none); everything not given an owner is that first
+user's.
+
+Files have owners where the filesystem keeps them: tmpfs, and a host
+directory, whose owner and group are kept in the host extended attribute
+`user.gex.owner` (`uid:gid`, in decimal) of the file itself, since the host
+will not give a file to root. A file with none is the host's: its owner and
+group are the user running gexc's (the first user's, whatever number that
+is) or its own host numbers. The mode, set-user-ID and set-group-ID bits
+included, is the host's own. So a root-owned set-user-ID program in a root
+the Mac user owns is made with:
+
+    xattr -w user.gex.owner 0:0 ROOT/usr/bin/su
+    chmod 4755 ROOT/usr/bin/su
+
+(or, as root in the guest, `chown root:wheel` and `chmod u+s`: a `chown`
+writes the attribute). An `execve` of a regular file with the bit takes the
+effective user (and, with the group-execute bit too, group) from the file's
+owner, saved as well; Darwin's `issetugid` (`P_SUGID`, which dyld asks
+before it drops `DYLD_*`) and Linux's `AT_SECURE` say so. A script's own
+bits are not honoured, its interpreter's are.
+
+Permissions (owner, group with the supplementary groups, other; root's
+override) are checked for what a process does to a file that has an owner
+(`open`, `access`, `exec`, creating, removing and renaming names in a
+directory, `chmod`, `chown`, the sticky bit, `kill`) once the process is no
+longer the first user: the first user's are the host's to check, as they
+always were, and a filesystem that keeps no owners (the devices, `/proc`,
+the page's store) is not checked at all. Not checked: the search permission
+of the directories on the way to a file, ACLs, flags, who may set times.
+`chown` gives a file to another user only with `CAP_CHOWN`, and a group to
+its owner who is in it; a file whose owner or group changes loses its
+set-id bits unless root does it.
+
+`mbr_check_membership` and the rest of libinfo's membership calls ask
+opendirectoryd, which is the userland's to provide; the kernel's own checks
+use the groups in the process's credentials, as XNU's do first.
+`settid` and `gettid` (a thread taking on another user's identity) are not
+kept: `gettid` is `ESRCH`.
+
 #### Beside Linux programs
 
 A Mac program in a system that is Linux's runs in a root of its own, as a

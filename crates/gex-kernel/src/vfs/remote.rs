@@ -194,6 +194,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         u64::from_le_bytes(a)
     };
     Metadata {
+        owner: None,
         file_type: file_type_of(u32at(0)),
         mode: u32at(4),
         size: u64at(8),

@@ -237,7 +237,7 @@ impl FileHandle for Pump {
         Err(Errno::ENXIO)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Fifo, size: 0, mode: 0o600, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { owner: None, file_type: FileType::Fifo, size: 0, mode: 0o600, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
     fn poll_readable(&self) -> bool {
         if self.rung.load(Ordering::SeqCst) {

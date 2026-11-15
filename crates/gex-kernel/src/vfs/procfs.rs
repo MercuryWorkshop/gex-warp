@@ -217,12 +217,12 @@ pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i3
 /// `tgid`, which has `threads`.
 pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8], u: &Usage) -> String {
     let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
-    let (uid, gid, caps) = status_ids(creds);
+    let (uid, gid, caps, groups) = status_ids(creds);
     let (size, rss) = (u.vsize >> 10, u.rss >> 10);
     format!(
         "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
          PPid:\t{ppid}\nTracerPid:\t0\n{uid}{gid}FDSize:\t64\n\
-         Groups:\t\nVmSize:\t{size:8} kB\nVmRSS:\t{rss:8} kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
+         {groups}VmSize:\t{size:8} kB\nVmRSS:\t{rss:8} kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n"
     )
 }
@@ -231,11 +231,12 @@ pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threa
 /// filesystem ids, the last the effective one) and its `Cap*:` lines, from
 /// [`crate::syscalls::Creds::save`]'s bytes; root's, every capability, for
 /// a process that has published none.
-pub fn status_ids(creds: &[u8]) -> (String, String, String) {
+pub fn status_ids(creds: &[u8]) -> (String, String, String, String) {
     let c = crate::syscalls::Creds::new(0, 0);
     c.restore(creds);
     let ([r, e, s], [gr, ge, gs]) = (c.uids(), c.gids());
     let [eff, perm, inh] = c.caps();
+    let groups: Vec<String> = c.groups().iter().map(|g| g.to_string()).collect();
     (
         format!("Uid:\t{r}\t{e}\t{s}\t{e}\n"),
         format!("Gid:\t{gr}\t{ge}\t{gs}\t{ge}\n"),
@@ -244,6 +245,7 @@ pub fn status_ids(creds: &[u8]) -> (String, String, String) {
             crate::syscalls::CAPS_ALL,
             0
         ),
+        format!("Groups:\t{}\n", groups.join(" ")),
     )
 }
 
@@ -306,6 +308,7 @@ impl FileHandle for Generated {
         // read until EOF rather than trust it, and some break if a stale
         // size disagrees with the contents.
         Ok(Metadata {
+            owner: None,
             file_type: FileType::Regular,
             size: 0,
             mode: 0o444,
@@ -333,7 +336,7 @@ impl FileHandle for Sink {
         Ok(buf.len() as u64)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o644, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { owner: None, file_type: FileType::Regular, size: 0, mode: 0o644, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
     }
 }
 
@@ -652,6 +655,7 @@ impl FileSystem for ProcFs {
         let (path, tid) = self.canonical(path)?;
         if self.generate(&path, tid).is_some() {
             return Ok(Metadata {
+                owner: None,
                 file_type: FileType::Regular,
                 size: 0,
                 mode: 0o444,
@@ -666,6 +670,7 @@ impl FileSystem for ProcFs {
             return match rest.as_str() {
                 "" | "task" | "ns" => Ok(Metadata::dir()),
                 r if self.generate_other(&e, r, tid).is_some() => Ok(Metadata {
+                    owner: None,
                     file_type: FileType::Regular,
                     size: 0,
                     mode: 0o444,
@@ -681,6 +686,7 @@ impl FileSystem for ProcFs {
         match path.as_str() {
             "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "self/ns" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
+                owner: None,
                 file_type: FileType::Symlink,
                 size: 0,
                 mode: 0o777,
@@ -1028,6 +1034,7 @@ impl FileSystem for SysCpuFs {
         let path = path.trim_matches('/');
         if Self::generate(path).is_some() {
             return Ok(Metadata {
+                owner: None,
                 file_type: FileType::Regular,
                 size: 4096,
                 mode: 0o444,

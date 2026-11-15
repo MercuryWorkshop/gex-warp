@@ -38,6 +38,7 @@ pub const NAME: &str = "gex-host";
 
 pub fn metadata() -> Metadata {
     Metadata {
+        owner: None,
         file_type: FileType::CharDevice,
         size: 0,
         mode: 0o666,

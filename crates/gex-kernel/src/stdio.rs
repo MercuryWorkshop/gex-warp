@@ -160,6 +160,7 @@ impl FileHandle for StdStream {
             }
         }
         Ok(Metadata {
+            owner: None,
             file_type: self.host_kind,
             size: 0,
             mode: if self.host_kind == FileType::CharDevice { 0o620 } else { 0o600 },

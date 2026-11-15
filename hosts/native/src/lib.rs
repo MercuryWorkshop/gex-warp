@@ -175,6 +175,10 @@ pub struct RunOptions {
     /// Who the guest thinks it is. `None` reports the host's own ids, which a
     /// passthrough filesystem needs for consistent stat/getuid answers.
     pub identity: Option<(u32, u32)>,
+    /// The groups the guest is in beside its own (`getgroups`): the host
+    /// user's, for the host's own identity. `None`: those the host reports
+    /// of itself where there is no `--uid`, none with one.
+    pub groups: Option<Vec<u32>>,
     /// Sample the guest's back-edges and report the hottest at exit.
     pub sample: bool,
     /// Where each object of the program's closure must be placed, by guest
@@ -357,6 +361,7 @@ impl Default for RunOptions {
             read_only: Vec::new(),
             exe: None,
             identity: None,
+            groups: None,
             sample: false,
             pins: std::collections::HashMap::new(),
             report_pins: false,
@@ -1436,10 +1441,15 @@ fn run_program_with(
         kernel.creds.clone()
     } else {
         let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
-        gex_kernel::syscalls::Creds::new(uid, gid)
+        let creds = gex_kernel::syscalls::Creds::new(uid, gid);
+        // The host's own groups are the guest's for the host's own identity.
+        let groups = opts.groups.clone().unwrap_or_else(|| if opts.identity.is_none() { gex_kernel::vfs::hostfs::host_groups() } else { Vec::new() });
+        creds.set_groups(&groups);
+        creds
     };
     // The ids the auxiliary vector gives the program (AT_UID, AT_EUID).
-    let (kernel_uid, kernel_gid) = (creds.uid(), creds.gid());
+    let (kernel_uid, kernel_gid) = (creds.ruid(), creds.rgid());
+    let (kernel_euid, kernel_egid) = (creds.uid(), creds.gid());
     let mut kernel = Kernel {
         trace: opts.trace,
         creds,
@@ -1676,6 +1686,9 @@ fn run_program_with(
         Identity {
             uid: kernel_uid,
             gid: kernel_gid,
+            euid: Some(kernel_euid),
+            egid: Some(kernel_egid),
+            secure: (kernel_euid, kernel_egid) != (kernel_uid, kernel_gid),
             interp_base: program.interp_base(),
             entry_hook: 0,
         },

@@ -849,6 +849,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     if ra.opts.identity.is_none() {
         // SAFETY: both calls only return a number.
         ra.opts.identity = Some(unsafe { (libc::getuid(), libc::getgid()) });
+        ra.opts.groups = Some(gex_kernel::vfs::hostfs::host_groups());
     }
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     // Resolved through the guest's namespace (the sysroot when given), so a
