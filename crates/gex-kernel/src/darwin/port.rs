@@ -720,6 +720,17 @@ impl Space {
         Some(e)
     }
 
+    /// A send right to `port` given this task by the kernel, as a reply
+    /// would carry it: the name it has here.
+    pub(super) fn give_send(&mut self, port: Arc<Port>) -> u32 {
+        self.give(port, disp::MOVE_SEND)
+    }
+
+    /// The port this task has a right to under `name`, if any.
+    pub(super) fn port_named(&mut self, pid: i32, name: u32) -> Option<Arc<Port>> {
+        self.entry(pid, name).map(|e| Arc::clone(&e.port))
+    }
+
     /// The ports `name` receives from: its own, or a set's members.
     /// `None`: it is a name for neither.
     fn receives(&self, name: u32) -> Option<Vec<(u32, Arc<Port>)>> {
@@ -2573,6 +2584,59 @@ impl Kernel {
                     None => plain(KERN_INVALID_ADDRESS as i32, &[]),
                 }
             }
+            // task_threads(task, out threads): a send right to each of the
+            // task's threads, as an array of ports out of line, under the
+            // names its threads' ports have ([`thread_port`]). Mojave's
+            // libobjc walks them before it frees a method cache.
+            (Kind::Task, 3402) => {
+                let pid = self.pid;
+                let mut tids: Vec<i32> = self.thread_signals.tids().into_iter().filter(|&t| t == self.tid || self.procs.task_owner(t) == Some(pid)).collect();
+                if !tids.contains(&self.tid) {
+                    tids.push(self.tid);
+                }
+                tids.sort_unstable();
+                let names: Vec<u8> = tids.iter().flat_map(|&t| super::mach::thread_port(pid, t).to_le_bytes()).collect();
+                let mut b = vec![0u8; 20];
+                put32(&mut b, 0, 1);
+                // mach_msg_ool_ports_descriptor_t: address, deallocate,
+                // copy, disposition, type, count.
+                b[4 + 10] = disp::MOVE_SEND as u8;
+                b[4 + 11] = 2; // MACH_MSG_OOL_PORTS_DESCRIPTOR
+                put32(&mut b, 4 + 12, tids.len() as u32);
+                b.extend_from_slice(&NDR);
+                b.extend_from_slice(&(tids.len() as u32).to_le_bytes());
+                // (Each name is a right this task has from now on.)
+                for &t in &tids {
+                    let _ = sp.entry(pid, super::mach::thread_port(pid, t));
+                }
+                Msg { id: req.id + 100, complex: true, body: b, once: false, reply: None, ports: Vec::new(), memory: vec![(4, names)], port_arrays: Vec::new(), sender: [0; 8] }
+            }
+            // thread_get_state(thread, flavor, out state, in-out count): a
+            // thread's registers are its own while it runs translated code,
+            // and are not kept for another to read; what is told is the
+            // general registers' flavor of the guest's processor, all zero
+            // (its program counter in no code), which is what Mojave's
+            // libobjc asks of each thread before freeing a cache (it waits
+            // while one is in objc_msgSend).
+            (Kind::Thread(_), 3603) => {
+                let (flavor, room) = (get32(&req.body, 8), get32(&req.body, 12) as usize);
+                // x86_THREAD_STATE64 (42 words), x86_THREAD_STATE (its
+                // header and those), ARM_THREAD_STATE64 (68 words).
+                let words: Option<Vec<u32>> = match flavor {
+                    4 if gex_abi::X86 => Some(vec![0; 42]),
+                    7 if gex_abi::X86 => Some([&[4u32, 42][..], &[0; 42][..]].concat()),
+                    6 if !gex_abi::X86 => Some(vec![0; 68]),
+                    _ => None,
+                };
+                match words {
+                    Some(w) if room >= w.len() => {
+                        let mut b = (w.len() as u32).to_le_bytes().to_vec();
+                        w.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                        plain(0, &b)
+                    }
+                    _ => plain(KERN_INVALID_ARGUMENT as i32, &[]),
+                }
+            }
             // thread_info(thread, flavor, out info, in-out count), likewise:
             // a thread's times and state, and which thread it is.
             (Kind::Thread(tid), 3612) => {
@@ -2728,6 +2792,28 @@ impl Kernel {
                     _ => plain(KERN_INVALID_ADDRESS as i32, &[]),
                 }
             }
+            // mach_vm_inherit(target, address, size, inheritance): what a
+            // fork's child is to have of the range. A child here has its
+            // parent's memory as `fork` gives it whatever is asked.
+            (Kind::Task, 4803) => plain(0, &[]),
+            // mach_vm_copy(target, source, size, dest): the task's memory
+            // copied within it, as if read and written at once.
+            (Kind::Task, 4807) => {
+                let at = |o: usize| u64::from_le_bytes(req.body.get(o..o + 8).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+                let (from, size, to) = (gex_abi::canon(at(8)), at(16), gex_abi::canon(at(24)));
+                let ok = {
+                    let mm = self.mem.lock();
+                    size <= u32::MAX as u64 && mm.check_access(from, size, crate::mem::prot::READ) && mm.check_access(to, size, crate::mem::prot::WRITE)
+                };
+                if !ok {
+                    plain(if size > u32::MAX as u64 { KERN_INVALID_ARGUMENT } else { KERN_PROTECTION_FAILURE } as i32, &[])
+                } else {
+                    match m.read(from, size as usize).map(|b| b.to_vec()) {
+                        Ok(bytes) if m.write(to, &bytes).is_ok() => plain(0, &[]),
+                        _ => plain(KERN_INVALID_ADDRESS as i32, &[]),
+                    }
+                }
+            }
             // mach_memory_entry_purgable_control(entry, control, in-out
             // state): an entry's object is never emptied, so it is what it
             // was made, not volatile.
@@ -2845,7 +2931,7 @@ impl Kernel {
             (Kind::Host, 412) => plain(KERN_INVALID_ARGUMENT as i32, &[]),
             // host_get_io_master(host, out master): IOKit's way in.
             (Kind::Host, 205) => with_port(Port::new(Kind::IoMaster)),
-            (Kind::IoMaster | Kind::IoObject(_), _) => self.darwin_iokit(m, kind, req),
+            (Kind::IoMaster | Kind::IoObject(_), _) => self.darwin_iokit(m, sp, kind, req),
             // host_get_clock_service(host, clock id, out clock)
             (Kind::Host, 206) => with_port(Port::new(Kind::Clock)),
             // clock_get_time(clock, out mach_timespec): the system clock,

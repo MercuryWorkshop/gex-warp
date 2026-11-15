@@ -4633,10 +4633,17 @@ impl PathIo<'_> {
             None => self.ns.metadata_nofollow(&path)?,
         };
         let at = file.as_ref().map(|f| f.path.clone()).filter(|p| p.starts_with('/')).unwrap_or(path);
-        if md.owner.is_none() {
-            return Ok(0);
-        }
         let privileged = self.creds.capable(cap::CHOWN);
+        if md.owner.is_none() {
+            // Nothing to change, but on Darwin what XNU refuses whoever
+            // owns the file is refused here too (the page's store keeps no
+            // owners, and the Mac says `EPERM`): giving it to another user,
+            // or to a group the caller is not in.
+            let refused = crate::darwin::on()
+                && !privileged
+                && (uid.is_some_and(|u| u != self.creds.uid()) || gid.is_some_and(|g| !self.creds.in_group(g) && g != self.creds.rgid()));
+            return if refused { Err(Errno::EPERM) } else { Ok(0) };
+        }
         // The machine's first user, unprivileged, on Linux: what it has
         // always been given, that the file is there and nothing changes
         // (tar treats a refused chown as a failure to unpack). Darwin's

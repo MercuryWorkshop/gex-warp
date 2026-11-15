@@ -30,6 +30,11 @@ const CLASSES: &[(&str, &str)] = &[
     ("IOAccelerationUserClient", "IOUserClient"),
     ("AppleGPUWrangler", "IOService"),
     ("AppleGPUWranglerUserClient", "IOUserClient"),
+    ("IOSurfaceRoot", "IOService"),
+    ("IOPMrootDomain", "IOService"),
+    ("RootDomainUserClient", "IOUserClient"),
+    ("IOSurfaceRootUserClient", "IOUserClient"),
+    ("IOSurfaceSendRight", "IOUserClient"),
 ];
 
 /// `class`'s superclass, if it has one (OSObject has none).
@@ -57,6 +62,11 @@ pub enum Opens {
     HidSystem,
     Framebuffer,
     GpuWrangler,
+    SurfaceRoot,
+    /// A client with no methods gex answers (`Client::Plain`), of any
+    /// type: what a family's service is opened for when only the opening
+    /// matters (the power manager's root domain).
+    Plain,
 }
 
 pub struct Entry {
@@ -137,7 +147,9 @@ impl Registry {
     ///   IOResources
     ///     IOHIDSystem
     ///     AppleGPUWrangler
-    ///   gex (IOPlatformExpertDevice)
+    ///     IOSurfaceRoot
+    ///   gex
+    ///     IOPMrootDomain (IOPlatformExpertDevice)
     ///     display@2 (IOPCIDevice)
     ///       IONDRVFramebuffer
     ///         display0 (IODisplayConnect)
@@ -188,6 +200,35 @@ impl Registry {
                 ("CFBundleIdentifier", Value::str("com.apple.AppleGraphicsControl")),
             ],
             Opens::GpuWrangler,
+        );
+        r.add(
+            Some(resources),
+            "IOSurfaceRoot",
+            "IOSurfaceRoot",
+            "",
+            vec![
+                ("IOProviderClass", Value::str("IOResources")),
+                ("IOResourceMatch", Value::str("IOKit")),
+                ("CFBundleIdentifier", Value::str("com.apple.iokit.IOSurface")),
+                ("IOUserClientClass", Value::str("IOSurfaceRootUserClient")),
+            ],
+            Opens::SurfaceRoot,
+        );
+        // The power manager: opened to register for sleep and wake (which
+        // never come), and asked of its properties.
+        r.add(
+            Some(platform),
+            "IOPMrootDomain",
+            "IOPMrootDomain",
+            "",
+            vec![
+                ("IOProviderClass", Value::str("IOPlatformExpertDevice")),
+                ("CFBundleIdentifier", Value::str("com.apple.kernel")),
+                ("IOUserClientClass", Value::str("RootDomainUserClient")),
+                ("SleepDisabled", Value::Bool(false)),
+                ("System Boot Complete", Value::Bool(true)),
+            ],
+            Opens::Plain,
         );
         let mode = mode();
         let pci = r.add(
@@ -262,6 +303,8 @@ impl Registry {
     pub fn lookup(&self, path: &str) -> Option<usize> {
         let rest = match path.split_once(':') {
             Some(("IOService", rest)) => rest,
+            // (The power plane has the root domain, under its connection.)
+            Some(("IOPower", rest)) if rest.trim_matches('/') == "IOPowerConnection/IOPMrootDomain" => return self.entries.iter().position(|e| e.class == "IOPMrootDomain"),
             Some((_, rest)) => return (rest.trim_matches('/').is_empty()).then_some(ROOT),
             None => path,
         };
@@ -335,6 +378,9 @@ impl Registry {
                     _ => false,
                 },
                 "IONameMatched" | "IOMatchCategory" | "IOProbeScore" | "IOKitDebug" | "IOMatchedPersonality" => true,
+                // (A disk's, which its family matches against its own
+                // property: no disk here has one.)
+                "BSD Name" | "BSD Major" | "BSD Minor" | "BSD Unit" => e.prop(k).is_some_and(|have| have.same(want)),
                 _ => true,
             };
             if !ok {

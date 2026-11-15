@@ -1028,7 +1028,24 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             }
         },
     });
+    save_framebuffer();
     run_program_with(program, opts, xlate, None)
+}
+
+/// With `GEX_FRAMEBUFFER_PNG=FILE`, what a Mac's framebuffer shows (once
+/// WindowServer has mapped it) is saved there as a PNG every two seconds,
+/// for as long as gexc runs.
+fn save_framebuffer() {
+    let Some(path) = std::env::var_os("GEX_FRAMEBUFFER_PNG").filter(|p| !p.is_empty()) else { return };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if let Some(png) = gex_kernel::syscalls::darwin::iokit::framebuffer_png() {
+            let tmp = std::path::PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+            if std::fs::write(&tmp, png).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    });
 }
 
 /// What survives an `execve`: the kernel, the process table, and the host-side
@@ -4136,7 +4153,10 @@ fn mount_filesystems(
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
-    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+    // Anyone's to make a name in, as Linux's is (1777) and as XNU's
+    // namespace, which has no directory, is: cfprefsd's agent, a user's,
+    // makes its own beside root's daemons'.
+    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::shm()));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(

@@ -565,6 +565,9 @@ fn name_of(oid: &[i32]) -> Option<&'static str> {
     (top_of(name) == top || (top == CTL_HW && row >= NAMES.len())).then_some(name)
 }
 
+/// What each process has told of its dirtiness (`proc_track_dirty`).
+static DIRTY: std::sync::Mutex<Option<std::collections::HashMap<i32, u32>>> = std::sync::Mutex::new(None);
+
 impl Kernel {
     /// The system this process is told it is on, worked out once for each
     /// program it runs: the release its environment chooses ([`CHOSEN`]),
@@ -1173,6 +1176,9 @@ impl Kernel {
         const CALL_PIDINFO: u64 = 2;
         const CALL_SETCONTROL: u64 = 5;
         const CALL_PIDRUSAGE: u64 = 9;
+        const CALL_DIRTYCONTROL: u64 = 8;
+        const PROC_DIRTY_TRACKED: u32 = 1;
+        const PROC_DIRTY_IS_DIRTY: u32 = 0x10000;
         const CALL_SET_DYLD_IMAGES: u64 = 15;
         const PIDTBSDINFO: u64 = 3;
         const PIDPATHINFO: u64 = 11;
@@ -1272,6 +1278,40 @@ impl Kernel {
             // a process asks of its own scheduling: taken, not kept.
             CALL_SETCONTROL | CALL_SET_DYLD_IMAGES => Ok(0),
             CALL_PIDRUSAGE => Err(Errno::EOPNOTSUPP),
+            // proc_track_dirty and its kin (a daemon's word to launchd of
+            // whether it may be killed when idle): its flags kept, and
+            // told back; nothing acts on them.
+            CALL_DIRTYCONTROL => {
+                let pid = if pid == 0 { self.pid } else { pid };
+                let mut t = DIRTY.lock().unwrap_or_else(|e| e.into_inner());
+                let t = t.get_or_insert_with(std::collections::HashMap::new);
+                let arg = x[3] as u32;
+                match flavor {
+                    // TRACK: tracked, with what it asks.
+                    1 => {
+                        t.insert(pid, PROC_DIRTY_TRACKED | arg & !PROC_DIRTY_TRACKED);
+                        Ok(0)
+                    }
+                    // SET: dirty or clean, of a process that is tracked.
+                    2 => match t.get_mut(&pid) {
+                        Some(f) if *f & PROC_DIRTY_TRACKED != 0 => {
+                            *f = if arg != 0 { *f | PROC_DIRTY_IS_DIRTY } else { *f & !PROC_DIRTY_IS_DIRTY };
+                            Ok(0)
+                        }
+                        _ => Err(Errno::EINVAL),
+                    },
+                    // GET: the flags, as the call's result.
+                    3 => Ok(t.get(&pid).copied().unwrap_or(0) as u64),
+                    // CLEAR
+                    4 => {
+                        if let Some(f) = t.get_mut(&pid) {
+                            *f &= !arg;
+                        }
+                        Ok(0)
+                    }
+                    _ => Err(Errno::EINVAL),
+                }
+            }
             _ => {
                 let n = NATIVE + d::PROC_INFO;
                 if !self.unimplemented.contains(&n) {

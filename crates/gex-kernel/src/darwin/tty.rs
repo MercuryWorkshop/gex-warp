@@ -382,6 +382,12 @@ impl Kernel {
                 self.sys_ioctl(m, fd, k::TIOCGWINSZ, scratch)?;
                 if m.read_u32(arg)? == 0 { Ok(0) } else { Err(Errno::ENXIO) }
             }
+            // The audit session device's (`AUDITSDEV_*`, group 'S'): which
+            // sessions it tells of, its handle's to take.
+            _ if (request >> 8) & 0xff == b'S' as u64 => {
+                let f = self.fds.get(fd)?;
+                f.handle.ioctl(m, request, arg).unwrap_or(Err(Errno::ENOTTY))
+            }
             _ => {
                 self.fds.get(fd)?;
                 if self.trace || std::env::var_os("GEX_DARWIN_UNIMPLEMENTED").is_some() {

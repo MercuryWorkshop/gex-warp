@@ -23,9 +23,11 @@ pub mod display;
 pub mod gpuw;
 pub mod hid;
 pub mod plist;
+pub mod png;
 pub mod registry;
+pub mod surface;
 
-use super::port::{get32, post, put32, Kind, Msg, Port, MIG_BAD_ID, NDR};
+use super::port::{get32, post, put32, Kind, Msg, Port, Space, MIG_BAD_ID, NDR};
 use super::*;
 use plist::Value;
 use registry::{Opens, Registry};
@@ -63,6 +65,8 @@ pub enum Client {
     Fb(display::Fb),
     /// The GPU wrangler's: the GPUs, and the framebuffer of each.
     Gpu(gpuw::Gpu),
+    /// `IOSurfaceRoot`'s: the surfaces the task has.
+    Surface(surface::Client),
     /// A client with no methods of its own (a family's that nothing here
     /// drives yet): every method is unsupported.
     Plain,
@@ -77,6 +81,8 @@ enum Obj {
     /// `IOServiceAddInterestNotification`): nothing is ever told by it, as
     /// no service comes or goes here.
     Note,
+    /// A send right to a surface (`IOSurfaceSendRight`), by its id.
+    SurfaceRight(u32),
 }
 
 struct Object {
@@ -141,6 +147,7 @@ impl IoKit {
                 Obj::Iter(items, at) => format!("iterator {at}/{}", items.len()),
                 Obj::Connect(c) => format!("connection to {}", self.reg.entries[c.entry].class),
                 Obj::Note => "notification".to_string(),
+                Obj::SurfaceRight(id) => format!("surface {id}'s send right"),
             },
         }
     }
@@ -185,6 +192,29 @@ pub fn framebuffer() -> Option<Pixels> {
             .map(|&(_, address, _)| Pixels { pid: *pid, address, width: fb.mode.width, height: fb.mode.height, row_bytes: fb.row_bytes() }),
         _ => None,
     })
+}
+
+/// The framebuffer's pixels: the object WindowServer maps, its size, and
+/// the mode's width, height and bytes a row.
+static VRAM: Mutex<Option<(Arc<crate::file::OpenFile>, u64, (u32, u32, u64))>> = Mutex::new(None);
+
+/// What the framebuffer shows now, as a PNG, once its server has mapped
+/// it: read from the pixels' shared memory, by any thread.
+pub fn framebuffer_png() -> Option<Vec<u8>> {
+    let (file, (w, h, row)) = {
+        let v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
+        let (f, _, shape) = v.as_ref()?;
+        (Arc::clone(f), *shape)
+    };
+    let mut buf = vec![0u8; (row * h as u64) as usize];
+    file.handle.read_at(0, &mut buf).ok()?;
+    Some(png::encode(w, h, row as usize, &buf))
+}
+
+/// Surface `id`'s pixels as a PNG, when they are 32-bit.
+pub fn surface_png(id: u32) -> Option<Vec<u8>> {
+    let (shape, buf) = surface::pixels(id)?;
+    (shape.bytes_per_element == 4 && shape.planes.is_empty()).then(|| png::encode(shape.width, shape.height, shape.bytes_per_row as usize, &buf[shape.offset as usize..]))
 }
 
 /// A request's arguments after its descriptors and NDR record, read in
@@ -451,7 +481,7 @@ impl Kernel {
         }
     }
 
-    pub(super) fn darwin_iokit(&mut self, m: &mut GuestMem<'_>, kind: Kind, req: &Msg) -> Msg {
+    pub(super) fn darwin_iokit(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kind: Kind, req: &Msg) -> Msg {
         self.darwin_hid_drain(m);
         let h = match kind {
             Kind::IoObject(h) => Some(h),
@@ -460,7 +490,7 @@ impl Kernel {
         let mut io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
         let kit = io.get_or_insert_with(IoKit::new);
         let mut said = String::new();
-        let reply = self.darwin_iokit_routine(m, kit, h, req, &mut said);
+        let reply = self.darwin_iokit_routine(m, sp, kit, h, req, &mut said);
         if self.trace || std::env::var_os("GEX_IOKIT_TRACE").is_some() {
             // (An error reply is `{ NDR, code }` and not complex.)
             let code = if reply.complex { 0 } else { get32(&reply.body, 8) as i32 };
@@ -470,7 +500,7 @@ impl Kernel {
         reply
     }
 
-    fn darwin_iokit_routine(&mut self, m: &mut GuestMem<'_>, kit: &mut IoKit, h: Option<u32>, req: &Msg, said: &mut String) -> Msg {
+    fn darwin_iokit_routine(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kit: &mut IoKit, h: Option<u32>, req: &Msg, said: &mut String) -> Msg {
         let id = req.id;
         let mut rd = Rd::of(req);
         let entry = kit.entry_of(h);
@@ -505,10 +535,12 @@ impl Kernel {
                             Client::Fb(ref fb) if fb.kind == 1 => "IOFramebufferSharedUserClient",
                             Client::Fb(_) => "IOFramebufferUserClient",
                             Client::Gpu(_) => "AppleGPUWranglerUserClient",
+                            Client::Surface(_) => "IOSurfaceRootUserClient",
                             Client::Plain => "IOUserClient",
                         },
                         Obj::Iter(..) => "IOUserIterator",
                         Obj::Note => "IOServiceUserNotification",
+                        Obj::SurfaceRight(_) => "IOSurfaceSendRight",
                     };
                     simple(id, SUCCESS, &cstr(class))
                 }
@@ -812,7 +844,9 @@ impl Kernel {
                         let id = |class: &str| kit.reg.entries.iter().find(|x| x.class == class).map_or(0, |x| x.id);
                         Client::Gpu(gpuw::Gpu { device: id("IOPCIDevice"), framebuffer: id("IONDRVFramebuffer") })
                     }
-                    Opens::HidSystem | Opens::Framebuffer | Opens::Nothing => {
+                    Opens::SurfaceRoot if kind == 0 => Client::Surface(surface::Client::default()),
+                    Opens::Plain => Client::Plain,
+                    Opens::HidSystem | Opens::Framebuffer | Opens::SurfaceRoot | Opens::Nothing => {
                         *said = format!("type {kind}: {class} has no such user client");
                         return no_port(id, Some(&UNSUPPORTED.to_le_bytes()));
                     }
@@ -821,7 +855,13 @@ impl Kernel {
                 let port = Arc::clone(&kit.objects[&c].port);
                 with_port(id, port, Some(&SUCCESS.to_le_bytes()))
             }
-            2816 => fail(SUCCESS),
+            2816 => {
+                if let Some(Object { obj: Obj::Connect(Connect { client: Client::Surface(sc), .. }), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) {
+                    let held: Vec<(u32, surface::Held)> = sc.held.drain().collect();
+                    self.darwin_surfaces_let_go(m, held);
+                }
+                fail(SUCCESS)
+            }
             2817 => {
                 let e = entry!();
                 with_port(id, kit.entry_port(e), None)
@@ -864,6 +904,35 @@ impl Kernel {
                     },
                     _ => return fail(BAD_ARGUMENT),
                 };
+                // The framebuffer's pixels are the system's shared memory,
+                // mapped shared, which gex reads without the task
+                // ([`framebuffer_png`]).
+                if let Client::Fb(fb) = &c.client {
+                    if kind != display::CURSOR_MEMORY && flags & 1 != 0 {
+                        let page = super::abi::PAGE_SIZE;
+                        let size = (initial.len() as u64).next_multiple_of(crate::mem::share_granule().max(page));
+                        let file = {
+                            let mut v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
+                            if v.as_ref().is_none_or(|(_, s, _)| *s != size) {
+                                match super::mement::new_object(size) {
+                                    Ok(f) => *v = Some((f, size, (fb.mode.width, fb.mode.height, fb.row_bytes()))),
+                                    Err(_) => return fail(0xe000_02bd_u32 as i32),
+                                }
+                            }
+                            Arc::clone(&v.as_ref().unwrap().0)
+                        };
+                        let e = super::mement::Entry { file, offset: 0, size, prot: 3 };
+                        let at = match self.darwin_map_entry(m, &e, 0, size, 0, 1, 0, false, 3) {
+                            Ok(at) => at,
+                            Err(_) => return fail(0xe000_02bd_u32 as i32),
+                        };
+                        c.maps.push((kind, at, initial.len() as u64));
+                        *said = format!("{said} -> {at:#x}+{:#x} (shared)", initial.len());
+                        let mut b = at.to_le_bytes().to_vec();
+                        b.extend_from_slice(&(initial.len() as u64).to_le_bytes());
+                        return simple(id, SUCCESS, &b);
+                    }
+                }
                 // kIOMapAnywhere, or at the address asked.
                 let anywhere = flags & 1 != 0;
                 let at = match self.darwin_vm_map_at(m, if anywhere { 0 } else { want }, initial.len() as u64, 0, anywhere as u64, 3) {
@@ -901,45 +970,26 @@ impl Kernel {
                 let (ool_out, ool_out_room) = if id == 2865 { (rd.u64(), rd.u64()) } else { (0, 0) };
                 let inband = if ool_in != 0 && ool_in_size != 0 { m.read(ool_in, ool_in_size as usize).map(|b| b.to_vec()).unwrap_or_default() } else { inband };
                 *said = format!("selector {selector} scalars {scalars:x?} struct {} bytes", inband.len());
+                // (IOSurfaceRoot's client is taken out while its method
+                // runs: it makes objects of the table's.)
+                if let Some(Object { obj: Obj::Connect(Connect { client: Client::Surface(sc), .. }), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) {
+                    let mut sc = std::mem::take(sc);
+                    *said = format!("{} {said}", surface::method_name(selector));
+                    let room = inband_room.max(ool_out_room as usize);
+                    let result = self.darwin_surface_method(m, sp, kit, &mut sc, selector, &scalars, &inband, room, said);
+                    if let Some(Object { obj: Obj::Connect(Connect { client: Client::Surface(slot), .. }), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) {
+                        *slot = sc;
+                    }
+                    return method_reply(m, id, result, inband_room, scalar_room, ool_out, ool_out_room);
+                }
                 let Some(Object { obj: Obj::Connect(c), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) else { return fail(BAD_ARGUMENT) };
                 let result = match &mut c.client {
                     Client::Hid(hc) => hc.method(selector, &scalars, &inband),
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
                     Client::Gpu(g) => gpuw::method(selector, &inband, g),
-                    Client::Plain => Err(UNSUPPORTED),
+                    Client::Surface(_) | Client::Plain => Err(UNSUPPORTED),
                 };
-                match result {
-                    Ok((mut so, mut sb)) => {
-                        so.truncate(scalar_room);
-                        let mut ool_wrote = 0u64;
-                        if sb.len() > inband_room && ool_out != 0 && ool_out_room != 0 {
-                            let n = sb.len().min(ool_out_room as usize);
-                            if m.write(ool_out, &sb[..n]).is_err() {
-                                return fail(BAD_ARGUMENT);
-                            }
-                            ool_wrote = n as u64;
-                            sb.clear();
-                        }
-                        sb.truncate(inband_room);
-                        let mut b = inline(&sb);
-                        b.extend_from_slice(&(so.len() as u32).to_le_bytes());
-                        so.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
-                        if id == 2872 {
-                            // (no output out of line)
-                            let mut out = vec![0u8; 20];
-                            put32(&mut out, 0, 1);
-                            out[4 + 11] = 1;
-                            out.extend_from_slice(&NDR);
-                            out.extend_from_slice(&b);
-                            out.extend_from_slice(&0u32.to_le_bytes());
-                            Msg::kernel(id + 100, out, Vec::new(), vec![(4, Vec::new())])
-                        } else {
-                            b.extend_from_slice(&ool_wrote.to_le_bytes());
-                            simple(id, SUCCESS, &b)
-                        }
-                    }
-                    Err(code) => fail(code),
-                }
+                method_reply(m, id, result, inband_room, scalar_room, ool_out, ool_out_room)
             }
             // The catalogue of drivers: nothing to load, nothing changed.
             2836..=2841 => fail(SUCCESS),
@@ -957,5 +1007,449 @@ impl Msg {
     fn complex_anyway(mut self) -> Msg {
         self.complex = true;
         self
+    }
+}
+
+/// `io_connect_method`'s reply: the structure out (inline, or written where
+/// the task has room out of line when larger than the reply holds) and the
+/// scalars out; or the method's error.
+#[allow(clippy::too_many_arguments)]
+fn method_reply(m: &mut GuestMem<'_>, id: u32, result: Result<(Vec<u64>, Vec<u8>), i32>, inband_room: usize, scalar_room: usize, ool_out: u64, ool_out_room: u64) -> Msg {
+    let fail = |code: i32| simple(id, code, &[]);
+    match result {
+        Ok((mut so, mut sb)) => {
+            so.truncate(scalar_room);
+            let mut ool_wrote = 0u64;
+            if sb.len() > inband_room && ool_out != 0 && ool_out_room != 0 {
+                let n = sb.len().min(ool_out_room as usize);
+                if m.write(ool_out, &sb[..n]).is_err() {
+                    return fail(BAD_ARGUMENT);
+                }
+                ool_wrote = n as u64;
+                sb.clear();
+            }
+            sb.truncate(inband_room);
+            let mut b = inline(&sb);
+            b.extend_from_slice(&(so.len() as u32).to_le_bytes());
+            so.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+            if id == 2872 {
+                // (no output out of line)
+                let mut out = vec![0u8; 20];
+                put32(&mut out, 0, 1);
+                out[4 + 11] = 1;
+                out.extend_from_slice(&NDR);
+                out.extend_from_slice(&b);
+                out.extend_from_slice(&0u32.to_le_bytes());
+                Msg::kernel(id + 100, out, Vec::new(), vec![(4, Vec::new())])
+            } else {
+                b.extend_from_slice(&ool_wrote.to_le_bytes());
+                simple(id, SUCCESS, &b)
+            }
+        }
+        Err(code) => fail(code),
+    }
+}
+
+/// The graphics comm page every client of `IOSurfaceRoot` maps: one page
+/// of zeroes, the system's.
+static COMM_PAGE: Mutex<Option<Arc<crate::file::OpenFile>>> = Mutex::new(None);
+
+impl Kernel {
+    /// Surface `s`'s memory mapped into this task, shared: its address.
+    fn darwin_map_surface(&mut self, m: &mut GuestMem<'_>, file: &Arc<crate::file::OpenFile>, total: u64) -> Result<u64, i32> {
+        let e = super::mement::Entry { file: Arc::clone(file), offset: 0, size: total, prot: 3 };
+        self.darwin_map_entry(m, &e, 0, total, 0, 1, 0, false, 3).map_err(|_| surface::NO_MEMORY)
+    }
+
+    /// Surfaces this task no longer has: unmapped, and let go of.
+    fn darwin_surfaces_let_go(&mut self, m: &mut GuestMem<'_>, held: Vec<(u32, surface::Held)>) {
+        for (id, h) in held {
+            let total = surface::table().as_ref().and_then(|t| t.all.get(&id).map(|s| s.total));
+            if let Some(total) = total {
+                let _ = self.map_io().call(m, crate::syscalls::nr::MUNMAP, [h.at, total, 0, 0, 0, 0]);
+            }
+            if let Some(t) = surface::table().as_mut() {
+                if h.uses > 0 {
+                    if let Some(s) = t.all.get_mut(&id) {
+                        s.use_count = s.use_count.saturating_sub(h.uses);
+                        let ro = s.shared_ro();
+                        let _ = s.file.handle.write_at(s.pixels, &ro);
+                    }
+                }
+                t.let_go(id);
+            }
+        }
+    }
+
+    /// The shared parts of surface `id` written where its memory is (the
+    /// object, and this task's mapping of it).
+    fn darwin_surface_share(&mut self, m: &mut GuestMem<'_>, id: u32, at: Option<u64>) {
+        let t = surface::table();
+        let Some(s) = t.as_ref().and_then(|t| t.all.get(&id)) else { return };
+        let ro = s.shared_ro();
+        let _ = s.file.handle.write_at(s.pixels, &ro);
+        if let Some(at) = at {
+            let _ = m.write(surface::ro_at(s, at, 0), &ro);
+        }
+    }
+
+    /// Surface `id` added to this task's table: mapped, held, and its lock
+    /// result.
+    fn darwin_surface_take(&mut self, m: &mut GuestMem<'_>, sc: &mut surface::Client, id: u32, created: bool) -> Result<Vec<u8>, i32> {
+        let (file, total) = {
+            let mut t = surface::table();
+            let Some(s) = t.as_mut().and_then(|t| t.all.get_mut(&id)) else { return Err(BAD_ARGUMENT) };
+            if !created {
+                s.holders += 1;
+            }
+            (Arc::clone(&s.file), s.total)
+        };
+        let at = match self.darwin_map_surface(m, &file, total) {
+            Ok(at) => at,
+            Err(e) => {
+                if let Some(t) = surface::table().as_mut() {
+                    t.let_go(id);
+                }
+                return Err(e);
+            }
+        };
+        sc.held.insert(id, surface::Held { at, uses: 0, created });
+        let t = surface::table();
+        let s = t.as_ref().and_then(|t| t.all.get(&id)).ok_or(BAD_ARGUMENT)?;
+        Ok(surface::lock_result(s, at))
+    }
+
+    /// `IOSurfaceRootUserClient`'s methods, as IOSurface.framework calls
+    /// them: the scalars and the structure out, or an `IOReturn`.
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_surface_method(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, kit: &mut IoKit, sc: &mut surface::Client, selector: u32, scalars: &[u64], inband: &[u8], room: usize, said: &mut String) -> Result<(Vec<u64>, Vec<u8>), i32> {
+        let none = Ok((Vec::new(), Vec::new()));
+        let arg = |i: usize| scalars.get(i).copied().unwrap_or(0);
+        // A surface this task has, by the id a request names.
+        let held = |sc: &surface::Client, id: u32| sc.held.get(&id).cloned().ok_or(BAD_ARGUMENT);
+        let id_in = get32(inband, 0);
+        // A C string at 8 of a structure in (a value's key): none when empty.
+        let key = || -> Option<String> {
+            let s = inband.get(8..)?;
+            let s = s.split(|&c| c == 0).next()?;
+            (!s.is_empty()).then(|| String::from_utf8_lossy(s).into_owned())
+        };
+        let page = super::abi::PAGE_SIZE;
+        match selector {
+            // create_surface(properties): a new surface, in this task.
+            0 => {
+                let Some(dict) = unserialize(inband) else { return Err(BAD_ARGUMENT) };
+                let Some(shape) = surface::Shape::parse(&dict) else {
+                    *said = format!("{said}: refused {}", brief(&dict));
+                    return Err(BAD_ARGUMENT);
+                };
+                let pixels = shape.pixel_bytes(page);
+                let total = (pixels + page).next_multiple_of(crate::mem::share_granule().max(page));
+                let file = super::mement::new_object(total).map_err(|_| surface::NO_MEMORY)?;
+                let id = {
+                    let mut t = surface::table();
+                    let t = t.get_or_insert_with(surface::Surfaces::get);
+                    let id = t.new_id();
+                    *said = format!("{said}: {}x{} {:?} {} bytes a row -> surface {id}", shape.width, shape.height, String::from_utf8_lossy(&shape.pixel_format.to_be_bytes()), shape.bytes_per_row);
+                    let s = surface::Surface {
+                        id,
+                        shape,
+                        file: Arc::clone(&file),
+                        pixels,
+                        total,
+                        creator: self.pid,
+                        values: vec![("CreationProperties".to_string(), dict)],
+                        generation: 1,
+                        seed: 0,
+                        use_count: 0,
+                        holders: 1,
+                        attachments: Vec::new(),
+                        registry_id: 0x1_0001_0000 + id as u64,
+                    };
+                    let _ = file.handle.write_at(pixels, &s.shared_ro());
+                    t.all.insert(id, s);
+                    id
+                };
+                Ok((Vec::new(), self.darwin_surface_take(m, sc, id, true)?))
+            }
+            // release_surface(id)
+            1 => {
+                let id = arg(0) as u32;
+                let h = sc.held.remove(&id).ok_or(BAD_ARGUMENT)?;
+                self.darwin_surfaces_let_go(m, vec![(id, h)]);
+                none
+            }
+            // lock_surface({id, options}), unlock_surface: the lock result
+            // with the seed; the seed, which a write's unlock moves on.
+            2 | 3 => {
+                let h = held(sc, id_in)?;
+                let options = get32(inband, 4);
+                *said = format!("{said}: surface {id_in} options {options:#x}");
+                let out = {
+                    let mut t = surface::table();
+                    let s = t.as_mut().and_then(|t| t.all.get_mut(&id_in)).ok_or(BAD_ARGUMENT)?;
+                    if selector == 3 && options & 1 == 0 {
+                        s.seed = s.seed.wrapping_add(1);
+                    }
+                    if selector == 2 { surface::lock_result(s, h.at) } else { s.seed.to_le_bytes().to_vec() }
+                };
+                if selector == 3 {
+                    self.darwin_surface_share(m, id_in, Some(h.at));
+                }
+                Ok((Vec::new(), out))
+            }
+            // lookup_surface(id): one this task made, a global one, or one
+            // it has been given.
+            4 | 27 => {
+                let id = if selector == 4 {
+                    arg(0) as u32
+                } else {
+                    let port = sp.port_named(self.pid, arg(0) as u32).ok_or(BAD_ARGUMENT)?;
+                    let Kind::IoObject(o) = port.kind else { return Err(BAD_ARGUMENT) };
+                    match kit.objects.get(&o).map(|o| &o.obj) {
+                        Some(Obj::SurfaceRight(id)) => *id,
+                        _ => return Err(BAD_ARGUMENT),
+                    }
+                };
+                *said = format!("{said}: surface {id}");
+                if sc.held.contains_key(&id) {
+                    if selector == 4 {
+                        return Err(BAD_ARGUMENT);
+                    }
+                    // (Had already: the framework finds it by its id.)
+                    let mut b = vec![0u8; surface::LOCK_RESULT];
+                    b[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+                    b[24..28].copy_from_slice(&id.to_le_bytes());
+                    return Ok((Vec::new(), b));
+                }
+                let allowed = surface::table().as_ref().and_then(|t| t.all.get(&id)).is_some_and(|s| selector == 27 || s.creator == self.pid || s.shape.global);
+                if !allowed {
+                    return Err(BAD_ARGUMENT);
+                }
+                Ok((Vec::new(), self.darwin_surface_take(m, sc, id, false)?))
+            }
+            // set_ycbcrmatrix(id, matrix), get_ycbcrmatrix(id)
+            5 | 8 => {
+                let id = arg(0) as u32;
+                let h = held(sc, id)?;
+                let matrix = {
+                    let mut t = surface::table();
+                    let s = t.as_mut().and_then(|t| t.all.get_mut(&id)).ok_or(BAD_ARGUMENT)?;
+                    if selector == 5 {
+                        s.shape.ycbcr = arg(1) as u32;
+                    }
+                    s.shape.ycbcr
+                };
+                if selector == 5 {
+                    self.darwin_surface_share(m, id, Some(h.at));
+                    none
+                } else {
+                    Ok((vec![matrix as u64], Vec::new()))
+                }
+            }
+            // set_value({id, [value, key]}), remove_value({id, key}): the
+            // values' new generation.
+            9 | 11 => {
+                let h = held(sc, id_in)?;
+                let generation = {
+                    let mut t = surface::table();
+                    let s = t.as_mut().and_then(|t| t.all.get_mut(&id_in)).ok_or(BAD_ARGUMENT)?;
+                    if selector == 9 {
+                        let Some(Value::Array(pair)) = inband.get(8..).and_then(unserialize) else { return Err(BAD_ARGUMENT) };
+                        let value = pair.first().cloned().ok_or(BAD_ARGUMENT)?;
+                        match pair.get(1) {
+                            Some(Value::Str(k)) => {
+                                *said = format!("{said}: surface {id_in} {k}");
+                                if k != "CreationProperties" {
+                                    match s.values.iter_mut().find(|(n, _)| n == k) {
+                                        Some(slot) => slot.1 = value,
+                                        None => s.values.push((k.clone(), value)),
+                                    }
+                                }
+                            }
+                            None => {
+                                let Value::Dict(d) = value else { return Err(BAD_ARGUMENT) };
+                                *said = format!("{said}: surface {id_in} {} values", d.len());
+                                for (k, v) in d {
+                                    if k == "CreationProperties" {
+                                        continue;
+                                    }
+                                    match s.values.iter_mut().find(|(n, _)| *n == k) {
+                                        Some(slot) => slot.1 = v,
+                                        None => s.values.push((k, v)),
+                                    }
+                                }
+                            }
+                            Some(_) => return Err(BAD_ARGUMENT),
+                        }
+                    } else {
+                        match key() {
+                            Some(k) if k != "CreationProperties" => s.values.retain(|(n, _)| *n != k),
+                            Some(_) => {}
+                            None => s.values.clear(),
+                        }
+                    }
+                    s.generation = (s.generation + 2) | 1;
+                    s.generation
+                };
+                self.darwin_surface_share(m, id_in, Some(h.at));
+                Ok((Vec::new(), generation.to_le_bytes().to_vec()))
+            }
+            // get_value({id, key}): {0, generation, the value serialized};
+            // get_data_value: a data value's bytes.
+            10 | 21 => {
+                held(sc, id_in)?;
+                let key = key();
+                *said = format!("{said}: surface {id_in} {}", key.as_deref().unwrap_or("(all)"));
+                let t = surface::table();
+                let s = t.as_ref().and_then(|t| t.all.get(&id_in)).ok_or(BAD_ARGUMENT)?;
+                let value = match &key {
+                    Some(k) => s.values.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+                    None => Some(Value::Dict(s.values.clone())),
+                };
+                let Some(value) = value else { return none };
+                if selector == 21 {
+                    let Value::Data(d) = value else { return Err(0xe000_02c7_u32 as i32) };
+                    return if d.len() > room { Err(surface::NO_SPACE) } else { Ok((Vec::new(), d)) };
+                }
+                let mut b = 0u32.to_le_bytes().to_vec();
+                b.extend_from_slice(&s.generation.to_le_bytes());
+                b.extend_from_slice(&plist::to_binary(&value));
+                if b.len() > room {
+                    return Err(surface::NO_SPACE);
+                }
+                Ok((Vec::new(), b))
+            }
+            // bind_accel, set_surface_notify, remove_surface_notify, log,
+            // set_gpu_policy_dict, the shared events' signals: taken.
+            12 | 17 | 18 | 19 | 30 | 32 | 33 | 34 | 35 | 36 => none,
+            13 => Ok((Vec::new(), surface::limits())),
+            // increment_surface_use_count, decrement_, get_
+            14 | 15 | 16 => {
+                let id = arg(0) as u32;
+                let mut h = held(sc, id)?;
+                let count = {
+                    let mut t = surface::table();
+                    let s = t.as_mut().and_then(|t| t.all.get_mut(&id)).ok_or(BAD_ARGUMENT)?;
+                    match selector {
+                        14 => {
+                            s.use_count += 1;
+                            h.uses += 1;
+                        }
+                        15 if h.uses > 0 => {
+                            s.use_count -= 1;
+                            h.uses -= 1;
+                        }
+                        _ => {}
+                    }
+                    s.use_count
+                };
+                if selector == 16 {
+                    return Ok((vec![count as u64], Vec::new()));
+                }
+                let at = h.at;
+                sc.held.insert(id, h);
+                self.darwin_surface_share(m, id, Some(at));
+                none
+            }
+            // set_purgeable(id, state): the state it was, never volatile.
+            20 => {
+                held(sc, arg(0) as u32)?;
+                Ok((vec![0], Vec::new()))
+            }
+            // set_bulk_attachments({id, attachments}), get_bulk_attachments(id)
+            22 => {
+                let h = held(sc, id_in)?;
+                {
+                    let mut t = surface::table();
+                    let s = t.as_mut().and_then(|t| t.all.get_mut(&id_in)).ok_or(BAD_ARGUMENT)?;
+                    s.attachments = inband.get(8..).unwrap_or(&[]).to_vec();
+                }
+                self.darwin_surface_share(m, id_in, Some(h.at));
+                none
+            }
+            23 => {
+                let id = arg(0) as u32;
+                held(sc, id)?;
+                let t = surface::table();
+                let s = t.as_ref().and_then(|t| t.all.get(&id)).ok_or(BAD_ARGUMENT)?;
+                let mut b = vec![0u8; 0x80];
+                let n = s.attachments.len().min(0x78);
+                b[8..8 + n].copy_from_slice(&s.attachments[..n]);
+                Ok((Vec::new(), b))
+            }
+            // gather_iosurface_data: nothing gathered.
+            24 => none,
+            // get_graphics_comm_page_address: the page, mapped once.
+            25 => {
+                if sc.comm_page == 0 {
+                    let file = {
+                        let mut c = COMM_PAGE.lock().unwrap_or_else(|e| e.into_inner());
+                        if c.is_none() {
+                            *c = Some(super::mement::new_object(page).map_err(|_| surface::NO_MEMORY)?);
+                        }
+                        Arc::clone(c.as_ref().unwrap())
+                    };
+                    let size = page.next_multiple_of(crate::mem::share_granule().max(page));
+                    let e = super::mement::Entry { file, offset: 0, size, prot: 1 };
+                    sc.comm_page = self.darwin_map_entry(m, &e, 0, size, 0, 1, 0, false, 1).map_err(|_| surface::NO_MEMORY)?;
+                }
+                Ok((vec![sc.comm_page], Vec::new()))
+            }
+            // set_indexed_timestamp(id, index, value)
+            26 => {
+                let id = arg(0) as u32;
+                let h = held(sc, id)?;
+                if arg(1) >= 4 {
+                    return Err(BAD_ARGUMENT);
+                }
+                let t = surface::table();
+                let s = t.as_ref().and_then(|t| t.all.get(&id)).ok_or(BAD_ARGUMENT)?;
+                let at = surface::rw_at(s, h.at, 8 * arg(1));
+                drop(t);
+                m.write(at, &arg(2).to_le_bytes()).map_err(|_| BAD_ARGUMENT)?;
+                none
+            }
+            // create_port_from_surface(id): a send right naming it, which
+            // keeps it.
+            28 => {
+                let id = arg(0) as u32;
+                held(sc, id)?;
+                if let Some(s) = surface::table().as_mut().and_then(|t| t.all.get_mut(&id)) {
+                    s.holders += 1;
+                }
+                let o = kit.add(Obj::SurfaceRight(id));
+                let name = sp.give_send(Arc::clone(&kit.objects[&o].port));
+                *said = format!("{said}: surface {id} -> name {name:#x}");
+                Ok((vec![name as u64], Vec::new()))
+            }
+            // create_shared_event, query_shared_event
+            29 => {
+                sc.next_event += 1;
+                Ok((vec![sc.next_event], Vec::new()))
+            }
+            31 => Ok((vec![0, 0], Vec::new())),
+            // get_pid_gpu_policy_dict: none kept.
+            37 => Err(UNSUPPORTED),
+            // set_detach_mode_code(id, mask, value, time)
+            38 => {
+                let id = arg(0) as u32;
+                let h = held(sc, id)?;
+                let t = surface::table();
+                let s = t.as_ref().and_then(|t| t.all.get(&id)).ok_or(BAD_ARGUMENT)?;
+                let at = surface::rw_at(s, h.at, surface::DETACH);
+                drop(t);
+                let mut cur = [0u8; 8];
+                if let Ok(b) = m.read(at, 8) {
+                    cur.copy_from_slice(b);
+                }
+                let v = u64::from_le_bytes(cur) & !arg(1) | arg(2) & arg(1);
+                m.write(at, &v.to_le_bytes()).map_err(|_| BAD_ARGUMENT)?;
+                none
+            }
+            // create_surface_fast_path, create_surface_client_mem: the
+            // framework of 10.14 does not use them.
+            _ => Err(UNSUPPORTED),
+        }
     }
 }

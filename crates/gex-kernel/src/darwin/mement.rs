@@ -101,7 +101,7 @@ pub(super) fn forget(h: u32) {
 
 /// A new object of `len` zeroes, and more to the end of the host's page,
 /// so that what is mapped of it is whole host pages a host can share.
-fn new_object(len: u64) -> Result<Arc<OpenFile>, u64> {
+pub(super) fn new_object(len: u64) -> Result<Arc<OpenFile>, u64> {
     let memfd = Arc::new(crate::unix::MemFd::new("mach memory entry"));
     memfd.reserve(len.next_multiple_of(crate::mem::share_granule().max(abi::PAGE_SIZE))).map_err(|_| KERN_RESOURCE_SHORTAGE)?;
     let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
