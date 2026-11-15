@@ -79,8 +79,9 @@ export default async function (t) {
   // kernel's shared memory, which gex reads); IOSurface opens
   // (IOSurfaceRoot, its limits); lsd answers it; and WindowServer checks in
   // its own services, com.apple.windowserver among them: it is up and
-  // serving. securityd is left out: its Mach daemon state (MDS) does not
-  // install yet, and lsd, which WindowServer waits on, would wait on it.
+  // serving. securityd installs its module directory (MDS: the databases
+  // the CDSA modules are found by, written through libsandbox's
+  // _amkrtemp and an atomic temporary file).
   // GEX_IOKIT_TRACE says each IOKit request; what it asks last is said in
   // the check's detail.
   //
@@ -98,6 +99,16 @@ export default async function (t) {
   // (GEX_FRAMEBUFFER_PNG): the picture is the window's, and so is what
   // WindowServer says the display shows (the stand-in asks it for the
   // display's image).
+  //
+  // Then it starts the user's session: Calculator, run as the user (501)
+  // in the login's audit session. The user's agents run as the user
+  // (gexlaunchd -a), and a name both a daemon and an agent serve is the
+  // agent's for the user's processes: Calculator is sandboxed, and its
+  // libsystem_secinit registers it with the user's secinitd, which makes a
+  // code identity of it (its program's path by proc_pidpath, its slice
+  // and cdhash by csops). (The Dock, which AppKit looks for, is one of the
+  // protected programs, and is left out.) How far the registration gets
+  // is said: the signature's validation does not finish yet.
   const lw = join(d, 'lw');
   const bl = await exec(['sh', join(ROOT, 'guest/loginwindow/build.sh'), lw, 'x86_64']);
   if (bl.code !== 0) throw new Error(`guest/loginwindow/build.sh: ${bl.stderr.trim()}`);
@@ -107,34 +118,37 @@ export default async function (t) {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.gex.loginwindow</string>
-<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string></array>
+<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string><string>--</string><string>/Applications/Calculator.app/Contents/MacOS/Calculator</string></array>
 </dict></plist>
 `);
   const fb = join(d, 'fb.png');
   const ws = join(d, 'ws');
   const binds = [];
-  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC']]) {
+  for (const [mine, theirs] of [['folders', '/private/var/folders'], ['tmp', '/private/var/tmp'], ['run', '/private/var/run'], ['log', '/private/var/log'], ['caches', '/Library/Caches'], ['mds', '/private/var/db/mds'], ['coreduet', '/private/var/db/CoreDuet'], ['tcc', '/Library/Application Support/com.apple.TCC'], ['tokens', '/private/var/db/TokenCache']]) {
     mkdirSync(join(ws, mine), { recursive: true });
     binds.push('--bind', `${join(ws, mine)}=${theirs}`);
   }
-  for (const [mine, theirs] of [['prefs', 'Library/Preferences'], ['root', 'private/var/root']]) {
+  // (And the system's caches, where secinitd keeps what it has made of
+  // the sandbox's profiles.)
+  for (const [mine, theirs] of [['prefs', 'Library/Preferences'], ['root', 'private/var/root'], ['caches-system', 'System/Library/Caches']]) {
     cpSync(join(root, theirs), join(ws, mine), { recursive: true });
     binds.push('--bind', `${join(ws, mine)}=/${theirs}`);
   }
-  // (It is stopped a few seconds after the window is up, for the
-  // framebuffer to be saved once more.)
-  let up = 0;
+  // (It is stopped a few seconds after Calculator has ended, or a while
+  // after it started, for the framebuffer to be saved once more.)
+  let [after, since] = [0, 0];
   const server = await n.gexc(
     ['run', '--uid', '0', '--sysroot', root, '--bind', `${gl}=/gex`, ...binds, '--bind', `${join(lw, 'x86_64')}=/gex-login`, '--bind', `${jobs}=/gex-jobs`,
+      '--bind', `${home}=/Users/gex`,
       '--bind', `${etc}/passwd=/etc/passwd`, '--bind', `${etc}/master.passwd=/etc/master.passwd`,
       '--env', 'OS_ACTIVITY_DT_MODE=YES',
       // (Not the daemons that would write into the root itself: the
       // network's configuration, the disks', the log's housekeeping.)
-      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.securityd',
-      '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-x', 'com.apple.configd', '-x', 'com.apple.diskarbitrationd', '-x', 'com.apple.aslmanager', '-x', 'com.apple.Dock.agent',
+      '-a', '501:20', '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
     // (It serves from then on, and is stopped.)
-    { timeout: 1500000, env: { GEX_IOKIT_TRACE: '1', GEX_FRAMEBUFFER_PNG: fb }, until: (out) => /^gexloginwindow: up$/m.test(out) && ++up > 8 },
+    { timeout: 2400000, env: { GEX_IOKIT_TRACE: '1', GEX_FRAMEBUFFER_PNG: fb }, until: (out) => (/^gexloginwindow: \/.*: (signal|exit) \d+$/m.test(out) && ++after > 8) || (/^gexloginwindow: started /m.test(out) && ++since > 600) },
   );
   const said = server.stderr;
   const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));
@@ -166,6 +180,16 @@ export default async function (t) {
   t.check('loginwindow\'s stand-in: draws in it', login.some((l) => /^gexloginwindow: context 0x[0-9a-f]+$/.test(l)) && login.includes('gexloginwindow: drawn'), told);
   t.check('loginwindow\'s stand-in: has it ordered in, and stays', login.includes('gexloginwindow: SLSOrderWindow -> 0') && login.includes('gexloginwindow: up'), told);
   t.check('loginwindow\'s stand-in: does not crash', !/\(loginwindow\) crashed/.test(said), (said.match(/.*crashed.*/g) || []).join(' / '));
+  // securityd's module directory, in the test's own /private/var/db/mds.
+  t.check('securityd: installs its module directory (MDS)', ['mdsObject.db', 'mdsDirectory.db'].every((f) => existsSync(join(ws, 'mds/system', f))), (said.match(/.*securityd\[.*|.*\(securityd\) crashed.*/g) || []).slice(-2).join(' / '));
+  // Calculator, the user's.
+  const started = login.map((l) => l.match(/^gexloginwindow: started \/Applications\/Calculator\.app\/Contents\/MacOS\/Calculator as 501, pid (\d+)$/)).find(Boolean);
+  t.check('Calculator: started as the console user, in the login\'s session', !!started, told);
+  const calc = started ? started[1] : 'none';
+  const reg = said.split('\n').filter((l) => new RegExp(`secinitd\\[\\d+:\\d+\\] Calculator\\[${calc}\\]`).test(l));
+  t.check('Calculator: the user\'s secinitd takes its registration', reg.some((l) => /root path for bundle "\/Applications\/Calculator\.app"/.test(l)) && !/does not match secinitd uid/.test(said), reg.slice(-1).join('') || (said.match(/.*secinitd.*/g) || []).slice(-1).join(''));
+  t.check('Calculator: secinitd makes a code identity of it', reg.length > 0 && !reg.some((l) => /Failed to create a code identity/.test(l)), reg.slice(-1).join(''));
+  t.say(`Calculator's registration: ${reg.slice(-1).join('') || 'none'}`);
   // The display is the framebuffer (1024 by 768, gex's default), and
   // WindowServer's own picture of it is the window's fill.
   t.check('the display: is the framebuffer\'s, online', login.some((l) => /^gexloginwindow: main display \d+, 1024x768 at 0,0, 1024x768 pixels$/.test(l)) && login.includes('gexloginwindow: display online 1, active 1, asleep 0'), told);

@@ -396,7 +396,20 @@ What does not, yet:
   gives the console to the user, and puts up a window over the display
   and draws in it; WindowServer takes each, and composites the window
   into the framebuffer's pixels, which `GEX_FRAMEBUFFER_PNG=FILE` saves:
-  the window, and WindowServer's cursor on it. The display is the
+  the window, and WindowServer's cursor on it. Given a program
+  (`-- PROGRAM`), it then starts the user's session with it, as the user
+  in the login's audit session, as loginwindow starts the applications of
+  whoever logs in. Calculator so gets as far as its sandbox: the user's
+  secinitd takes its registration and makes a code identity of it (the
+  program's path by `proc_pidpath`, its slice offset and cdhash by
+  `csops`), but the signature's validation ends in
+  `CSSMERR_CSP_INVALID_CONTEXT_HANDLE` and Calculator stops (as TextEdit
+  and Chess would: each is sandboxed). Stickies, which is not, gets
+  through AppKit's start to LaunchServices, which waits on the user's lsd
+  registering every application before it answers (a quarter of an hour
+  here, every run: its database is not saved yet), and has no window up
+  after that. The Dock is a protected program, and is left out. The
+  display is the
   framebuffer's: IOKit's IOGraphics library lists its one mode (it asks
   for a mode's information and timing together, and a framebuffer with no
   mode it can list is one CoreDisplay leaves offline, drawing a virtual
@@ -417,10 +430,13 @@ What does not, yet:
   notification center makes no connection to distnoted in one that is,
   so the first observer added there (LaunchServices' check-in adds one)
   sent on no connection, which libxpc ends a process for.
-  securityd starts, and its audit sessions' device answers it
-  (`/dev/auditsessions`, where nothing logs in or out), but its Mach
-  daemon state (MDS) does not install yet and it stops, which leaves lsd
-  waiting on it: WindowServer's runs leave it out (`-x`). It leaves out logd, which runs now but keeps its store in
+  securityd starts, its audit sessions' device answers it
+  (`/dev/auditsessions`, where nothing logs in or out), and it installs
+  its module directory (MDS). The user's agents run as the user (`-a
+  UID[:GID]`, the first program staying root), and a name both a daemon
+  and an agent serve (secinitd's, lsd's) is the agent's for a process in
+  the user's session and the daemon's for the system's, as launchd's
+  domains have it. It leaves out logd, which runs now but keeps its store in
   the root (`-i com.apple.logd` offers it, with `/private/var/db/diagnostics`
   and `uuidtext` bound elsewhere); coreservicesd, which refuses its
   clients' first request (and they do without it); opendirectoryd; and
