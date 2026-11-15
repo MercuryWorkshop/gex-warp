@@ -580,10 +580,13 @@ impl FileSystem for HostFs {
                 custom |= host_o::CREAT;
             }
         }
-        if flags & oflags::O_EXCL != 0 {
+        // (O_EXCL without O_CREAT asks nothing of a file that is there, on
+        // Linux as on XNU: Security's AtomicTempFile opens its temporary
+        // file again so, for writing.)
+        if flags & oflags::O_EXCL != 0 && flags & oflags::O_CREAT != 0 {
             if want_write {
                 opts.create_new(true);
-            } else if flags & oflags::O_CREAT != 0 {
+            } else {
                 custom |= host_o::EXCL;
             }
         }
@@ -1051,6 +1054,15 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = f.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf[..n as usize], b"contents");
+    }
+
+    #[test]
+    fn exclusive_without_create_opens_a_file_that_is_there() {
+        let dir = scratch();
+        std::fs::write(dir.join("excl.txt"), b"x").unwrap();
+        let fs = HostFs::new(&dir);
+        assert!(fs.open("excl.txt", oflags::O_WRONLY | oflags::O_EXCL, 0).is_ok());
+        assert_eq!(fs.open("excl.txt", oflags::O_WRONLY | oflags::O_CREAT | oflags::O_EXCL, 0o600).err(), Some(Errno::EEXIST));
     }
 
     #[test]

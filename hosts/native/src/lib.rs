@@ -1451,7 +1451,8 @@ fn run_program_with(
     let (kernel_uid, kernel_gid) = (creds.ruid(), creds.rgid());
     let (kernel_euid, kernel_egid) = (creds.uid(), creds.gid());
     let mut kernel = Kernel {
-        trace: opts.trace,
+        // (A process traced before its exec, as `GEX_STRACE_EXEC` makes one, stays so.)
+        trace: opts.trace || kernel.trace,
         creds,
         argv: opts.args.clone(),
         envp: opts.env.clone(),
@@ -3903,6 +3904,11 @@ fn exec_program(
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
     note_exec(kernel.pid, &req.path, &req.argv);
+    // `GEX_STRACE_EXEC=NAME`: the system calls of a program by its file's
+    // name traced from its exec on (`--strace`, for the one program).
+    if std::env::var("GEX_STRACE_EXEC").is_ok_and(|n| req.path.rsplit('/').next() == Some(n.as_str())) {
+        kernel.trace = true;
+    }
     // What the translators knew of the old image is about addresses the new
     // one holds now.
     let mut xlate = xlate.clone();
