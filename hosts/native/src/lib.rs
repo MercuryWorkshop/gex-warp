@@ -1023,7 +1023,24 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             }
         },
     });
+    save_framebuffer();
     run_program_with(program, opts, xlate, None)
+}
+
+/// With `GEX_FRAMEBUFFER_PNG=FILE`, what a Mac's framebuffer shows (once
+/// WindowServer has mapped it) is saved there as a PNG every two seconds,
+/// for as long as gexc runs.
+fn save_framebuffer() {
+    let Some(path) = std::env::var_os("GEX_FRAMEBUFFER_PNG").filter(|p| !p.is_empty()) else { return };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if let Some(png) = gex_kernel::syscalls::darwin::iokit::framebuffer_png() {
+            let tmp = std::path::PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+            if std::fs::write(&tmp, png).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    });
 }
 
 /// What survives an `execve`: the kernel, the process table, and the host-side
