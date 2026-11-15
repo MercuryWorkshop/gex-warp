@@ -68,7 +68,7 @@ impl FileHandle for AuditSessions {
         Err(Errno::EAGAIN)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o444, ino: 1, mtime: 0, nlink: 1, rdev: 0x2200_0000, times: Default::default() })
+        Ok(Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o444, ino: 1, mtime: 0, nlink: 1, rdev: 0x2200_0000, times: Default::default(), owner: None })
     }
     fn is_stream(&self) -> bool {
         true
