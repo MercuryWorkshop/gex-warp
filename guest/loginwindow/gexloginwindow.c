@@ -3,9 +3,8 @@
 // A Mac's loginwindow is the program that owns the console's session: the
 // one WindowServer draws, until somebody logs in and after. (Apple's is a
 // protected binary, which gex does not run.) WindowServer starts with a
-// session of its own making that nobody owns, and a client that connects
-// meanwhile is shown a display that is not there. What it waits for is
-// narrow, and this is that part:
+// session of its own making that nobody owns. What it waits for is narrow,
+// and this is that part:
 //
 // - an audit session for the login (`setaudit_addr`, with a new id): its
 //   audit user the console's user, and the flags that say it reaches the
@@ -19,8 +18,8 @@
 //   program's signature carries (build.sh);
 // - the console given to the user: its device's owner, and the login name;
 // - and something to show: a window the size of the display, filled, with
-//   a square in it, for WindowServer to composite (onto CoreDisplay's
-//   virtual display, until it has a hardware one online: README).
+//   a square in it, which WindowServer composites to the framebuffer; and
+//   what WindowServer says the display then shows (its image of it).
 //
 //   gexloginwindow [-u UID[:GID]] [-n NAME]
 //
@@ -119,6 +118,20 @@ int main(int argc, char **argv) {
     e = SLSOrderWindow(cid, wid, kOrderAbove, 0);
     printf("gexloginwindow: SLSOrderWindow -> %d\n", (int)e);
     if (c) CGContextFlush(c);
+    // What WindowServer shows of it: the display as it composites it.
+    sleep(2);
+    printf("gexloginwindow: display online %d, active %d, asleep %d\n", (int)CGDisplayIsOnline(display), (int)CGDisplayIsActive(display),
+           (int)CGDisplayIsAsleep(display));
+    CGImageRef shown = CGDisplayCreateImage(display);
+    CFDataRef pixels = shown ? CGDataProviderCopyData(CGImageGetDataProvider(shown)) : NULL;
+    if (pixels) {
+        const uint8_t *p = CFDataGetBytePtr(pixels);
+        size_t row = CGImageGetBytesPerRow(shown), w = CGImageGetWidth(shown), h = CGImageGetHeight(shown);
+        const uint8_t *in = p + 50 * row + 50 * 4, *square = p + 200 * row + 200 * 4;
+        printf("gexloginwindow: shown %zux%zu: at 50,50 %02x%02x%02x, at 200,200 %02x%02x%02x\n", w, h, in[2], in[1], in[0], square[2], square[1], square[0]);
+    } else {
+        printf("gexloginwindow: shown: no image (%p)\n", (void *)shown);
+    }
     printf("gexloginwindow: up\n");
     for (;;) pause();
 }
