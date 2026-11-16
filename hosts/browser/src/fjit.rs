@@ -250,6 +250,8 @@ fn page_gen(key: u64, fresh: &mut Vec<(u64, u32)>) -> (u64, u32) {
     crate::with_jit_only(|j| match j.page_table.lookup(key) {
         Some(b) => (at, b),
         None => {
+            // (The table's identity hooks answer from the snapshot.)
+            crate::with_px(crate::refresh_ident_snapshot);
             let b = j.page_table.base(key);
             fresh.push((key, b));
             (at, b)

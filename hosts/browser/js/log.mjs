@@ -32,6 +32,12 @@
 //   GEX_LOG=mem          a line per wasm memory the tab makes or lets go, with
 //                        how many it holds (lazy-fetch.mjs `wasmMemory`; a
 //                        tab holds about 124) (only when named)
+//   GEX_LOG=slots        per program at its end (and at its exec), where its
+//                        dispatch slots went: the pages of slots it drew from
+//                        the page's pool, how many pages it numbered afresh
+//                        and how many it holds at bases given elsewhere, by
+//                        object and where the object is mapped (the shim's
+//                        `slot_report`; test/darwin/slots) (only when named)
 //   GEX_LOG=a,b          several of those
 //   GEX_LOG=quiet        the default lines but the routine ones: no line per
 //                        process started or library loaded; errors and rare

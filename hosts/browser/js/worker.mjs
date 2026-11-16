@@ -1280,6 +1280,8 @@ async function handle(msg) {
     if (msg.phases || msg.opts?.phases) gex.shim.exports.gex_set_phases?.(msg.phases || msg.opts.phases);
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
+    // `log: 'slots'`: each program says where its dispatch slots went as it ends.
+    if (logNamed('slots')) gex.shim.exports.gex_set_slot_notes?.(1);
     if (msg.fcacheStats) gex.shim.exports.gex_set_fcache_stats?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
@@ -1457,6 +1459,17 @@ async function handle(msg) {
     // that faults is handled by the Worker's error path and never reaches here.
     // `?fjit=`: what the function JIT did, and how often its lock was held.
     if (!thread) ex.gex_fjit_report?.();
+    // `log: 'slots'`: what this program drew from the page's dispatch slots,
+    // and for which objects (the shim's `slot_report`). An exec says its own.
+    if (!thread && logNamed('slots') && ex.gex_slot_report) {
+      try {
+        const at = ex.gex_alloc(8192) >>> 0;
+        const n = ex.gex_slot_report(at, 8192) >>> 0;
+        const text = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, n).slice());
+        ex.gex_free?.(at, 8192);
+        console.log(`[gex] slots pid ${msg.child?.pid ?? msg.pid ?? 1} {${gex.cmdline ?? ''}}: ${text}`);
+      } catch {}
+    }
     if (!thread) ex.gex_process_gone?.(134);
     // `?xcache=`: what this process added to the store, kept for the next load.
     // After the exit is published, so a parent's wait does
@@ -1552,6 +1565,10 @@ async function handle(msg) {
       // exist and the engine refuses it. Per process, because the question is
       // always how many more processes a run can afford.
       slotsLeftK: Number(gex.shim.exports.gex_slots_left_k?.() ?? -1),
+      // And how many of them this program drew (1024 a page of AArch64
+      // code, 4096 a page of x86-64): none, when all its code had been run
+      // before.
+      slotsDrew: Number(gex.shim.exports.gex_slots_drew?.() ?? -1),
       // Where this process's address space went: guest mappings, the runtime's
       // own heap, Worker stacks. In MiB.
       // What this process's fork copied into it, and what `?forkskip` left out.
