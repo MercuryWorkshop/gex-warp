@@ -108,9 +108,12 @@ pub fn on() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
-/// Whether directory table `k` may be dense.
+/// Whether directory table `k` may be dense: a table there is. An entry
+/// numbered past the last one (the page's slot space spent) names table
+/// `DISPATCH_TABLES` or later, which has no map: the shim's windows are
+/// indexed by this, and one out of range was a panic there.
 pub fn table(k: usize) -> bool {
-    on() && k >= FIRST_TABLE
+    on() && (FIRST_TABLE..gex_abi::DISPATCH_TABLES).contains(&k)
 }
 
 /// A module's dense elements, as [`SECTION`] holds them.
