@@ -50,6 +50,9 @@ pub struct HostFs {
     gate: Arc<super::RenameGate>,
     /// `root` held open, once a walk asks ([`host_walk`]).
     root_dir: std::sync::OnceLock<Option<File>>,
+    /// Whether the host looks names up here without regard to case, once
+    /// asked ([`host_case_insensitive`]).
+    case: std::sync::OnceLock<bool>,
 }
 
 impl HostFs {
@@ -60,6 +63,7 @@ impl HostFs {
             canon: Default::default(),
             gate: Default::default(),
             root_dir: Default::default(),
+            case: Default::default(),
         }
     }
 
@@ -70,6 +74,7 @@ impl HostFs {
             canon: Default::default(),
             gate: Default::default(),
             root_dir: Default::default(),
+            case: Default::default(),
         }
     }
 
@@ -94,6 +99,49 @@ impl HostFs {
             self.root.join(rel)
         })
     }
+}
+
+/// Whether the host looks names up in `dir` without regard to case: a name
+/// there with a letter in it, asked for with its letters' case swapped, is
+/// the same file. A directory with no such name is asked about by its own
+/// name, from its parent. Nothing to ask with: sensitive, as every host
+/// but a Mac's is by default.
+fn host_case_insensitive(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let swapped = |n: &str| -> String {
+        n.chars().map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() }).collect()
+    };
+    // (The case of each pair: the name and its swap.)
+    let same = |parent: &Path, name: &str| -> Option<bool> {
+        let other = swapped(name);
+        if other == name {
+            return None;
+        }
+        match (id(&parent.join(name)), id(&parent.join(&other))) {
+            (Some(a), Some(b)) => Some(a == b),
+            (Some(_), None) => Some(false),
+            _ => None,
+        }
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten().take(64) {
+            if let Some(answer) = e.file_name().to_str().and_then(|n| same(dir, n)) {
+                return answer;
+            }
+        }
+    }
+    let Ok(canon) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let mut at = canon.as_path();
+    while let (Some(parent), Some(name)) = (at.parent(), at.file_name().and_then(|n| n.to_str())) {
+        if let Some(answer) = same(parent, name) {
+            return answer;
+        }
+        at = parent;
+    }
+    false
 }
 
 fn file_type_of(md: &std::fs::Metadata) -> FileType {
@@ -637,6 +685,13 @@ impl FileSystem for HostFs {
         true
     }
 
+    /// The host's: a guest's lookups here are the host's own, so its
+    /// answer is the true one (insensitive over a Mac's default APFS).
+    /// (One answer for the whole mount: the volume under its root's.)
+    fn case_insensitive(&self, _path: &str) -> bool {
+        *self.case.get_or_init(|| host_case_insensitive(&self.root))
+    }
+
     fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
@@ -1043,6 +1098,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gex-hostfs-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn a_mount_says_the_hosts_case() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch().join("case");
+        let _ = std::fs::create_dir_all(dir.join("Empty"));
+        std::fs::write(dir.join("Name"), b"").unwrap();
+        // The host's own answer: is the other spelling the same file?
+        let truth = std::fs::metadata(dir.join("NAME"))
+            .is_ok_and(|m| m.ino() == std::fs::metadata(dir.join("Name")).unwrap().ino());
+        assert_eq!(HostFs::new(&dir).case_insensitive(""), truth);
+        // A directory with nothing in it is asked about by its own name.
+        assert_eq!(HostFs::new(dir.join("Empty")).case_insensitive(""), truth);
+        assert_eq!(HostFs::read_only(&dir).case_insensitive(""), truth);
     }
 
     #[test]
