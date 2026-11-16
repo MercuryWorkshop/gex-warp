@@ -403,6 +403,8 @@ mod tests {
                                 gex_ir::BinOp::Mul => x.wrapping_mul(y),
                                 gex_ir::BinOp::Shl => x << (y & 63),
                                 gex_ir::BinOp::ShrU => x >> (y & 63),
+                                gex_ir::BinOp::Rotr => x.rotate_right((y & 63) as u32),
+                                gex_ir::BinOp::Add => x.wrapping_add(y),
                                 o => panic!("not evaluated here: {o:?}"),
                             }) as u128
                         }
@@ -878,8 +880,9 @@ mod tests {
         }
     }
 
-    /// FEAT_SHA3's `eor3`, `bcax`, `rax1` and `xar` (every rotation) are lowered, and to
-    /// what the reference says of them.
+    /// FEAT_SHA3's `eor3`, `bcax`, `rax1` and `xar` (every rotation), and FEAT_SHA512's
+    /// `sha512h`, `sha512h2`, `sha512su0` and `sha512su1`, are lowered, and to what the
+    /// reference says of them.
     #[test]
     fn sha3_words_match_the_reference() {
         let mut seed = 0x243f_6a88_85a3_08d3u64;
@@ -889,7 +892,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let words_of = [0xce020c20u32, 0xce220c20, 0xce628c20].into_iter().chain((0..64).map(|r| 0xce820020 | r << 10));
+        let words_of = [0xce020c20u32, 0xce220c20, 0xce628c20, 0xce628020, 0xce628420, 0xce628820, 0xcec08020].into_iter().chain((0..64).map(|r| 0xce820020 | r << 10));
         for raw in words_of {
             let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
             assert!(!block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })), "{raw:08x} goes to the host");

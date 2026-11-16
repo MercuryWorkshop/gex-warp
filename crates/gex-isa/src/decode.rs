@@ -1505,9 +1505,10 @@ fn decode_simd_fp(raw: u32) -> Inst {
     }
 
     // FEAT_SHA3, under `1100 1110`: eor3 and bcax `00 op Rm 0 Ra Rn Rd`, xar
-    // `100 Rm imm6 Rn Rd`, rax1 `011 Rm 1000 11 Rn Rd`. Its neighbours there
-    // are SHA-512's (the slow path's, `gex_isa::slow`) and SM3 and SM4, which
-    // no Apple processor has.
+    // `100 Rm imm6 Rn Rd`, rax1 `011 Rm 1000 11 Rn Rd`, and SHA-512's beside
+    // them: sha512h, sha512h2 and sha512su1 `011 Rm 1000 00/01/10 Rn Rd`,
+    // sha512su0 `110 00000 1000 00 Rn Rd`. Its other neighbours are SM3 and
+    // SM4, which no Apple processor has.
     if raw >> 24 == 0xce {
         let sha3 = |op, rot| Inst::VSha3 {
             op,
@@ -1522,6 +1523,10 @@ fn decode_simd_fp(raw: u32) -> Inst {
             0b001 if bit(raw, 15) == 0 => sha3(VSha3Op::Bcax, 0),
             0b100 => sha3(VSha3Op::Xar, bits(raw, 15, 10) as u8),
             0b011 if bits(raw, 15, 10) == 0b100011 => sha3(VSha3Op::Rax1, 0),
+            0b011 if bits(raw, 15, 10) == 0b100000 => sha3(VSha3Op::Sha512H, 0),
+            0b011 if bits(raw, 15, 10) == 0b100001 => sha3(VSha3Op::Sha512H2, 0),
+            0b011 if bits(raw, 15, 10) == 0b100010 => sha3(VSha3Op::Sha512Su1, 0),
+            0b110 if bits(raw, 20, 10) == 0b00000_100000 => sha3(VSha3Op::Sha512Su0, 0),
             _ => Inst::Unknown { raw },
         };
     }
@@ -3410,8 +3415,12 @@ mod tests {
         assert_eq!(d(0xce220c20), Inst::VSha3 { op: VSha3Op::Bcax, vd: v(0), vn: v(1), vm: v(2), va: v(3), rot: 0 });
         assert!(matches!(d(0xce628c20), Inst::VSha3 { op: VSha3Op::Rax1, .. }));
         assert!(matches!(d(0xce82fc20), Inst::VSha3 { op: VSha3Op::Xar, rot: 63, .. }));
-        // SHA-512's stay the slow path's, and SM3's nobody's.
-        for raw in [0xce628020u32, 0xce628420, 0xce628820, 0xcec08020, 0xce420c20, 0xce42a020] {
+        // SHA-512's are lowered like SHA-3's; SM3's are nobody's.
+        assert!(matches!(d(0xce628020), Inst::VSha3 { op: VSha3Op::Sha512H, .. }));
+        assert!(matches!(d(0xce628420), Inst::VSha3 { op: VSha3Op::Sha512H2, .. }));
+        assert!(matches!(d(0xce628820), Inst::VSha3 { op: VSha3Op::Sha512Su1, .. }));
+        assert!(matches!(d(0xcec08020), Inst::VSha3 { op: VSha3Op::Sha512Su0, .. }));
+        for raw in [0xce420c20u32, 0xce42a020, 0xcec28020] {
             assert!(matches!(d(raw), Inst::Unknown { .. }), "{raw:08x}");
         }
         assert_eq!(d(0x1e7e0020), Inst::FpJsToInt { rd: RegSel::gp(0), vn: v(1) });

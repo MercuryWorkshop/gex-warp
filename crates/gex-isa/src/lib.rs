@@ -1471,13 +1471,22 @@ pub enum FlagOp {
     Setf { rn: RegSel, bits: u8 },
 }
 
-/// Which of FEAT_SHA3's instructions an [`Inst::VSha3`] is.
+/// Which of FEAT_SHA3's and FEAT_SHA512's instructions an [`Inst::VSha3`] is.
+/// SHA-512's four read `vd` as well and have no `va` or `rot`.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VSha3Op {
     Eor3,
     Bcax,
     Rax1,
     Xar,
+    /// `sha512h`: two rounds of the half of the state that takes `T1`.
+    Sha512H,
+    /// `sha512h2`: two rounds of the half that takes `T2` as well.
+    Sha512H2,
+    /// `sha512su0`: the schedule's first step (`vn` only its low doubleword).
+    Sha512Su0,
+    /// `sha512su1`: the schedule's second step.
+    Sha512Su1,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]

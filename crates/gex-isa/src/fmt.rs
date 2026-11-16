@@ -1080,6 +1080,10 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             VSha3Op::Bcax => format!("bcax v{}.16b, v{}.16b, v{}.16b, v{}.16b", vd.0, vn.0, vm.0, va.0),
             VSha3Op::Rax1 => format!("rax1 v{}.2d, v{}.2d, v{}.2d", vd.0, vn.0, vm.0),
             VSha3Op::Xar => format!("xar v{}.2d, v{}.2d, v{}.2d, #{rot}", vd.0, vn.0, vm.0),
+            VSha3Op::Sha512H => format!("sha512h q{}, q{}, v{}.2d", vd.0, vn.0, vm.0),
+            VSha3Op::Sha512H2 => format!("sha512h2 q{}, q{}, v{}.2d", vd.0, vn.0, vm.0),
+            VSha3Op::Sha512Su0 => format!("sha512su0 v{}.2d, v{}.2d", vd.0, vn.0),
+            VSha3Op::Sha512Su1 => format!("sha512su1 v{}.2d, v{}.2d, v{}.2d", vd.0, vn.0, vm.0),
         },
         Inst::VCnt { vd, vn, q } => {
             let w = if q { "16b" } else { "8b" };

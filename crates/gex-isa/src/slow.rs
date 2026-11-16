@@ -386,8 +386,8 @@ pub fn execute(raw: u32, v: &mut VRegs, fpsr: &mut u32) -> bool {
     }
     // SHA-512 and SHA-3 (FEAT_SHA512, FEAT_SHA3), under 1100 1110: sha512h, sha512h2,
     // sha512su1 and rax1 `011 Rm 1000 opc Rn Rd`, sha512su0 `110 00000 100000 Rn Rd`, eor3
-    // and bcax `00 op Rm 0 Ra Rn Rd`, xar `100 Rm imm6 Rn Rd`. (The lifter lowers SHA-3's
-    // four itself; they are here as what it is checked against.)
+    // and bcax `00 op Rm 0 Ra Rn Rd`, xar `100 Rm imm6 Rn Rd`. (The lifter lowers all eight
+    // itself; they are here as what it is checked against.)
     if raw >> 24 == 0xce {
         let (d, n, m, a) = (v.get(rd), v.get(rn), v.get(rm), v.get(bits(raw, 14, 10)));
         let each = |x: u128, f: &dyn Fn(u64) -> u64| from_w64(f(w64(x, 0)), f(w64(x, 1)));

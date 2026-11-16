@@ -2549,6 +2549,12 @@ impl<'a> Lifter<'a> {
                         let nm = vbin(self, VBinOp::Xor, n, m);
                         rotr(self, nm, rot as u32)
                     }
+                    // SHA-512's, on doublewords: git, curl and TLS hash with them, and a host
+                    // call each was most of the time such a program spent.
+                    op => {
+                        let d = self.b.read(GuestReg::V128(vd.0));
+                        self.sha512(op, d, n, m)
+                    }
                 };
                 self.b.write(GuestReg::V128(vd.0), r);
                 Flow::Next
@@ -2953,6 +2959,94 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
         }
+    }
+
+    /// SHA-512's four (`gex_isa::slow`'s `sha512h` and the rest, which they are checked
+    /// against), on the doublewords of `d`, `n` and `m`: rotates, shifts, logic and
+    /// wrapping adds, then the two halves put back together.
+    fn sha512(&mut self, op: gex_isa::VSha3Op, d: Value, n: Value, m: Value) -> Value {
+        use gex_isa::VSha3Op;
+        let half = |lift: &mut Self, v: Value, lane: u32| lift.b.def(Expr::VExtract { a: v, lane, lane_bytes: 8, signed: false, ty: Ty::I64 });
+        let bin = |lift: &mut Self, op: BinOp, a: Value, b: Value| lift.b.bin(op, Ty::I64, a, b);
+        let ror = |lift: &mut Self, a: Value, by: u64| {
+            let k = lift.b.const_i64(by);
+            lift.b.bin(BinOp::Rotr, Ty::I64, a, k)
+        };
+        let shr = |lift: &mut Self, a: Value, by: u64| {
+            let k = lift.b.const_i64(by);
+            lift.b.bin(BinOp::ShrU, Ty::I64, a, k)
+        };
+        // `x` rotated right by each of `a`, `b` and the third (a rotate, or with
+        // `shift` a plain shift), xored together: the Σ and σ functions.
+        let sigma = |lift: &mut Self, x: Value, a: u64, b: u64, c: u64, shift: bool| {
+            let ra = ror(lift, x, a);
+            let rb = ror(lift, x, b);
+            let rc = if shift { shr(lift, x, c) } else { ror(lift, x, c) };
+            let ab = bin(lift, BinOp::Xor, ra, rb);
+            bin(lift, BinOp::Xor, ab, rc)
+        };
+        let not = |lift: &mut Self, a: Value| {
+            let ones = lift.b.const_i64(u64::MAX);
+            bin(lift, BinOp::Xor, a, ones)
+        };
+        let add3 = |lift: &mut Self, a: Value, b: Value, c: Value| {
+            let ab = bin(lift, BinOp::Add, a, b);
+            bin(lift, BinOp::Add, ab, c)
+        };
+        let (d0, d1) = (half(self, d, 0), half(self, d, 1));
+        let (n0, n1) = (half(self, n, 0), half(self, n, 1));
+        let (m0, m1) = (half(self, m, 0), half(self, m, 1));
+        let (lo, hi) = match op {
+            // Ch, Σ1 and the summed words, twice: the second on the first's sum with m0.
+            VSha3Op::Sha512H => {
+                let ch = |lift: &mut Self, e: Value, f: Value, g: Value| {
+                    let ef = bin(lift, BinOp::And, e, f);
+                    let ne = not(lift, e);
+                    let ng = bin(lift, BinOp::And, ne, g);
+                    bin(lift, BinOp::Xor, ef, ng)
+                };
+                let c1 = ch(self, m1, n0, n1);
+                let s1 = sigma(self, m1, 14, 18, 41, false);
+                let hi = add3(self, c1, s1, d1);
+                let t = bin(self, BinOp::Add, hi, m0);
+                let c0 = ch(self, t, m1, n0);
+                let s0 = sigma(self, t, 14, 18, 41, false);
+                let lo = add3(self, c0, s0, d0);
+                (lo, hi)
+            }
+            // Maj, Σ0 and the summed words, twice: the second on the first's result.
+            VSha3Op::Sha512H2 => {
+                let maj = |lift: &mut Self, a: Value, b: Value, c: Value| {
+                    let ab = bin(lift, BinOp::And, a, b);
+                    let ac = bin(lift, BinOp::And, a, c);
+                    let bc = bin(lift, BinOp::And, b, c);
+                    let x = bin(lift, BinOp::Xor, ab, ac);
+                    bin(lift, BinOp::Xor, x, bc)
+                };
+                let j1 = maj(self, n0, m1, m0);
+                let s1 = sigma(self, m0, 28, 34, 39, false);
+                let hi = add3(self, j1, s1, d1);
+                let j0 = maj(self, hi, m0, m1);
+                let s0 = sigma(self, hi, 28, 34, 39, false);
+                let lo = add3(self, j0, s0, d0);
+                (lo, hi)
+            }
+            // Each word plus σ0 of the one after it, n's low after d's high.
+            VSha3Op::Sha512Su0 => {
+                let s_lo = sigma(self, d1, 1, 8, 7, true);
+                let s_hi = sigma(self, n0, 1, 8, 7, true);
+                (bin(self, BinOp::Add, d0, s_lo), bin(self, BinOp::Add, d1, s_hi))
+            }
+            // Each half of d, plus σ1 of n's, plus m's.
+            VSha3Op::Sha512Su1 => {
+                let s_lo = sigma(self, n0, 19, 61, 6, true);
+                let s_hi = sigma(self, n1, 19, 61, 6, true);
+                (add3(self, d0, s_lo, m0), add3(self, d1, s_hi, m1))
+            }
+            _ => unreachable!("SHA-3's are lowered by the caller"),
+        };
+        let r = self.b.def(Expr::VReplace { a: d, lane: 0, lane_bytes: 8, val: lo });
+        self.b.def(Expr::VReplace { a: r, lane: 1, lane_bytes: 8, val: hi })
     }
 
     // -- scalar floating point ---------------------------------------------
