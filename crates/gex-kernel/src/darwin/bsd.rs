@@ -969,10 +969,45 @@ impl Kernel {
             return self.map_io().mmap(m, [addr, len, prot_bits, kflags, fd, off]).map(|a| if asked == a { a } else { gex_abi::guest_addr(a) });
         }
         let len = len.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
+        // The dynamic linker's room for a library goes where every process
+        // has that library, when the host keeps such places.
+        let addr = match self.darwin_library_place(addr, len, fd) {
+            Some(home) => home,
+            None => addr,
+        };
         let at = self.darwin_place(addr, len, prot_bits as u32, fd != u64::MAX, 0)?;
         // The hint is honoured: the range was free a moment ago, under the
         // same lock.
         self.map_io().mmap(m, [at, len, prot_bits, kflags, fd, off]).map(gex_abi::guest_addr)
+    }
+
+    /// Where the library the dynamic linker is making room for belongs,
+    /// if this mapping is that room and the host places libraries
+    /// ([`crate::syscalls::ObjectPlace`]: the page's runtime, where a
+    /// translation of a library's code is shared by the processes that
+    /// have the library at one address).
+    ///
+    /// dyld maps a library as an anonymous mapping of its whole extent,
+    /// wherever there is room, and then each segment of the file at its
+    /// place in that: so the room is what decides the address, and it
+    /// names no file. The file is the one dyld opened last
+    /// (`MapLog::armed_place`, armed at that open). Without this each
+    /// program had libSystem's libraries where its own earlier mappings
+    /// left them, a different address in every program (and, the arena
+    /// being the runtime's heap's too, in two runs of one), and each was
+    /// translated again into dispatch slots of its own.
+    ///
+    /// A hint: taken when free in this process, as any address asked for.
+    /// The library is named as the system outside the process's root names
+    /// it and by its extent, so two files of one name (two roots', one
+    /// replaced by a longer) have a place each.
+    fn darwin_library_place(&mut self, addr: u64, len: u64, fd: u64) -> Option<u64> {
+        if addr != 0 || fd != u64::MAX || self.place.is_none() || !self.map_io().from_dyld() {
+            return None;
+        }
+        let path = self.mem.lock().log.armed_place.take()?;
+        let name = format!("{}\0mach-o\0{len:x}", self.vfs.outer_path(&path));
+        self.place.as_ref()?.place(&name, len)
     }
 
     /// A free range of `len` bytes on a Darwin page boundary (and on one of

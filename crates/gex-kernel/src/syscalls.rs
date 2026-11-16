@@ -615,6 +615,9 @@ fn is_shared_object(path: &str) -> bool {
     name.ends_with(".so") || name.contains(".so.")
 }
 
+/// A Mac's dynamic linker, as every Mac root names it.
+const DYLD: &str = "/usr/lib/dyld";
+
 /// Somewhere that knows where a shared object belongs.
 ///
 /// Implemented by the host, because the answer has to be the same in every
@@ -3875,7 +3878,12 @@ impl PathIo<'_> {
             // After the open rather than before, so a path that does not
             // exist -- `ld.so` probes several directories for every library
             // it loads -- leaves nothing armed.
-            if self.map.place.is_some() && is_shared_object(&p) {
+            //
+            // A Mac's dynamic linker names its libraries no one way (a
+            // `.dylib`, a framework's bare name, a bundle): what it opens,
+            // from its own code, is armed, and its reservation takes it
+            // (`Kernel::darwin_library_place`).
+            if self.map.place.is_some() && (is_shared_object(&p) || self.map.from_dyld()) {
                 self.map.mem.lock().log.armed_place = Some(p.clone());
             }
             h
@@ -5004,6 +5012,15 @@ pub struct MapIo<'a> {
 }
 
 impl MapIo<'_> {
+    /// Whether the call in hand is made by a Mac's dynamic linker, from
+    /// its own code: the mapping the pc is in was loaded from a file named
+    /// [`DYLD`] (in whatever root).
+    pub fn from_dyld(&self) -> bool {
+        let mm = self.mem.lock();
+        mm.vma_at(self.pc)
+            .is_some_and(|v| v.code.as_ref().map_or(v.name.as_str(), |(id, _)| id.as_str()).ends_with(DYLD))
+    }
+
     /// The mapping call `n` (canonical), or `None` for any other.
     ///
     /// Its addresses may be a Darwin process's (`gex_abi::DARWIN_BASE`
