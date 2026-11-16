@@ -28,6 +28,13 @@ fn dsmos_key() -> Result<[u8; 64], LoadError> {
     }
 }
 
+/// Whether protected segments can be decrypted here: a key of the right
+/// length is configured. (What a launcher asks before it offers to run a
+/// protected program; the key itself is never said.)
+pub fn key_configured() -> bool {
+    dsmos_key().is_ok()
+}
+
 /// Decrypt a protected segment's bytes in place. `seg_flags` is the
 /// segment_command_64's flags field; if `SG_PROTECTED_VERSION_1` is not set,
 /// this is a no-op.

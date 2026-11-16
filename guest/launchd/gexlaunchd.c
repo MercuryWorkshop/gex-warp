@@ -38,6 +38,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -49,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
@@ -124,6 +127,8 @@ static int verbose;
 // which the client aborts: without it they do without. And fseventsd,
 // which keeps its log at the root of the volume (/.fseventsd), in the
 // system's root itself. -i offers one of these after all.
+// (A job whose program is a protected binary is not offered either,
+// whatever is asked, where the kernel cannot run one: `protected_binary`.)
 static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd", "com.apple.coreservicesd", "com.apple.fseventsd"};
 static int nskipped = 4;
 static const char *at_load[16];
@@ -142,6 +147,64 @@ static void say(const char *fmt, ...) {
 
 static char *dup_string(xpc_object_t s) {
     return s && xpc_get_type(s) == XPC_TYPE_STRING ? strdup(xpc_string_get_string_ptr(s)) : NULL;
+}
+
+// Whether the kernel runs protected binaries. A Mac's does. gex does when
+// it was given the key their text is encrypted with, and says whether it
+// was (the sysctl gex.protected_binaries; the key itself stays gex's): a
+// kernel with no such name is taken for a Mac's.
+static int runs_protected(void) {
+    static int known = -1;
+    if (known < 0) {
+        int v = 0;
+        size_t n = sizeof v;
+        known = sysctlbyname("gex.protected_binaries", &v, &n, NULL, 0) != 0 || v != 0;
+    }
+    return known;
+}
+
+// Whether the program at `path` is one of the system's protected binaries
+// (the Dock, Finder, loginwindow, SystemUIServer, mds): a segment of its
+// Mach-O for this processor says its pages are encrypted
+// (SG_PROTECTED_VERSION_1), which a Mac's kernel undoes as it pages them
+// in, and gex as it loads them if it has the key. Where it has not, such
+// a program cannot be run, so a job of one is not offered: who looks for
+// its service is told there is none, and does not wait on a program that
+// never serves.
+static int protected_binary(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int found = 0;
+    off_t at = 0;
+    struct fat_header fat;
+    if (pread(fd, &fat, sizeof fat, 0) == sizeof fat && fat.magic == OSSwapBigToHostInt32(FAT_MAGIC)) {
+        uint32_t n = OSSwapBigToHostInt32(fat.nfat_arch);
+        for (uint32_t i = 0; i < n && i < 16; i++) {
+            struct fat_arch arch;
+            if (pread(fd, &arch, sizeof arch, sizeof fat + i * sizeof arch) != sizeof arch) break;
+#if defined(__x86_64__)
+            if (OSSwapBigToHostInt32(arch.cputype) == CPU_TYPE_X86_64) at = OSSwapBigToHostInt32(arch.offset);
+#else
+            if (OSSwapBigToHostInt32(arch.cputype) == CPU_TYPE_ARM64) at = OSSwapBigToHostInt32(arch.offset);
+#endif
+        }
+    }
+    struct mach_header_64 mh;
+    if (pread(fd, &mh, sizeof mh, at) == sizeof mh && mh.magic == MH_MAGIC_64 && mh.sizeofcmds <= (1 << 20)) {
+        char *cmds = malloc(mh.sizeofcmds);
+        if (pread(fd, cmds, mh.sizeofcmds, at + sizeof mh) == (ssize_t)mh.sizeofcmds) {
+            for (uint32_t o = 0, i = 0; i < mh.ncmds && o + sizeof(struct load_command) <= mh.sizeofcmds; i++) {
+                struct load_command *lc = (struct load_command *)(cmds + o);
+                if (lc->cmdsize < sizeof *lc || lc->cmdsize > mh.sizeofcmds - o) break;
+                if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64))
+                    found |= (((struct segment_command_64 *)lc)->flags & SG_PROTECTED_VERSION_1) != 0;
+                o += lc->cmdsize;
+            }
+        }
+        free(cmds);
+    }
+    close(fd);
+    return found;
 }
 
 // One job description: its program and its Mach services.
@@ -179,6 +242,10 @@ static void add_job(const char *path) {
     for (size_t i = 0; i < n; i++) argv[i] = dup_string(xpc_array_get_value(args, i));
     if (!n && program) argv[0] = strdup(program), n = 1;
     if (!n) return;
+    if (!runs_protected() && protected_binary(program ? program : argv[0])) {
+        say("%s: its program (%s) is a protected binary, which gex cannot run without its key: not offered", label, program ? program : argv[0]);
+        return;
+    }
     if (program) argv[n + 1] = program;  // (the file, kept past the arguments)
     jobs = realloc(jobs, (njobs + 1) * sizeof *jobs);
     jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL};

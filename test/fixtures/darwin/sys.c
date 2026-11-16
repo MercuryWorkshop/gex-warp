@@ -267,6 +267,11 @@ static void process(int argc, char **argv) {
     // (The linker signs every arm64 program; an x86-64 one it leaves bare.)
     t_check("signed and valid", flags & 1);
 #endif
+    // (The status is one word whatever size is said: the Security
+    // framework asks it of a process with none.)
+    u32 again = 0;
+    t_show("csops status, no size said", SYS(SYS_csops, me, 0, &again, 0));
+    t_check("the same status", again == flags);
     t_show("csops of nobody", SYS(SYS_csops, 0x3fffffff, 0, &flags, sizeof flags));
     t_show("csops of an operation there is not", SYS(SYS_csops, me, 999, &flags, sizeof flags));
 

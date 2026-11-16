@@ -2,7 +2,9 @@
 // missed: what kind of device a descriptor is, a descriptor opened by its
 // number, a file locked as it is opened, who may give a file away, a
 // link's own mode, the priority of a process there is none of, and what a
-// child that was waited for used.
+// child that was waited for used. And what Apple's sqlite asks of its
+// files: a lock that is the open file's with a process named in it, and
+// writes to a guarded descriptor.
 #include "t.h"
 
 enum { SYS_chown = 16, SYS_fchown = 123, SYS_setpriority = 96, SYS_getpriority = 100, SYS_fchmodat = 467, SYS_fchownat = 468 };
@@ -127,6 +129,27 @@ int main(int argc, char **argv, char **envp, char **apple) {
     SYS(SYS_wait4, locker, &lock_status, 0, 0);
     fl.start = 128, fl.len = 1, fl.type = F_UNLCK;
     t_show("unlock it", SYS(SYS_fcntl, rec, F_SETLK, &fl));
+    // A lock that is the open file's (F_OFD_SETLK, 90), with a process
+    // named in it, as Apple's sqlite asks for its own: the name is not
+    // looked at.
+    fl.start = 300, fl.len = 1, fl.type = F_WRLCK, fl.pid = (int)self;
+    t_show("an open file's lock, a process named in it", SYS(SYS_fcntl, rec, 90, &fl));
+    fl.type = F_UNLCK;
+    t_show("and unlocked", SYS(SYS_fcntl, rec, 90, &fl));
+
+    // A guarded descriptor (guarded against being closed or duplicated
+    // by who does not say its guard), written by the calls that say it,
+    // as Apple's sqlite writes its files.
+    enum { SYS_guarded_open_np = 441, SYS_guarded_close_np = 442, SYS_guarded_write_np = 485, SYS_guarded_pwrite_np = 486 };
+    u64 guard = 0x6765786775617264;
+    long gfd = SYS(SYS_guarded_open_np, "guarded", &guard, 3, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    t_check("guarded_open_np", gfd >= 3);
+    t_show("guarded_write_np", SYS(SYS_guarded_write_np, gfd, &guard, "0123456789", 10));
+    t_show("guarded_pwrite_np", SYS(SYS_guarded_pwrite_np, gfd, &guard, "abc", 3, 4));
+    char back[16] = {0};
+    t_show("read back", SYS(SYS_pread, gfd, back, 15, 0));
+    t_printf("  \"%s\"\n", back);
+    t_show("guarded_close_np", SYS(SYS_guarded_close_np, gfd, &guard));
 
     // Who may give a file away.
     long me = SYS(SYS_getuid), mine = SYS(SYS_getgid);

@@ -10248,6 +10248,27 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
     }
 }
 
+/// What a traced 64-bit program writes to its standard error, for the
+/// trace: a daemon that has made `/dev/null` of its own (as one not
+/// started by process 1 does) says it to nobody otherwise.
+fn traced_stderr(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
+    if a[0] != 2 {
+        return String::new();
+    }
+    let mut text = Vec::new();
+    match n {
+        nr::WRITE => text = m.read(a[1], a[2].min(512) as usize).map(<[u8]>::to_vec).unwrap_or_default(),
+        nr::WRITEV => {
+            for i in 0..a[2].min(8) {
+                let (Ok(base), Ok(len)) = (m.read_u64(a[1] + 16 * i), m.read_u64(a[1] + 16 * i + 8)) else { break };
+                text.extend_from_slice(m.read(base, len.min(512) as usize).unwrap_or_default());
+            }
+        }
+        _ => return String::new(),
+    }
+    format!(" {:?}", String::from_utf8_lossy(&text))
+}
+
 /// The terminal's settings and how much of them the kernel exchanges.
 ///
 /// Both live in [`crate::tty`] now, next to the discipline that obeys them --
@@ -12523,7 +12544,7 @@ impl Kernel {
                 a[0],
                 a[1],
                 a[2],
-                traced_path(m, n, a),
+                if self.darwin && traced_path(m, n, a).is_empty() { traced_stderr(m, n, a) } else { traced_path(m, n, a) },
                 ret as i64
             );
             // `GEX_STRACE_STACK=N`: the top N stack words too, which in a
@@ -13689,7 +13710,11 @@ impl FdIo<'_> {
             return Err(Errno::EINVAL);
         }
         let ofd = matches!(cmd, 36..=38);
-        if ofd && m.read_u32(pid_at)? != 0 {
+        // (Linux wants no process named in a lock that is an open file's.
+        // XNU does not look: Apple's sqlite names its own, and with this
+        // refused every lock of trustd's databases failed, "disk I/O
+        // error".)
+        if ofd && !mac && m.read_u32(pid_at)? != 0 {
             return Err(Errno::EINVAL);
         }
         // A lock of a kind the descriptor cannot be used for (unlocking is

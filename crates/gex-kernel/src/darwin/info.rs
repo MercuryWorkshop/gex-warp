@@ -398,6 +398,7 @@ const NAMES: &[(&str, &[i32])] = &[
     ("gex.bottle.name", &[]),
     ("gex.bottle.graphics", &[]),
     ("gex.bottle.serial", &[]),
+    ("gex.protected_binaries", &[]),
     ("user.cs_path", &[CTL_USER, 1]),
     ("sysctl.proc_translated", &[]),
     ("security.mac.proc_enforce", &[]),
@@ -780,6 +781,11 @@ impl Kernel {
             "gex.bottle.name" => Str(self.darwin_conf().get("name").unwrap_or("").into()),
             "gex.bottle.graphics" => Str(mac.graphics.clone()),
             "gex.bottle.serial" => Str(self.darwin_conf().get("serial").unwrap_or("").into()),
+            // Whether a protected program (one whose text is encrypted on
+            // disk: the Dock, Finder, mds) can be run: gex was given the
+            // key for them (`GEX_DSMOS_KEY`, which stays gex's own). What
+            // gexlaunchd asks before it offers a job of one.
+            "gex.protected_binaries" => Int(gex_ld::dsmos::key_configured() as i64),
             "hw.byteorder" => Int(1234),
             // An `int`, so no more than it holds.
             "hw.physmem" | "hw.usermem" => Int(mem.min(i32::MAX as i64)),
@@ -1131,11 +1137,13 @@ impl Kernel {
             return Err(Errno::ESRCH);
         }
         match op {
+            // (One word, whatever size is said: XNU copies it out and
+            // does not look, and the Security framework's check of a
+            // process against its code on disk says none.)
             STATUS => {
-                if size < 4 {
-                    return Err(Errno::EINVAL);
+                if addr != 0 {
+                    m.write_u32(addr, CS_VALID | CS_ADHOC | CS_SIGNED)?;
                 }
-                m.write_u32(addr, CS_VALID | CS_ADHOC | CS_SIGNED)?;
                 Ok(0)
             }
             MARKINVALID | MARKHARD | MARKKILL | MARKRESTRICT => Ok(0),
