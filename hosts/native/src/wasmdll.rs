@@ -128,6 +128,8 @@ pub(crate) struct WinePe {
     data_size: u64,
     /// Each DLL's table slots and data (pelink's `gexw.dllslots`).
     dll_slots: Arc<Vec<DllRange>>,
+    /// Its slots' wasm types, when it has class adapters ([`bind_classes`]).
+    slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
     /// Each DLL's data as it was before its first load ran anything
     /// ([`DataSnap`]), to start it afresh when it is loaded again; and the
     /// DLLs whose snapshot the next [`apply_pending`] takes.
@@ -325,7 +327,48 @@ fn apply_pending_one(wp: &Arc<WinePe>, shared: &Arc<Mutex<JitShared>>, memory: &
         if let Err(e) = bind_entry_thunks(wp, shared, memory) {
             eprintln!("gex-pe: Wine's PE module {}: entry thunks: {e:#}", wp.file.display());
         }
+        if let Err(e) = bind_classes(wp, shared, memory) {
+            eprintln!("gex-pe: Wine's PE module {}: class adapters: {e:#}", wp.file.display());
+        }
     }
+}
+
+/// The ICALL pass's class adapters (its `GEXW_ENTRY=classes` mode): guest
+/// code calls any of the module's functions, its table index as an address,
+/// through the adapter of its class -- its wasm type and the facts its type
+/// does not say (`gex_kernel::ftab::facts`). `__gexw_adapters` bounds the
+/// directory, `{ adapter, witness, facts }` records (a witness is a function
+/// of the class's wasm type), and `__gexw_facts` the `{ function, facts }`
+/// records of functions whose facts are not 0; pointer-sized words,
+/// relocated with the data. Nothing is bound per function: a lookup of the
+/// address finds the adapter (`FuncMap::get`).
+fn bind_classes(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) -> Result<()> {
+    let (Some(types), Some(&dir)) = (wp.slot_types.as_ref(), wp.data_exports.get("__gexw_adapters")) else { return Ok(()) };
+    let w = if wp.ptr64 { 8 } else { 4 };
+    let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(wp.install).base;
+    // `n`-word records between the bounds at `off` in the module's data
+    let records = |off: u32, n: u64| -> Result<Vec<Vec<u32>>> {
+        let at = wp.data + off as u64;
+        let (start, stop) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + w)? as u64);
+        let mut out = Vec::new();
+        let mut a = start;
+        while start != 0 && a + n * w <= stop {
+            out.push((0..n).map(|k| memory_u32(memory, a + k * w)).collect::<Result<Vec<u32>>>()?);
+            a += n * w;
+        }
+        Ok(out)
+    };
+    let slot = |f: u32| f.checked_sub(base).filter(|_| f != 0);
+    let adapters: Vec<(u32, u32, u32)> = records(dir, 3)?.into_iter().filter_map(|r| Some((slot(r[0])?, slot(r[1])?, r[2]))).collect();
+    let facts: Vec<(u32, u32)> = match wp.data_exports.get("__gexw_facts") {
+        Some(&off) => records(off, 2)?.into_iter().filter_map(|r| Some((slot(r[0])?, r[1]))).collect(),
+        None => Vec::new(),
+    };
+    let n = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.set_native(wp.install, &types.0, &types.1, &facts, &adapters);
+    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+        eprintln!("gex: wine PE: {n} class adapters, {} functions with facts", facts.len());
+    }
+    Ok(())
 }
 
 /// The ICALL pass's entry thunks (toolchain/sysroot/icall): native functions
@@ -432,6 +475,9 @@ struct ParsedModule {
     /// With modules of their own (pelink's `gexw.modules`): each DLL's module file.
     modules: std::collections::HashMap<String, String>,
     dll_slots: Arc<Vec<DllRange>>,
+    /// Its slots' wasm types (`gex_dylink::slot_types`), when it has class
+    /// adapters (`__gexw_adapters`).
+    slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
     module: wasmtime::Module,
 }
 
@@ -498,15 +544,18 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
             t2.elapsed().as_secs_f64()
         );
     }
+    let data_exports = exported_offsets(&wasm)?;
+    let slot_types = if data_exports.contains_key("__gexw_adapters") { Some(Arc::new(gex_dylink::slot_types(&wasm)?)) } else { None };
     let pm = Arc::new(ParsedModule {
         size: size as u32,
         align: align as u32,
         n_names: names.len() as u32,
         slots,
         any_dll,
-        data_exports: exported_offsets(&wasm)?,
+        data_exports,
         modules,
         dll_slots: Arc::new(dll_slots(&wasm)),
+        slot_types,
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -598,7 +647,19 @@ fn install_shared(
     // names a host path)
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let beside = |name: &str| {
-        let file = real.with_file_name(name);
+        // found as Windows finds files, without case (the skeleton's
+        // .wasmref names the link's output; an installer may have given it
+        // other case)
+        let mut file = real.with_file_name(name);
+        if !file.exists() {
+            let dir = real.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let found = std::fs::read_dir(&dir).ok().and_then(|rd| {
+                rd.flatten().map(|e| e.file_name()).find(|n| n.to_str().is_some_and(|n| gex_kernel::win::same_name_nocase(n, name)))
+            });
+            if let Some(n) = found {
+                file = dir.join(n);
+            }
+        }
         // a twin install's memory64 module, beside it
         let twin = real.with_file_name(format!("{name}.m64"));
         if gex_abi::mem64() && twin.is_file() { twin } else { file }
@@ -1069,14 +1130,21 @@ fn install_module(
         mapped: Default::default(),
         data_size: size as u64,
         dll_slots: Arc::clone(&pm.dll_slots),
+        slot_types: pm.slot_types.clone(),
         snaps: Default::default(),
         snap_todo: Default::default(),
     });
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
     // (`wine_pe` is the core of the process's own mode; the other mode's
     // core is with the modules of their own)
+    // A program's module with no core beside it (a gexcc-win program's)
+    // was installed without one, before ntdll's skeleton mapped: the
+    // core installed since takes its place and it stays with the modules
+    // of their own, for image_of and its later mappings to find.
     if core.is_none() && !alt {
-        s.wine_pe = Some(wp.clone());
+        if let Some(prev) = s.wine_pe.replace(wp.clone()) {
+            s.wine_pe_split.push(prev);
+        }
     } else {
         s.wine_pe_split.push(wp.clone());
     }

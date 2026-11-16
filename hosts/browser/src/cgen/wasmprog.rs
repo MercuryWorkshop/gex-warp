@@ -349,6 +349,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // The bytes before the record: a Worker catching up takes the record
     // (`gex_cgen_pmod_ready`) as the sign that both are there.
     let lowered = is_lowered(&wasm);
+    crate::LOWERED64.store(lowered, Ordering::Release);
     lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, relocating: false, key: None, path: path.clone(), lowered, from_file: false, gone: None });
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     CURRENT.store(entry, Ordering::Relaxed);

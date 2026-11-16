@@ -216,12 +216,15 @@ export class NodeNetwork {
   }
 
   /**
-   * Whether a `recv` would return something -- including end of stream, which
-   * is a thing to return rather than a reason to keep waiting.
+   * What a `recv` would find (net.js `available`): the bytes waiting, -1 for
+   * the end of stream (a thing to return rather than a reason to keep
+   * waiting), 0 for nothing yet.
    */
   available(id) {
     const s = this.#sockets.get(id);
-    return !!s && (s.rx.length > 0 || s.eof || s.status === REFUSED);
+    if (!s) return 0;
+    const n = s.rx.reduce((a, d) => a + d.length, 0);
+    return n > 0 ? n : s.eof || s.status === REFUSED ? -1 : 0;
   }
 
   /** Another holder (page/src/net.js's `dup`): the last `close` ends it. */

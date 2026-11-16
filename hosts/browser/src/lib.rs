@@ -237,6 +237,17 @@ impl net::Transport for PageStream {
         id != 0 && unsafe { net_avail(id) } != 0
     }
 
+    /// The bytes waiting (`net_avail`: -1 is the end, which has none). A
+    /// program sizes its read by `FIONREAD`: Qt reads that many each time it
+    /// hears the socket is readable, so 1 here cost a wakeup a byte.
+    fn available(&self) -> usize {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return 0;
+        }
+        unsafe { net_avail(id) }.max(0) as usize
+    }
+
     fn close(&self) {
         let id = self.id.swap(0, std::sync::atomic::Ordering::AcqRel);
         if id != 0 {
@@ -993,6 +1004,12 @@ pub extern "C" fn gex_slot_report(out: u32, cap: u32) -> u32 {
     n as u32
 }
 
+thread_local! {
+    /// The page and base this thread's page table last published by identity
+    /// (`shared_page_table`), until its adopt asks after it.
+    static JUST_PUBLISHED: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
+}
+
 fn shared_page_table(
     entries: &[(u64, u32)],
     next_slot: u64,
@@ -1020,11 +1037,19 @@ fn shared_page_table(
     {
     table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
         adopt: Box::new(|page| {
+            let just = JUST_PUBLISHED.with(|j| j.take());
             let (key, id) = snapshot_page_key(page)?;
             // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
             let base = unsafe { k_slot_get(page, key) };
             // (Never one past the last table: see `publish`.)
             let base = if gex_abi::dispatch_entry_table(base) < gex_abi::DISPATCH_TABLES { base } else { 0 };
+            // The page table asks again right after it publishes a base of
+            // its own (`PageTable::base`: another process may have published
+            // first, and the map keeps the first): its own base back is no
+            // adoption, and is not counted or said as one.
+            if just == Some((page, base)) {
+                return Some(base);
+            }
             if tracing() && base != 0 {
                 trace_line(&format!(
                     "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
@@ -1045,6 +1070,7 @@ fn shared_page_table(
             if gex_abi::dispatch_entry_table(entry) >= gex_abi::DISPATCH_TABLES {
                 return;
             }
+            JUST_PUBLISHED.with(|j| j.set(Some((page, entry))));
             if let Some((key, id)) = snapshot_page_key(page) {
                 if tracing() {
                     trace_line(&format!(
@@ -3598,6 +3624,13 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 /// process outgrowing its lowered memory ([`runtime_outgrow`]).
 static RUNTIME_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// gex's own memory for this process (a provider's heap or stack, mapped
+/// as guest memory) could not have `len` bytes: recorded as a runtime
+/// shortfall ([`RUNTIME_SHORT`]), as the arena's own refusal is.
+pub(crate) fn runtime_short(len: u64) {
+    RUNTIME_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
     arena_take_for(len, false)
@@ -3770,7 +3803,7 @@ fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
         // a 64-bit memory: the trap that follows is its outgrowing the
         // lowered one, which the kernel's line says (`runtime_outgrow`).
         // SAFETY: `warn` and `debug` read the bytes and keep none of them.
-        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32()) {
             unsafe { debug(b.0.as_ptr() as u32, b.1 as u32) };
         } else {
             unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -10278,6 +10311,16 @@ fn frames_stay() -> bool {
 /// (`frames_stay`). Set where the kernel's is, and by `set_host`.
 pub(crate) static WASM32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// This process's wasm32 program was built LP64 and lowered (64-bit Wine):
+/// a 32-bit guest by its memory only, which a 64-bit memory can run.
+pub(crate) static LOWERED64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is a 32-bit guest for moving it to a 64-bit memory
+/// (`note_runtime_short`): a wasm32 program not lowered from wasm64.
+fn guest32() -> bool {
+    WASM32.load(std::sync::atomic::Ordering::Acquire) && !LOWERED64.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
 ///
@@ -12178,7 +12221,7 @@ pub extern "C" fn gex_thread_park() -> i32 {
     IN_PROVIDER.with(|c| c.set(false));
     IN_SYSCALL.with(|c| c.set(false));
     NO_LEAVE.with(|c| c.set(false));
-    CALLOUT_GUARD.with(|c| c.set((0, false)));
+    CALLOUT_GUARD.with(|c| c.set((0, false, u64::MAX)));
     FAR_NEXT.with(|c| c.set((0, 0)));
     WOW64_WAITS.with(|c| c.set(0));
     SNAP_CARRY.with(|c| c.set(false));
@@ -12903,6 +12946,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
+    LOWERED64.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
     // Clones above the context this program goes on, which is the exec'ing
@@ -14965,6 +15009,11 @@ fn wait_why(r: &Run) -> u8 {
 fn schedule() -> i32 {
     let r = schedule_turn();
     if r == 1 {
+        // A thread runs: a turn that paused this Worker and a later one
+        // that resumes it, with no `gex_wake` between (a blocking call's
+        // park and second ask), left it parked to its processor time, and
+        // the thread's CPU clock stood still.
+        set_paused_to(0);
         cgen::ftab_resume();
     } else {
         cgen::ftab_out(SCHED_OVER.with(|c| c.get()));
@@ -16969,17 +17018,32 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 
 thread_local! {
     /// The innermost open call-out of JavaScript's loops, as the stack
-    /// pointer past which its caller's frame is unwound and whether it was
-    /// made from code in the other mode (`gex_callout_guard`); 0 for none,
-    /// or one that wants no stack.
-    static CALLOUT_GUARD: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+    /// pointer past which its caller's frame is unwound, whether it was
+    /// made from code in the other mode, and the top of the stack it was
+    /// made on (`gex_callout_guard`); a limit of 0 for none, or one that
+    /// wants no stack.
+    static CALLOUT_GUARD: std::cell::Cell<(u64, bool, u64)> = const { std::cell::Cell::new((0, false, u64::MAX)) };
 }
 
 /// JavaScript's innermost call-out (`gex.mjs` `#calloutGuard`): `limit` the
-/// stack pointer past which its caller is unwound, 0 for none.
+/// stack pointer past which its caller is unwound, 0 for none; `top` the
+/// top of its stack (`gex_callout_stack_top`), above which the stack is
+/// another fiber's.
 #[no_mangle]
-pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
-    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0)));
+pub extern "C" fn gex_callout_guard(limit: i64, alt: i32, top: i64) {
+    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0, top as u64)));
+}
+
+/// The top of the stack a call-out made now in `alt` mode, its caller's
+/// frame at `sp_want`, is made on (`gex_kernel::x86::callout_stack_top`):
+/// -1 (no bound) for none known.
+#[no_mangle]
+pub extern "C" fn gex_callout_stack_top(ctx: i32, alt: i32, sp_want: i64) -> i64 {
+    if !gex_abi::X86 || sp_want == 0 {
+        return -1;
+    }
+    let class32 = gex_xlate::default_compat() != (alt != 0);
+    gex_kernel::x86::callout_stack_top(&guest(), ctx as u32 as u64, class32, sp_want as u64) as i64
 }
 
 /// Whether the stack of the thread at `ctx` has unwound past the caller of
@@ -16987,12 +17051,12 @@ pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
 /// `NtCallbackReturn`'s): a change of mode then traps, and the call-out's
 /// loop leaves, as it did when every change of mode trapped.
 fn callout_unwound(ctx: i32) -> bool {
-    let (limit, alt) = CALLOUT_GUARD.with(|g| g.get());
+    let (limit, alt, top) = CALLOUT_GUARD.with(|g| g.get());
     if limit == 0 {
         return false;
     }
     let sp = gex_callout_live_sp(ctx, alt as i32);
-    sp != -1 && sp as u64 > limit
+    sp != -1 && sp as u64 > limit && sp as u64 <= top
 }
 
 thread_local! {
@@ -18100,6 +18164,13 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         stop_gone();
         trap();
     }
+    // gex's own memory for this process could not grow (a dispatch table's
+    // slot map, say), and the process can move to a 64-bit memory: it ends
+    // here, as a trap, and the Worker records it for its next start
+    // (`gex_outgrew`). Translating on would miss here for good.
+    if gex_outgrew() == 1 {
+        warch::unreachable();
+    }
     if gex_abi::X86 && pc == gex_kernel::x86::FAR_PAD {
         return far_switch(_ctx);
     }
@@ -18219,6 +18290,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // process's i386 images are placed as the other mode's (`cgen::place`).
     if cgen::wine32_miss(pc) {
         miss_way(pc, 8);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
+    // A native function's table index (guest code calling a function pointer
+    // native code handed it), served by its class's adapter, which has no
+    // bridge until now: this Worker catches up on it and goes on at pc.
+    if !alt && cgen::bridge_native(pc) {
+        miss_way(pc, 6);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
@@ -19622,6 +19702,17 @@ pub extern "C" fn gex_native_oob() -> u32 {
     (!own) as u32
 }
 
+/// Whether a trap on this thread now is in the program's own code: not in a
+/// syscall, translating, or after the shim's own panic. For the run loop's
+/// word on an `unreachable` that [`gex_guest_trap`] did not take (a Windows
+/// program's: its fault hook takes access violations only): the program
+/// aborted (a Rust panic under panic=abort, `abort()`, `__builtin_trap`),
+/// its crash, not gex's (gex.mjs).
+#[no_mangle]
+pub extern "C" fn gex_trap_in_program() -> u32 {
+    (gex_native_oob() == 1 && !PANICKED.with(|p| p.get())) as u32
+}
+
 /// The PE images Wine mapped in this process (`gex_image_mapped`): base,
 /// end and file name. Wine maps an image into anonymous memory, so the
 /// memory map has no name for its code; the KUSER lines name it from here.
@@ -19803,8 +19894,18 @@ fn retire_noted(mm: &gex_kernel::mem::Mm, logged: Logged, recheck: &[(u64, u64)]
             };
             for w in &why {
                 for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
-                    // Pages kept (`keep_guarded`) are not counted.
-                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() && retiring(page) {
+                    pwatch_say(page, || {
+                        format!(
+                            "{} of [{:#x}, {:#x}) prot {:#x} from pc {:#x}: {}",
+                            w.why, w.start, w.end, w.prot, w.pc,
+                            if retiring(page) { "retired" } else { "kept" }
+                        )
+                    });
+                    // Pages kept (`keep_guarded`) are not counted; a
+                    // page with code of either mode is (a WoW64 process's
+                    // 32-bit blocks are under `gex_abi::ALT_PAGE` alone).
+                    let translated = j.page_table.lookup(page).is_some() || j.page_table.lookup(page | gex_abi::ALT_PAGE).is_some();
+                    if page < gex_abi::dispatch_max_pages() && translated && retiring(page) {
                         note_page_retired(Some(mm), page, w);
                     }
                 }
@@ -21662,7 +21763,7 @@ fn outgrow_end(pid: i32, status: i32) {
 /// its next start (`outgrow_ending`, which [`outgrow_end`] calls next).
 fn runtime_outgrow(pid: i32) -> bool {
     let len = RUNTIME_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, guest32()) {
         return false;
     }
     if let Some(home) = sigs::home() {
@@ -21679,7 +21780,7 @@ fn runtime_outgrow(pid: i32) -> bool {
 #[no_mangle]
 pub extern "C" fn gex_outgrew() -> i32 {
     (RUNTIME_SHORT.load(std::sync::atomic::Ordering::Relaxed) != 0
-        && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire))) as i32
+        && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32())) as i32
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.

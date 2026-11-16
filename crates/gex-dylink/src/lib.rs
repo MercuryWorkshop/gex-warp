@@ -1496,6 +1496,70 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 
+/// The wasm type of each function a module's active element segments put in
+/// its table range (the slots from `__table_base`, in order, as
+/// [`Info::elem`]): an index into the returned signatures, one per distinct
+/// function type, written as [`Info::sigs`] writes them (`None` for a type
+/// with other values). A native module's class adapters are matched to its
+/// functions by these (`gex_kernel::ftab::NativeClasses`).
+pub fn slot_types(wasm: &[u8]) -> Result<(Vec<u32>, Vec<Option<String>>)> {
+    use wasmparser::{Payload, TypeRef};
+    let mut sigs: Vec<Option<String>> = Vec::new();
+    let mut seen: HashMap<Option<String>, u32> = HashMap::default();
+    // each type's distinct signature number, and each function's type
+    let mut type_sig: Vec<u32> = Vec::new();
+    let mut func_type: Vec<u32> = Vec::new();
+    let mut slots = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            Payload::TypeSection(r) => {
+                for g in r {
+                    for t in g?.into_types() {
+                        let s = match &t.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(f) => sig_text(f.params(), f.results()),
+                            _ => None,
+                        };
+                        let n = *seen.entry(s.clone()).or_insert_with(|| {
+                            sigs.push(s);
+                            sigs.len() as u32 - 1
+                        });
+                        type_sig.push(n);
+                    }
+                }
+            }
+            Payload::ImportSection(s) => {
+                for imp in s {
+                    if let TypeRef::Func(t) = imp?.ty {
+                        func_type.push(t);
+                    }
+                }
+            }
+            Payload::FunctionSection(s) => {
+                for t in s {
+                    func_type.push(t?);
+                }
+            }
+            Payload::ElementSection(s) => {
+                for el in s {
+                    let el = el?;
+                    if !matches!(el.kind, wasmparser::ElementKind::Active { .. }) {
+                        continue;
+                    }
+                    if let wasmparser::ElementItems::Functions(fs) = el.items {
+                        for f in fs {
+                            let f = f? as usize;
+                            let t = func_type.get(f).and_then(|&t| type_sig.get(t as usize)).copied();
+                            slots.push(t.unwrap_or(u32::MAX));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((slots, sigs))
+}
+
 /// Add (or replace) a custom section at the end of a module.
 pub fn set_custom_section(wasm: &[u8], name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = wasm[..8].to_vec();

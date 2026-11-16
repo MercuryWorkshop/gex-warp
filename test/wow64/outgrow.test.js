@@ -12,6 +12,8 @@
 // (WINE64_TWIN=1). Each second start comes the moment the first ends,
 // so the record must be made before anything can see the first gone:
 // on the page, a run of copies started that way, each found recorded.
+// One whose thread gex has no memory of its own for (outgrow thread)
+// outgrows it the same way.
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -80,5 +82,14 @@ export default async function (t) {
   t.check('page: reaching the old KUSER page without units says nothing by default', !KUSER_LINE.test(pf.out + pf.err), w.detail(pf));
   const pd = await w.page(['/t/outgrow.exe', 'fallback'], { files: { '/t/outgrow.exe': exe }, env: { GEX_LOG: 'debug' }, name: 'page-fallback-debug', timeout: 600000 });
   t.check('page: and says it as debug output', KUSER_LINE.test(pd.out + pd.err), w.detail(pd));
+  // gex's own memory for a thread (its provider stack) with no room left
+  // in the lowered memory: 64-bit Wine's loader is a wasm32 program, but
+  // one lowered from wasm64, so the process outgrew it as a program whose
+  // reservation did not fit does, and its next start has a 64-bit memory
+  const pr = await w.page(['/t/outgrow.exe', 'twice', 'thread'], { files: { '/t/outgrow.exe': exe }, name: 'page-runtime', timeout: 600000 });
+  const run = lines(pr.out).split('\n');
+  t.check('page: a thread gex has no memory for ends the first start', run[0] === 'outgrow filling' && /^outgrow child exit (?!00000000)/.test(run[1] ?? ''), w.detail(pr));
+  t.eq('page: and its next start, in a 64-bit memory, runs the thread', run.slice(2).join('\n'), 'outgrow filling\noutgrow thread ran\noutgrow child exit 00000000', w.detail(pr));
+  t.check("page: gex says its own memory for it could not grow", /outgrow\.exe needs 64-bit memory \(gex's own memory for it could not grow by 0x[0-9a-f]+ bytes\); it gets it from its next start/.test(pr.out), w.detail(pr));
   w.clean();
 }

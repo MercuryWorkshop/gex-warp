@@ -137,15 +137,16 @@ def rewrite(b, fix, aliases=()):
             subend = r + sublen
             if sub == SEGMENT_INFO:
                 # `wasm-ld -r` drops the RETAIN flag: put it back on the
-                # ICALL pass's entry-thunk pairs (`gexw_entries`), which
-                # nothing references but gex.
+                # ICALL pass's entry-thunk pairs (`gexw_entries`) and its
+                # class adapters' directory and facts (`gexw_adapters`,
+                # `gexw_facts`), which nothing references but gex.
                 count, s = leb(b, r)
-                segs = enc(count)
+                segs = bytearray(enc(count))
                 for _ in range(count):
                     nm, s = name(b, s)
                     align, s = leb(b, s)
                     flags, s = leb(b, s)
-                    if nm in ('gexw_entries', 'gexw_entries_decl'):
+                    if nm in ('gexw_entries', 'gexw_entries_decl', 'gexw_adapters', 'gexw_facts'):
                         flags |= WASM_SEG_FLAG_RETAIN
                     segs += enc_name(nm) + enc(align) + enc(flags)
                 body += bytes([sub]) + enc(len(segs)) + segs; r = subend; continue

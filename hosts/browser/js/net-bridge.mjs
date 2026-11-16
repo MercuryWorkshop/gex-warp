@@ -42,6 +42,11 @@ const FRAME = 11;
  *  as a socket does); a recv takes at most this much. */
 const DATA_BYTES = 1 << 20;
 
+/** A network's `available(id)` as a number (net.js): bytes waiting, -1 for the
+ *  end, 0 for none yet. A network that answers true or false says nothing of
+ *  how many: true is 1 byte at least. */
+export const availableOf = (v) => (v === true ? 1 : v === false || v == null ? 0 : v | 0);
+
 // Receive rings: what a stream receives, the page writes into a ring in
 // shared memory as it arrives, and a Worker's status, poll and recv read it
 // there, with no call to the page. A slot per open stream (none left: the
@@ -269,11 +274,14 @@ export class Rings {
     });
   }
 
-  /** Whether a read of stream `id` would not wait; undefined without a ring. */
+  /** Stream `id`'s `available` (net.js): the bytes in its ring (1 when only
+   *  the page holds some), -1 once it ended with none, 0 while a read would
+   *  wait; undefined without a ring. */
   available(id) {
     const b = this.find(id);
     if (b < 0) return undefined;
-    return this.queued(b) > 0 || this.spill(b) || this.ended(b);
+    const n = this.queued(b);
+    return n > 0 ? n : this.spill(b) ? 1 : this.ended(b) ? -1 : 0;
   }
 
   /** Stream `id`'s state; undefined without a ring. */
@@ -329,7 +337,7 @@ export function serveNet(net, channel) {
         case STATUS: r = net.status(id); break;
         case SEND: r = net.send(id, data.subarray(0, ctl[A1])); break;
         case RECV: r = net.recv(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))); break;
-        case AVAILABLE: r = net.available(id) ? 1 : 0; break;
+        case AVAILABLE: r = availableOf(net.available(id)); break;
         case CLOSE: net.close(id); break;
         case DUP: r = net.dup ? net.dup(id) : 0; break;
         case PEEK: r = net.peek ? net.peek(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))) : -2; break;
@@ -484,7 +492,7 @@ export class NetProxy {
   #refill(id) { this.#run(this.#call(REFILL, id)); }
 
   available(id) {
-    return this.#rings?.available(id) ?? this.#run(this.#call(AVAILABLE, id)) === 1;
+    return this.#rings?.available(id) ?? this.#run(this.#call(AVAILABLE, id));
   }
 
   close(id) { this.#run(this.#call(CLOSE, id)); }

@@ -105,6 +105,31 @@ pub fn callout_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool, 
     alt.then(|| m.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff)
 }
 
+/// The top of the stack a call-out whose caller's frame is at `sp_want` was
+/// made on: its thread's TEB's StackBase then (the 32-bit TEB's, FS, for
+/// `class32` code; else the 64-bit one's, GS). A stack pointer past
+/// `sp_want` and at most this has unwound past that caller; one above it is
+/// on another stack -- a fiber's, which has a stack of its own and the TEB
+/// names while it runs -- and says nothing about it. `u64::MAX` when the TEB
+/// names no stack holding `sp_want`.
+pub fn callout_stack_top(m: &GuestMem<'_>, ctx_addr: u64, class32: bool, sp_want: u64) -> u64 {
+    let range = if class32 {
+        let teb = m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap_or(0) & 0xffff_ffff;
+        m.read_u32(teb + 4).ok().zip(m.read_u32(teb + 8).ok()).map(|(b, l)| (u64::from(b), u64::from(l)))
+    } else {
+        let teb = m.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+        m.read_u64(teb + 8).ok().zip(m.read_u64(teb + 16).ok())
+    };
+    match range {
+        Some((base, limit)) if teb_names(base, limit, sp_want) => base,
+        _ => u64::MAX,
+    }
+}
+
+fn teb_names(base: u64, limit: u64, sp: u64) -> bool {
+    limit < base && sp >= limit && sp <= base
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -750,17 +775,18 @@ pub fn canonical_number(raw: u64) -> u64 {
     translate(raw, &mut a, &mut m, 0, 0)
 }
 
-/// The processor gex claims to be: an SSSE3-era Intel core (family 6, model
-/// 15) with the baseline x86-64 feature set plus SSE3, SSSE3, CMPXCHG16B and
-/// POPCNT -- exactly the instruction set the lifter implements, so glibc's
-/// IFUNC resolvers pick code gex can run. No AVX, no SSE4, no XSAVE.
+/// The processor gex claims to be: an Intel core (family 6, model 15) with
+/// the baseline x86-64 feature set plus SSE3, SSSE3, SSE4.1, SSE4.2,
+/// PCLMULQDQ, CMPXCHG16B and POPCNT (x86-64-v2) -- exactly the instruction
+/// set the lifter implements, so glibc's IFUNC resolvers pick code gex can
+/// run. No AVX, no XSAVE.
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     match leaf {
         0 => [7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69], // "GenuineIntel"
         1 => {
             let eax = 0x0000_06fb; // family 6, model 15, stepping 11
             let ebx = 0x0001_0800; // 1 logical processor, 64-byte clflush line
-            let ecx = 1 | (1 << 9) | (1 << 13) | (1 << 23); // SSE3 SSSE3 CX16 POPCNT
+            let ecx = 1 | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23); // SSE3 PCLMULQDQ SSSE3 CX16 SSE4.1 SSE4.2 POPCNT
             let edx = (1 << 0)
                 | (1 << 4)
                 | (1 << 8)
@@ -1269,7 +1295,7 @@ pub const CPUINFO: &str = concat!(
     "fpu_exception\t: yes\n",
     "cpuid level\t: 7\n",
     "wp\t\t: yes\n",
-    "flags\t\t: fpu tsc cx8 cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm pni ssse3 cx16 popcnt lahf_lm\n",
+    "flags\t\t: fpu tsc cx8 cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm\n",
     "bogomips\t: 2000.00\n",
     "clflush size\t: 64\n",
     "cache_alignment\t: 64\n",
@@ -1390,6 +1416,25 @@ mod tests {
         // switch): R14.
         regs(&mut m, 0x8000, 0x18000);
         assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x18000));
+    }
+
+    #[test]
+    fn a_call_out_is_unwound_past_only_on_its_own_stack() {
+        // 64-bit TEB at 0x2000 naming 0x10000..0x20000; 32-bit TEB at 0x3000
+        // naming 0x6000..0x9000.
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u64(CTX + ctx::GS_BASE as u64, 0x2000).unwrap();
+        m.write_u64(0x2008, 0x20000).unwrap();
+        m.write_u64(0x2010, 0x10000).unwrap();
+        m.write_u64(CTX + ctx::FS_BASE as u64, 0x3000).unwrap();
+        m.write_u32(0x3004, 0x9000).unwrap();
+        m.write_u32(0x3008, 0x6000).unwrap();
+        assert_eq!(callout_stack_top(&m, CTX, false, 0x1f000), 0x20000);
+        assert_eq!(callout_stack_top(&m, CTX, true, 0x8000), 0x9000);
+        // a frame the TEB's stack does not hold: no bound
+        assert_eq!(callout_stack_top(&m, CTX, false, 0x30000), u64::MAX);
+        assert_eq!(callout_stack_top(&m, CTX, true, 0x1f000), u64::MAX);
     }
 
     #[test]

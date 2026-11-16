@@ -90,6 +90,7 @@ const perf = globalThis.performance;
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
 import { logNamed, setLog } from './log.mjs';
@@ -190,6 +191,8 @@ if (!(SP_CODE && single.on)) setNoteSink((note) => port.post({ kind: 'note', not
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// The host's USD clock, in the one Worker the host keeps for it.
+let usdClock = null;
 /// The unit cache's small files the page's Workers read before this one
 /// started (host.mjs `#unitFiles`), by path; null for one the cache lacks.
 const unitFiles = new Map();
@@ -461,6 +464,15 @@ async function handle(msg) {
     });
     return;
   }
+  // The host's clock of the Wine processes' user shared data pages
+  // (usd-clock.mjs): this Worker runs no process, only that.
+  if (msg?.kind === 'usdClock') {
+    usdClock ??= new UsdClock();
+    if (msg.op === 'add') usdClock.add(msg.pid, msg.memory, msg.at, msg.clock);
+    else if (msg.op === 'drop') usdClock.drop(msg.pid);
+    else if (msg.op === 'door') usdClock.door(msg.door);
+    return;
+  }
   // The wineserver's door, from the host: this Worker's door calls go to it
   // from its next one. Before this Worker has a `Gex`, the start message
   // carries it instead.
@@ -665,6 +677,12 @@ async function handle(msg) {
     // the host forgets them too, or its relay keeps their code alive.
     dropModules(keys) {
       port.post({ kind: 'droppedModules', keys });
+    }
+    // This process's KUSER_SHARED_DATA copy (`gex.usd_tick`): up to the
+    // host, whose clock advances it from now on.
+    // (Its own memory: the single-thread build's fibers share this module.)
+    usdTick(at, clock, memory) {
+      port.post({ kind: 'usdTick', at, clock, memory: memory ?? workerGex?.memory });
     }
     // The wineserver published its door: up to
     // the host, which hands it to every Worker of the session.

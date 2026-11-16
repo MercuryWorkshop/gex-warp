@@ -1,7 +1,7 @@
 // The case sets 64-bit Wine's tests share, natively and on the page
 // (winerun.mjs's `nt`): each a function of a session `w` and `o`, the
 // options every case gets (`page`, `env`), and a `pre` for its names.
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { Skip } from '../lib/t.js';
 import { graphics, ppm, ROOT } from '../lib/winerun.mjs';
@@ -217,7 +217,68 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,
     want: /cbfault: sending\ncbfault: veh c0000005\n([^\n]*\n)*cbfault: returned 0, veh [0-9]+/ });
   await one('ptval', join(F, 'ptval.c'), ['-O1', '-mwindows'], { nullDriver: true });
+  await one('selfaddr', join(F, 'selfaddr.c'), ['-O1'], { want: /selfaddr: data 1 bss 1 code 1\nselfaddr ok/ });
+  await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
+  if (want('missimp')) {
+    // an import no DLL exports: a stub, listed at the link; the program
+    // runs, and a call of it ends the process as Wine's stubs do
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'missimp.c'), 'missimp.exe', ['-O1', '-ladvapi32']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      exe = null; t.check(`${pre}missimp: build`, false, String(e.message));
+    }
+    if (exe) {
+      t.check(`${pre}missimp: the link lists the stub`,
+        /pelink: warning: .*advapi32\.dll\.RegOpenKeyTransactedW/.test(readFileSync(`${exe}.build`, 'utf8')));
+      await w.nt({ want: /missimp: start\nmissimp: done/, ...o, name: `${pre}missimp`, exe, extra: [`${exe}.wasm`] });
+      const r = await w.nt({ want: /missimp: start/, ...o, name: `${pre}missimp-call`, exe, args: ['call'], extra: [`${exe}.wasm`], code: 1 });
+      if (r) t.check(`${pre}missimp-call: Unimplemented function advapi32.dll.RegOpenKeyTransactedW`,
+        /Unimplemented function advapi32\.dll\.RegOpenKeyTransactedW called/.test(`${r.out}\n${r.err}`), w.detail(r));
+    }
+  }
+  if (want('bigrelocs')) {
+    // more addresses in data than one function of their relocations can
+    // apply within the engines' function size limit
+    const n = 480000;
+    const src = join(w.work, 'bigrelocs.c');
+    let sum = 0;
+    const ents = [];
+    for (let i = 0; i < n; i++) { ents.push(`s+${i & 0xffff}`); sum += i & 0xffff; }
+    writeFileSync(src, `#include <stdio.h>\nstatic char s[0x10000];\nchar *tab[${n}] = {${ents.join(',')}};\n` +
+      `int main(int argc, char **argv) { unsigned long long t = 0; for (int i = 0; i < ${n}; i++) t += (unsigned long long)(tab[i] - s);\n` +
+      `  printf("bigrelocs %llu\\n", t); return 0; }\n`);
+    await one('bigrelocs', src, ['-O1'], { want: new RegExp(`bigrelocs ${sum}\\b`) });
+  }
+  if (want('bigdata')) {
+    // more data than the PE data window of builtins with data exports
+    // holds (16 MiB in the compact space): its ends written, read back and
+    // the program's own module
+    const src = join(w.work, 'bigdata.c');
+    writeFileSync(src, '#include <windows.h>\n#include <stdio.h>\nstatic char big[24 << 20];\nint lit[4] = {1, 2, 3, 4};\n' +
+      'static int of(const void *p) { HMODULE h = 0; return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ' +
+      'GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, p, &h) && h == GetModuleHandleW(NULL); }\n' +
+      'int main(int argc, char **argv) { big[0] = 7; big[sizeof big - 1] = 9; int ok = big[0] == 7 && big[sizeof big - 1] == 9 && lit[3] == 4;\n' +
+      '  printf("bigdata: ends %d module %d %d\\n", ok, of(big), of(big + sizeof big - 1)); return 0; }\n');
+    await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
+  }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('modcase')) {
+    // installed under other case than its link (an installer naming the
+    // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names
+    // modcase.exe.wasm, found as Windows finds files
+    const src = join(w.work, 'modcase.c');
+    writeFileSync(src, '#include <stdio.h>\nint main(int argc, char **argv) { printf("modcase ok\\n"); return 0; }\n');
+    let exe;
+    try { exe = await w.gexccWin(src, 'modcase.exe', ['-O1']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}modcase: build`, false, String(e.message));
+    }
+    const dir = join(w.work, 'modcase-inst');
+    mkdirSync(dir, { recursive: true });
+    copyFileSync(exe, join(dir, 'ModCase.exe'));
+    copyFileSync(`${exe}.wasm`, join(dir, 'ModCase.exe.wasm'));
+    await w.nt({ ...o, name: `${pre}modcase`, exe: join(dir, 'ModCase.exe'), extra: [join(dir, 'ModCase.exe.wasm')], want: /modcase ok/ });
+  }
   if (want('wmain0')) {
     // wmain(void) compiled and linked in one step
     const w0 = join(w.work, 'wmain0.c');
@@ -239,6 +300,71 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     return t.check(`${pre}xthr_dll: build`, false, String(e.message));
   }
   for (const n of ['xthr', 'xhoist']) await one(n, join(F, `${n}.c`), ['-O2'], { extra: [dll, `${dll}.wasm`] });
+}
+
+/**
+ * Guest x86-64 code calling native code (fixtures/wine64/conv.h): convdll.c
+ * built with GEX_TEST_GEXCC_WIN (a native DLL; a skip without it) beside
+ * MinGW programs (guest code):
+ * - convmatrix: every Win64 shape (16 arguments, mixed XMM and integer,
+ *   narrow integers with other bits above, structs by value and by
+ *   reference, small and large struct results, floating point, a guest
+ *   callback) through conv_table()'s pointers (the module's entry path)
+ *   and through GetProcAddress (the export path);
+ * - lateload: the DLL loaded while another thread spins with no system
+ *   call, its functions called from that thread, unloaded, loaded and
+ *   called again;
+ * - cbthrow: a guest callback of a native function jumping out over the
+ *   native frames, 4000 times, one and two native calls deep;
+ * - fibcb: fibers switched inside such callbacks, each fiber on a stack of
+ *   its own (a callback's call is open while another fiber runs), and the
+ *   two calls returning in the other order, which ends the process at
+ *   worst;
+ * - comvt: Wine's own native functions through COM and C++ vtables and
+ *   exports (fixtures/wow64/comvt.c; wow64/comvt.test.js runs it as i386).
+ * `only` the names to run (all by default). `classes`: the DLL built with
+ * the ICALL pass's class adapters (GEXW_ENTRY=classes) in place of its
+ * entry thunks, and comvt left out (Wine's own DLLs are built as they are).
+ */
+export async function guestNative(t, w, o = {}, pre = '', only = null, { classes = false } = {}) {
+  const want = (n) => !only || only.includes(n);
+  if (want('comvt') && !classes) {
+    let exe;
+    try { exe = await w.mingw('comvt', { x64: true, out: 'comvt64.exe', libs: ['-lole32', '-luuid'] }); } catch (e) {
+      return t.check(`${pre}comvt: build`, false, String(e.message));
+    }
+    await w.nt({ want: allOk, ...o, name: `${pre}comvt`, exe });
+  }
+  const progs = ['convmatrix', 'lateload', 'cbthrow', 'fibcb'].filter(want);
+  if (!progs.length) return;
+  let dll;
+  try {
+    dll = await w.gexccWin(join(F, 'convdll.c'), classes ? 'classes/convdll.dll' : 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')],
+      { env: classes ? { GEXW_ENTRY: 'classes' } : {} });
+  } catch (e) {
+    if (e instanceof Skip) throw e;
+    return t.check(`${pre}convdll: build`, false, String(e.message));
+  }
+  // (the class adapters' directory is a data export of the module; entry
+  // thunks' pairs are another)
+  const mod = readFileSync(`${dll}.wasm`);
+  const has = (n) => mod.includes(Buffer.from(n));
+  if (classes) t.check(`${pre}convdll: class adapters, no entry thunks`, has('__gexw_adapters') && !has('__gexe.'), `adapters ${has('__gexw_adapters')}, thunks ${has('__gexe.')}`);
+  const src = { convmatrix: 'convmain' };
+  for (const n of progs) {
+    let exe;
+    try { exe = await w.mingw(n, { x64: true, src: join(F, `${src[n] ?? n}.c`), flags: [`-I${F}`] }); } catch (e) {
+      t.check(`${pre}${n}: build`, false, String(e.message));
+      continue;
+    }
+    await w.nt({ want: allOk, ...o, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
+    // Not last in, first out: may be refused, but by the process ending
+    // (any exit, any output short of a wrong result), never by hanging.
+    if (n === 'fibcb') {
+      await w.nt({ ...o, name: `${pre}fibcb interleaved`, exe, args: ['50', 'interleaved'], extra: [dll, `${dll}.wasm`], code: null,
+        want: /(ok interleaved[^\n]*\n0 failures)?/, timeout: Math.min(o.timeout ?? 300000, 300000) });
+    }
+  }
 }
 
 const WL = join(ROOT, 'test/fixtures/wine');

@@ -889,6 +889,7 @@ class Compositor {
       }
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
+      win.grabbing = s.placed && s.grab;
       win.layer = s.layer;
       win.stackId = s.stackId;
       if (s.placed) {
@@ -1006,9 +1007,10 @@ class Compositor {
 
   /** The windows bottom to top: the stacking order, a layer at a time. */
   #stack() {
+    // The desktop layer (3) is under every other window, placed or not.
     const layer = (k) => {
       const w = this.#windows.get(k);
-      return w?.placed ? w.layer : 0;
+      return !w?.placed ? 0 : w.layer === 3 ? -1 : w.layer;
     };
     // `sort` is stable: within a layer, the stacking order stands.
     return [...this.#order].sort((a, b) => layer(a) - layer(b));
@@ -1712,6 +1714,34 @@ class Compositor {
     sendEvent(this.#channel, win.block, EV_POINTER_CLEAR, 0, 0, 0, 0, win.client, 0);
   }
 
+  /** The placed window whose client grabbed the pointer (a Win32 menu or move
+   *  loop: gex_window_placement_v1.grab, as an X server grab), the topmost
+   *  when several say so: every pointer event is its, wherever the pointer
+   *  is, so a click on another program's window or the desktop reaches the
+   *  loop and ends it (the menu closes) rather than leaving it open. */
+  #clientGrab() {
+    const stack = this.#stack();
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const win = this.#windows.get(stack[i]);
+      if (win?.grabbing) return { key: stack[i], win };
+    }
+    return null;
+  }
+
+  /** The pointer's place, to the grabbing window: it leaves whatever else had it. */
+  #toGrab(g, time) {
+    const { key, win } = g;
+    if (this.#pointer.over && this.#pointer.over !== key) {
+      const prev = this.#windows.get(this.#pointer.over);
+      if (prev && (prev.token !== win.token || prev.client !== win.client)) this.#leave(this.#pointer.over);
+    }
+    this.#pointer.over = key;
+    const at = this.#placeOf(win);
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_MOTION, Math.floor((this.#pointer.x - at.x) / k), Math.floor((this.#pointer.y - at.y) / k),
+      time, 0, win.client, win.surface);
+  }
+
   pointerMove(x, y, time) {
     // Direct present: the page's coordinates are the GL frame's pixels.
     if (this.#direct) {
@@ -1727,6 +1757,11 @@ class Compositor {
     }
     if (this.#resize) {
       this.#resizeTo(x, y, false);
+      return;
+    }
+    const cg = this.#clientGrab();
+    if (cg) {
+      this.#toGrab(cg, time);
       return;
     }
     // A button held on a placed window: the motion is that window's, inside
@@ -1796,6 +1831,14 @@ class Compositor {
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
+    const cg = !this.#resize && !this.#drag ? this.#clientGrab() : null;
+    if (cg) {
+      // at the pointer's place: the grab may have begun since its last motion
+      if (pressed) this.#toGrab(cg, time);
+      sendEvent(this.#channel, cg.win.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, cg.win.client, cg.win.surface);
+      if (!this.#pointer.buttons) this.#grab = null;
+      return;
+    }
     if (!pressed && this.#resize) {
       this.#resizeTo(this.#pointer.x, this.#pointer.y, true);
       this.#resize = null;
@@ -1886,6 +1929,11 @@ class Compositor {
   }
 
   pointerAxis(axis, value, time) {
+    const cg = this.#clientGrab();
+    if (cg) {
+      sendEvent(this.#channel, cg.win.block, EV_AXIS, axis, value, time, 0, cg.win.client, cg.win.surface);
+      return;
+    }
     const hit = this.#hit(this.#pointer.x, this.#pointer.y);
     if (!hit || hit.part !== 'content') return;
     sendEvent(this.#channel, hit.win.block, EV_AXIS, axis, value, time, 0, hit.win.client,
@@ -1903,7 +1951,7 @@ class Compositor {
     if (!this.#focus && pressed) {
       const shown = (w) => w?.role === ROLE_TOPLEVEL && (w.info?.serial ?? 0) > 0 && w.width > 0 && w.height > 0
         && w.x < this.#outW && w.y < this.#outH && w.x + w.width > 0 && w.y + w.height > 0;
-      const top = [...this.#order].reverse().find((o) => shown(this.#windows.get(o)));
+      const top = this.#stack().reverse().find((o) => shown(this.#windows.get(o)));
       if (top) {
         this.#note(`no window has the keyboard; it goes to the top one, ${top}`);
         this.#focusWindow(top);

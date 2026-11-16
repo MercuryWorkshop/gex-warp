@@ -80,6 +80,50 @@ pub struct Func {
     pub install: u32,
 }
 
+/// A native function's facts towards the guest (the ICALL pass's `gexw_facts`
+/// records and its class adapters' directory, `gexw_adapters`): what its wasm
+/// type does not say of how guest code calls it. 0 for most functions.
+pub mod facts {
+    /// Win64: a struct return of 1, 2, 4 or 8 bytes, which comes back in RAX
+    /// (the wasm function's first parameter is where it writes it).
+    pub const SRET_SMALL: u32 = 1;
+    /// Win64: a larger struct return, through the caller's hidden pointer in
+    /// the first slot, which also comes back in RAX.
+    pub const SRET_BIG: u32 = 2;
+    /// Win64: parameter `i` (of the wasm function) is a 1, 2, 4 or 8-byte
+    /// struct by value: its slot's address, not its value.
+    pub const fn byval(i: u32) -> u32 {
+        1 << (2 + i)
+    }
+    /// The guest cannot call it (varargs, or a type with no guest shape).
+    pub const REFUSED: u32 = 1 << 31;
+}
+
+/// The class adapters of a native module (one per wasm type and [`facts`]):
+/// a guest call to any of its functions -- its table index as an address --
+/// runs the adapter of the function's class, which reads the target from
+/// `ctx::LAST_TARGET`. Nothing is bound per function ([`FuncMap::get`]).
+#[derive(Debug, Default)]
+pub struct NativeClasses {
+    /// Each slot's signature ([`FuncMap`]'s numbering), `u32::MAX` for none.
+    slot_sig: Vec<u32>,
+    /// `(slot, facts)` of the slots whose facts are not 0, by slot.
+    facts: Vec<(u32, u32)>,
+    /// `(signature, facts)` → the adapter's slot.
+    adapters: std::collections::HashMap<(u32, u32), u32>,
+}
+
+impl NativeClasses {
+    /// How many classes the module has adapters for.
+    pub fn classes(&self) -> usize {
+        self.adapters.len()
+    }
+
+    fn facts_of(&self, slot: u32) -> u32 {
+        self.facts.binary_search_by_key(&slot, |x| x.0).map_or(0, |k| self.facts[k].1)
+    }
+}
+
 /// The process's function table, host side.
 #[derive(Clone)]
 pub struct FuncMap {
@@ -97,6 +141,12 @@ pub struct FuncMap {
     log: Vec<Event>,
     /// Indices handed out and later retired, for statistics.
     pub retired: u64,
+    /// The native installs whose functions the guest calls through class
+    /// adapters ([`FuncMap::set_native`]), by install.
+    natives: Vec<(u32, std::sync::Arc<NativeClasses>)>,
+    /// The function signatures of [`NativeClasses`], numbered process-wide:
+    /// an adapter of one module serves a function of another of its class.
+    sigs: std::collections::HashMap<String, u32>,
 }
 
 impl Default for FuncMap {
@@ -107,7 +157,17 @@ impl Default for FuncMap {
 
 impl FuncMap {
     pub fn new() -> FuncMap {
-        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), kept: Default::default(), log: Vec::new(), retired: 0 }
+        FuncMap {
+            next: RESERVED,
+            by_addr: BTreeMap::new(),
+            refs: Default::default(),
+            installs: Vec::new(),
+            kept: Default::default(),
+            log: Vec::new(),
+            retired: 0,
+            natives: Vec::new(),
+            sigs: Default::default(),
+        }
     }
 
     /// Map `addr` to `f`, and retire the index it had if nothing else
@@ -147,7 +207,92 @@ impl FuncMap {
         if addr & gex_abi::ftab::TWIN != 0 {
             return None;
         }
-        self.by_addr.get(&addr).copied()
+        self.by_addr.get(&addr).copied().or_else(|| self.native_get(addr))
+    }
+
+    /// The class adapter serving `addr` when nothing is mapped at it: a
+    /// native function's table index (see [`FuncMap::native_get`]). A host
+    /// publishes its bridge on the first dispatch miss there.
+    pub fn native(&self, addr: u64) -> Option<Func> {
+        if self.by_addr.contains_key(&addr) {
+            return None;
+        }
+        self.native_get(addr)
+    }
+
+    /// A native function's table index called as a guest address: its class's
+    /// adapter ([`NativeClasses`]), its own module's or else any other's.
+    /// None for an index of no such install, a refused class, or a class no
+    /// module has an adapter for.
+    fn native_get(&self, addr: u64) -> Option<Func> {
+        if self.natives.is_empty() || addr >= gex_abi::ftab::NATIVE_FN_TOP {
+            return None;
+        }
+        let idx = u32::try_from(addr).ok()?;
+        let i = self.install_of(idx)?;
+        let nc = &self.natives[self.natives.binary_search_by_key(&i, |x| x.0).ok()?].1;
+        let inst = &self.installs[i as usize];
+        if inst.module == DEAD_MODULE {
+            return None;
+        }
+        let slot = idx - inst.base;
+        let sig = *nc.slot_sig.get(slot as usize)?;
+        let facts = nc.facts_of(slot);
+        if sig == u32::MAX || facts & facts::REFUSED != 0 {
+            return None;
+        }
+        let key = (sig, facts);
+        if let Some(&a) = nc.adapters.get(&key) {
+            return Some(Func { idx: inst.base + a, install: i });
+        }
+        self.natives.iter().find_map(|(j, other)| {
+            let x = &self.installs[*j as usize];
+            (x.module != DEAD_MODULE).then_some(())?;
+            other.adapters.get(&key).map(|&a| Func { idx: x.base + a, install: *j })
+        })
+    }
+
+    /// Install `install`'s functions are called from the guest through class
+    /// adapters: `slot_types`/`sigs` are its slots' wasm types
+    /// (`gex_dylink::slot_types`), `facts` the `(slot, facts)` of functions
+    /// whose facts are not 0, and `adapters` its directory, `(adapter slot,
+    /// witness slot, facts)`: each adapter calls functions of the witness's
+    /// wasm type with those facts. Slots past the install are left out.
+    /// Returns the number of classes.
+    pub fn set_native(&mut self, install: u32, slot_types: &[u32], sigs: &[Option<String>], facts: &[(u32, u32)], adapters: &[(u32, u32, u32)]) -> usize {
+        let len = self.installs[install as usize].len;
+        let global: Vec<u32> = sigs
+            .iter()
+            .map(|s| match s {
+                Some(s) => {
+                    let n = self.sigs.len() as u32;
+                    *self.sigs.entry(s.clone()).or_insert(n)
+                }
+                None => u32::MAX,
+            })
+            .collect();
+        let slot_sig: Vec<u32> = slot_types.iter().take(len as usize).map(|&t| global.get(t as usize).copied().unwrap_or(u32::MAX)).collect();
+        let mut fs: Vec<(u32, u32)> = facts.iter().copied().filter(|&(s, f)| s < len && f != 0).collect();
+        fs.sort_unstable_by_key(|x| x.0);
+        fs.dedup_by_key(|x| x.0);
+        let mut map = std::collections::HashMap::new();
+        for &(a, w, f) in adapters {
+            if a >= len {
+                continue;
+            }
+            if let Some(&sig) = slot_sig.get(w as usize) {
+                if sig != u32::MAX {
+                    map.entry((sig, f)).or_insert(a);
+                }
+            }
+        }
+        let nc = std::sync::Arc::new(NativeClasses { slot_sig, facts: fs, adapters: map });
+        let n = nc.classes();
+        match self.natives.binary_search_by_key(&install, |x| x.0) {
+            Ok(k) => self.natives[k].1 = nc,
+            Err(k) => self.natives.insert(k, (install, nc)),
+        }
+        n
     }
 
     /// The lifted twin of the export at `addr` (`gex_abi::ftab::TWIN`), if
@@ -517,6 +662,37 @@ mod tests {
         let aligned = 0x71dc1a0u64;
         assert!(!rebridge_gives_up(aligned, REBRIDGE_LIMIT));
         assert!(rebridge_gives_up(aligned, REBRIDGE_LIMIT + 1));
+    }
+
+    /// A native install's function, its table index as a guest address,
+    /// finds its class's adapter: by its wasm type and facts, its own
+    /// module's adapter first, another module's of the same class next;
+    /// nothing for a refused class, one no module has, or a dead module.
+    #[test]
+    fn a_native_function_finds_its_class_adapter() {
+        let mut m = FuncMap::new();
+        let sigs = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        // a: slots 0-1 functions of type 0, 2 of type 1, 3 its adapter for
+        // (type 0, facts 0), 4 the witness of type 0, 5 a varargs function
+        let a = m.publish(6, 1, Tier::Unit, &[]);
+        let ab = m.install(a).base;
+        m.set_native(a, &[0, 0, 1, 2, 0, 1], &sigs(&["j_i", "jj_i", "iiij_i"]), &[(1, facts::SRET_SMALL), (5, facts::REFUSED)], &[(3, 4, 0)]);
+        assert_eq!(m.get(ab as u64), Some(Func { idx: ab + 3, install: a }));
+        // the same type with other facts: no adapter anywhere
+        assert_eq!(m.get(ab as u64 + 1), None);
+        assert_eq!(m.get(ab as u64 + 2), None);
+        assert_eq!(m.get(ab as u64 + 5), None);
+        // b: an adapter for type "jj_i" (its own numbering), which a's slot 2 has
+        let b = m.publish(3, 2, Tier::Unit, &[]);
+        let bb = m.install(b).base;
+        m.set_native(b, &[1, 0, 1], &sigs(&["iiij_i", "jj_i"]), &[], &[(1, 2, 0)]);
+        assert_eq!(m.get(ab as u64 + 2), Some(Func { idx: bb + 1, install: b }));
+        // an address mapped as usual wins
+        m.bind(a, &[(ab as u64, 2)]);
+        assert_eq!(m.get(ab as u64), Some(Func { idx: ab + 2, install: a }));
+        m.kill_module(2);
+        assert_eq!(m.get(ab as u64 + 2), None);
+        assert_eq!(m.get(bb as u64), None);
     }
 
     #[test]

@@ -2461,7 +2461,13 @@ export class Gex {
           if (!this.#net.peek) return -2;
           return frameOf((o) => this.#net.peek(id, o), (o) => this.#net.recv(id, o), out, take !== 0);
         },
-        net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
+        // The bytes a read finds (`FIONREAD`), -1 for the end, 0 for none yet (net.js
+        // `available`; a network answering true or false: true is a byte at least).
+        net_avail: (id) => {
+          if (!this.#net) return -1;
+          const v = this.#net.available(id);
+          return v === true ? 1 : v === false || v == null ? 0 : v | 0;
+        },
         net_close: (id) => this.#net?.close(id),
         // Another holder of a stream (a socket passed to another process).
         net_dup: (id) => (this.#netShared && this.#net?.dup ? this.#net.dup(id) : 0),
@@ -5874,6 +5880,10 @@ export class Gex {
           ? ` (arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
             `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB)`
           : '';
+        // A process that can move to a 64-bit memory outgrew this one (lib.rs
+        // `gex_outgrew`): said as the trap path says it.
+        if (e.gex_outgrew?.() === 1)
+          throw Object.assign(new Error('its memory ran out: gex could not grow its own memory for it below the 32-bit ceiling'), { outgrew: true });
         throw new Error(`gex-pe: no memory for a provider stack${a}`);
       }
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
@@ -5889,7 +5899,11 @@ export class Gex {
       const size = 1 << 20;
       const e = this.#shim.exports;
       const base = e.gex_provider_stack(size) >>> 0;
-      if (!base) throw new Error('gex: no memory for a provider stack');
+      if (!base) {
+        if (e.gex_outgrew?.() === 1)
+          throw Object.assign(new Error('its memory ran out: gex could not grow its own memory for it below the 32-bit ceiling'), { outgrew: true });
+        throw new Error('gex: no memory for a provider stack');
+      }
       this.#provStackLo = BigInt(base);
       this.#provStack64 = new WebAssembly.Global({ value: 'i64', mutable: true }, BigInt(base + size - 16));
     }
@@ -7280,6 +7294,9 @@ export class Gex {
       // The end of 64-bit Wine's space in a 64-bit memory, in 64 KiB units
       // (shim `gex_space_top`): ntdll's top instead of its probe; 0 to probe.
       space_top: () => (e.gex_space_top?.() ?? 0) | 0,
+      // (shim `gex_image_floats`): 1 when an image the server places below
+      // 4 GiB goes top down instead, a DLL of Wine's core PE module.
+      image_floats: (fd) => (e.gex_image_floats?.(fd) ?? 0) | 0,
       // (shim `gex_host_space`): where its own space below 4 GiB starts, which Wine reports reserved
       host_space: () => (e.gex_host_space?.() ?? 0) | 0,
       // The session mapping, a block of the server's memory (area +128,
@@ -7292,6 +7309,13 @@ export class Gex {
       // process's start and written by the first boot's fill.
       usd_copy: (dst, size) => this.#usdMove(addrNum(dst), size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(addrNum(src), size >>> 0, true),
+      // The process's own copy of that page, whose clocks the host advances
+      // from now on (usd-clock.mjs): its address, and the guest clock as
+      // this runtime reads it (`#guestMono`).
+      usd_tick: (at) => {
+        const c = this.#guestClock();
+        this.#env.usdTick?.(addrNum(at), { boot: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n + this.#monoHeld(), scale: c.scale, shift: c.shift }, this.memory);
+      },
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
@@ -8034,7 +8058,7 @@ export class Gex {
       if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
         const sp = this.#liveSp(Number(ctx), c);
-        if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
+        if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && this.#left(c, sp)) {
           err.gexNativeLeft = true;
           throw err;
         }
@@ -8518,6 +8542,16 @@ export class Gex {
             n === -1 || n === 0xffffffff
               ? ''
               : `, ${within ? 'inside' : 'after'} syscall ${n}`);
+          // An `unreachable` in the program's own code that no handler took
+          // (a Windows program's: its fault hook takes access violations only):
+          // the program aborted, as a Rust panic under panic=abort, abort() or
+          // __builtin_trap end one. Its crash, said as such, not the runtime's.
+          if (tsig === 4 && ask(e.gex_trap_in_program, (v) => v) === 1) {
+            throw Object.assign(new Error(
+              `the program aborted: its own code reached an unreachable instruction${at}${nr} ` +
+              '(an abort: a Rust panic under panic=abort, abort(), __builtin_trap); what it said first, ' +
+              'such as a panic message, went to its standard error'), { programAbort: true });
+          }
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
           // Physical size of the linear memory at the trap: a "memory access out
           // of bounds" fires only past this, so it is the ceiling the faulting
@@ -9487,10 +9521,12 @@ export class Gex {
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
     // callee's argument bytes (cgen.rs `callout_span`): exactly those, as
     // its native caller's frames start just above them. One that names
-    // none: NATIVE_UNWOUND past the arguments.
+    // none: its return comes back within NATIVE_UNWOUND (`back`), and it is
+    // left past NATIVE_UNWOUND too unless its stack is known (below).
     const span = e.gex_callout_span?.() ?? -1n;
     c.span = span >= 0n ? span : CALLOUT_UNWOUND;
     c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
+    c.back = c.unwound;
     // WoW64's stops: reached with the stack anywhere, never unwound past
     // (a spWant of 0 is never read as unwound). The shim counts them for
     // its stray-arrival rule (`gex_wow64_waits`).
@@ -9500,6 +9536,15 @@ export class Gex {
       c.span = c.unwound = (1n << 64n) - 1n;
       e.gex_wow64_waits?.(1);
     }
+    // The top of the stack it is made on: a stack pointer above it is
+    // another fiber's (a stack of its own), not past the caller (`#left`).
+    c.top = BigInt.asUintN(64, BigInt(e.gex_callout_stack_top?.(ctx, c.alt ? 1 : 0, BigInt.asIntN(64, c.spWant)) ?? -1));
+    // A guest call from native Wine with no argument bytes named, on a
+    // stack that is known: any jump out of it to a guest frame below (a
+    // longjmp or a catch past the native frames, however small they are)
+    // leaves it, not only one past NATIVE_UNWOUND, which would hold one
+    // more call-out open per jump landing within it.
+    if (span < 0n && c.ret === NATIVE_RETURN_PAD && !anyStack && c.top !== (1n << 64n) - 1n) c.unwound = 0n;
     // Deep inside others, one more needs the host's stack to have room for
     // it: native Wine's guest calls hold their native frames, which no trap
     // drops, so the shim's count cannot bound them (the shim ends the
@@ -9623,7 +9668,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && this.#liveSp(ctx, c) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && this.#left(c, this.#liveSp(ctx, c))) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -9705,7 +9750,7 @@ export class Gex {
           // call-out waiting for the pad itself with the stack where it
           // wants it is simply done.
           if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
-            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.unwound;
+            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.back;
             if (mine) e.gex_callout_stray(1);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
@@ -9715,7 +9760,7 @@ export class Gex {
           // handled further out): its frame is gone, so it leaves. A call-out
           // that wants no stack (native Wine's thread loop) has no caller's
           // frame to unwind past.
-          if (c.spWant !== 0n && sp > c.spWant + c.unwound) {
+          if (c.spWant !== 0n && this.#left(c, sp)) {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
@@ -9751,8 +9796,14 @@ export class Gex {
     const g = this.#shim.exports.gex_callout_guard;
     if (!g) return;
     const c = this.#callouts.at(-1);
-    if (!c || c.spWant === 0n) g(0n, 0);
-    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0);
+    if (!c || c.spWant === 0n) g(0n, 0, -1n);
+    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0, BigInt.asIntN(64, c.top));
+  }
+
+  /** Whether the guest, its stack pointer at `sp`, has unwound past call-out
+   *  `c`'s caller: above its frame on the stack it was made on. */
+  #left(c, sp) {
+    return sp > c.spWant + c.unwound && sp <= c.top;
   }
 
   /** The guest stack pointer's byte offset in a thread's context, which

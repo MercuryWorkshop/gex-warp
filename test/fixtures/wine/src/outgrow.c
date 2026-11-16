@@ -10,6 +10,13 @@
  *                      reserves 64 KiB at 0x7ff00000, just below Windows'
  *                      old KUSER_SHARED_DATA page, and says "outgrow
  *                      reached 2g" when it got it; exits 0
+ *   outgrow thread     fills the memory with 1 MiB blocks (each too small
+ *                      for gex to record a refusal) until one is refused
+ *                      or 2 GiB are taken, gives the last three back, and
+ *                      starts a thread with a 64 KiB stack: in the lowered
+ *                      memory gex's own memory for the thread (its
+ *                      provider stack) has no room; says "outgrow thread
+ *                      ran" from the thread
  *   outgrow twice M    runs `outgrow M` twice, one after the other
  *                      (CreateProcess each), and says how each ended
  *   outgrow each M X.. the same for each program X (a copy of this one),
@@ -45,6 +52,12 @@ static void once(const char *exe, const char *mode) {
     CloseHandle(pi.hProcess);
 }
 
+static DWORD WINAPI thread(void *arg) {
+    printf("outgrow thread ran\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "crash";
     void *p;
@@ -60,6 +73,28 @@ int main(int argc, char **argv) {
             once(argv[i], argv[2]);
             once(argv[i], argv[2]);
         }
+        return 0;
+    }
+    if (!strcmp(mode, "thread")) {
+        void *last[3] = { NULL, NULL, NULL };
+        HANDLE h;
+        int n = 0, i;
+
+        printf("outgrow filling\n");
+        fflush(stdout);
+        while (n < 2048 && (p = VirtualAlloc(NULL, 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))) {
+            last[n % 3] = p;
+            n++;
+        }
+        /* room for the thread's stack and Wine's own for it, not gex's */
+        for (i = 0; i < 3; i++)
+            if (last[i]) VirtualFree(last[i], 0, MEM_RELEASE);
+        h = CreateThread(NULL, 64 << 10, thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (!h) {
+            printf("outgrow no thread %lu\n", GetLastError());
+            return 3;
+        }
+        WaitForSingleObject(h, INFINITE);
         return 0;
     }
     p = VirtualAlloc(NULL, BIG, MEM_RESERVE, PAGE_NOACCESS);

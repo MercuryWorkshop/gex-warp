@@ -406,12 +406,16 @@ export class Sockets {
     return frameOf((o) => this.peek(id, o), (o) => this.recv(id, o), out, take);
   }
 
+  /** What a read of stream `id` finds: the bytes waiting (`FIONREAD`; a
+   *  program sizes its read by it), -1 once it ended with none (the read
+   *  returns the end), 0 while it would wait. */
   available(id) {
     const ring = this.rings?.available(id);
     if (ring !== undefined) return ring;
     const s = this.#streams.get(id);
-    if (!s) return true;
-    return s.chunks.length > 0 || s.state === CLOSED || s.state === REFUSED;
+    if (!s) return -1;
+    if (s.buffered > 0) return s.buffered;
+    return s.state === CLOSED || s.state === REFUSED ? -1 : 0;
   }
 
   /** Another holder of a stream (a descriptor passed to another process:

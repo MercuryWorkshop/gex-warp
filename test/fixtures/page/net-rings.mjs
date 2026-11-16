@@ -103,7 +103,9 @@ if (isMainThread) {
   check('no ring bytes before a stream, a few rings at the first', before === 0 && first === 4 << 18, `(${before}, then ${first})`);
   check('every byte, in order', r.got === TOTAL && r.wrong === -1, `(${r.got} of ${TOTAL}, first wrong at ${r.wrong})`);
   check('a peek leaves the bytes', r.peekOk);
-  check('drained and closed: recv 0, polls ready', r.endRecv === 0 && r.endAvail === true, `(recv ${r.endRecv}, ready ${r.endAvail})`);
+  check('drained and closed: recv 0, polls ready (available -1: the end, no bytes)', r.endRecv === 0 && r.endAvail === -1, `(recv ${r.endRecv}, available ${r.endAvail})`);
+  // FIONREAD's answer: a program sizes its read by it, so 1 cost a wakeup a byte
+  check('available says the bytes waiting, not just that some are', r.availN > 1, `(available ${r.availN})`);
   // Besides refills: the stream without a ring's reads, and the closed
   // stream's status and recv (it has no ring any more).
   check('the page asked to refill only', asked.status + asked.recv + asked.peek + asked.available === r.ringless + 2 && asked.refill > 0,
@@ -131,6 +133,7 @@ if (isMainThread) {
   for (;;) {
     if (!peeked && got > 1 << 20) {
       while (!p.available(id)) await wait();
+      out.availN = p.available(id);
       const pk = new Uint8Array(10);
       const n = p.peek(id, pk);
       const b2 = new Uint8Array(10);

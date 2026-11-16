@@ -12,6 +12,24 @@
 //   access violation its vectored handler sees, and the process goes on;
 // - ptval: user32 calls taking a POINT by value, directly and through
 //   GetProcAddress's pointers;
+// - selfaddr: GetModuleHandleExW(FROM_ADDRESS) on the program's own data,
+//   zeroed data and function is the program's module;
+// - bigdata: 24 MiB of zeroed data, more than the page's PE data window
+//   for builtins' data exports holds: its ends written and read, and the
+//   program's module;
+// - fontset: IDWriteFontSet::GetMatchingFonts by family, weight, stretch
+//   and style, on the system set (Tahoma bold first when asked for bold)
+//   and on a set of a font file in memory;
+// - modcase: the program and its module installed under other case
+//   (ModCase.exe, ModCase.exe.wasm) than the name its .wasmref gives
+//   (modcase.exe.wasm): the module found without case, as Windows finds
+//   files;
+// - missimp: an import no DLL exports, bound to a stub (listed at the
+//   link): the program runs, and a call of it ends the process as Wine's
+//   stubs do;
+// - bigrelocs: more addresses in data than one function of their
+//   relocations applies within the engines' function size limit (pelink
+//   splits it);
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
 // - wmain0, wmain3: wmain(void) and wmain(argc, argv, envp);
 // - xthr: a just-loaded DLL's function called by a thread with no system

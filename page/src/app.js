@@ -193,10 +193,13 @@ function progressMeter(state, onProgress) {
     elapsed: 0,
     error: null,
     fetch: null,
+    // the rest bundles' background download, once it starts: compressed bytes of this visit's, `complete` at its end
+    rest: null,
     boot: { units: { done: 0, total: 0 }, programs: { done: 0, total: 0 }, program: null, image: null },
     log: [],
   };
   state.progress = p;
+  const onReady = [];
   const log = (kind, text) => {
     p.log.push({ t: Math.round(performance.now() - t0), kind, text });
     if (p.log.length > 50) p.log.splice(0, p.log.length - 50);
@@ -314,7 +317,8 @@ function progressMeter(state, onProgress) {
           // A native module (a Wine builtin) is `providers/<name>-<fingerprint>.wasm`.
           name = unit === 'providers' ? rel.slice('providers/'.length).replace(/-[0-9a-f]+\.wasm$/i, '') : unitNames[unit] || '';
         } else {
-          try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
+          // (with its `#OFFSET`: a file in the rest bundle is named by it, not by the bundle)
+          try { const u = new URL(m.what, globalThis.location?.href); key = decodeURIComponent(u.pathname + u.hash); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
@@ -359,6 +363,15 @@ function progressMeter(state, onProgress) {
       }
       if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
       if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
+      emit();
+      if (name === 'ready') for (const f of onReady.splice(0)) f();
+    },
+    /** `f` once the start-up is over. */
+    whenReady(f) { if (p.phase === 'ready') f(); else onReady.push(f); },
+    /** The rest bundles' background download: `done` of `total` compressed bytes, `complete` at its end. */
+    rest(done, total, complete = false) {
+      p.rest = { done, total, complete };
+      if (complete) log('phase', `The rest of the files are here (${(total / 1e6).toFixed(1)} MB downloaded)`);
       emit();
     },
     /** The run is over: 'exited' or 'failed'. */
@@ -818,6 +831,11 @@ async function begin(opts, base, at, state, meter, lets) {
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => {
           if (m.kind === 'ready') r(m);
+          else if (m.kind === 'rest') meter.rest(m.done, m.total);
+          else if (m.kind === 'ahead') {
+            meter.rest(meter.p.rest?.done ?? 0, meter.p.rest?.total ?? 0, true);
+            say(`[app] rest bundle fetched ahead: ${m.frames} frames, ${(m.bytes / 1e6).toFixed(1)} MB\n`);
+          }
           else if (m.kind === 'bytes') {
             lc.net += m.net;
             lc.cached += m.cached;
@@ -832,6 +850,17 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
+        // The rest bundles downloaded in the background as soon as the title files are in (the pieces, the
+        // streamed archive), not after the start-up: the program does not wait for them, and the reads after
+        // find their frames in the owner's store (none while the page is hidden).
+        const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
+        if (restBundles.length && sw.restahead !== '0') {
+          const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
+          Promise.allSettled([pieceBufs, streamed?.done]).then(() => {
+            w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
+            document.addEventListener('visibilitychange', paused);
+          });
+        }
       } else {
         w.terminate();
         lc.why = ready.why;
@@ -1012,6 +1041,12 @@ async function begin(opts, base, at, state, meter, lets) {
         desk.style.height = `${h}px`;
         desktop?.resizeOutput?.(w, h);
       } else {
+        // The canvas's CSS size too: the compositor sizes only its pixels,
+        // and a canvas keeps the size it was laid out at.
+        if (canvas) {
+          canvas.style.width = `${w}px`;
+          canvas.style.height = `${h}px`;
+        }
         sys?.compositor?.resize?.(w, h);
       }
       return { w, h };

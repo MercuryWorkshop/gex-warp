@@ -259,6 +259,12 @@ impl PageTable {
         self.note_virtual(v);
         if let Some(id) = &self.identity {
             (id.publish)(page, entry);
+            // (first writer winning: one that published between the adopt
+            // above and this is the page's, these slots left unused)
+            if let Some(won) = (id.adopt)(page).filter(|&w| w != 0 && w != entry) {
+                self.pages.insert(page, won);
+                return won;
+            }
         }
         entry
     }
