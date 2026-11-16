@@ -2258,6 +2258,7 @@ fn install_bundle_remote() {
     MODES.0.borrow_mut().clear();
     MTIMES.0.borrow_mut().clear();
     XATTRS.0.borrow_mut().clear();
+    OWNERS.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -7204,6 +7205,25 @@ pub extern "C" fn gex_chmod(path: u32, path_len: u32, mode: u32) {
     MODES.0.borrow_mut().push((name.to_string(), mode));
 }
 
+/// A bundled file's (or directory's, or link's) owner and group, from an
+/// archive whose owners the page trusts; only those that are not root's
+/// (a name nobody gave an owner is the first user's) are sent. Like
+/// `gex_chmod`: set once the bundle is in, on the name itself.
+#[no_mangle]
+pub extern "C" fn gex_chown(path: u32, path_len: u32, uid: u32, gid: u32) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    // SAFETY: scalars naming a range of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_chown(gex_kernel::PAddr::from(path), path_len, uid, gid) };
+        }
+        return;
+    }
+    OWNERS.0.borrow_mut().push((name.to_string(), uid, gid));
+}
+
 /// A directory the bundle contains, even an empty one: `gex_add_file` makes the
 /// directories on the way to each file, but an empty directory has no file to
 /// carry it and a program expecting one (apt's cache dirs) errors without it.
@@ -7361,6 +7381,10 @@ static MTIMES: SingleThreaded<Vec<(String, i64)>> =
 static MODES: SingleThreaded<Vec<(String, u32)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
 
+/// Owners of bundled files, from an archive the page trusts. See `gex_chown`.
+static OWNERS: SingleThreaded<Vec<(String, u32, u32)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Bundled files' extended attributes (a tar's `SCHILY.xattr.user.*`
 /// records: Wine's DOS attributes). See `gex_set_xattr`.
 static XATTRS: SingleThreaded<Vec<(String, String, Vec<u8>)>> =
@@ -7434,6 +7458,9 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
     }
     for (name, secs) in std::mem::take(&mut *MTIMES.0.borrow_mut()) {
         let _ = gex_kernel::vfs::FileSystem::set_mtime(root, name.trim_start_matches('/'), secs);
+    }
+    for (name, uid, gid) in std::mem::take(&mut *OWNERS.0.borrow_mut()) {
+        let _ = gex_kernel::vfs::FileSystem::chown(root, name.trim_start_matches('/'), uid, gid);
     }
     for (path, name, value) in std::mem::take(&mut *XATTRS.0.borrow_mut()) {
         let op = gex_kernel::vfs::XattrOp::Set { name: &name, value: &value, flags: 0 };

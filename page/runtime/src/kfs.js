@@ -12,7 +12,10 @@ const O_WRONLY = 1, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND 
 const READ_MAX = 4 << 20;
 /** A tar's or a file's bytes go to the kernel in parts of this. */
 const PART = 16 << 20;
-const META_BYTES = 72;
+/** remote::META_BYTES: the kernel writes all of them. */
+const META_BYTES = 84;
+/** vfs::BASE_ID: half an owner nobody gave (the first user's). */
+const BASE_ID = 0xffffffff;
 /** gex-kernel vfs::remote::xattr_op::SET. */
 const XATTR_SET = 1;
 const TYPES = ['file', 'directory', 'symlink', 'chardev', 'fifo', 'socket'];
@@ -110,6 +113,14 @@ class SeedRecords {
     const pb = enc.encode(p);
     this.#room(9 + pb.length);
     this.#u8(4); this.#u32(mode); this.#text(pb);
+  }
+
+  /** The name `p` itself (a link not followed) is `uid`'s and `gid`'s. */
+  chown(p, uid, gid) {
+    if (!this.#seed) return void this.#list.push({ f: 'k_fs_chown', a: [{ in: p }, uid, gid] });
+    const pb = enc.encode(p);
+    this.#room(13 + pb.length);
+    this.#u8(8); this.#u32(uid); this.#u32(gid); this.#text(pb);
   }
 
   /** The records so far, as one call on the list. */
@@ -283,15 +294,16 @@ export class Files {
 
   /** A layer (fs.js) into the root, over whatever is there: a tar (its
    *  bytes, unpacked in the kernel as they come, pagetar.rs) laid at `at`,
-   *  single files with their modes, lazy files (`[path, size, url, mode,
-   *  mtime]`, mtime in seconds; either may be undefined).
+   *  its entries' owners theirs when `owners` (else none recorded), single
+   *  files with their modes and owners (`[uid, gid]`), lazy files (`[path,
+   *  size, url, mode, mtime]`, mtime in seconds; either may be undefined).
    *  Seeding, not a program's writes: the store keeps none of it. The
    *  count of files laid. */
-  async lay({ tar, at = '/', files = {}, modes = {}, lazy = [] }) {
+  async lay({ tar, at = '/', owners = false, files = {}, modes = {}, fileOwners = {}, lazy = [] }) {
     const k = this.#k;
     let n = 0;
     if (tar) {
-      const id = await k.r('k_fs_tar_open', { in: at });
+      const id = await k.r('k_fs_tar_open', { in: at }, owners ? 1 : 0);
       const list = [];
       for (let off = 0; off < tar.length; off += PART) list.push({ f: 'k_fs_tar_feed', a: [id, { in: tar.subarray(off, off + PART) }] });
       await batched(k, list);
@@ -307,6 +319,7 @@ export class Files {
       list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
       for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
       if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      if (fileOwners[p]) list.push({ f: 'k_fs_chown', a: [{ in: p }, fileOwners[p][0], fileOwners[p][1]] });
       list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, now] });
       n++;
     }
@@ -327,8 +340,9 @@ export class Files {
    *  own loading of it took: empty directories, files with their modes,
    *  directories' modes, lazy files (`[path, size, url, head]`; a bundled
    *  file wins over a lazy one unless it is that file's first `head` bytes),
-   *  hard links, symbolic links, file times (seconds) and extended
-   *  attributes. The count of files laid. */
+   *  hard links, symbolic links, file times (seconds), owners (`owners`,
+   *  path to `[uid, gid]`: given only for an archive whose owners are
+   *  trusted) and extended attributes. The count of files laid. */
   async layImage(l) {
     if (l.stream) return this.#layStream(l);
     const { files = {}, modes = {}, dirs = [] } = l;
@@ -352,7 +366,7 @@ export class Files {
    *  lazy files' (the parts' own win, as one untarred tree's would). Nothing
    *  runs in the guest until boot's layers are all in (system.js `#start`). */
   async #layStream(l) {
-    const { stream, streamIndex, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart } = l;
+    const { stream, streamIndex, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, owners: baseOwners, lazy = [], onPart } = l;
     const k = this.#k;
     if (streamIndex && k.has('k_fs_fill')) {
       const index = await streamIndex;
@@ -365,6 +379,9 @@ export class Files {
     const hard = {};
     const mtimes = {};
     const xattrs = { ...(baseXattrs ?? {}) };
+    // (A part's owners are kept only when the layer says the archive's are
+    // to be believed: it gives `owners`.)
+    const owners = baseOwners ? { ...baseOwners } : null;
     let n = 0;
     for await (const t of stream) {
       const list = [];
@@ -382,6 +399,7 @@ export class Files {
       Object.assign(hard, t.hard);
       Object.assign(mtimes, t.mtimes);
       Object.assign(xattrs, t.xattrs);
+      if (owners) Object.assign(owners, t.owners);
       await batched(k, list, (r, c) => {
         if (c.f === 'k_fs_add' && r < 0) throw errno(r, c.a[0].in);
       });
@@ -391,7 +409,7 @@ export class Files {
     // untarred tree keeps them (app.js).
     for (const [p, target] of Object.entries(hard)) if (!sizes.has(target)) delete hard[p];
     return n + await this.#layRest([], {
-      dirs, modes, lazy, hard, symlinks, mtimes: lazyMtimes ? { ...lazyMtimes, ...mtimes } : undefined, xattrs,
+      dirs, modes, lazy, hard, symlinks, mtimes: lazyMtimes ? { ...lazyMtimes, ...mtimes } : undefined, xattrs, owners,
       has: (p) => sizes.has(p), size: (p) => sizes.get(p),
       // the bytes of a link the kernel would not make, from the copy laid
       bytes: (p) => this.readFile(p),
@@ -406,7 +424,7 @@ export class Files {
    *  does. The files' bytes are laid as they arrive (`k_fs_fill`), in
    *  `background`; at the archive's end, or its failure, what has not come
    *  is EIO (`k_fs_pending_end`), never ENOENT. The count of files named. */
-  async #layEarly({ stream, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart }, index) {
+  async #layEarly({ stream, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, owners: baseOwners, lazy = [], onPart }, index) {
     const k = this.#k;
     const r = await k.r('k_fs_seed', { in: index });
     if (r < 0) throw errno(r, 'the bundle\'s index');
@@ -414,7 +432,7 @@ export class Files {
     // over its pending copy at the end, as `#layStream` would).
     const heads = lazy.filter((f) => f[3]);
     const n = r + await this.#layRest([], {
-      modes: lazyModes, lazy: lazy.filter((f) => !f[3]), mtimes: lazyMtimes, xattrs: baseXattrs,
+      modes: lazyModes, lazy: lazy.filter((f) => !f[3]), mtimes: lazyMtimes, xattrs: baseXattrs, owners: baseOwners,
       has: () => false, size: () => 0, bytes: null,
     });
     const run = async () => {
@@ -431,6 +449,7 @@ export class Files {
             list.push({ f: 'k_fs_xattr', a: [-1, { in: p }, XATTR_SET, { in: name }, { in: v }, 0] });
           }
         }
+        if (baseOwners) for (const [p, [uid, gid]] of Object.entries(t.owners ?? {})) list.push({ f: 'k_fs_chown', a: [{ in: p }, uid, gid] });
         await batched(k, list, (r, c) => {
           if (c.f === 'k_fs_fill' && r < 0) throw errno(r, c.a[0].in);
         });
@@ -454,7 +473,7 @@ export class Files {
    *  extended attributes. `has(p)`/`size(p)`: whether the image has file
    *  `p` and its length; `bytes(p)` its contents. Resolves to the lazy files
    *  laid. */
-  async #layRest(list, { dirs = [], modes = {}, lazy = [], hard = {}, symlinks = {}, mtimes, xattrs, has, size, bytes }) {
+  async #layRest(list, { dirs = [], modes = {}, lazy = [], hard = {}, symlinks = {}, mtimes, xattrs, owners, has, size, bytes }) {
     const k = this.#k;
     let n = 0;
     const seed = new SeedRecords(list, k.has('k_fs_seed'));
@@ -486,6 +505,8 @@ export class Files {
     for (const [p, target] of Object.entries(hard)) if (modes[target] !== undefined) seed.chmod(p, modes[target]);
     for (const [p, target] of Object.entries(symlinks)) seed.symlink(target, p);
     for (const [p, secs] of Object.entries(mtimes ?? {})) seed.mtime(p, secs);
+    // Owners last, on names that are all there now (links themselves).
+    for (const [p, [uid, gid]] of Object.entries(owners ?? {})) seed.chown(p, uid, gid);
     seed.flush();
     for (const [p, attrs] of Object.entries(xattrs ?? {})) {
       for (const [name, value] of Object.entries(attrs)) {
@@ -532,5 +553,14 @@ function meta(b) {
     ino: Number(v.getBigUint64(16, true)),
     mtime: Number(v.getBigInt64(24, true)) * 1000 + Math.floor(v.getUint32(36, true) / 1e6),
     nlink: v.getUint32(32, true),
+    // The owner and group: null where the filesystem keeps none, or where
+    // nobody gave the file one (the first user's: root's, in a page).
+    ...owner(v),
   };
+}
+
+function owner(v) {
+  if (v.getUint32(72, true) !== 1) return { uid: null, gid: null };
+  const id = (x) => (x === BASE_ID ? null : x);
+  return { uid: id(v.getUint32(76, true)), gid: id(v.getUint32(80, true)) };
 }

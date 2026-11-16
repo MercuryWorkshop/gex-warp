@@ -2,7 +2,8 @@
 //! ustar (with its `prefix` field), GNU long names and link targets, GNU
 //! base-256 sizes, and pax extended headers' path, link target and user
 //! extended attributes (GNU's `SCHILY.xattr.user.*`, raw; libarchive's
-//! `LIBARCHIVE.xattr.user.*`, base64).
+//! `LIBARCHIVE.xattr.user.*`, base64), and each entry's numeric owner and
+//! group (ustar's fields, a pax header's `uid` and `gid` over them).
 //!
 //! Two ways in over one header reader: [`entries`], a whole tar in memory
 //! (the eject reads bundles so), and [`Reader`], a tar fed in parts with the
@@ -29,6 +30,11 @@ pub struct Header {
     pub path: String,
     pub kind: Kind,
     pub mode: u32,
+    /// The numeric owner and group the archive gives the entry: whether
+    /// they are to be believed is the caller's to say (an archive an
+    /// ordinary user made names that user for every file).
+    pub uid: u32,
+    pub gid: u32,
     pub mtime: i64,
     pub size: u64,
     /// A symbolic link's target as written; a hard link's, resolved as
@@ -118,6 +124,8 @@ struct Carry {
 struct Pax {
     path: Option<String>,
     link: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     xattrs: Vec<(String, Vec<u8>)>,
 }
 
@@ -139,6 +147,13 @@ fn pax(rec: &[u8]) -> Pax {
             out.path = Some(String::from_utf8_lossy(value).into_owned());
         } else if key == "linkpath" {
             out.link = Some(String::from_utf8_lossy(value).into_owned());
+        } else if key == "uid" || key == "gid" {
+            let n = std::str::from_utf8(value).ok().and_then(|v| v.trim().parse::<u32>().ok());
+            if key == "uid" {
+                out.uid = n.or(out.uid);
+            } else {
+                out.gid = n.or(out.gid);
+            }
         } else if let Some(n) = key.strip_prefix("SCHILY.xattr.").filter(|n| n.starts_with("user.")) {
             out.xattrs.push((n.to_string(), value.to_vec()));
         } else if let Some(n) = key.strip_prefix("LIBARCHIVE.xattr.").map(unescape).filter(|n| n.starts_with("user.")) {
@@ -180,9 +195,13 @@ fn block(h: &[u8], carry: &mut Carry) -> Block {
         link = l;
     }
     let mut xattrs = Vec::new();
+    let mut uid = number(&h[108..116]) as u32;
+    let mut gid = number(&h[116..124]) as u32;
     if let Some(p) = carry.pax.take() {
         name = p.path.unwrap_or(name);
         link = p.link.unwrap_or(link);
+        uid = p.uid.unwrap_or(uid);
+        gid = p.gid.unwrap_or(gid);
         xattrs = p.xattrs;
     }
     let kind = match kind {
@@ -199,6 +218,8 @@ fn block(h: &[u8], carry: &mut Carry) -> Block {
         path: clean(&name),
         kind,
         mode: number(&h[100..108]) as u32 & 0o7777,
+        uid,
+        gid,
         mtime: number(&h[136..148]) as i64,
         size: if kind == Kind::File { size } else { 0 },
         link,
@@ -332,6 +353,8 @@ mod tests {
         let mut h = vec![0u8; BLOCK];
         h[..name.len()].copy_from_slice(name.as_bytes());
         h[100..107].copy_from_slice(b"0000755");
+        h[108..115].copy_from_slice(b"0000765");
+        h[116..123].copy_from_slice(b"0000024");
         h[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
         h[136..147].copy_from_slice(b"00000001750");
         h[156] = kind;
@@ -360,7 +383,7 @@ mod tests {
             }
             format!("{n}{body}")
         };
-        let pax = format!("{}{}", rec("path", "usr/bin/sh"), rec("SCHILY.xattr.user.rt", "kept"));
+        let pax = format!("{}{}{}", rec("path", "usr/bin/sh"), rec("SCHILY.xattr.user.rt", "kept"), rec("uid", "100042"));
         entry(&mut t, "PaxHeader", b'x', pax.as_bytes(), "");
         entry(&mut t, "cut2", b'0', b"#!x\n", "");
         entry(&mut t, "./bin", b'2', b"", "usr/bin");
@@ -382,6 +405,9 @@ mod tests {
         assert_eq!((e[4].0.kind, e[4].0.link.as_str()), (Kind::Symlink, "usr/bin"));
         assert_eq!((e[5].0.kind, e[5].0.link.as_str()), (Kind::Hard, "usr/bin/sh"));
         assert_eq!((e[2].0.mode, e[2].0.mtime, e[2].0.size), (0o755, 1000, 700));
+        // ustar's owner and group, and a pax header's uid over the first.
+        assert_eq!((e[2].0.uid, e[2].0.gid), (501, 20));
+        assert_eq!((e[3].0.uid, e[3].0.gid), (100042, 20));
     }
 
     #[test]
