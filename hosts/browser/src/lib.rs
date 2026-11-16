@@ -773,10 +773,22 @@ fn slot_space_top() -> u64 {
 static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64, String)>> =
     SingleThreaded(RefCell::new(Vec::new()));
 
-fn refresh_ident_snapshot(p: &Px<'_>) {
+/// What [`IDENT_SNAPSHOT`] was taken of: the map's generation, the program
+/// (`EXEC_GEN`: an exec's map starts its count again) and the root's name.
+static IDENT_STAMP: SingleThreaded<Option<(u64, u32, String)>> = SingleThreaded(RefCell::new(None));
+
+pub(crate) fn refresh_ident_snapshot(p: &Px<'_>) {
     use std::hash::Hash;
     let mut snap = Vec::new();
-    for v in p.mm.lock().vmas().iter() {
+    let mm = p.mm.lock();
+    // Unchanged since it was taken: every miss asks, and a process's map
+    // changes far less often than it misses.
+    let stamp = (mm.generation(), EXEC_GEN.load(std::sync::atomic::Ordering::Relaxed), p.ns.root().to_string());
+    if IDENT_STAMP.0.borrow().as_ref() == Some(&stamp) {
+        return;
+    }
+    *IDENT_STAMP.0.borrow_mut() = Some(stamp);
+    for v in mm.vmas().iter() {
         if v.prot & gex_kernel::mem::prot::WRITE != 0 {
             continue;
         }
@@ -810,6 +822,177 @@ fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     Some((hs.finish(), id.clone()))
 }
 
+/// What this process's program has drawn from the page's slot pool, for
+/// the account a run is given under `log: 'slots'` ([`slot_report`]): the
+/// first slot of each chunk the refill handed it, and how long a chunk is.
+/// In the process's memory: a forked child starts from its parent's and
+/// clears it ([`slot_acct_reset`]), as an `execve` does.
+const SLOT_CHUNK_MAX: usize = 4096;
+static SLOT_CHUNKS: [std::sync::atomic::AtomicU64; SLOT_CHUNK_MAX] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_CHUNK_MAX];
+static SLOT_CHUNK_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SLOT_CHUNK_LEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SLOTS_DREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Pages a translation or a unit numbered at the base the system has for
+/// their code ([`shared_page_table`]'s identity), rather than afresh.
+static SLOT_PAGES_ADOPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The refill handed this process slots past the top of the last table:
+/// the pool is spent, and what was numbered from them cannot be installed.
+/// Taken by the translation that drew them (`dispatch_miss`).
+static SLOTS_SPENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// This thread's miss found the pool spent: its process ends
+    /// ([`slots_spent_end`]) once the JIT state is let go.
+    static SPENT_END: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The process ends, killed, for want of dispatch slots: said on the
+/// console, and as the process's own console output (which a page may show
+/// where its user reads; under Node a Worker's console can be lost when
+/// the run ends here).
+///
+/// It ended in a panic before, in every program started after the pool
+/// was spent, those whose code had all been run included: a page numbered
+/// past the last table has a directory entry naming table
+/// `DISPATCH_TABLES`, the shim's dense slot maps indexed their windows by
+/// it (`dense::window`, out of bounds), and a module built from such an
+/// entry imports a table no instance has.
+fn slots_spent_end(pc: u64) {
+    let text = format!(
+        "gex: pid {}: no dispatch slots are left to translate the code at {pc:#x} ({}) into: \
+         this page has spent its runtime slot space, and the program ends here, killed\n",
+        my_pid(),
+        object_off_at(pc)
+    );
+    warn_line(&text);
+    // SAFETY: a write of this module's own bytes to the host's console.
+    unsafe { write_stderr(&text) };
+    exit_here(-9, Some(pc));
+}
+
+/// Whether each program's account is said as it ends (`gex_set_slot_notes`).
+static SLOT_NOTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_slot_notes(on: i32) {
+    SLOT_NOTES.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn slot_acct_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    SLOTS_SPENT.store(false, Relaxed);
+    SLOT_CHUNK_N.store(0, Relaxed);
+    SLOTS_DREW.store(0, Relaxed);
+    SLOT_PAGES_ADOPTED.store(0, Relaxed);
+}
+
+fn slot_acct_drew(base: u64, n: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SLOT_CHUNK_LEN.store(n, Relaxed);
+    SLOTS_DREW.fetch_add(n, Relaxed);
+    let i = SLOT_CHUNK_N.fetch_add(1, Relaxed);
+    if let Some(c) = SLOT_CHUNKS.get(i) {
+        c.store(base, Relaxed);
+    }
+}
+
+/// Slots this process's program has drawn from the pool so far.
+#[no_mangle]
+pub extern "C" fn gex_slots_drew() -> u64 {
+    SLOTS_DREW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where this program's dispatch slots went: how many pages' worth it drew
+/// from the pool, how many of the pages it holds were numbered from them
+/// (afresh), and how many it holds at bases given elsewhere (its parent's at
+/// the fork, a stored module's as it was served, or the system's for the
+/// page's code as a translation numbered it); then each object's pages,
+/// `afresh+elsewhere`, with where the object is mapped (the address its
+/// file's start has): the same object at another address in each process
+/// is a translation nobody can share.
+fn slot_report(table: &gex_xlate::PageTable, mm: &gex_kernel::mem::Mm) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = SLOT_CHUNK_N.load(Relaxed).min(SLOT_CHUNK_MAX);
+    let len = SLOT_CHUNK_LEN.load(Relaxed);
+    let mut chunks: Vec<u64> = SLOT_CHUNKS[..n].iter().map(|c| c.load(Relaxed)).collect();
+    chunks.sort_unstable();
+    let per_table = gex_xlate::PageTable::slots_per_table();
+    let mine = |entry: u32| {
+        let v = gex_abi::dispatch_entry_table(entry) as u64 * per_table + gex_abi::dispatch_entry_base(entry) as u64;
+        let i = chunks.partition_point(|c| *c <= v);
+        i > 0 && v < chunks[i - 1] + len
+    };
+    // (object, where its first page here is) -> (fresh, others)
+    let mut by: std::collections::BTreeMap<String, (u64, u64, u64)> = std::collections::BTreeMap::new();
+    let (mut fresh, mut other) = (0u64, 0u64);
+    {
+        let mm = mm.lock();
+        for (page, entry) in table.entries() {
+            let addr = (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
+            let (name, start) = match mm.vma_at(addr) {
+                Some(v) => {
+                    let id = v.code.as_ref().map(|(id, off)| (id.clone(), v.start.wrapping_sub(*off)));
+                    match id {
+                        Some((id, at)) => (id, at),
+                        None if v.name.is_empty() => ("[anonymous]".to_string(), 0),
+                        None => (format!("{} (unnamed code)", v.name), v.start),
+                    }
+                }
+                None => ("[unmapped]".to_string(), 0),
+            };
+            let e = by.entry(name).or_insert((0, 0, start));
+            if mine(entry) {
+                fresh += 1;
+                e.0 += 1;
+            } else {
+                other += 1;
+                e.1 += 1;
+            }
+        }
+    }
+    let drew = SLOTS_DREW.load(Relaxed) / gex_abi::SLOTS_PER_PAGE;
+    let mut objs: Vec<(String, (u64, u64, u64))> = by.into_iter().collect();
+    objs.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.1 .1.cmp(&a.1 .1)));
+    let mut text = format!(
+        "drew {drew} pages of slots: {fresh} numbered afresh, {} unused or let go; {other} more pages held at bases given elsewhere ({} by identity as they were numbered)",
+        drew.saturating_sub(fresh),
+        SLOT_PAGES_ADOPTED.load(Relaxed),
+    );
+    for (name, (f, o, at)) in objs.iter().take(24) {
+        text.push_str(&format!("; {name}@{at:#x} {f}+{o}"));
+    }
+    if objs.len() > 24 {
+        text.push_str(&format!("; and {} more objects", objs.len() - 24));
+    }
+    text
+}
+
+/// A program is replaced by an exec: its account said (`log: 'slots'`), if
+/// it numbered or drew anything, and the next program's started.
+fn slot_note_exec(h: &Host) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if SLOT_NOTES.load(Relaxed) && (SLOTS_DREW.load(Relaxed) != 0 || !h.jit.page_table.entries().is_empty()) {
+        warn_line(&format!(
+            "[gex] slots pid {} {{{}}} (to its exec): {}\n",
+            h.kernel.pid,
+            h.kernel.exe_path,
+            slot_report(&h.jit.page_table, &h.kernel.mem)
+        ));
+    }
+    slot_acct_reset();
+}
+
+/// [`slot_report`] as text at `out` (at most `cap` bytes): its length.
+#[no_mangle]
+pub extern "C" fn gex_slot_report(out: u32, cap: u32) -> u32 {
+    let Some(home) = sigs::home() else { return 0 };
+    let text = with_jit_only(|j| slot_report(&j.page_table, home.mm()));
+    let n = text.len().min(cap as usize);
+    // SAFETY: the caller's buffer, `cap` bytes at `out`.
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out as usize as *mut u8, n) };
+    n as u32
+}
+
 fn shared_page_table(
     entries: &[(u64, u32)],
     next_slot: u64,
@@ -824,22 +1007,44 @@ fn shared_page_table(
     }
     // Pages numbered by identity, so every process gives a library page the
     // same base and the units they store are interchangeable. See `Identity`.
-    // x86-64 only: its byte-granular code makes two processes' numberings
-    // diverge within a few misses; AArch64 keeps its established numbering.
-    if gex_abi::X86 {
+    // On both processors. AArch64 once numbered a page afresh wherever a
+    // translation first reached it and took another process's base only
+    // for the page a miss landed on, and only once a stored module was
+    // installed: a page first reached from inside a translation got a base
+    // of its own, every stored module with code on it was then refused
+    // (`serve`: "number a page differently here"), and the process
+    // translated that code again into new slots. A shell run a second time
+    // drew 80 pages of slots, git 700 to 970, every time: a session of a
+    // few hundred processes spent the page's whole slot space
+    // (test/darwin/slots).
+    {
     table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
         adopt: Box::new(|page| {
             let (key, id) = snapshot_page_key(page)?;
             // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
             let base = unsafe { k_slot_get(page, key) };
+            // (Never one past the last table: see `publish`.)
+            let base = if gex_abi::dispatch_entry_table(base) < gex_abi::DISPATCH_TABLES { base } else { 0 };
             if tracing() && base != 0 {
                 trace_line(&format!(
                     "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
                 ));
             }
+            if base != 0 {
+                SLOT_PAGES_ADOPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             (base != 0).then_some(base)
         }),
         publish: Box::new(|page, entry| {
+            // A base past the last table (the pool spent) is nobody's: the
+            // translation that drew it is dropped (`dispatch_miss`). Kept
+            // as the page's base, the next process to run the code took it
+            // without drawing anything, so nothing said the pool was spent,
+            // and ran on with a directory entry naming a table there is
+            // none of.
+            if gex_abi::dispatch_entry_table(entry) >= gex_abi::DISPATCH_TABLES {
+                return;
+            }
             if let Some((key, id)) = snapshot_page_key(page) {
                 if tracing() {
                     trace_line(&format!(
@@ -856,6 +1061,7 @@ fn shared_page_table(
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
         let base = unsafe { k_slot_alloc(n) };
+        slot_acct_drew(base, n);
         // Each tenth of the runtime space (the upper half of the tables)
         // spent is said once, by the allocation that crosses it (ranges are
         // disjoint, so one in the whole system), so a run can be watched
@@ -879,12 +1085,17 @@ fn shared_page_table(
         // is left with a wasm validation error for what is really a budget.
         // Said here, before the module that cannot compile is built.
         if base + n > slot_space_top() {
+            // What numbered a page from this is not installed: a miss's
+            // translation is dropped and its process ended (`slots_spent_end`).
+            SLOTS_SPENT.store(true, std::sync::atomic::Ordering::Release);
             static SAID: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 warn_line(&format!(
                     "[gex] the runtime dispatch slot space is spent: slot {base} is past \
-                     the top of table {} and nothing can be translated after this. \
+                     the top of table {} and no code new to this page can be translated \
+                     after this (a program that needs some is ended, killed; one whose \
+                     code other processes have run goes on). \
                      Slots are never given back, so a page's whole life shares \
                      {} of them; this run has used them all.\n",
                     gex_abi::DISPATCH_TABLES - 1,
@@ -5971,7 +6182,7 @@ impl<'a> Px<'a> {
 }
 
 /// `f` with this process's [`Px`] from its published `Home`.
-fn with_px<R>(f: impl FnOnce(&Px<'_>) -> R) -> R {
+pub(crate) fn with_px<R>(f: impl FnOnce(&Px<'_>) -> R) -> R {
     let home = sigs::home().expect("gex: no process published");
     let ns = home.ns();
     f(&Px { mm: home.mm(), ns: &ns, pid: home.pid() })
@@ -12080,6 +12291,9 @@ pub extern "C" fn gex_adopt_child(
         forget_copied_host();
     }
     FORK_COPY.store(true, std::sync::atomic::Ordering::Relaxed);
+    slot_acct_reset();
+    // The identities kept in the copied memory are of the parent's map.
+    *IDENT_STAMP.0.borrow_mut() = None;
     // The slot maps the copied low region names are the parent's.
     dense::child();
     // So is the probe cache, which names the parent's table indices.
@@ -12348,6 +12562,7 @@ thread_local! {
 /// on, its descriptors and signal state carried, in the Worker the host
 /// starts with the other flavour's runtime (host.mjs `execAway`).
 pub(crate) fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
+    slot_note_exec(h);
     let ctx = h.threads[cur()].ctx_addr() as u32;
     vfork::stage_exec_parts(h, path, argv, envp);
     EXEC_AWAY.with(|c| c.set(Some((h.kernel.pid, ctx))));
@@ -12530,6 +12745,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             (Err(_), _) => return 0,
         }
     };
+    slot_note_exec(h);
     note_exec(path, argv);
     // Record, when this is the first process to run the program and there is
     // a linker to catch.
@@ -13108,7 +13324,12 @@ fn shared_slot(j: &Jit, page: u64, key: u64) -> Option<u32> {
 /// dozen processes spent the page's whole slot space in minutes. (x86-64's
 /// table numbers every page by identity itself.)
 pub(crate) fn number_by_identity(j: &mut Jit, page: u64) -> u32 {
-    if gex_abi::X86 || unsafe { k_present() } == 0 {
+    if unsafe { k_present() } == 0 {
+        return j.page_table.base(page);
+    }
+    // What the table's identity hooks answer from, as the map is now.
+    with_px(refresh_ident_snapshot);
+    if gex_abi::X86 {
         return j.page_table.base(page);
     }
     let Some((pid, key)) = with_px(|px| page_identity(px, page * gex_abi::DISPATCH_PAGE).map(|k| (px.pid, k))) else {
@@ -13118,6 +13339,7 @@ pub(crate) fn number_by_identity(j: &mut Jit, page: u64) -> u32 {
         if tracing() {
             trace_line(&format!("[gex] pid {pid}: unit page {page:#x} adopts base {base:#x}\n"));
         }
+        SLOT_PAGES_ADOPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         j.page_table.assign(page, base);
         return base;
     }
@@ -18780,8 +19002,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // and which pages are a JIT's (writable and executable, or written
         // through another view), so their blocks carry a self-modifying-code
         // guard. See `Block::guard`, `MemoryMap::volatile_code`.
-        if gex_abi::X86 {
         refresh_ident_snapshot(px);
+        if gex_abi::X86 {
         volatile = px.mm.lock().volatile_code();
         gex_xlate::set_volatile_ranges(volatile.clone());
         }
@@ -18874,6 +19096,21 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
                 stats.blocks, ok, has_block, exec.len(),
             ));
+        }
+        // The pool had no slots for a page this unit numbered: nothing of
+        // it is installed, kept or stored, and the pages it numbered are
+        // let go (their bases are in no table). Its process ends.
+        if SLOTS_SPENT.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            for a in &fresh {
+                j.translated.remove(a);
+            }
+            for (p, b) in &unit.dir_entries {
+                if j.page_table.lookup(*p) == Some(*b) {
+                    j.page_table.forget(*p);
+                }
+            }
+            SPENT_END.with(|c| c.set(true));
+            return false;
         }
         // Code retired while this lifted: installed all the same, then those
         // ranges retired again below (see `jitout::EPOCH`). The program
@@ -19122,6 +19359,10 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }))
         }
     };
+    if SPENT_END.with(|c| c.replace(false)) {
+        slots_spent_end(pc);
+        trap();
+    }
     // The other mode's code: installed now (JavaScript keeps a module of
     // that mode to enter by), then the loop goes on at `pc` through it, for
     // the shared miss stub dispatches through the process's own directory.
@@ -19759,6 +20000,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
                 // old base back. The snapshot is taken again before the next
                 // translation.
                 IDENT_SNAPSHOT.0.borrow_mut().clear();
+                *IDENT_STAMP.0.borrow_mut() = None;
                 let _ = j.page_table.base(page);
             }
             // The same page's code in the other mode (a WoW64 process's
@@ -20093,6 +20335,8 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // copy taken under the lock and written back over whatever a sibling's
     // miss had installed meanwhile.)
     let (exec, page_table, known, intrinsics, epoch) = with_px(|px| with_jit_only(|j| {
+        // What the table's identity hooks answer from (`shared_page_table`).
+        refresh_ident_snapshot(px);
         let exec: Vec<(u64, u64)> = px
             .mm
             .lock()

@@ -2188,6 +2188,7 @@ export class ProcessHost {
               // this only falls, and how fast it falls is what says how many
               // more processes the run can translate code in.
               (m.slotsLeftK >= 0 ? `, ${m.slotsLeftK}k dispatch slots left` : '') +
+              (m.slotsDrew > 0 ? ` (this program drew ${m.slotsDrew})` : '') +
               // What this process's memory grew to. One memory per process, so
               // this times the number live at once is what the tab costs.
               (m.memoryMib !== undefined ? `, memory ${m.memoryMib} MiB` : '') +
