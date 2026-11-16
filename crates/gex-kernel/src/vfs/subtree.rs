@@ -84,6 +84,9 @@ impl FileSystem for Subtree {
     fn keeps_owners(&self) -> bool {
         self.inner.keeps_owners()
     }
+    fn case_insensitive(&self) -> bool {
+        self.inner.case_insensitive()
+    }
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         self.inner.set_mtime(&self.at(path), secs)
     }

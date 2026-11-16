@@ -599,8 +599,17 @@ impl Kernel {
             d::GETSOCKOPT => self.darwin_sockopt(m, true, x),
             d::GETFSSTAT64 | d::GETFSSTAT => self.darwin_getfsstat(m, x[0], x[1], code == d::GETFSSTAT),
             d::GETDIRENTRIES => self.darwin_getdirentries(m, x[0] as i32, x[1], x[2] & 0xffff_ffff, x[3], true),
-            d::PATHCONF => self.darwin_pathconf(x[1]),
-            d::FPATHCONF => self.fds.get(x[0] as i32).and_then(|_| self.darwin_pathconf(x[1])),
+            d::PATHCONF => {
+                let p = self.path_io().at_path(m, CWD as i32, x[0])?;
+                self.vfs.metadata(&p)?;
+                let insensitive = self.vfs.case_insensitive(&self.vfs.canonical(&p));
+                self.darwin_pathconf(x[1], insensitive)
+            }
+            d::FPATHCONF => {
+                let path = self.fds.get(x[0] as i32)?.path.clone();
+                let insensitive = path.starts_with('/') && self.vfs.case_insensitive(&path);
+                self.darwin_pathconf(x[1], insensitive)
+            }
             // Trace points, which nothing collects.
             d::KDEBUG_TRACE | d::KDEBUG_TRACE64 | d::KDEBUG_TRACE_STRING | d::KDEBUG_TYPEFILTER => Ok(0),
             // PT_DENY_ATTACH: there is no debugger to deny.
@@ -898,7 +907,9 @@ impl Kernel {
 
     /// `pathconf` and `fpathconf`: a limit of the filesystem, by Darwin's
     /// numbers (`<sys/unistd.h>`).
-    fn darwin_pathconf(&mut self, name: u64) -> SysResult {
+    /// `pathconf`'s answers for a file on a filesystem that looks names up
+    /// without regard to case, or not.
+    fn darwin_pathconf(&mut self, name: u64, case_insensitive: bool) -> SysResult {
         Ok(match name {
             1 => 32767,       // _PC_LINK_MAX
             2 | 3 => 1024,    // _PC_MAX_CANON, _PC_MAX_INPUT
@@ -907,7 +918,8 @@ impl Kernel {
             6 => 512,         // _PC_PIPE_BUF
             7 | 8 => 200112,  // _PC_CHOWN_RESTRICTED, _PC_NO_TRUNC
             9 => 255,         // _PC_VDISABLE
-            11 | 12 => 1,     // _PC_CASE_SENSITIVE, _PC_CASE_PRESERVING
+            11 => (!case_insensitive).into(), // _PC_CASE_SENSITIVE
+            12 => 1,          // _PC_CASE_PRESERVING
             18 => 64,         // _PC_FILESIZEBITS
             24 => 1024,       // _PC_SYMLINK_MAX
             26 => 64,         // _PC_XATTR_SIZE_BITS

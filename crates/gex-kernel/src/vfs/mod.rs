@@ -950,6 +950,14 @@ pub trait FileSystem: Send + Sync {
     fn keeps_owners(&self) -> bool {
         false
     }
+    /// Whether names in this filesystem are looked up without regard to
+    /// case (as a Mac's default APFS is), keeping the case they were
+    /// written with. What `pathconf`'s `_PC_CASE_SENSITIVE` and a volume's
+    /// `VOL_CAP_FMT_CASE_SENSITIVE` answer for it, so it must say what its
+    /// lookups do.
+    fn case_insensitive(&self) -> bool {
+        false
+    }
     /// Change the mode of the symlink `path` itself, which a Mac's link
     /// has and Linux's has not (`lchmod`, `chmod -h`). `EOPNOTSUPP` where
     /// a link's mode is not kept.
@@ -2251,6 +2259,13 @@ impl Namespace {
     /// Whether the filesystem `path` is in keeps owners.
     pub fn keeps_owners(&self, path: &str) -> bool {
         self.resolve(path).is_ok_and(|(fs, _)| fs.keeps_owners())
+    }
+
+    /// Whether the filesystem `path` is in looks names up without regard to
+    /// case ([`FileSystem::case_insensitive`]).
+    pub fn case_insensitive(&self, path: &str) -> bool {
+        self.resolve(path)
+            .is_ok_and(|(fs, _)| fs.case_insensitive())
     }
 
     /// An extended-attribute call on `path`, following a final symlink when

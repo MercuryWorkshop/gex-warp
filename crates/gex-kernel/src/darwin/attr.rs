@@ -250,10 +250,12 @@ impl Kernel {
                 (self.vfs.metadata(&p)?, self.vfs.canonical(&p))
             }
         };
-        // (A volume's own attributes are its root's.)
+        // (A volume's own attributes are its root's, but for its case: the
+        // filesystem's the path is on.)
+        let case_insensitive = full.starts_with('/') && self.vfs.case_insensitive(&full);
         let (md, full) = if volume != 0 { (self.vfs.metadata("/")?, "/".to_string()) } else { (md, full) };
         let full = if full.starts_with('/') { full } else { "/".to_string() };
-        let out = self.darwin_pack_attrs(&md, &full, [common, volume, dirs, files, fork], options, false);
+        let out = self.darwin_pack_attrs(&md, &full, [common, volume, dirs, files, fork], options, false, case_insensitive);
         m.write(buf, &out[..out.len().min(size as usize)])?;
         Ok(0)
     }
@@ -262,7 +264,7 @@ impl Kernel {
     /// much there turns out to be room for), then what was asked for. One
     /// of a directory's entries read in bulk (`bulk`) is a multiple of
     /// eight bytes long.
-    fn darwin_pack_attrs(&self, md: &crate::vfs::Metadata, full: &str, want: [u32; 5], options: u64, bulk: bool) -> Vec<u8> {
+    fn darwin_pack_attrs(&self, md: &crate::vfs::Metadata, full: &str, want: [u32; 5], options: u64, bulk: bool, case_insensitive: bool) -> Vec<u8> {
         let [common, volume, dirs, files, fork] = want;
         let st = self.path_io().stat_owned(md);
         let (parent, name) = split(full);
@@ -326,7 +328,7 @@ impl Kernel {
             }
         }
         if volume != 0 {
-            self.darwin_volume_attrs(&mut p, volume);
+            self.darwin_volume_attrs(&mut p, volume, case_insensitive);
         }
         let (mut dirs, mut files) = (dirs, files);
         if is_dir {
@@ -418,7 +420,7 @@ impl Kernel {
             let path = format!("{dir}/{}", e.name);
             // (An entry gone since the directory was read is passed over.)
             let Ok(md) = self.vfs.metadata_nofollow(&path) else { return true };
-            let entry = self.darwin_pack_attrs(&md, &path, [common, 0, dirs, files, fork], options, true);
+            let entry = self.darwin_pack_attrs(&md, &path, [common, 0, dirs, files, fork], options, true, false);
             if out.len() + entry.len() > size as usize {
                 full_up = true;
                 return false;
@@ -461,18 +463,19 @@ impl Kernel {
     }
 
     /// The attributes of the one volume there is: APFS, mounted on `/`,
-    /// of the size `statfs` says.
-    fn darwin_volume_attrs(&self, p: &mut Pack, volume: u32) {
+    /// of the size `statfs` says, and of the case the filesystem asked
+    /// about keeps ([`crate::vfs::FileSystem::case_insensitive`]).
+    fn darwin_volume_attrs(&self, p: &mut Pack, volume: u32, case_insensitive: bool) {
         // (`statfs`'s numbers: 4096-byte blocks, 2^20 of them, half free.)
         const BLOCK: u64 = 4096;
         const SIZE: u64 = BLOCK << 20;
         const FREE: u64 = BLOCK << 19;
         // What the volume can do (VOL_CAP_FMT_*, VOL_CAP_INT_*): its
         // format keeps persistent ids, symbolic and hard links, sparse
-        // files, case as written and told apart, files past 2 GiB, hidden
-        // files and 64-bit ids, and answers `statfs` cheaply; of the
-        // interfaces it has `getattrlist`, advisory locks, `access` by
-        // attribute and extended attributes.
+        // files, case as written and (unless the filesystem does not) told
+        // apart, files past 2 GiB, hidden files and 64-bit ids, and answers
+        // `statfs` cheaply; of the interfaces it has `getattrlist`, advisory
+        // locks, `access` by attribute and extended attributes.
         const FORMAT: u32 = 0x1 | 0x2 | 0x4 | 0x40 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2_0000;
         const INTERFACES: u32 = 0x2 | 0x100 | 0x400 | 0x4000;
         for bit in (0..31).map(|i| 1u32 << i).filter(|b| volume & b != 0) {
@@ -496,7 +499,9 @@ impl Kernel {
                 vol::CAPABILITIES => {
                     // What it can do, then which of those answers mean
                     // anything: all that are given.
-                    for v in [FORMAT, INTERFACES, 0, 0, FORMAT, INTERFACES, 0, 0] {
+                    // (VOL_CAP_FMT_CASE_SENSITIVE is an answer either way.)
+                    let format = if case_insensitive { FORMAT & !0x100 } else { FORMAT };
+                    for v in [format, INTERFACES, 0, 0, FORMAT, INTERFACES, 0, 0] {
                         p.u32(v);
                     }
                 }
