@@ -127,6 +127,14 @@ impl FileHandle for DevHandle {
         true
     }
 
+    /// As Linux's: a seek on null, zero, full or a random source succeeds
+    /// and leaves the offset at 0; only the terminal answers `ESPIPE`. (A
+    /// Windows program's output to NUL seeks it, and an error there is
+    /// "Invalid function.")
+    fn seek(&self, _offset: i64, _whence: u32) -> Option<SysResult> {
+        (self.device != Device::Tty).then_some(Ok(0))
+    }
+
     fn is_tty(&self) -> bool {
         self.device == Device::Tty
     }
@@ -563,6 +571,17 @@ mod tests {
         let mut buf = [0xffu8; 8];
         assert_eq!(f.read_at(0, &mut buf).unwrap(), 0);
         assert_eq!(f.write_at(0, b"discarded").unwrap(), 9);
+    }
+
+    #[test]
+    fn seeks_as_linux() {
+        let fs = DevFs::new();
+        for dev in ["null", "zero", "full", "urandom"] {
+            let f = fs.open(dev, 0, 0).unwrap();
+            assert_eq!(f.seek(0, 2), Some(Ok(0)), "/dev/{dev} seeks to 0");
+            assert_eq!(f.seek(100, 0), Some(Ok(0)), "/dev/{dev} stays at 0");
+        }
+        assert_eq!(fs.open("tty", 0, 0).unwrap().seek(0, 0), None, "/dev/tty is a stream");
     }
 
     #[test]

@@ -1266,6 +1266,8 @@ struct Screen {
     /// Who has the keyboard (by `activate`) and the pointer (by hit test).
     focus: Option<Key>,
     pointer: Option<Key>,
+    /// Where the pointer is on the screen.
+    at: (i32, i32),
     /// The scripted drag: which file list, and the surface it is over.
     drag: Option<(usize, Option<Key>)>,
     /// A client's drag's icon: its surface, where the pointer is, and its
@@ -1333,7 +1335,7 @@ impl Screen {
     /// The placed surfaces bottom to top, layers kept apart.
     fn stack(&self) -> Vec<Key> {
         let mut v = self.order.clone();
-        v.sort_by_key(|k| self.placed.get(k).map(|p| p.2.layer).unwrap_or(0));
+        v.sort_by_key(|k| self.placed.get(k).map(|p| p.2.rank()).unwrap_or(0));
         v
     }
 
@@ -1410,14 +1412,26 @@ impl Screen {
         None
     }
 
+    /// The placed surface whose client grabbed the pointer (placement
+    /// version 4: a menu or move loop), the topmost when several say so, and
+    /// where it is.
+    fn grabber(&self) -> Option<(Key, i32, i32)> {
+        self.stack().into_iter().rev().find_map(|k| match self.placed.get(&k) {
+            Some(&(px, py, p)) if p.grab => Some((k, px, py)),
+            _ => None,
+        })
+    }
+
     /// Route scripted events: the pointer to whatever placed window is under
-    /// it, buttons with it, keys to the window its client activated.
+    /// it (or to the one whose client grabbed it), buttons with it, keys to
+    /// the window its client activated.
     fn route(&mut self, due: &[(Ev, u32)]) -> Vec<(u64, Routed)> {
         let mut out: Vec<(u64, Routed)> = self.leaves.drain(..).map(|s| (s, Routed::KeyboardLeave)).collect();
         for &(ev, ms) in due {
             match ev {
                 Ev::Motion(x, y) => {
-                    let hit = self.hit(x, y);
+                    self.at = (x, y);
+                    let hit = self.grabber().map(|(k, px, py)| (k, x - px, y - py)).or_else(|| self.hit(x, y));
                     if let Some(old) = self.pointer {
                         if hit.map(|h| h.0 .0) != Some(old.0) {
                             out.push((old.0, Routed::PointerClear));
@@ -1431,6 +1445,18 @@ impl Screen {
                     }
                 }
                 Ev::Button(b, down) => {
+                    // A grab taken since the last motion: the button is the
+                    // grabber's, at the pointer's place on it.
+                    if let Some((k, px, py)) = self.grabber() {
+                        if self.pointer != Some(k) {
+                            if let Some(old) = self.pointer {
+                                out.push((old.0, Routed::PointerClear));
+                            }
+                            self.pointer = Some(k);
+                            out.push((k.0, Routed::Origin(k.1, px, py)));
+                            out.push((k.0, Routed::PointerTo(k.1, self.at.0 - px, self.at.1 - py, ms)));
+                        }
+                    }
                     if let Some((sid, _)) = self.pointer {
                         out.push((sid, Routed::Button(b, down, ms)));
                     }
@@ -1507,19 +1533,29 @@ impl Screen {
         }
     }
 
-    /// What to draw, bottom to top: windows nobody placed centred, as
-    /// before, then the placed ones where they are, then a drag's icon at
-    /// the pointer. `size`: the screen's, which centres a window.
+    /// What to draw, bottom to top: the desktop layer's placed windows, then
+    /// windows nobody placed centred, as before, then the other placed ones
+    /// where they are, then a drag's icon at the pointer. `size`: the
+    /// screen's, which centres a window.
     fn items(&self, size: (u32, u32)) -> Vec<(u64, &Frame, Option<(i32, i32)>)> {
         let key = |k: &Key| (k.0 << 32) | u64::from(k.1);
         let icon = self.icon.map(|i| i.0);
+        let stack = self.stack();
+        let desktop = |k: &Key| self.placed.get(k).is_some_and(|p| p.2.rank() < 0);
+        let mut out = Vec::new();
+        let mut placed = |out: &mut Vec<_>, k: &Key| {
+            if let (Some(f), Some(&(x, y, _))) = (self.frames.get(k), self.placed.get(k)) {
+                out.push((key(k), f, Some((x, y))));
+            }
+        };
+        for k in stack.iter().filter(|k| desktop(k)) {
+            placed(&mut out, k);
+        }
         let mut loose: Vec<_> = self.frames.iter().filter(|(k, _)| !self.placed.contains_key(k) && Some(**k) != icon).collect();
         loose.sort_by_key(|(k, _)| **k);
-        let mut out: Vec<_> = loose.into_iter().map(|(k, f)| (key(k), f, None)).collect();
-        for k in self.stack() {
-            if let (Some(f), Some(&(x, y, _))) = (self.frames.get(&k), self.placed.get(&k)) {
-                out.push((key(&k), f, Some((x, y))));
-            }
+        out.extend(loose.into_iter().map(|(k, f)| (key(k), f, None)));
+        for k in stack.iter().filter(|k| !desktop(k)) {
+            placed(&mut out, k);
         }
         if let Some((k, at, hx, hy)) = self.icon {
             let point = match at {
@@ -1546,11 +1582,12 @@ impl Screen {
                 continue;
             };
             s += &format!(
-                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}{}",
+                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}{}{}",
                 k.0, k.1, p.id, f.width, f.height, x, y, p.layer,
                 // the client draws its whole window: a page compositor puts no frame round it
                 if p.unmanaged { " unmanaged" } else { "" },
-                if self.focus == Some(k) { " focus" } else { "" }
+                if self.focus == Some(k) { " focus" } else { "" },
+                if p.grab { " grab" } else { "" }
             );
         }
         if s != self.listed {
@@ -1785,6 +1822,24 @@ mod tests {
         let out = s.route(&[(Ev::Key(28, true), 10)]);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], (1, Routed::Key(28, true, 10))));
+    }
+
+    /// A desktop-layer window stays under a normal window sent to the bottom
+    /// of its layer, is drawn first, and takes the pointer over the bare
+    /// desktop.
+    #[test]
+    fn the_desktop_layer_is_under_the_rest() {
+        let mut s = Screen::default();
+        window(&mut s, (1, 5), 0);
+        s.placed.get_mut(&(1, 5)).unwrap().2.layer = Placement::DESKTOP;
+        window(&mut s, (2, 7), 50);
+        s.restack((2, 7), Placement::BOTTOM);
+        assert_eq!(s.order, vec![(2, 7), (1, 5)], "the bottom of the order");
+        assert_eq!(s.stack(), vec![(1, 5), (2, 7)], "the desktop still under");
+        let drawn: Vec<u64> = s.items((640, 480)).iter().map(|i| i.0).collect();
+        assert_eq!(drawn, vec![(1 << 32) | 5, (2 << 32) | 7]);
+        assert_eq!(s.hit(10, 10), Some(((1, 5), 10, 10)), "over the bare desktop");
+        assert_eq!(s.hit(60, 10), Some(((2, 7), 10, 10)), "over the window");
     }
 
     /// With no window on the screen, a key goes nowhere.

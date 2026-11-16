@@ -384,7 +384,7 @@ pub struct Placement {
     pub placed: bool,
     /// The client draws the whole window: no decoration.
     pub unmanaged: bool,
-    /// 0 normal, 1 topmost, 2 overlay (menus).
+    /// 0 normal, 1 topmost, 2 overlay (menus), 3 desktop (below the rest).
     pub layer: u32,
     /// The client's name for the surface, which other placed surfaces --
     /// of any client in the session -- use to say what they go below.
@@ -396,17 +396,30 @@ pub struct Placement {
     pub restack: u32,
     /// Bumped by every activate request: give this surface the keyboard.
     pub activate: u32,
+    /// The client grabbed the pointer for this surface (version 4): every
+    /// pointer event is its, wherever the pointer is, until it lets go.
+    pub grab: bool,
 }
 
 impl Placement {
     /// The bottom of a layer, for `below`.
     pub const BOTTOM: u32 = u32::MAX;
+    /// The desktop layer: below every other window, placed or not (a window
+    /// system's own desktop window, which draws the background and its icons).
+    pub const DESKTOP: u32 = 3;
+
+    /// Where the layer goes in the stacking, low to high: the desktop under
+    /// normal, topmost and overlay.
+    pub fn rank(&self) -> i32 {
+        if self.layer == Self::DESKTOP { -1 } else { self.layer as i32 }
+    }
 
     /// The placement words of a surface record (`R_PLACE`.. in
-    /// `wl-bridge.mjs`): flags and layer, id, below, restack, activate.
+    /// `wl-bridge.mjs`): flags (placed, unmanaged, grab) and layer, id, below,
+    /// restack, activate.
     pub fn record_words(&self) -> [i32; 5] {
         [
-            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | ((self.layer as i32 & 0xff) << 8),
+            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | (i32::from(self.grab) << 2) | ((self.layer as i32 & 0xff) << 8),
             self.id as i32,
             self.below as i32,
             self.restack as i32,
@@ -632,8 +645,10 @@ const GLOBALS: &[(&str, u32)] = &[
     // and what it is under, and the compositor shows it there rather than
     // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
     // adds the `origin` event: where the compositor has the surface, for
-    // turning its surface-local pointer positions into Win32's.
-    ("gex_window_placement_manager_v1", 2),
+    // turning its surface-local pointer positions into Win32's; version 3
+    // the desktop layer, under every other window; version 4 the grab, every
+    // pointer event to one surface while its client's menu or move loop runs.
+    ("gex_window_placement_manager_v1", 4),
     // Mouse look: a lock the host grants (the page's pointer lock) and the
     // movement under it (pointer.rs). Xwayland locks for an X client that
     // grabs the pointer and hides it.
@@ -910,6 +925,9 @@ pub struct Client {
     /// Device pixels per surface unit: what `wl_output.scale` says. A
     /// toplevel's configure is in surface units, so `default_size / scale`.
     scale: i32,
+    /// `wl_keyboard.repeat_info`: keys a second and the delay in ms (rate 0:
+    /// the client repeats nothing, the host sends each repeat as a press).
+    key_repeat: (i32, i32),
     /// The version this client bound `xdg_wm_base` at, which its toplevels
     /// share: `configure_bounds` is only for 4 and up.
     wm_base_version: u32,
@@ -1022,6 +1040,7 @@ impl Client {
             default_size: (640, 480),
             fullscreen_changes: Vec::new(),
             scale: 1,
+            key_repeat: (25, 600),
             wm_base_version: 0,
             placement_version: 0,
             host_frames: true,
@@ -1117,6 +1136,17 @@ impl Client {
         self.scale = scale.clamp(1, 8);
     }
 
+    /// The key repeat this client is told (`wl_keyboard.repeat_info`): `rate`
+    /// keys a second after `delay` ms, or none at rate 0. A host whose input
+    /// already repeats (a browser's keydowns while a key is held) says 0 and
+    /// sends each repeat as a press: a repeat timer in the client runs from
+    /// the press it saw, and when the host is late handing on the release
+    /// (a page's main thread busy) it repeats a key the user let go of.
+    /// Set before the client asks for its keyboard.
+    pub fn set_key_repeat(&mut self, rate: i32, delay: i32) {
+        self.key_repeat = (rate.max(0), delay.max(0));
+    }
+
     /// Feed bytes and descriptors that arrived together.
     pub fn receive(&mut self, bytes: &[u8], fds: &[u32], buffers: &dyn Buffers) {
         self.inbox.extend_from_slice(bytes);
@@ -1186,6 +1216,16 @@ impl Client {
 
     /// `GEX_WL_KEYTRACE=1`: every keyboard object made or released, and every
     /// enter, leave and key sent (a scripted key that a client never acts on).
+    /// `GEX_WL_CURSORTRACE`: every `wl_pointer.set_cursor`, the surface or
+    /// none (a hidden pointer), as `[wl-cursor]`: what a test of the pointer
+    /// over a client's windows reads.
+    fn cursortrace(what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("GEX_WL_CURSORTRACE").is_some()) {
+            eprintln!("[wl-cursor] {what}");
+        }
+    }
+
     fn keytrace(what: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ON.get_or_init(|| std::env::var_os("GEX_WL_KEYTRACE").is_some()) {
@@ -1288,6 +1328,7 @@ impl Client {
                             let (_serial, cursor, hx, hy) =
                                 (r.uint(), r.object(), r.int(), r.int());
                             let cursor = cursor.unwrap_or(0);
+                            Self::cursortrace(&if cursor != 0 { format!("surface {cursor}") } else { "none".to_string() });
                             if let Some(prev) = self.cursor_surface.take() {
                                 if prev != cursor {
                                     if let Some(s) = self.surfaces.get_mut(&prev) {
@@ -1497,7 +1538,7 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
-                self.placement_version = version.min(2);
+                self.placement_version = version.min(4);
             }
             "zwp_relative_pointer_manager_v1" => {
                 self.objects.insert(id, Object::RelativePointerManager);
@@ -2956,9 +2997,12 @@ impl Client {
                 }),
                 _ => ok = false,
             },
-            // set_layer(layer)
+            // set_layer(layer): desktop is for version 3 and up.
             2 => match r.uint() {
-                Some(layer) => apply(self, &mut |s| s.placement.layer = layer.min(2)),
+                Some(layer) => {
+                    let layer = if layer == Placement::DESKTOP && self.placement_version >= 3 { layer } else { layer.min(2) };
+                    apply(self, &mut |s| s.placement.layer = layer)
+                }
                 None => ok = false,
             },
             // set_stack_id(id)
@@ -2978,6 +3022,15 @@ impl Client {
             5 => apply(self, &mut |s| s.placement.unmanaged = true),
             // activate
             6 => apply(self, &mut |s| s.placement.activate = s.placement.activate.wrapping_add(1)),
+            // grab, release_grab (version 4): one surface of the session has
+            // the grab, which the host picks out of the scene (the last made)
+            7 if self.placement_version >= 4 => {
+                for s in self.surfaces.values_mut() {
+                    s.placement.grab = false;
+                }
+                apply(self, &mut |s| s.placement.grab = true)
+            }
+            8 if self.placement_version >= 4 => apply(self, &mut |s| s.placement.grab = false),
             _ => ok = false,
         }
         ok
@@ -3011,8 +3064,8 @@ impl Client {
                 self.send(w);
                 self.pending_keymap = Some(km);
                 // repeat_info(rate keys/s, delay ms) for v4+, so the client does
-                // not have to assume a repeat rate.
-                let w = Writer::new(id, 5).int(25).int(600);
+                // not have to assume a repeat rate (`set_key_repeat`).
+                let w = Writer::new(id, 5).int(self.key_repeat.0).int(self.key_repeat.1);
                 self.send(w);
                 true
             }
@@ -4228,6 +4281,26 @@ mod tests {
         assert_eq!(r.uint(), Some(1), "pressed");
     }
 
+    /// The repeat a keyboard is told: 25 a second after 600 ms by default; a
+    /// host that sends its own repeats as presses says rate 0 (none).
+    #[test]
+    fn a_keyboard_is_told_the_hosts_key_repeat() {
+        let rate = |set: Option<(i32, i32)>| {
+            let mut c = with_seat();
+            if let Some((r, d)) = set {
+                c.set_key_repeat(r, d);
+            }
+            c.receive(&Writer::new(12, 1).new_id(13).finish(), &[], &no_pool());
+            let msgs = messages(&c.take_outgoing());
+            let info = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 5).expect("repeat_info");
+            let mut fds = Vec::new();
+            let mut r = Reader::new(&info.2, &mut fds);
+            (r.int().unwrap(), r.int().unwrap())
+        };
+        assert_eq!(rate(None), (25, 600));
+        assert_eq!(rate(Some((0, 600))), (0, 600));
+    }
+
     /// A window that never commits a buffer (its pixels are the host's GL)
     /// gets the keyboard from `focus_fallback`, so scripted keys reach it.
     #[test]
@@ -4994,6 +5067,58 @@ mod tests {
         c.receive(&Writer::new(6, 6).finish(), &[], &pool);
         let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
         assert_eq!((s.width, s.height, s.addr), (200, 125, 0x10_0000));
+    }
+
+    /// The desktop layer is for clients that bound version 3: an older one's
+    /// unknown layer is the overlay, as it always was.
+    #[test]
+    fn the_desktop_layer_needs_version_3() {
+        let pool = Placed(0x6000, 8192);
+        for (version, want) in [(3, Placement::DESKTOP), (2, 2)] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 2).uint(Placement::DESKTOP).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert_eq!((p.layer, p.rank() < 0), (want, version == 3), "version {version}");
+        }
+    }
+
+    /// A grab (version 4) is the surface's until it lets go or its placement
+    /// goes, rides in the record's flags, and is refused to an older client.
+    #[test]
+    fn a_grab_needs_version_4_and_ends_with_release_or_destroy() {
+        let pool = Placed(0x6000, 8192);
+        for version in [4, 3] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            if version < 4 {
+                assert!(c.failed.is_some(), "a version 3 client's grab is not a request it has");
+                continue;
+            }
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert!(p.grab);
+            assert_eq!(p.record_words()[0] & 4, 4);
+            c.receive(&Writer::new(60, 8).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "released");
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 0).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "gone with its placement");
+        }
     }
 
     #[test]

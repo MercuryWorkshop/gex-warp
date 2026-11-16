@@ -11523,7 +11523,11 @@ impl Kernel {
             .clone()
             .or_else(|| (!exec).then(|| wine_program(path, &self.argv, &self.envp)).flatten())
             .or_else(|| (!path.is_empty() && !loader(path)).then(|| path.to_string()));
-        let stay32 = self.exec_mem64 == Some(false);
+        // A 32-bit Windows program (a PE32 image, in a WoW64 process) has
+        // no 64-bit memory to move to: the i386 builtins have no memory64
+        // modules. It keeps the lowered memory, as if it asked to.
+        let stay32 = self.exec_mem64 == Some(false)
+            || image.as_deref().and_then(|p| self.read_head(p, 4096)).is_some_and(|h| pe_is_32bit(&h));
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
             Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
@@ -14810,9 +14814,11 @@ impl Kernel {
 }
 
 /// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
-/// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
-/// always does: glibc's `statvfs` otherwise looks the mount flags up in
-/// /proc/mounts.
+/// magic, a 256 GiB volume with 192 GiB free). Installers refuse to start
+/// when the free space is below what they will lay down, and large ones
+/// ask for several GiB; a write past what the host can hold still fails
+/// at the write. `f_flags` has ST_VALID, as Linux's always does: glibc's
+/// `statvfs` otherwise looks the mount flags up in /proc/mounts.
 pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
@@ -14823,9 +14829,9 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     };
     put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
     put(&mut out, 8, 4096); // f_bsize
-    put(&mut out, 16, 1 << 20); // f_blocks
-    put(&mut out, 24, 1 << 19); // f_bfree
-    put(&mut out, 32, 1 << 19); // f_bavail
+    put(&mut out, 16, 1 << 26); // f_blocks
+    put(&mut out, 24, 3 << 24); // f_bfree
+    put(&mut out, 32, 3 << 24); // f_bavail
     put(&mut out, 40, 1 << 18); // f_files
     put(&mut out, 48, 1 << 17); // f_ffree
     // f_fsid (8 bytes) at 56
@@ -15229,6 +15235,7 @@ mod tests {
         statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
         let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
         assert_eq!(q(8), 4096, "f_bsize");
+        assert!(q(32) * q(8) >= 64 << 30, "f_bavail: room for a large installer");
         assert_eq!(q(56), 0, "f_fsid");
         assert_eq!(q(64), 255, "f_namelen");
         assert_eq!(q(72), 4096, "f_frsize");
@@ -20115,6 +20122,14 @@ pub const W64_CODE_TOP: u64 = 0x7fff_0000;
 /// relocation directory), so it goes at its preferred base alone, and that
 /// base puts it above [`W64_CODE_TOP`] (a linker's default x86-64 base,
 /// 0x140000000, is). Anything else, or headers that do not parse: false.
+/// Whether `head` is a PE32 image's (a 32-bit Windows program or DLL).
+pub fn pe_is_32bit(head: &[u8]) -> bool {
+    let at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let nt = head.get(0x3c..0x40).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    head.get(..2) == Some(b"MZ")
+        && nt.is_some_and(|nt| head.get(nt..nt + 4) == Some(b"PE\0\0") && at(nt + 24) == Some(0x10b))
+}
+
 pub fn pe_needs_mem64(head: &[u8]) -> bool {
     let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -20143,7 +20158,16 @@ pub fn pe_needs_mem64(head: &[u8]) -> bool {
 
 #[cfg(test)]
 mod pe_mem64_tests {
-    use super::pe_needs_mem64;
+    use super::{pe_is_32bit, pe_needs_mem64};
+
+    #[test]
+    fn pe32_is_32bit() {
+        let mut b = pe(0x400000, 0x102, 0x100, 0x14c);
+        b[0x98..0x9a].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert!(pe_is_32bit(&b));
+        assert!(!pe_is_32bit(&pe(0x140000000, 0x22, 0x100, 0x8664)));
+        assert!(!pe_is_32bit(b"\x7fELF"));
+    }
 
     /// A minimal PE32+ header: `base`, `chars`, the relocation directory's size.
     fn pe(base: u64, chars: u16, relocs: u32, machine: u16) -> Vec<u8> {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link Wine's PE side as one wasm module.
 
-    pelink.py [--split FILE DLL,...] [--exports-of CORE.wasm] [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
+    pelink.py [--split FILE DLL,...] [--exports-of CORE.wasm] [--extra NAME R.O EXPORTS IMPORTS ...] [--stub-imports] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
 
 For each DLL (all of them, or those named), the build left the DLL as one
@@ -56,6 +56,8 @@ M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
 STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as paths (pelink's main)
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
+STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
+EXTRA = set()  # the --extra DLLs (pelink's main)
 
 
 def cc(*args):
@@ -195,6 +197,24 @@ def spec_own(spec):
     return out
 
 
+def spec_reexports(spec):
+    """The function names a .spec re-exports from a DLL it imports
+    (`-import` entries)."""
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) < 3 or parts[1] not in ('stdcall', 'cdecl', 'thiscall', 'varargs', 'fastcall') or '-import' not in parts:
+            continue
+        rest = [t for t in parts[2:] if not t.startswith('-')]
+        if rest:
+            out.add(rest[0].split('(', 1)[0])
+    return out
+
+
 def spec_functions(spec):
     """The function names a .spec exports (its stdcall/cdecl/thiscall/
     varargs entries; not data, stubs or extern)."""
@@ -260,6 +280,16 @@ def main():
     while sys.argv[1] == '--extra':
         extra.append((sys.argv[2], sys.argv[3], sys.argv[4], [i for i in sys.argv[5].split(',') if i]))
         del sys.argv[1:6]
+    # --stub-imports (gexcc-win's link of a program, a --split module of
+    # --extra DLLs): a function the program imports that no module exports is
+    # bound, as Wine's loader binds an import its DLL does not export, to a
+    # stub that raises EXCEPTION_WINE_STUB when called; each is listed. The
+    # core and the tree's DLLs stay checked (check_imports).
+    global STUB_IMPORTS
+    if sys.argv[1] == '--stub-imports':
+        STUB_IMPORTS = True
+        del sys.argv[1]
+    EXTRA.update(e[0] for e in extra)
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -551,6 +581,146 @@ def dll_slots(path, mapfile, obj_dll):
     return ''.join(f'{dll} {kind} {lo:x} {hi:x}\n' for (dll, kind), rs in sorted(ranges.items()) for lo, hi in rs)
 
 
+# A function body over the engines' limit (7654321 bytes) fails the load:
+# wasm-ld's __wasm_apply_data_relocs, one store for each address in a large
+# program's data, passes it. Such a straight-line function is split.
+SPLIT_FUNC_AT = 1 << 20
+
+
+def split_big_funcs(path):
+    """Each function of a module that takes nothing and returns nothing, has
+    no locals and is a sequence of stores of constants, globals and their
+    sums over SPLIT_FUNC_AT bytes: its statements in functions of their
+    own, appended after the others (no index changes), which it calls."""
+    b = open(path, 'rb').read()
+    secs, i = [], 8
+    while i < len(b):
+        size, j = leb_at(b, i + 1)
+        secs.append([b[i], b[j:j + size]])
+        i = j + size
+    by = {sid: k for k, (sid, _) in enumerate(secs) if sid}
+    if 10 not in by or 3 not in by or 1 not in by:
+        return
+    def sleb_end(body, k):
+        while body[k] & 0x80:
+            k += 1
+        return k + 1
+    # the types taking and returning nothing
+    void, (n, k) = set(), leb_at(secs[by[1]][1], 0)
+    tb = secs[by[1]][1]
+    for t in range(n):
+        if tb[k] != 0x60:
+            return
+        np_, k = leb_at(tb, k + 1)
+        k += np_
+        nr, k = leb_at(tb, k)
+        k += nr
+        if not np_ and not nr:
+            void.add(t)
+    fb = secs[by[3]][1]
+    nf, k = leb_at(fb, 0)
+    ftypes = []
+    for _ in range(nf):
+        t, k = leb_at(fb, k)
+        ftypes.append(t)
+    cb = secs[by[10]][1]
+    nc, k = leb_at(cb, 0)
+    bodies = []
+    for _ in range(nc):
+        sz, k2 = leb_at(cb, k)
+        bodies.append(cb[k2:k2 + sz])
+        k = k2 + sz
+    nimp = 0
+    if 2 in by:
+        ib = secs[by[2]][1]
+        n, k = leb_at(ib, 0)
+        for _ in range(n):
+            for _ in range(2):
+                ln, k = leb_at(ib, k)
+                k += ln
+            kind = ib[k]
+            k += 1
+            if kind == 0:
+                nimp += 1
+                _, k = leb_at(ib, k)
+            elif kind in (1, 2):
+                k += kind == 1
+                fl, k = leb_at(ib, k)
+                _, k = leb_at(ib, k)
+                if fl & 1:
+                    _, k = leb_at(ib, k)
+            elif kind == 3:
+                k += 2
+            elif kind == 4:
+                k += 1
+                _, k = leb_at(ib, k)
+    # (stack effect of each opcode such a function may use)
+    PUSH = {0x23: 1, 0x41: 1, 0x42: 1}
+    BIN = {0x6a, 0x6b, 0x7c, 0x7d}
+    UN = {0xa7, 0xac, 0xad}
+    STORE = {0x36, 0x37}
+    new = []
+    for x, body in enumerate(bodies):
+        if len(body) <= SPLIT_FUNC_AT or ftypes[x] not in void or body[0] != 0:
+            continue
+        cuts, k, depth, ok = [1], 1, 0, True
+        while k < len(body) - 1:
+            op = body[k]
+            if op == 0x23:
+                _, k = leb_at(body, k + 1)
+            elif op in (0x41, 0x42):
+                k = sleb_end(body, k + 1)
+            elif op in BIN or op in UN:
+                k += 1
+            elif op in STORE:
+                _, k = leb_at(body, k + 1)
+                _, k = leb_at(body, k)
+            else:
+                ok = False
+                break
+            depth += PUSH.get(op, 0) - (op in BIN) - 2 * (op in STORE)
+            if depth == 0 and k - cuts[-1] >= SPLIT_FUNC_AT // 2:
+                cuts.append(k)
+        if not ok or depth or body[-1] != 0x0b:
+            continue
+        cuts.append(len(body) - 1)
+        calls = bytearray(b'\0')
+        for a, z in zip(cuts, cuts[1:]):
+            idx = nimp + nf + len(new)
+            new.append((ftypes[x], b'\0' + body[a:z] + b'\x0b'))
+            calls += b'\x10' + enc_leb(idx)
+        bodies[x] = bytes(calls) + b'\x0b'
+    if not new:
+        return
+    ftypes += [t for t, _ in new]
+    bodies += [bd for _, bd in new]
+    secs[by[3]][1] = enc_leb(len(ftypes)) + b''.join(enc_leb(t) for t in ftypes)
+    secs[by[10]][1] = enc_leb(len(bodies)) + b''.join(enc_leb(len(bd)) + bd for bd in bodies)
+    with open(path, 'wb') as f:
+        f.write(b[:8])
+        for sid, body in secs:
+            f.write(bytes([sid]) + enc_leb(len(body)) + body)
+
+
+def drop_custom(path, names):
+    """A module without the custom sections `names` (link-time inputs only,
+    which wasm-ld concatenates and wasm-opt keeps)."""
+    b = open(path, 'rb').read()
+    out, i, dropped = bytearray(b[:8]), 8, False
+    while i < len(b):
+        size, j = leb_at(b, i + 1)
+        if b[i] == 0:
+            n, k = leb_at(b, j)
+            if b[k:k + n].decode('utf-8', 'replace') in names:
+                dropped = True
+                i = j + size
+                continue
+        out += b[i:j + size]
+        i = j + size
+    if dropped:
+        open(path, 'wb').write(out)
+
+
 def name_imports(path):
     """A --split module's function imports named by their symbols: wasm-ld
     keeps an undefined symbol's original import name (env.strlen) though
@@ -670,6 +840,67 @@ def with_static_exports(dlls):
         subprocess.check_call(['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['-r', '-o', merged, ro] + objs)
         out.append((mod, merged, ex, imports))
     return out
+
+
+def stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp):
+    """--stub-imports: each program module's function imports that no module
+    defines get a definition in the module, raising EXCEPTION_WINE_STUB with
+    the DLL whose .spec lists the name (as a stub or commented out), as
+    Wine's stub entry points do: an unhandled one ends the process with
+    "unimplemented function DLL.NAME". The core exports RaiseException for
+    them."""
+    rt = syms([gexrt], '--defined-only') if gexrt else set()
+    ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+    owners = None
+    for g in objs:
+        mods = [m for m, _, _, _ in dlls if grp(m) == g]
+        if not g or not mods or not all(m in EXTRA for m in mods):
+            continue
+        undef = syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only')
+        gaps = {}
+        for m in mods:
+            for (n, k), sig in sigs.get(m, {}).items():
+                if (k == 'undefined' and n in undef and '!' not in n and n not in elsewhere and n not in rt
+                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS
+                        and n not in CROSS_MODE and not n.startswith(('__gexw_', 'gexw_', '__wasm'))):
+                    gaps.setdefault(n, sig)
+        if not gaps:
+            continue
+        if owners is None:
+            # (the stubs and commented-out entries of the tree's .spec files)
+            owners = {}
+            for d in sorted(os.listdir(os.path.join(SRC, 'dlls'))):
+                mod = makefile_var(os.path.join(SRC, 'dlls', d, 'Makefile.in'), 'MODULE')
+                if not mod:
+                    continue
+                try:
+                    lines = open(spec_path(SRC, 'dlls', d, mod[0])).read().splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    w = line.lstrip('# ').split()
+                    if len(w) >= 3 and w[0] == '@':
+                        owners.setdefault(w[-1] if w[1] == 'stub' else w[2].split('(')[0], mod[0])
+        src = os.path.join(tmp, f'stubs{g}.c')
+        with open(src, 'w') as f:
+            f.write('void __stdcall gexw_raise(unsigned int, unsigned int, unsigned int, const unsigned long long *)'
+                    ' __asm__("kernelbase.dll!RaiseException");\n'
+                    'static void gexw_stub(const char *dll, const char *name)\n{\n'
+                    '    const unsigned long long args[2] = { (unsigned long long)dll, (unsigned long long)name };\n'
+                    '    for (;;) gexw_raise(0x80000100 /* EXCEPTION_WINE_STUB */, 1 /* EXCEPTION_NONCONTINUABLE */, 2, args);\n}\n')
+            for k, (n, sig) in enumerate(sorted(gaps.items())):
+                r, ps = sig.split(':')
+                params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
+                f.write(f'{ctype[r]} s{k}({params}) __asm__("{n}");\n'
+                        f'{ctype[r]} s{k}({params}) {{ gexw_stub("{owners.get(n, "?")}", "{n}"); for (;;); }}\n')
+        obj = os.path.join(tmp, f'stubs{g}.o')
+        subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
+        objs[g].append(obj)
+        needs.add('kernelbase.dll!RaiseException')
+        elsewhere |= set(gaps)
+        print(f'pelink: warning: {g}: {len(gaps)} imports no DLL exports, bound to stubs that raise '
+              f'EXCEPTION_WINE_STUB when called: ' + ' '.join(f'{owners.get(n, "?")}.{n}' for n in sorted(gaps)),
+              file=sys.stderr)
 
 
 def link(dlls, out, gexrt, others=None):
@@ -947,6 +1178,18 @@ def link(dlls, out, gexrt, others=None):
         return first is None or first in vias
 
     for mod, ro, ex, imports in dlls:
+        # A `-import` re-export of a DLL the module only delay-imports
+        # (imagehlp's SymSetOptions, dbghelp's): gex binds the export to the
+        # owner's adapter when the module's DLL maps, which needs the
+        # owner's module installed, and its DLL loaded and attached, by
+        # then. Nothing would load it later: the export's callers never go
+        # through the module's delay thunks. So it loads with the module.
+        for name in sorted(spec_reexports(owner_spec(SRC, mod))) if SRC else ():
+            via = next((d for d in DELAY.get(mod, []) if lazy_delay(mod, d)
+                        and (d in exporters.get(name, ()) or d in forwards.get(name, {}))), None)
+            if via:
+                delay_eager.setdefault(mod, set()).add(via)
+                direct_refs.setdefault(grp(mod), set()).add(via)
         local = os.path.join(tmp, mod + '.l.o')
         alias_file = os.path.join(tmp, mod + '.aliases')
         with open(alias_file, 'w') as f:
@@ -1465,6 +1708,8 @@ static void *gexw_ntdll_proc(const char *name)
     # what each module defines, for the others' imports
     elsewhere = {n for g in objs for n in syms(objs[g], '--defined-only')} if SPLIT else set()
     main_out = out
+    if STUB_IMPORTS:
+        stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp)
     def emit(g, out, gexrt):
         rsp = os.path.join(tmp, f'exports{g}.rsp')
         with open(rsp, 'w') as f:
@@ -1503,6 +1748,10 @@ static void *gexw_ntdll_proc(const char *name)
             # gexrt's bounds of the entry-thunk pairs (gexw_entries)
             f.write('--export-if-defined=__gexw_entries\n')
             f.write('--export-if-defined=__gexw_entries_decl\n')
+            # the ICALL pass's class adapters' directory and facts (its
+            # GEXW_ENTRY=classes mode), whose bounds its objects define
+            f.write('--export-if-defined=__gexw_adapters\n')
+            f.write('--export-if-defined=__gexw_facts\n')
             # a module with thread-local data (a gexcc-win program's C++
             # runtime): the host gives each thread's instance a block of
             # its own (wasmdll), as wasm-ld's start function does only for
@@ -1614,6 +1863,10 @@ static void *gexw_ntdll_proc(const char *name)
                                    '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
                                    '--enable-exception-handling', '--enable-reference-types',
                                    '--translate-to-exnref', '-o', out])
+        # (gexw.sig64, the ICALL pass's signatures: read from the defining
+        # DLL's objects and side module at link time, never from the module)
+        drop_custom(out, {'gexw.sig64'})
+        split_big_funcs(out)
         # The forwards, for gex to bind a -import re-export of a forwarded name
         # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
         # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.

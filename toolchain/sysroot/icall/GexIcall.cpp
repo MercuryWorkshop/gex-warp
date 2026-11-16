@@ -66,6 +66,8 @@
 #include <map>
 #include <set>
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 using namespace llvm;
 
@@ -622,6 +624,246 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     appendToUsed(M, {G});
   }
 
+  // ---- Class adapters (GEXW_ENTRY=classes; wasm64 only, for now) ----
+  //
+  // In place of a thunk per function, one adapter per class: the function's
+  // wasm type and the facts that type does not say (gex_kernel::ftab::facts:
+  // a struct return's kind, which parameters are small structs by value).
+  // The adapter has the thunks' F_body shape and reads its target from
+  // ctx::LAST_TARGET, which every guest transfer through the table sets, so
+  // it serves every function of its class. For each class this object's
+  // escaping functions use, the pass writes the adapter, its body, a
+  // witness (a function of the class's wasm type, never called: gex reads
+  // the class's wasm type from its table slot, whatever the link and
+  // wasm-opt made of the types) and a directory record { adapter, witness,
+  // facts } in the data section `gexw_adapters`; for each escaping function
+  // whose facts are not 0, a record { function, facts } in `gexw_facts`. gex
+  // finds a guest call's adapter by the callee's slot (FuncMap::get).
+
+  static constexpr uint32_t FACT_SRET_SMALL = 1, FACT_SRET_BIG = 2, FACT_REFUSED = 1u << 31;
+  static constexpr unsigned CTX_LAST_TARGET = 352;  // gex_abi ctx::LAST_TARGET
+
+  static bool classesMode() {
+    const char *e = getenv("GEXW_ENTRY");
+    return e && !strcmp(e, "classes");
+  }
+
+  // F's class: the canonical type of F as wasm sees it (pointers as i64,
+  // integers of up to 32 bits as i32) in CT, and its facts. False, with
+  // FACT_REFUSED, when the guest cannot call it.
+  bool classOf(Function &F, FunctionType *&CT, uint32_t &facts) {
+    LLVMContext &C = F.getContext();
+    const DataLayout &DL = F.getParent()->getDataLayout();
+    Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+    FunctionType *FT = F.getFunctionType();
+    facts = 0;
+    auto canon = [&](Type *T) -> Type * {
+      if (T->isPointerTy() || T->isIntegerTy(64)) return I64;
+      if (T->isIntegerTy() && T->getIntegerBitWidth() <= 32) return I32;
+      if (T->isFloatTy() || T->isDoubleTy() || T->isIntegerTy(128)) return T;
+      return nullptr;
+    };
+    if (FT->isVarArg()) {
+      facts = FACT_REFUSED;
+      return false;
+    }
+    std::vector<Type *> ps;
+    for (unsigned i = 0; i < FT->getNumParams(); i++) {
+      Type *P = FT->getParamType(i);
+      if (i == 0 && F.hasParamAttribute(0, Attribute::StructRet)) {
+        facts |= smallStruct(DL.getTypeAllocSize(F.getParamStructRetType(0))) ? FACT_SRET_SMALL : FACT_SRET_BIG;
+        ps.push_back(I64);
+        continue;
+      }
+      if (Type *BT = F.getParamByValType(i)) {
+        if (smallStruct(DL.getTypeAllocSize(BT))) {
+          if (i >= 28) {
+            facts = FACT_REFUSED;
+            return false;
+          }
+          facts |= 1u << (2 + i);
+        }
+        ps.push_back(I64);
+        continue;
+      }
+      Type *T = canon(P);
+      if (!T) {
+        facts = FACT_REFUSED;
+        return false;
+      }
+      ps.push_back(T);
+    }
+    Type *R = FT->getReturnType();
+    Type *RT = R->isVoidTy() ? R : canon(R);
+    if (!RT || RT->isIntegerTy(128)) {
+      facts = FACT_REFUSED;
+      return false;
+    }
+    CT = FunctionType::get(RT, ps, false);
+    return true;
+  }
+
+  static std::string typeKey(FunctionType *CT) {
+    auto t = [](Type *T) -> char {
+      if (T->isVoidTy()) return 'v';
+      if (T->isIntegerTy(32)) return 'i';
+      if (T->isIntegerTy(64)) return 'I';
+      if (T->isIntegerTy(128)) return 'X';
+      if (T->isFloatTy()) return 'f';
+      return 'd';
+    };
+    std::string s(1, t(CT->getReturnType()));
+    s += '_';
+    for (Type *P : CT->params()) s += t(P);
+    return s;
+  }
+
+  // The witness of wasm type CT: a function never called, whose table slot
+  // says the class's wasm type.
+  Function *witness(Module &M, FunctionType *CT) {
+    std::string name = "__gexw_ty." + typeKey(CT);
+    if (Function *W = M.getFunction(name)) return W;
+    Function *W = Function::Create(CT, GlobalValue::LinkOnceODRLinkage, name, M);
+    W->setVisibility(GlobalValue::HiddenVisibility);
+    W->addFnAttr("gexw-no-icall");
+    W->addFnAttr(Attribute::NoInline);
+    IRBuilder<> B(BasicBlock::Create(M.getContext(), "entry", W));
+    B.CreateUnreachable();
+    return W;
+  }
+
+  // The Win64 adapter of class (CT, facts): entryThunk64's body with the
+  // target from ctx::LAST_TARGET.
+  Function *adapter64(Module &M, FunctionType *CT, uint32_t facts) {
+    char hex[16];
+    snprintf(hex, sizeof hex, "%x", facts);
+    std::string name = "__gexw_adapt." + typeKey(CT) + "." + hex;
+    if (Function *A = M.getFunction(name)) return A;
+    LLVMContext &C = M.getContext();
+    Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *F32 = Type::getFloatTy(C),
+         *F64 = Type::getDoubleTy(C);
+    Type *Ptr = PointerType::get(C, 0);
+    FunctionType *BodyT = FunctionType::get(I32, {I32, I32, I32, I64}, false);
+    Function *Body = Function::Create(BodyT, GlobalValue::LinkOnceODRLinkage, name + ".body", M);
+    Body->setVisibility(GlobalValue::HiddenVisibility);
+    Body->addFnAttr("gexw-no-icall");
+    IRBuilder<> B(BasicBlock::Create(C, "entry", Body));
+    Value *Ctx = Body->getArg(0), *Ret = Body->getArg(3);
+    auto helper = [&](const char *n, Type *R, ArrayRef<Type *> P) {
+      return M.getOrInsertFunction(n, FunctionType::get(R, P, false));
+    };
+    // the target first: a call-out below changes it
+    Value *At = B.CreateIntToPtr(B.CreateAdd(B.CreateZExt(Ctx, I64), B.getInt64(CTX_LAST_TARGET)), Ptr);
+    Value *Target = B.CreateIntToPtr(B.CreateLoad(I64, At), Ptr);
+    auto arg = [&](unsigned k) { return B.CreateCall(helper("__gexw_arg", I64, {I32, I32}), {Ctx, B.getInt32(k)}); };
+    std::vector<Value *> args;
+    unsigned k = 0, first = 0;
+    Value *SRet = nullptr;
+    if (facts & FACT_SRET_SMALL) {
+      SRet = B.CreateAlloca(I64);
+      B.CreateStore(B.getInt64(0), SRet);
+      args.push_back(B.CreatePtrToInt(SRet, I64));
+      first = 1;
+    } else if (facts & FACT_SRET_BIG) {
+      SRet = arg(k++);
+      args.push_back(SRet);
+      first = 1;
+    }
+    for (unsigned i = first; i < CT->getNumParams(); i++, k++) {
+      Type *P = CT->getParamType(i);
+      if (facts & (1u << (2 + i))) args.push_back(B.CreateCall(helper("__gexw_argptr", I64, {I32, I32}), {Ctx, B.getInt32(k)}));
+      else if (P->isIntegerTy(64)) args.push_back(arg(k));
+      else if (P->isIntegerTy(32)) args.push_back(B.CreateTrunc(arg(k), I32));
+      else if (P->isIntegerTy(128)) args.push_back(B.CreateLoad(P, B.CreateIntToPtr(arg(k), Ptr)));
+      else if (P->isDoubleTy()) args.push_back(B.CreateCall(helper("__gexw_argf64", F64, {I32, I32}), {Ctx, B.getInt32(k)}));
+      else args.push_back(B.CreateCall(helper("__gexw_argf32", F32, {I32, I32}), {Ctx, B.getInt32(k)}));
+    }
+    Value *R = B.CreateCall(CT, Target, args);
+    Type *RT = CT->getReturnType();
+    auto ret64 = [&](Value *V) { return B.CreateCall(helper("__gexw_ret", I32, {I32, I64, I64}), {Ctx, Ret, V}); };
+    Value *Out;
+    if (facts & FACT_SRET_SMALL) Out = ret64(B.CreateLoad(I64, SRet));
+    else if (facts & FACT_SRET_BIG) Out = ret64(SRet);
+    else if (RT->isVoidTy()) Out = B.CreateCall(helper("__gexw_ret_void", I32, {I32, I64}), {Ctx, Ret});
+    else if (RT->isDoubleTy()) Out = B.CreateCall(helper("__gexw_ret_f64", I32, {I32, I64, F64}), {Ctx, Ret, R});
+    else if (RT->isFloatTy()) Out = B.CreateCall(helper("__gexw_ret_f32", I32, {I32, I64, F32}), {Ctx, Ret, R});
+    else Out = ret64(RT->isIntegerTy(64) ? R : B.CreateZExt(R, I64));
+    B.CreateRet(Out);
+
+    Function *A = Function::Create(BodyT, GlobalValue::LinkOnceODRLinkage, name, M);
+    A->setVisibility(GlobalValue::HiddenVisibility);
+    A->addFnAttr("gexw-no-icall");
+    IRBuilder<> AB(BasicBlock::Create(C, "entry", A));
+    FunctionCallee Entry = helper("__gexw_entry", I32, {I32, I32, I32, I64, Ptr});
+    AB.CreateRet(AB.CreateCall(Entry, {A->getArg(0), A->getArg(1), A->getArg(2), A->getArg(3), Body}));
+    return A;
+  }
+
+  // Records of pointer-sized words in `section`, an internal used array
+  // (with an all-zero record first, which gex skips: the section exists in
+  // every object of this mode, so its bounds always link), and the bounds
+  // `bounds` = { __start_<section>, __stop_<section> } (linkonce_odr).
+  void emitRecords(Module &M, std::vector<std::vector<Constant *>> recs, unsigned words, const char *name,
+                   const char *section, const char *bounds) {
+    LLVMContext &C = M.getContext();
+    Type *I64 = Type::getInt64Ty(C);
+    Type *Ptr = PointerType::get(C, 0);
+    std::vector<Type *> ft(words, I64);
+    StructType *RT = StructType::get(C, ft);
+    std::vector<Constant *> elems;
+    elems.push_back(Constant::getNullValue(RT));
+    for (auto &r : recs) {
+      std::vector<Constant *> f;
+      for (Constant *c : r) f.push_back(c->getType()->isPointerTy() ? ConstantExpr::getPtrToInt(c, I64) : c);
+      elems.push_back(ConstantStruct::get(RT, f));
+    }
+    ArrayType *AT = ArrayType::get(RT, elems.size());
+    auto *G = new GlobalVariable(M, AT, true, GlobalValue::InternalLinkage, ConstantArray::get(AT, elems), name);
+    G->setSection(section);
+    G->setAlignment(Align(8));
+    appendToUsed(M, {G});
+    if (!M.getNamedValue(bounds)) {
+      std::string sec(section);
+      auto ext = [&](const std::string &n) {
+        return new GlobalVariable(M, Type::getInt8Ty(C), true, GlobalValue::ExternalLinkage, nullptr, n);
+      };
+      GlobalVariable *Start = ext("__start_" + sec), *Stop = ext("__stop_" + sec);
+      ArrayType *BT = ArrayType::get(Ptr, 2);
+      auto *Bd = new GlobalVariable(M, BT, true, GlobalValue::LinkOnceODRLinkage,
+                                    ConstantArray::get(BT, {Start, Stop}), bounds);
+      Bd->setAlignment(Align(8));
+      appendToUsed(M, {Bd});
+    }
+  }
+
+  unsigned classAdapters(Module &M) {
+    LLVMContext &C = M.getContext();
+    Type *I64 = Type::getInt64Ty(C);
+    std::vector<std::vector<Constant *>> dir, facts;
+    std::set<Function *> seen;
+    std::vector<Function *> fs;
+    for (Function &F : M) {
+      if (F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
+      StringRef n = F.getName();
+      if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_") || n.starts_with("llvm.")) continue;
+      // (a declaration's facts are its definition's; the object handing
+      // out a function defined elsewhere still needs its class's adapter)
+      if (escapes(F)) fs.push_back(&F);
+    }
+    for (Function *F : fs) {
+      FunctionType *CT = nullptr;
+      uint32_t f = 0;
+      bool ok = classOf(*F, CT, f);
+      if (f) facts.push_back({F, ConstantInt::get(I64, f)});
+      if (!ok) continue;
+      Function *A = adapter64(M, CT, f);
+      if (seen.insert(A).second) dir.push_back({A, witness(M, CT), ConstantInt::get(I64, f)});
+    }
+    emitRecords(M, dir, 3, "__gexw_adapt.dir", "gexw_adapters", "__gexw_adapters");
+    emitRecords(M, facts, 2, "__gexw_adapt.facts", "gexw_facts", "__gexw_facts");
+    return dir.size();
+  }
+
   unsigned entryThunks(Module &M) {
     std::map<Function *, Conv> cv = conventions(M);
     std::vector<std::pair<Function *, Function *>> pairs, decl_pairs;
@@ -701,7 +943,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     Type *IP = Wasm64 ? Type::getInt64Ty(C) : I32;
     unsigned narrowed = narrowInts(M);
     emitSigs(M);
-    unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
+    unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : Wasm64 && classesMode() ? classAdapters(M) : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
     // gexrt's setter of one variable: it returns and does not unwind (so a
     // limit load after it in a loop may still be hoisted)

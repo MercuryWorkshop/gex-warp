@@ -133,6 +133,9 @@ impl Server {
     }
     fn kick(&self) {
         let _ = self.kick.write_at(0, b"k");
+        // Written outside a syscall: wake the pump parked on it now, not at
+        // its next turn.
+        crate::ready::notify();
     }
 }
 
@@ -396,10 +399,15 @@ pub(crate) fn wake_pipe(caller: &mut Caller<'_, HostState>, fd: i32) -> i32 {
 pub(crate) fn wake_write(id: i32, bytes: &[u8]) -> i32 {
     let h = WAKES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).cloned().flatten();
     let Some(h) = h else { return -9 }; // EBADF
-    match h.write_at(0, bytes) {
+    let r = match h.write_at(0, bytes) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
-    }
+    };
+    // Written outside a syscall, so no syscall exit wakes the client parked
+    // on its wait pipe: wake it here, or it waits out a whole turn of its
+    // wait loop for every wakeup.
+    crate::ready::notify();
+    r
 }
 
 /// `gex.wake_close(id)`: the thread's wait pipe closed.
@@ -477,6 +485,125 @@ pub(crate) fn usd_move(caller: &mut Caller<'_, HostState>, at: u32, size: u32, p
         }
     }
     Ok(n as i32)
+}
+
+/// A process's KUSER_SHARED_DATA copy, whose clocks the host advances
+/// (`gex.usd_tick`): its memory (keyed by where the memory's bytes are) and
+/// the page's address there.
+struct UsdPage {
+    key: usize,
+    mem: gex_mem::GuestMemory,
+    at: u64,
+}
+static USD_PAGES: Mutex<Vec<UsdPage>> = Mutex::new(Vec::new());
+/// KUSER_SHARED_DATA's fields the clock writes, by offset.
+const USD_TICK_LOW: u64 = 0x000;
+const USD_INTERRUPT: u64 = 0x008;
+const USD_SYSTEM: u64 = 0x014;
+const USD_ZONE_BIAS: u64 = 0x020;
+const USD_ZONE_ID: u64 = 0x240;
+const USD_TICK: u64 = 0x320;
+/// 100 ns intervals from 1601 to 1970 (ntdll's ticks_from_time_t).
+const EPOCH_1601: u64 = 116_444_736_000_000_000;
+
+/// A KSYSTEM_TIME written as Windows's clock interrupt writes it: High2Time,
+/// LowPart, High1Time. A reader takes High1Time, LowPart, then High2Time and
+/// tries again while the two highs differ, so it never sees half of a write.
+fn usd_store_time(b: &mut [u8], at: u64, v: u64) {
+    let (lo, hi) = (v as u32, (v >> 32) as u32);
+    let _ = gex_atomic::store_u32(b, at + 8, hi);
+    let _ = gex_atomic::store_u32(b, at, lo);
+    let _ = gex_atomic::store_u32(b, at + 4, hi);
+}
+
+/// One page's clocks now; with `zone`, the time zone from the server's page
+/// too, which the server recomputes (a process may have copied its page
+/// before the server had; the bias changes with daylight saving time).
+fn usd_tick_page(p: &UsdPage, mono_ns: u64, wall_ns: u64, zone: Option<(u64, u32)>) {
+    let b = p.mem.bytes();
+    if p.at + 0x338 > b.len() as u64 {
+        return;
+    }
+    let interrupt = mono_ns / 100;
+    let tick = interrupt / 10_000;
+    usd_store_time(b, p.at + USD_SYSTEM, wall_ns / 100 + EPOCH_1601);
+    usd_store_time(b, p.at + USD_INTERRUPT, interrupt);
+    usd_store_time(b, p.at + USD_TICK, tick);
+    let _ = gex_atomic::store_u32(b, p.at + USD_TICK_LOW, tick as u32);
+    if let Some((bias, id)) = zone {
+        usd_store_time(b, p.at + USD_ZONE_BIAS, bias);
+        let _ = gex_atomic::store_u32(b, p.at + USD_ZONE_ID, id);
+    }
+}
+
+/// The time zone the server's page has: its bias (a KSYSTEM_TIME, read whole)
+/// and id.
+fn usd_server_zone() -> Option<(u64, u32)> {
+    let s = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let usd = s.get(area::USD) as u64;
+    let b = s.mem.bytes();
+    if usd == 0 || usd + 0x338 > b.len() as u64 {
+        return None;
+    }
+    loop {
+        let hi = gex_atomic::load_u32(b, usd + USD_ZONE_BIAS + 4)?;
+        let lo = gex_atomic::load_u32(b, usd + USD_ZONE_BIAS)?;
+        if hi == gex_atomic::load_u32(b, usd + USD_ZONE_BIAS + 8)? {
+            return Some((((hi as u64) << 32) | lo as u64, gex_atomic::load_u32(b, usd + USD_ZONE_ID)?));
+        }
+    }
+}
+
+fn usd_clocks() -> (u64, u64) {
+    (gex_kernel::clock_ns(gex_kernel::system_clock, 7), gex_kernel::clock_ns(gex_kernel::system_clock, 0))
+}
+
+/// `gex.usd_tick(at)`: the caller's KUSER_SHARED_DATA copy at `at`, whose
+/// SystemTime, InterruptTime and TickCount one host thread advances every
+/// 16 ms from now on, as wineserver refreshes its own page (server/fd.c,
+/// user_shared_data_timeout), and its time zone about once a second. It was a
+/// thread in each process. The page is forgotten when its memory's process
+/// ends or execs ([`UsdGuard`]).
+pub(crate) fn usd_tick(caller: &mut Caller<'_, HostState>, at: u32) -> Result<()> {
+    let mem = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let page = UsdPage { key: mem.bytes().as_ptr() as usize, mem, at: at as u64 };
+    let (mono, wall) = usd_clocks();
+    usd_tick_page(&page, mono, wall, usd_server_zone());
+    {
+        let mut pages = USD_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        pages.retain(|p| p.key != page.key);
+        pages.push(page);
+    }
+    static CLOCK: std::sync::Once = std::sync::Once::new();
+    CLOCK.call_once(|| {
+        let _ = std::thread::Builder::new().name("gex-usd-clock".into()).spawn(|| {
+            let mut n = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                n = n.wrapping_add(1);
+                let zone = if n % 64 == 0 { usd_server_zone() } else { None };
+                let (mono, wall) = usd_clocks();
+                for p in USD_PAGES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    usd_tick_page(p, mono, wall, zone);
+                }
+            }
+        });
+    });
+    Ok(())
+}
+
+/// Held for as long as a process's memory: dropped, the memory's page (if it
+/// named one) is no longer written nor its memory held.
+pub(crate) struct UsdGuard(usize);
+impl UsdGuard {
+    pub(crate) fn new(mem: &gex_mem::GuestMemory) -> UsdGuard {
+        UsdGuard(mem.bytes().as_ptr() as usize)
+    }
+}
+impl Drop for UsdGuard {
+    fn drop(&mut self) {
+        USD_PAGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p.key != self.0);
+    }
 }
 
 /// `gex.session_seq(off)`: a seqlock word of the session block, whole.

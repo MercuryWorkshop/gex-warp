@@ -387,7 +387,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         Some(c) => Some(c),
         None if module_name == CORE_MODULE => None,
         None => match read_module(dir.as_deref(), CORE_MODULE) {
-            Ok(m) => Some(install_module(&mut g, dir.as_deref(), CORE_MODULE, m, None, pe.is64, &mut Vec::new())?),
+            Ok(m) => Some(install_module(&mut g, dir.as_deref(), CORE_MODULE, m, None, pe.is64, None, &Default::default(), &mut Vec::new())?),
             // no core beside it: this module is Wine's whole PE side
             Err(_) => None,
         },
@@ -397,7 +397,10 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         None => {
             let m = read_module(dir.as_deref(), &module_name)?;
             let c = core.filter(|_| module_name != CORE_MODULE);
-            install_module(&mut g, dir.as_deref(), &module_name, m, c, pe.is64, &mut Vec::new())?
+            // (in a 64-bit memory, the DLLs Wine maps for its imports before
+            // any of its code runs: their modules are installed as they map)
+            let later = if gex_abi::mem64() { pe.imports.iter().map(|i| i.dll.to_ascii_lowercase()).collect() } else { Default::default() };
+            install_module(&mut g, dir.as_deref(), &module_name, m, c, pe.is64, Some(base), &later, &mut Vec::new())?
         }
     };
     let fresh = g.mods.len() > before;
@@ -449,8 +452,12 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                 crate::warn_line(&format!("gex-pe: {path}: data export {link} is not in Wine's PE module\n"));
                 continue;
             };
-            let target = (wp.data + *off as u64).wrapping_sub(base) as u32;
-            let _ = gm.write_u32(base + functions + 4 * *i as u64, target);
+            let at = wp.data + *off as u64;
+            let target = at.wrapping_sub(base);
+            if target > u32::MAX as u64 {
+                crate::warn_line(&format!("gex-pe: {path}: data export {link} at {at:#x} is out of its 32-bit RVA's reach from the image at {base:#x}\n"));
+            }
+            let _ = gm.write_u32(base + functions + 4 * *i as u64, target as u32);
         }
     }
     // winecrt0's base of this DLL: the skeleton's (after the module's data
@@ -525,11 +532,13 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 /// (wine64-dist.sh WINE64_TWIN=1) memory64 build `<module>.m64` in a
 /// process with a 64-bit memory. The file it was read from too.
 fn read_module(dir: Option<&str>, name: &str) -> Result<(String, Vec<u8>), String> {
+    let ns = crate::sigs::proc_home().ns();
+    // found as Windows finds files, without case (the skeleton's .wasmref
+    // names the link's output; an installer may have given it other case)
     let file = match dir {
-        Some(d) => format!("{d}/{name}"),
+        Some(d) => gex_kernel::win::guest_file_nocase(&ns, d, name).unwrap_or_else(|| format!("{d}/{name}")),
         None => name.to_string(),
     };
-    let ns = crate::sigs::proc_home().ns();
     let twin = format!("{file}.m64");
     Ok(match gex_abi::mem64().then(|| gex_kernel::win::read_guest_file(&ns, &twin).ok()).flatten() {
         Some(w) => (twin, w),
@@ -665,6 +674,8 @@ fn install_module(
     (file, wasm): (String, Vec<u8>),
     core: Option<usize>,
     is64: bool,
+    near: Option<u64>,
+    later: &std::collections::HashSet<String>,
     busy: &mut Vec<String>,
 ) -> Result<usize, String> {
     // The module's memory must be this process's: a wasm32 one in a
@@ -695,9 +706,13 @@ fn install_module(
     // The modules it calls into or takes function addresses of, installed
     // first (no code of theirs runs until Wine loads their DLLs): its
     // imports then bind to their functions directly. Only a cycle's far
-    // side is left to `Late` slots.
+    // side is left to `Late` slots. In a 64-bit memory a module's data is
+    // placed for where its DLL maps (`pe_data_near`), which is known only
+    // once it has: a DLL Wine maps for this one's imports (`later`) is left
+    // to `Late` slots too, and installed as it maps. One its calls reach
+    // through another's forward is not mapped for it, and is installed now.
     if core.is_some() {
-        let mut deps = std::collections::BTreeSet::new();
+        let mut deps = std::collections::BTreeMap::new();
         // (not a DLL it only delay-imports, which it marks `gexw-delay!DLL`:
         // its calls load the DLL first, and then are bound, through `Late`
         // slots, when Wine loads it)
@@ -708,17 +723,17 @@ fn install_module(
                     continue;
                 }
                 if let Some(f) = sh.modules.get(d) {
-                    deps.insert(f.clone());
+                    deps.insert(f.clone(), d.to_string());
                 }
             }
         }
         busy.push(name.to_string());
-        for f in deps {
-            if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) {
+        for (f, d) in deps {
+            if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) || later.contains(&d.to_ascii_lowercase()) {
                 continue;
             }
             let Ok(m) = read_module(dir, &f) else { continue };
-            if let Err(e) = install_module(g, dir, &f, m, core, is64, busy) {
+            if let Err(e) = install_module(g, dir, &f, m, core, is64, None, &Default::default(), busy) {
                 busy.pop();
                 return Err(e);
             }
@@ -728,11 +743,22 @@ fn install_module(
 
     let (size, align) = dylink_memory(&wasm)?;
     let a = 1u64 << align;
-    // (an LLP64 module's above the images: see `crate::wine64_pe_data`;
-    // and an i386 module's in a 64-bit process, whose 64-bit side finds
-    // ntdll's data exports so, wow64's Wow64Transition)
-    let data = if is64 || alt {
-        alloc_pe_data_window(&mut g.data_low, (size as u64).max(16) + a, "[wine PE data]")?
+    let data_exports = exported_offsets(&wasm)?;
+    // (an LLP64 module's above the images when it has data exports, whose
+    // export table holds their RVAs from the skeleton: see
+    // `crate::wine64_pe_data`; and an i386 module's in a 64-bit process,
+    // whose 64-bit side finds ntdll's data exports so, wow64's
+    // Wow64Transition. A module without any, a program's, has nothing
+    // relative to its skeleton and may be larger than the window.)
+    // (`near`: the image of the PE32+ DLL it is installed for, as it maps:
+    // see `pe_data_near`)
+    let rva_data = data_exports.keys().any(|k| k.split_once('!').is_some_and(|(_, n)| !n.starts_with("__gexw_")));
+    let data = if (is64 || alt) && rva_data {
+        let len = (size as u64).max(16) + a;
+        match near.filter(|_| is64).and_then(|b| pe_data_near(g.data_low, b, len)) {
+            Some(d) => d,
+            None => alloc_pe_data_window(&mut g.data_low, len, "[wine PE data]")?,
+        }
     } else {
         provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
     };
@@ -755,7 +781,6 @@ fn install_module(
             }
         }
     }
-    let data_exports = exported_offsets(&wasm)?;
     let exports: std::collections::HashSet<String> = sh.exports.iter().map(|(n, _)| n.clone()).collect();
     let funcs: std::collections::HashSet<String> = sh.exports.iter().filter(|(_, f)| *f).map(|(n, _)| n.clone()).collect();
     let number = lock(&PROVIDERS).len() as u32;
@@ -1184,6 +1209,62 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
+/// `gex.image_floats(fd)` (64-bit Wine's ntdll, in a 64-bit memory, for an
+/// image the server gives an address below 4 GiB): 1 when the image is a
+/// DLL of Wine's core PE module, whose one data block the DLLs it holds
+/// share. That block is in the window at the top of the space, within the
+/// 32-bit RVA reach of the images placed top down below it but of none
+/// lower, so ntdll places such an image top down too, not at its address
+/// (a pin of the prefix's dll-bases). 0 for any other image.
+#[no_mangle]
+pub extern "C" fn gex_image_floats(fd: i32) -> i32 {
+    if !gex_abi::mem64() {
+        return 0;
+    }
+    let Some(file) = crate::fds_free().and_then(|fds| Some(Arc::clone(&fds.get(fd).ok()?.handle))) else { return 0 };
+    let Some((pe, _)) = super::read_pe(&file) else { return 0 };
+    let Some(sec) = pe.sections.iter().find(|s| s.name == ".wasmref") else { return 0 };
+    let raw = pe.data.get(sec.raw_offset as usize..).unwrap_or_default();
+    let module = raw.strip_prefix(&b"GEXWREF1"[..]).and_then(|r| r.split(|&c| c == 0).next());
+    (pe.is64 && module == Some(CORE_MODULE.as_bytes())) as i32
+}
+
+/// In a 64-bit memory, a PE32+ module's data where its skeleton's data
+/// exports reach it, when the window's next would not: the export address
+/// table holds 32-bit RVAs, so a data export is at most 4 GiB above the
+/// image. The window is at the top of the space, within reach of the
+/// images Wine places top-down from there, but one mapped lower (a DLL the
+/// prefix pins, dll-bases, from 0x11000000) is more than 4 GiB below it:
+/// its data goes in the highest free arena above the image within reach
+/// instead, zeroed.
+/// None: the window's next is in reach, or nothing there is.
+fn pe_data_near(low: u64, base: u64, len: u64) -> Option<u64> {
+    use gex_kernel::mem::{flags, prot};
+    if !gex_abi::mem64() {
+        return None;
+    }
+    let len = (len + 0xfff) & !0xfff;
+    let reach = |at: u64| at >= base && at + len - base <= 1 << 32;
+    let (_, mut hi) = crate::wine64_pe_data();
+    if low != 0 {
+        hi = hi.min(low);
+    }
+    if reach(hi.saturating_sub(len)) {
+        return None;
+    }
+    let mut mm = crate::sigs::proc_home().mm().lock();
+    let at = mm.find_free_down(base, base + (1 << 32), len)?;
+    let a = mm.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[wine PE data]").ok()?;
+    if !reach(a) {
+        let _ = mm.unmap(a, len);
+        return None;
+    }
+    mm.note_host_data(a, a + len);
+    drop(mm);
+    let _ = crate::guest().zero(a, len as usize);
+    Some(a)
+}
+
 /// A PE32+ module's data, from the top of [`crate::wine64_pe_data`] (reserved at
 /// the x86-64 split) down, below `low` (the last one's, 0 for none), zeroed.
 /// Packed by the page, not the 64 KiB granule: a process that loads every
@@ -1217,6 +1298,36 @@ fn clear(addrs: &[u64]) {
     for &a in addrs {
         gex_kernel::ftab::fcache_clear(&mut mem, a);
     }
+}
+
+/// A dispatch miss at a native function's table index that a class adapter
+/// serves (`FuncMap::native`: nothing is bound per function, so no bridge
+/// was published with the install): its bridge, queued for every Worker as
+/// [`bind`]'s, and true; the caller has this Worker catch up and go on at
+/// `pc`. False for any other pc, and after three misses in a row at one pc
+/// (the bridge did not take).
+pub(super) fn bridge_native(pc: u64) -> bool {
+    thread_local! {
+        static LAST: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    if pc >= gex_abi::ftab::NATIVE_FN_TOP {
+        return false;
+    }
+    let Some(f) = ftab(|m| m.native(pc)) else { return false };
+    let n = LAST.with(|l| {
+        let (p, n) = l.get();
+        let n = if p == pc { n + 1 } else { 1 };
+        l.set((pc, n));
+        n
+    });
+    if n > 3 {
+        return false;
+    }
+    clear(&[pc]);
+    let alt = lock(&ALT_INSTALLS).contains(&f.install);
+    let (regs, dirs, slots) = super::bridges_mode(&[pc], alt);
+    binds_push(Bind { regs, dirs, slots });
+    true
 }
 
 /// Map `pairs` to slots of `install` and queue their bridges for every
@@ -1287,13 +1398,47 @@ pub extern "C" fn gex_wasmdll_installed() {
                 let pending = std::mem::take(&mut wp.pending);
                 let entries = wp.data_exports.get("__gexw_entries").copied();
                 let decl = wp.data_exports.get("__gexw_entries_decl").copied();
-                (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 })
+                // the class adapters' directory, its facts and the module's
+                // slot types (`bind_classes`)
+                let classes = wp.data_exports.get("__gexw_adapters").and_then(|&dir| {
+                    let types = gex_dylink::slot_types(&wp.wasm).map_err(|e| crate::warn_line(&format!("gex-pe: {}: slot types: {e:#}\n", wp.file))).ok()?;
+                    Some((dir, wp.data_exports.get("__gexw_facts").copied(), types))
+                });
+                (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 }, classes)
             })
             .collect()
     };
-    for (install, data, entries, pending, w) in todo {
+    for (install, data, entries, pending, w, classes) in todo {
         installed_one(install, data, entries, pending, w);
+        if let Some((dir, facts, types)) = classes {
+            bind_classes(install, data, w, dir, facts, &types);
+        }
     }
+}
+
+/// The ICALL pass's class adapters (as the native `bind_classes`): the
+/// directory's `{ adapter, witness, facts }` records and the `{ function,
+/// facts }` records, pointer-sized words; guest calls to the module's
+/// functions find their class's adapter through `FuncMap::get`.
+fn bind_classes(install: u32, data: u64, w: u64, dir: u32, facts: Option<u32>, types: &(Vec<u32>, Vec<Option<String>>)) {
+    let gm = crate::guest();
+    let base = ftab(|m| m.install(install).base);
+    let ptr = |a: u64| if w == 8 { gm.read_u64(a).unwrap_or(0) } else { gm.read_u32(a).unwrap_or(0) as u64 };
+    let records = |off: u32, n: u64| -> Vec<Vec<u32>> {
+        let at = data + off as u64;
+        let (start, stop) = (ptr(at), ptr(at + w));
+        let mut out = Vec::new();
+        let mut a = start;
+        while start != 0 && a + n * w <= stop {
+            out.push((0..n).map(|k| gm.read_u32(a + k * w).unwrap_or(0)).collect());
+            a += n * w;
+        }
+        out
+    };
+    let slot = |f: u32| f.checked_sub(base).filter(|_| f != 0);
+    let adapters: Vec<(u32, u32, u32)> = records(dir, 3).into_iter().filter_map(|r| Some((slot(r[0])?, slot(r[1])?, r[2]))).collect();
+    let facts: Vec<(u32, u32)> = facts.map(|off| records(off, 2).into_iter().filter_map(|r| Some((slot(r[0])?, r[1]))).collect()).unwrap_or_default();
+    ftab(|m| m.set_native(install, &types.0, &types.1, &facts, &adapters));
 }
 
 fn installed_one(install: u32, data: u64, entries: Option<(u32, Option<u32>)>, pending: Vec<(u64, Vec<u8>)>, w: u64) {

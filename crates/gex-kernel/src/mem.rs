@@ -124,6 +124,11 @@ pub struct Vma {
     /// How many times this mapping's code has been named by its bytes
     /// ([`MemoryMap::name_by_content`]); a new mapping starts from none.
     pub namings: u32,
+    /// Made writable and executable at once since it was mapped (`mprotect`:
+    /// a loader patching its own `.text` one write at a time). Its code
+    /// may change again with no more than another such `mprotect`, so it
+    /// stays [`MemoryMap::volatile_code`] once made executable only.
+    pub patched: bool,
 }
 
 impl Vma {
@@ -136,7 +141,11 @@ impl Vma {
             (Some((x, o)), Some((y, p))) => x == y && o + (self.end - self.start) == *p,
             _ => false,
         };
-        self.prot == next.prot && self.name == next.name && continues(&self.origin, &next.origin) && continues(&self.code, &next.code)
+        self.prot == next.prot
+            && self.name == next.name
+            && self.patched == next.patched
+            && continues(&self.origin, &next.origin)
+            && continues(&self.code, &next.code)
     }
 
     /// A piece of this mapping, with the origin offset moved to match.
@@ -155,6 +164,7 @@ impl Vma {
                 .as_ref()
                 .map(|(id, off)| (id.clone(), off + (start - self.start))),
             namings: self.namings,
+            patched: self.patched,
         }
     }
 }
@@ -1006,12 +1016,16 @@ impl MemoryMap {
     /// first one's address (a wasm memory cannot show one page at two), so
     /// a JIT's read+write view of its read+execute code is the same pages,
     /// and its writes there come with no `mprotect` to retire what was
-    /// translated (.NET's W^X).
+    /// translated (.NET's W^X). And code made writable and executable at
+    /// once before ([`Vma::patched`]), executable only now: a loader that
+    /// patches its `.text` one write at a time runs the code doing it there
+    /// between the writes, and its translations there are kept across the
+    /// next `mprotect` only if they check their bytes.
     pub fn volatile_code(&self) -> Vec<(u64, u64)> {
         let shared: Vec<(u64, u64)> = self.log.shared_maps.iter().filter(|s| s.file.writable).map(|s| (s.start, s.start + s.len)).collect();
         let mut out = Vec::new();
         for v in self.vmas.iter().filter(|v| v.prot & prot::EXEC != 0) {
-            if v.prot & prot::WRITE != 0 {
+            if v.prot & prot::WRITE != 0 || v.patched {
                 out.push((v.start, v.end));
                 continue;
             }
@@ -1258,6 +1272,30 @@ impl MemoryMap {
         }
         self.fixed_only.push((lo, hi));
         self.fixed_only.sort_unstable();
+    }
+
+    /// The highest `len` free bytes in `[lo, hi)`, page-aligned, inside
+    /// this map's arena and clear of every mapping and of the fixed-only
+    /// ranges: for a mapping that has to be in a window of its own (mapped
+    /// there then with `MAP_FIXED_NOREPLACE`).
+    pub fn find_free_down(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
+        for &(a, b) in self.arena.iter().rev() {
+            let (a, b) = (a.max(lo), b.min(hi));
+            let mut candidate = b;
+            while candidate >= a + len {
+                let start = page_align_down(candidate - len);
+                if start < a {
+                    break;
+                }
+                let mapped = self.vmas.iter().filter(|v| v.start < start + len && v.end > start).map(|v| v.start);
+                let fixed = self.fixed_only.iter().filter(|&&(x, y)| x < start + len && y > start).map(|&(x, _)| x);
+                match mapped.chain(fixed).min() {
+                    Some(below) => candidate = below,
+                    None => return Some(start),
+                }
+            }
+        }
+        None
     }
 
     /// The arena spans this map has been handed (sorted, disjoint).
@@ -1606,6 +1644,7 @@ impl MemoryMap {
             origin: None,
             code,
             namings: 0,
+            patched: false,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1668,6 +1707,7 @@ impl MemoryMap {
             code,
             origin,
             namings: 0,
+            patched: false,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -2238,6 +2278,9 @@ impl MemoryMap {
             // file's, and two processes relocate them identically.
             let mut piece = v.slice(v.start.max(addr), v.end.min(end), new_prot);
             piece.origin = None;
+            if new_prot & (prot::WRITE | prot::EXEC) == prot::WRITE | prot::EXEC {
+                piece.patched = true;
+            }
             out.push(piece);
             if v.end > end {
                 out.push(v.slice(end, v.end, v.prot));
@@ -3002,6 +3045,28 @@ mod tests {
         assert!(m.check_access(a + 0x1000, 0x1000, prot::EXEC));
         assert!(!m.check_access(a, 0x1000, prot::EXEC));
         assert!(!m.check_access(a + 0x2000, 0x1000, prot::EXEC));
+    }
+
+    /// Code made writable and executable at once stays volatile once it is
+    /// executable only again, and only it; the flag goes with the mapping:
+    /// mapped again over it, or unmapped and mapped again, it is not.
+    #[test]
+    fn patched_code_stays_volatile_until_mapped_again() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let rx = prot::READ | prot::EXEC;
+        let a = m.mmap(0, 0x3000, rx, flags::ANONYMOUS, "x").unwrap();
+        assert!(m.volatile_code().is_empty());
+        m.protect(a + 0x1000, 0x1000, rx | prot::WRITE).unwrap();
+        m.protect(a + 0x1000, 0x1000, rx).unwrap();
+        assert_eq!(m.volatile_code(), vec![(a + 0x1000, a + 0x2000)]);
+        m.mmap(a, 0x3000, rx, flags::ANONYMOUS | flags::FIXED, "x").unwrap();
+        assert!(m.volatile_code().is_empty());
+        m.protect(a, 0x1000, rx | prot::WRITE).unwrap();
+        m.protect(a, 0x1000, rx).unwrap();
+        assert_eq!(m.volatile_code(), vec![(a, a + 0x1000)]);
+        m.unmap(a, 0x3000).unwrap();
+        m.mmap(a, 0x3000, rx, flags::ANONYMOUS | flags::FIXED, "x").unwrap();
+        assert!(m.volatile_code().is_empty());
     }
 
     /// A range made read-only and writable again is one mapping again, as

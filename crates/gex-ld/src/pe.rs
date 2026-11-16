@@ -535,7 +535,17 @@ pub struct ClrMixed {
 
 /// Parse a PE32 or PE32+ image.
 pub fn parse(bytes: &[u8]) -> Result<PeImage> {
-    let d = bytes;
+    parse_cow(std::borrow::Cow::Borrowed(bytes))
+}
+
+/// [`parse`], the image keeping `bytes` as its data rather than a copy of
+/// them: a large file read to be parsed is then one buffer, not two.
+pub fn parse_owned(bytes: Vec<u8>) -> Result<PeImage> {
+    parse_cow(std::borrow::Cow::Owned(bytes))
+}
+
+fn parse_cow(bytes: std::borrow::Cow<'_, [u8]>) -> Result<PeImage> {
+    let d: &[u8] = &bytes;
     if d.len() < 64 {
         return Err(PeError::malformed("truncated DOS header"));
     }
@@ -696,9 +706,10 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         tls: None,
         resources: Vec::new(),
         pdata: Vec::new(),
-        data: d.to_vec(),
+        data: Vec::new(),
         clr: None,
     };
+    pe.data = bytes.into_owned();
     if pe.dir(dir::CLR).0 != 0 {
         pe.clr = Some(pe.parse_clr()?);
     }
