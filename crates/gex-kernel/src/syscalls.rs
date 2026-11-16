@@ -1367,6 +1367,12 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     use std::sync::atomic::Ordering;
     let mut base = MONOTONIC_BASE.load(Ordering::Relaxed);
     if base == 0 {
+        // (In this crate's tests, from the real clock, whichever test reads
+        // first: a test's own fixed clock -- kqueue's 1000 s, a 2023 date --
+        // would make every later real reading in the binary an uptime of
+        // decades.)
+        #[cfg(test)]
+        let secs = system_clock().0;
         let mut want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
         if let Some(f) = MONOTONIC_SHARED.get() {
             want = f(want);
@@ -15466,12 +15472,6 @@ mod tests {
         fn fixed() -> (u64, u32) {
             (1_700_000_000, 123_456_789)
         }
-        // The monotonic clocks' base is one per host process, set by the
-        // first monotonic reading. Set it from the real clock before `fixed`
-        // can: from 2023's `fixed` it made every later reading in this test
-        // binary an uptime of years (the_monotonic_clock_counts_from_boot_
-        // not_the_epoch failed when this test ran first).
-        monotonic_from(system_clock());
         let (mut mem, mut k) = setup();
         k.clock = fixed;
         let buf = 0x3000u64;
@@ -19342,62 +19342,67 @@ mod tests {
     fn free_path_calls_answer_as_the_kernel_does() {
         let mut seen = Vec::new();
         for lock_free in [true, false] {
-            let (_, mut k) = setup();
-            let mut buf = vec![0u8; 0x40000];
-            let at = k.ctx_addr;
-            let mut m = GuestMem::new(&mut buf);
-            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
-                set_args(m, at, n, a);
-                if lock_free {
-                    let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, shares: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
-                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
-                } else {
-                    k.syscall(m, 0);
+            // (Both passes' files stamped at one time: tmpfs takes whole
+            // seconds of the real clock, and a second that turned between
+            // the passes made their stat bytes differ.)
+            seen.push(crate::vfs::tmpfs::at_time(1_700_000_000, || {
+                let (_, mut k) = setup();
+                let mut buf = vec![0u8; 0x40000];
+                let at = k.ctx_addr;
+                let mut m = GuestMem::new(&mut buf);
+                let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                    set_args(m, at, n, a);
+                    if lock_free {
+                        let call = free_class(m, at, false).expect("in the class");
+                        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, shares: None, tid: k.tid as u32, clock: k.clock };
+                        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                        assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                    } else {
+                        k.syscall(m, 0);
+                    }
+                    ret(m, at)
+                };
+                let cwd = (-100i64) as u64;
+                for (a, t) in [(0x20000u64, &b"/d\0"[..]), (0x20100, b"f\0"), (0x20200, b"/d/f\0"), (0x20300, b"/d/l\0"), (0x20400, b"/d/none\0"), (0x20500, b"l\0")] {
+                    m.write(a, t).unwrap();
                 }
-                ret(m, at)
-            };
-            let cwd = (-100i64) as u64;
-            for (a, t) in [(0x20000u64, &b"/d\0"[..]), (0x20100, b"f\0"), (0x20200, b"/d/f\0"), (0x20300, b"/d/l\0"), (0x20400, b"/d/none\0"), (0x20500, b"l\0")] {
-                m.write(a, t).unwrap();
-            }
-            sys_locked(&mut m, &mut k, at, nr::MKDIRAT, &[cwd, 0x20000, 0o755]);
-            sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20200, cwd, 0x20300]);
-            let mut got = Vec::new();
-            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
-            got.push(dir);
-            let f = sys(&mut m, &mut k, nr::OPENAT, &[dir as u64, 0x20100, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_CLOEXEC) as u64, 0o640]);
-            got.push(f);
-            m.write(0x21000, b"twelve bytes").unwrap();
-            got.push(sys(&mut m, &mut k, nr::WRITE, &[f as u64, 0x21000, 12]));
-            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, 0]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
-            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, AT_SYMLINK_NOFOLLOW]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
-            got.push(sys(&mut m, &mut k, nr::FSTAT, &[f as u64, 0x22000]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
-            got.push(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20300, 0, 0x7ff, 0x23000]));
-            got.extend(m.read(0x23000, 256).unwrap().iter().map(|&b| b as i64));
-            // the mount's id, the same for the file and for the root
-            // (systemd's chase compares them)
-            let sx = m.read(0x23000, 256).unwrap();
-            let mask = u32::from_le_bytes(sx[0..4].try_into().unwrap());
-            let mnt = u64::from_le_bytes(sx[144..152].try_into().unwrap());
-            assert!(mask & 0x1000 != 0 && mnt != 0, "statx mask {mask:#x}, mount {mnt}");
-            m.write(0x20600, b"/\0").unwrap();
-            assert_eq!(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20600, 0, 0x1000, 0x23000]), 0);
-            let root = m.read(0x23000, 256).unwrap();
-            assert_eq!(u64::from_le_bytes(root[144..152].try_into().unwrap()), mnt, "the root's mount");
-            got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20200, 4]));
-            got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20400, 0]));
-            got.push(sys(&mut m, &mut k, nr::READLINKAT, &[dir as u64, 0x20500, 0x24000, 64]));
-            got.extend(m.read(0x24000, 8).unwrap().iter().map(|&b| b as i64));
-            got.push(sys(&mut m, &mut k, nr::GETCWD, &[0x25000, 64]));
-            got.push(sys(&mut m, &mut k, nr::GETDENTS64, &[dir as u64, 0x26000, 4096]));
-            got.push(sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20400, 0, 0]));
-            got.push(k.fds.cloexec(f as i32).unwrap() as i64);
-            seen.push(got);
+                sys_locked(&mut m, &mut k, at, nr::MKDIRAT, &[cwd, 0x20000, 0o755]);
+                sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20200, cwd, 0x20300]);
+                let mut got = Vec::new();
+                let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
+                got.push(dir);
+                let f = sys(&mut m, &mut k, nr::OPENAT, &[dir as u64, 0x20100, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_CLOEXEC) as u64, 0o640]);
+                got.push(f);
+                m.write(0x21000, b"twelve bytes").unwrap();
+                got.push(sys(&mut m, &mut k, nr::WRITE, &[f as u64, 0x21000, 12]));
+                got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, 0]));
+                got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+                got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, AT_SYMLINK_NOFOLLOW]));
+                got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+                got.push(sys(&mut m, &mut k, nr::FSTAT, &[f as u64, 0x22000]));
+                got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+                got.push(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20300, 0, 0x7ff, 0x23000]));
+                got.extend(m.read(0x23000, 256).unwrap().iter().map(|&b| b as i64));
+                // the mount's id, the same for the file and for the root
+                // (systemd's chase compares them)
+                let sx = m.read(0x23000, 256).unwrap();
+                let mask = u32::from_le_bytes(sx[0..4].try_into().unwrap());
+                let mnt = u64::from_le_bytes(sx[144..152].try_into().unwrap());
+                assert!(mask & 0x1000 != 0 && mnt != 0, "statx mask {mask:#x}, mount {mnt}");
+                m.write(0x20600, b"/\0").unwrap();
+                assert_eq!(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20600, 0, 0x1000, 0x23000]), 0);
+                let root = m.read(0x23000, 256).unwrap();
+                assert_eq!(u64::from_le_bytes(root[144..152].try_into().unwrap()), mnt, "the root's mount");
+                got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20200, 4]));
+                got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20400, 0]));
+                got.push(sys(&mut m, &mut k, nr::READLINKAT, &[dir as u64, 0x20500, 0x24000, 64]));
+                got.extend(m.read(0x24000, 8).unwrap().iter().map(|&b| b as i64));
+                got.push(sys(&mut m, &mut k, nr::GETCWD, &[0x25000, 64]));
+                got.push(sys(&mut m, &mut k, nr::GETDENTS64, &[dir as u64, 0x26000, 4096]));
+                got.push(sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20400, 0, 0]));
+                got.push(k.fds.cloexec(f as i32).unwrap() as i64);
+                got
+            }));
         }
         assert_eq!(seen[0], seen[1]);
         let g = &seen[0];
