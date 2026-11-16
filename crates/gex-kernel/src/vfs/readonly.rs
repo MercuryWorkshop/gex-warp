@@ -75,8 +75,11 @@ impl FileSystem for ReadOnly {
     fn links_are_names(&self) -> bool {
         self.inner.links_are_names()
     }
-    fn case_insensitive(&self) -> bool {
-        self.inner.case_insensitive()
+    fn case_insensitive(&self, path: &str) -> bool {
+        self.inner.case_insensitive(path)
+    }
+    fn set_case_insensitive(&self, path: &str, on: bool) -> bool {
+        self.inner.set_case_insensitive(path, on)
     }
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         match self.refuse_open(path, flags) {

@@ -950,13 +950,20 @@ pub trait FileSystem: Send + Sync {
     fn keeps_owners(&self) -> bool {
         false
     }
-    /// Whether names in this filesystem are looked up without regard to
-    /// case (as a Mac's default APFS is), keeping the case they were
+    /// Whether names at `path` (and below it) are looked up without regard
+    /// to case (as a Mac's default APFS does), keeping the case they were
     /// written with. What `pathconf`'s `_PC_CASE_SENSITIVE` and a volume's
-    /// `VOL_CAP_FMT_CASE_SENSITIVE` answer for it, so it must say what its
+    /// `VOL_CAP_FMT_CASE_SENSITIVE` answer there, so it must say what the
     /// lookups do.
-    fn case_insensitive(&self) -> bool {
+    fn case_insensitive(&self, path: &str) -> bool {
+        let _ = path;
         false
+    }
+    /// Look names at `path` and below up without regard to case from now
+    /// on, or with it, where this filesystem can be told to: whether it
+    /// now does as asked.
+    fn set_case_insensitive(&self, path: &str, on: bool) -> bool {
+        self.case_insensitive(path) == on
     }
     /// Change the mode of the symlink `path` itself, which a Mac's link
     /// has and Linux's has not (`lchmod`, `chmod -h`). `EOPNOTSUPP` where
@@ -1055,6 +1062,15 @@ pub fn mount_id(at: &str) -> u64 {
 /// Whether absolute `abs` is `at` or below it.
 fn within(abs: &str, at: &str) -> bool {
     abs.starts_with(at) && matches!(abs.as_bytes().get(at.len()), None | Some(b'/'))
+}
+
+/// [`within`], with `at`'s letters matched in either case when `fold`.
+fn within_as(abs: &str, at: &str, fold: bool) -> bool {
+    if !fold {
+        return within(abs, at);
+    }
+    let (a, m) = (abs.as_bytes(), at.as_bytes());
+    a.len() >= m.len() && a[..m.len()].eq_ignore_ascii_case(m) && matches!(a.get(m.len()), None | Some(b'/'))
 }
 
 /// A process's mount table and working directory, and its published
@@ -2047,11 +2063,12 @@ impl Namespace {
     /// The mount holding absolute path `abs`, and where it is mounted.
     fn mount_at<'a>(&'a self, abs: &str) -> Result<(&'a str, &'a Arc<dyn FileSystem>), Errno> {
         let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
+        let fold = self.folds_mount_points();
         for (at, fs) in &self.mounts {
             let matches = if at == "/" {
                 true
             } else {
-                within(abs, at)
+                within_as(abs, at, fold)
             };
             if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
                 best = Some((at, fs));
@@ -2060,13 +2077,23 @@ impl Namespace {
         best.map(|(at, fs)| (at.as_str(), fs)).ok_or(Errno::ENOENT)
     }
 
+    /// Whether a mount point is found however its path is spelled: when
+    /// the root looks names up without regard to case, as a Mac's does
+    /// (`/OPT/HOMEBREW` is the volume mounted at `/opt/homebrew`). A
+    /// mount below one that tells case apart is then matched the same way,
+    /// a simplification no Mac's tree (one insensitive root) meets.
+    fn folds_mount_points(&self) -> bool {
+        self.mounts.iter().any(|(at, fs)| at == "/" && fs.case_insensitive(""))
+    }
+
     fn mount_of<'a>(&'a self, abs: String) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
         let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
+        let fold = self.folds_mount_points();
         for (at, fs) in &self.mounts {
             let matches = if at == "/" {
                 true
             } else {
-                within(&abs, at)
+                within_as(&abs, at, fold)
             };
             if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
                 best = Some((at, fs));
@@ -2264,8 +2291,13 @@ impl Namespace {
     /// Whether the filesystem `path` is in looks names up without regard to
     /// case ([`FileSystem::case_insensitive`]).
     pub fn case_insensitive(&self, path: &str) -> bool {
-        self.resolve(path)
-            .is_ok_and(|(fs, _)| fs.case_insensitive())
+        self.resolve(path).is_ok_and(|(fs, rel)| fs.case_insensitive(&rel))
+    }
+
+    /// Look names up at `path` and below without regard to case, or with
+    /// it ([`FileSystem::set_case_insensitive`]): whether that is now so.
+    pub fn set_case_insensitive(&self, path: &str, on: bool) -> bool {
+        self.resolve(path).is_ok_and(|(fs, rel)| fs.set_case_insensitive(&rel, on))
     }
 
     /// An extended-attribute call on `path`, following a final symlink when
@@ -2493,6 +2525,18 @@ pub fn walk_plain(abs: &str, follow_final: bool, mounts: &str, is_link: &dyn Fn(
 
 /// Whether `abs` is within one of `mounts` (NUL-separated, as
 /// [`walk_links`] takes them).
+/// `abs` with the mount point it is in (of `mounts`, the walk's) spelled
+/// as it is mounted, where `abs` spells it otherwise: for a tree whose
+/// names are looked up without regard to case, whose walk stops at a
+/// mount point by its name ([`within_any`]).
+pub fn mount_spelled<'a>(abs: &'a str, mounts: &str) -> std::borrow::Cow<'a, str> {
+    let best = mounts.split('\0').filter(|m| !m.is_empty() && within_as(abs, m, true)).max_by_key(|m| m.len());
+    match best {
+        Some(m) if !abs.starts_with(m) => std::borrow::Cow::Owned(format!("{m}{}", &abs[m.len()..])),
+        _ => std::borrow::Cow::Borrowed(abs),
+    }
+}
+
 pub fn within_any(abs: &str, mounts: &str) -> bool {
     mounts.split('\0').any(|m| !m.is_empty() && within(abs, m))
 }

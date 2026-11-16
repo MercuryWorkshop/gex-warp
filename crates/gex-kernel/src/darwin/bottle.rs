@@ -59,7 +59,7 @@ pub const NAMED: &str = "GEX_BOTTLE";
 pub const MODEL: &str = "GEX_MAC_MODEL";
 
 /// The settings a configuration has, and what each is.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 10] = [
     ("name", "the bottle's name"),
     ("system", "the system layer: a Mac root's directory, by its name outside the bottle"),
     ("uuid", "the machine's identifier (gethostuuid), made with the bottle"),
@@ -69,6 +69,7 @@ pub const KEYS: [(&str, &str); 9] = [
     ("graphics", "the graphics profile: honest, machine (the chosen Mac's GPU family), or a family (mac2, apple7, apple8)"),
     ("share.system", "whether the system outside is the volume /Volumes/Linux: yes or no"),
     ("share.home", "a directory outside that is the user's home in place of the bottle's own"),
+    ("filesystem.case", "whether names are looked up without regard to case, as on a Mac's default volume: insensitive or sensitive; as the root's files are without it"),
 ];
 
 /// The settings an application's section may have.
@@ -214,6 +215,7 @@ pub fn refuse(key: &str, value: &str, app: bool) -> Option<String> {
     }
     match key {
         "share.system" if !["", "yes", "no"].contains(&value) => Some("share.system is yes or no".into()),
+        "filesystem.case" if !["", "insensitive", "sensitive"].contains(&value) => Some("filesystem.case is insensitive or sensitive".into()),
         "graphics" if !value.is_empty() && !value.chars().all(|c| c.is_ascii_alphanumeric()) => Some("graphics is a profile's name: honest, machine, mac2, apple7, apple8".into()),
         _ => None,
     }

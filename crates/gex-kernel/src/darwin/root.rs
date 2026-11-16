@@ -44,14 +44,22 @@ impl Kernel {
             let entered = match self.darwin_bottle_of(path, envp) {
                 Some(layout) => self.enter_bottle(&layout),
                 None => {
-                    let Some(root) = self.darwin_root_of(path, envp) else { return path.to_string() };
+                    let Some(root) = self.darwin_root_of(path, envp) else {
+                        // (The system's own root is the program's.)
+                        self.darwin_take_case();
+                        return path.to_string();
+                    };
                     self.enter_root(&root)
                 }
             };
             if entered.is_err() {
                 return path.to_string();
             }
+            self.darwin_take_case();
             self.vfs.inner_name(&named).unwrap_or(named)
+        } else if gex_ld::macho::is_macho(&head) {
+            self.darwin_take_case();
+            path.to_string()
         } else if head.starts_with(b"\x7fELF") && self.vfs.entered() {
             let named = self.vfs.outer_name(path).unwrap_or_else(|| path.to_string());
             if self.vfs.leave() {
@@ -61,6 +69,26 @@ impl Kernel {
             named
         } else {
             path.to_string()
+        }
+    }
+
+    /// The root's word on case ([`bottle::CONF`]'s `filesystem.case`), as
+    /// a Mac program starts in it: its names, and its bottle's, looked up
+    /// without regard to case or with it from now on. Without one, as they
+    /// were. (Shared directories, the system outside's, are not the root's
+    /// to say.)
+    fn darwin_take_case(&mut self) {
+        let Some(text) = self.read_file(bottle::CONF) else { return };
+        let conf = bottle::Conf::parse(&String::from_utf8_lossy(&text));
+        let on = match conf.get("filesystem.case") {
+            Some("insensitive") => true,
+            Some("sensitive") => false,
+            _ => return,
+        };
+        for at in std::iter::once("/").chain(bottle::PARTS) {
+            if !self.vfs.set_case_insensitive(at, on) {
+                eprintln!("[gex:{}] {}: filesystem.case: {at} cannot be made case-{}sensitive; it is as its filesystem is", self.pid, &bottle::CONF[1..], if on { "in" } else { "" });
+            }
         }
     }
 

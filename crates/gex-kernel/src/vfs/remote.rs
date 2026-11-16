@@ -88,6 +88,10 @@ pub struct Remote {
     pub chown: extern "C" fn(path: crate::PAddr, path_len: u32, uid: u32, gid: u32) -> i32,
     /// `fchown` on an open handle.
     pub fchown: extern "C" fn(handle: i32, uid: u32, gid: u32) -> i32,
+    /// Whether names at `path` are looked up without regard to case: 1 or
+    /// 0, after making them so (`set` 1) or not (`set` 2) where `set` asks
+    /// ([`FileSystem::case_insensitive`], [`FileSystem::set_case_insensitive`]).
+    pub case: extern "C" fn(path: crate::PAddr, path_len: u32, set: u32) -> i32,
     pub symlink: extern "C" fn(target: crate::PAddr, target_len: u32, path: crate::PAddr, path_len: u32) -> i32,
     pub link: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
     /// Put a socket node at a path.
@@ -439,6 +443,17 @@ impl FileSystem for RemoteFs {
     /// The global kernel's tree keeps them, and says them in its metadata.
     fn keeps_owners(&self) -> bool {
         true
+    }
+
+    /// The global kernel's tree's answer.
+    fn case_insensitive(&self, path: &str) -> bool {
+        let (a, n) = at(path.as_bytes());
+        (self.remote.case)(a, n, 0) == 1
+    }
+
+    fn set_case_insensitive(&self, path: &str, on: bool) -> bool {
+        let (a, n) = at(path.as_bytes());
+        (self.remote.case)(a, n, if on { 1 } else { 2 }) == on as i32
     }
 
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {

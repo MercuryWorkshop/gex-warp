@@ -704,9 +704,11 @@ impl Nodes {
         }
     }
 
-    /// Look names up without regard to case from now on, or with it.
+    /// Keep the index of folded names, or drop it.
     fn set_folding(&mut self, on: bool) {
-        self.fold = on.then(|| self.map.keys().map(|p| (fold(p), p.clone())).collect());
+        if on != self.fold.is_some() {
+            self.fold = on.then(|| self.map.keys().map(|p| (fold(p), p.clone())).collect());
+        }
     }
 
     /// `path` as the tree spells it: each name on it that is there, as it
@@ -742,6 +744,39 @@ impl Nodes {
     }
 }
 
+/// Whether `path` is `dir` or below it (`dir` `""`: every path is).
+fn within_dir(path: &str, dir: &str) -> bool {
+    dir.is_empty() || path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+}
+
+impl Inner {
+    /// Whether names at `path` are looked up without regard to case.
+    fn folds(&self, path: &str) -> bool {
+        let path = path.trim_matches('/');
+        self.folded.iter().any(|d| within_dir(path, d))
+    }
+
+    /// `path` as the tree spells it, where it is looked up without regard
+    /// to case ([`Nodes::spell`]).
+    fn spell<'p>(&self, path: &'p str) -> std::borrow::Cow<'p, str> {
+        if self.folds(path) { self.nodes.spell(path) } else { std::borrow::Cow::Borrowed(path) }
+    }
+
+    /// `abs` with its mount point spelled as it is mounted, where names
+    /// there are looked up without regard to case ([`super::mount_spelled`]).
+    fn mount_spelled<'a>(&self, abs: &'a str, mounts: &str) -> std::borrow::Cow<'a, str> {
+        if self.folded.is_empty() || !self.folds(abs) {
+            return std::borrow::Cow::Borrowed(abs);
+        }
+        super::mount_spelled(abs, mounts)
+    }
+
+    /// The node at `path`, however it is spelled where that does not matter.
+    fn node(&self, path: &str) -> Option<&Node> {
+        if self.folds(path) { self.nodes.node(path) } else { self.nodes.get(path) }
+    }
+}
+
 /// A name as a filesystem that looks names up without regard to case
 /// compares it: its letters' lower case (Unicode's, of each character),
 /// which is what a Mac's APFS tells apart less normalisation.
@@ -757,6 +792,10 @@ fn fold(s: &str) -> String {
 struct Inner {
     /// Path (relative to the mount, no leading slash) to node.
     nodes: Nodes,
+    /// The directories whose names, and their descendants', are looked up
+    /// without regard to case: `""` for the whole tree, or a Mac's root in
+    /// a Linux one (`opt/mac`), as the root says ([`FileSystem::set_case_insensitive`]).
+    folded: Vec<String>,
     next_ino: u64,
     inos: BTreeMap<String, u64>,
     /// Modes for the files that are not the 0644 default. Sparse: only the
@@ -981,9 +1020,9 @@ struct Shared {
     /// The files a bundle's index named, by path as it named them, until
     /// the bundle ends ([`TmpFs::add_pending`], [`TmpFs::fill_pending`]).
     pending: Mutex<std::collections::HashMap<String, Arc<FileNode>>>,
-    /// Names are looked up without regard to case ([`TmpFs::set_case_insensitive`]):
-    /// asked before the tree's lock, so a tree that tells case apart pays
-    /// nothing for it.
+    /// Names somewhere are looked up without regard to case
+    /// ([`Inner::folded`]): asked before the tree's lock, so a tree that
+    /// tells case apart everywhere pays nothing for it.
     case: core::sync::atomic::AtomicBool,
 }
 
@@ -1011,6 +1050,8 @@ impl TmpFs {
     /// `mkdir`, the directory dated `now`, the caller's clock (a kernel
     /// module with none takes its process's).
     pub fn mkdir_now(&self, path: &str, mode: u32, now: i64) -> Result<(), Errno> {
+        let spelled = self.spell(path);
+        let path: &str = &spelled;
         let mut inner = self.inner.lock().unwrap();
         if inner.nodes.contains_key(path) {
             return Err(Errno::EEXIST);
@@ -1035,6 +1076,8 @@ impl TmpFs {
     /// [`FileHandle::set_times_now`]). A file keeps both times to the
     /// nanosecond; anything else keeps whole-second modification times.
     pub fn set_times_now(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) -> Result<(), Errno> {
+        let spelled = self.spell(path);
+        let path: &str = &spelled;
         let mut inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {
             None => return Err(Errno::ENOENT),
@@ -1054,7 +1097,9 @@ impl TmpFs {
     /// on it, `None` for [`FileSystem::walk`] to follow them.
     pub fn walk_plain(&self, abs: &str, follow_final: bool, mounts: &str) -> Option<bool> {
         let inner = self.inner.read().unwrap();
-        super::walk_plain(abs, follow_final, mounts, &|rel| matches!(inner.nodes.get(rel), Some(Node::Symlink(_))))
+        let abs = inner.mount_spelled(abs, mounts);
+        let abs: &str = &abs;
+        super::walk_plain(abs, follow_final, mounts, &|rel| matches!(inner.node(rel), Some(Node::Symlink(_))))
     }
 
     /// How many directories have been renamed here
@@ -1070,6 +1115,8 @@ impl TmpFs {
     /// What `from` is is checked again under the tree's lock: `EAGAIN` from
     /// `rename_locked` is "it changed meanwhile".
     pub fn rename2_as(&self, from: &str, to: &str, noreplace: bool, own: u32) -> Result<(), Errno> {
+        let (from_s, to_s) = (self.spell(from), self.spell_rename_target(from, to));
+        let (from, to): (&str, &str) = (&from_s, &to_s);
         loop {
             let dir = matches!(self.inner.read().unwrap().nodes.get(from), Some(Node::Dir));
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
@@ -1192,15 +1239,24 @@ impl TmpFs {
         Ok(())
     }
 
-    /// Look names up without regard to case from now on (keeping each as
-    /// it was written), as a Mac's default volume does, or with it again.
-    /// The names already here are indexed as they are: two that differ only
-    /// in case stay two, the later found by either spelling.
-    pub fn set_case_insensitive(&self, on: bool) {
-        self.inner.lock().unwrap().nodes.set_folding(on);
-        self.inner
-            .case
-            .store(on, core::sync::atomic::Ordering::Release);
+    /// Look names at `dir` and below up without regard to case from now on
+    /// (keeping each as it was written), as a Mac's default volume does, or
+    /// with it again. The names already there are indexed as they are: two
+    /// that differ only in case stay two, the later found by either spelling.
+    fn fold_under(&self, dir: &str, on: bool) {
+        let dir = dir.trim_matches('/');
+        let mut inner = self.inner.lock().unwrap();
+        // (A directory within one already folded is folded with it, and a
+        // directory told apart again is told apart below it too.)
+        if on && !inner.folds(dir) {
+            inner.folded.retain(|d| !within_dir(d, dir));
+            inner.folded.push(dir.to_string());
+        } else if !on {
+            inner.folded.retain(|d| !within_dir(d, dir));
+        }
+        let any = !inner.folded.is_empty();
+        inner.nodes.set_folding(any);
+        self.inner.case.store(any, core::sync::atomic::Ordering::Release);
     }
 
     /// Where a rename to `to` puts the name: as [`TmpFs::spell`] has it,
@@ -1208,7 +1264,7 @@ impl TmpFs {
     /// which is then the new spelling (in the directory as it is spelled).
     fn spell_rename_target<'p>(&self, from: &str, to: &'p str) -> std::borrow::Cow<'p, str> {
         let spelled = self.spell(to);
-        if !self.case_insensitive() || fold(from) != fold(to) || spelled != self.spell(from) {
+        if !self.case_insensitive(from) || fold(from) != fold(to) || spelled != self.spell(from) {
             return spelled;
         }
         match to.rfind('/') {
@@ -1222,7 +1278,8 @@ impl TmpFs {
         if !self.inner.case.load(core::sync::atomic::Ordering::Acquire) {
             return std::borrow::Cow::Borrowed(path);
         }
-        match self.inner.read().unwrap().nodes.spell(path) {
+        let inner = self.inner.read().unwrap();
+        match inner.spell(path) {
             std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(path),
             std::borrow::Cow::Owned(p) => std::borrow::Cow::Owned(p),
         }
@@ -2288,8 +2345,13 @@ impl FileSystem for TmpFs {
         true
     }
 
-    fn case_insensitive(&self) -> bool {
-        self.inner.case.load(core::sync::atomic::Ordering::Acquire)
+    fn case_insensitive(&self, path: &str) -> bool {
+        self.inner.case.load(core::sync::atomic::Ordering::Acquire) && self.inner.read().unwrap().folds(path)
+    }
+
+    fn set_case_insensitive(&self, path: &str, on: bool) -> bool {
+        self.fold_under(path, on);
+        true
     }
 
     fn chmod_link(&self, path: &str, mode: u32) -> Result<(), Errno> {
@@ -2324,8 +2386,6 @@ impl FileSystem for TmpFs {
     }
 
     fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
-        let spelled = self.spell(path);
-        let path: &str = &spelled;
         self.set_times_now(path, atime, mtime, now())
     }
 
@@ -2357,13 +2417,15 @@ impl FileSystem for TmpFs {
     /// The walk and the metadata under one lock.
     fn walk_metadata(&self, abs: &str, mounts: &str) -> Result<Option<Metadata>, Errno> {
         let inner = self.inner.read().unwrap();
-        let is_link = |rel: &str| matches!(inner.nodes.node(rel), Some(Node::Symlink(_)));
+        let abs = inner.mount_spelled(abs, mounts);
+        let abs: &str = &abs;
+        let is_link = |rel: &str| matches!(inner.node(rel), Some(Node::Symlink(_)));
         // The directories without a link (or a mount) on them: the last
         // name's node is then looked up once, for its link and its metadata.
         match super::walk_plain(abs, false, mounts, &is_link) {
             Some(true) => return Ok(None),
             Some(false) if !super::within_any(abs, mounts) => {
-                let rel = inner.nodes.spell(abs.trim_start_matches('/'));
+                let rel = inner.spell(abs.trim_start_matches('/'));
                 let rel: &str = &rel;
                 match inner.nodes.get(rel) {
                     None => return Err(Errno::ENOENT),
@@ -2373,20 +2435,22 @@ impl FileSystem for TmpFs {
             }
             _ => {}
         }
-        let w = super::walk_links(abs.to_string(), true, mounts, &|rel| match inner.nodes.node(rel) {
+        let w = super::walk_links(abs.to_string(), true, mounts, &|rel| match inner.node(rel) {
             Some(Node::Symlink(t)) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
         })?;
         if w.at_mount {
             return Ok(None);
         }
-        TmpFs::meta_at(&inner, &inner.nodes.spell(w.path.trim_start_matches('/'))).map(Some)
+        TmpFs::meta_at(&inner, &inner.spell(w.path.trim_start_matches('/'))).map(Some)
     }
 
     /// One lock for the whole walk, not one per component.
     fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {
         let inner = self.inner.read().unwrap();
-        super::walk_links(abs.to_string(), follow_final, mounts, &|rel| match inner.nodes.node(rel) {
+        let abs = inner.mount_spelled(abs, mounts);
+        let abs: &str = &abs;
+        super::walk_links(abs.to_string(), follow_final, mounts, &|rel| match inner.node(rel) {
             Some(Node::Symlink(t)) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
         })
@@ -2413,8 +2477,6 @@ impl FileSystem for TmpFs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let spelled = self.spell(path);
-        let path: &str = &spelled;
         self.mkdir_now(path, mode, now())
     }
 
@@ -2464,8 +2526,6 @@ impl FileSystem for TmpFs {
     /// file over a directory (`EISDIR`); a destination whose directory is
     /// not there (`ENOENT`).
     fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
-        let (from_s, to_s) = (self.spell(from), self.spell_rename_target(from, to));
-        let (from, to): (&str, &str) = (&from_s, &to_s);
         self.rename2_as(from, to, noreplace, super::own_holds())
     }
 
@@ -2980,7 +3040,7 @@ mod tests {
     fn case_is_told_apart_unless_asked_not_to() {
         let fs = TmpFs::new();
         fs.add_file("a/Foo", b"x".to_vec());
-        assert!(!fs.case_insensitive());
+        assert!(!fs.case_insensitive("a"));
         assert_eq!(fs.metadata("a/foo").unwrap_err(), Errno::ENOENT);
         fs.add_file("a/foo", b"y".to_vec());
         assert_eq!(names(&fs, "a"), ["Foo", "foo"]);
@@ -2990,8 +3050,8 @@ mod tests {
     fn a_case_insensitive_tree_finds_a_name_however_it_is_spelled() {
         let fs = TmpFs::new();
         fs.add_file("Apps/Thing/Info.plist", b"x".to_vec());
-        fs.set_case_insensitive(true);
-        assert!(fs.case_insensitive());
+        assert!(fs.set_case_insensitive("", true));
+        assert!(fs.case_insensitive("Apps"));
         let ino = fs.metadata("Apps/Thing/Info.plist").unwrap().ino;
         assert_eq!(fs.metadata("apps/THING/info.PLIST").unwrap().ino, ino);
         // A create of the other spelling is the name that is there.
@@ -3019,12 +3079,30 @@ mod tests {
         fs.unlink("APPS/OTHER/new.txt").unwrap();
         assert_eq!(names(&fs, "Apps/Other"), ["Info.plist"]);
         // And asked to tell case apart again, it does.
-        fs.set_case_insensitive(false);
+        fs.set_case_insensitive("", false);
         assert_eq!(
             fs.metadata("apps/other/info.plist").unwrap_err(),
             Errno::ENOENT
         );
         assert!(fs.metadata("Apps/Other/Info.plist").is_ok());
+    }
+
+    #[test]
+    fn a_mac_root_in_a_linux_tree_is_folded_alone() {
+        let fs = Arc::new(TmpFs::new());
+        fs.add_file("opt/mac/Users/Shared/Notes", b"x".to_vec());
+        fs.add_file("home/Me/Notes", b"y".to_vec());
+        assert!(fs.set_case_insensitive("opt/mac", true));
+        assert!(fs.metadata("opt/mac/USERS/shared/notes").is_ok());
+        assert!(fs.case_insensitive("opt/mac/Users") && !fs.case_insensitive("home"));
+        // The Linux tree around it still tells case apart.
+        assert_eq!(fs.metadata("home/me/notes").unwrap_err(), Errno::ENOENT);
+        assert_eq!(fs.metadata("OPT/mac/Users").unwrap_err(), Errno::ENOENT);
+        // And the root, as a Mac program's (a subtree), says so of itself.
+        let root = super::super::subtree::Subtree::new(fs.clone(), "opt/mac");
+        assert!(root.case_insensitive("") && root.metadata("users/SHARED").is_ok());
+        assert!(root.set_case_insensitive("", false));
+        assert_eq!(fs.metadata("opt/mac/USERS").unwrap_err(), Errno::ENOENT);
     }
 
     #[test]

@@ -687,7 +687,8 @@ impl FileSystem for HostFs {
 
     /// The host's: a guest's lookups here are the host's own, so its
     /// answer is the true one (insensitive over a Mac's default APFS).
-    fn case_insensitive(&self) -> bool {
+    /// (One answer for the whole mount: the volume under its root's.)
+    fn case_insensitive(&self, _path: &str) -> bool {
         *self.case.get_or_init(|| host_case_insensitive(&self.root))
     }
 
@@ -1108,10 +1109,10 @@ mod tests {
         // The host's own answer: is the other spelling the same file?
         let truth = std::fs::metadata(dir.join("NAME"))
             .is_ok_and(|m| m.ino() == std::fs::metadata(dir.join("Name")).unwrap().ino());
-        assert_eq!(HostFs::new(&dir).case_insensitive(), truth);
+        assert_eq!(HostFs::new(&dir).case_insensitive(""), truth);
         // A directory with nothing in it is asked about by its own name.
-        assert_eq!(HostFs::new(dir.join("Empty")).case_insensitive(), truth);
-        assert_eq!(HostFs::read_only(&dir).case_insensitive(), truth);
+        assert_eq!(HostFs::new(dir.join("Empty")).case_insensitive(""), truth);
+        assert_eq!(HostFs::read_only(&dir).case_insensitive(""), truth);
     }
 
     #[test]

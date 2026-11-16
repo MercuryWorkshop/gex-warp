@@ -3693,6 +3693,25 @@ pub extern "C" fn k_fs_chown(path: gex_kmem::PAddr, path_len: u32, uid: u32, gid
     as_unit(rootfs().chown(&p, uid, gid))
 }
 
+/// Whether names at a path are looked up without regard to case, after
+/// making them so (`set` 1) or not (`set` 2) where asked
+/// (`remote::Remote::case`): 1 or 0.
+#[no_mangle]
+pub extern "C" fn k_fs_case(path: gex_kmem::PAddr, path_len: u32, set: u32) -> i32 {
+    use gex_kernel::vfs::FileSystem;
+    fn answer(fs: &dyn FileSystem, rel: &str, set: u32) -> i32 {
+        if set != 0 {
+            fs.set_case_insensitive(rel, set == 1);
+        }
+        fs.case_insensitive(rel) as i32
+    }
+    let p = path_of(path, path_len);
+    match pagefs::find(&p) {
+        Some((m, rel)) => answer(&*m, &rel, set),
+        None => answer(&**rootfs(), &p, set),
+    }
+}
+
 /// An extended-attribute call (`remote::Remote::xattr`): on open `handle`,
 /// or on `path` when `handle` is negative.
 #[no_mangle]
