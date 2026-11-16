@@ -10,8 +10,13 @@
 //! segment per generation since (the records that changed, and the paths
 //! that no longer have one). A record is a path's difference from the
 //! sources: gone, a directory, a symlink, a file of the sources with its
-//! mode and extended attributes changed (its bytes still the sources'), or
-//! a file with its bytes (a small one) or its blocks in the store.
+//! mode, owner or extended attributes changed (its bytes still the
+//! sources'), or a file with its bytes (a small one) or its blocks in the
+//! store. A record names an owner only where the path's is not the one the
+//! sources gave it (a `chown`, a file a user made): one that names none
+//! (every record an older store has) leaves the sources' owner, so a
+//! rebuilt archive's new owners are what a boot shows wherever no program
+//! changed one.
 //!
 //! A generation is written at `sync(2)`, `syncfs`, `fsync`, `fdatasync`, the
 //! page's sync, and by the write-back ([`tick`]) once something has waited
@@ -23,7 +28,7 @@
 //! The files' bytes are not journalled: after a fall back, a file reads
 //! what was last written into the blocks it had.
 
-use super::{FileNode, Inner, Lazy, Node, TmpFs, META};
+use super::{FileNode, Inner, Lazy, Node, TmpFs, META, NO_OWNER};
 use crate::errno::Errno;
 use crate::vfs::blocks;
 use crate::vfs::Metadata;
@@ -82,6 +87,9 @@ fn fnv(h: u64, b: &[u8]) -> u64 {
 const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
 
 type Xattrs = Vec<(String, Vec<u8>)>;
+/// A record's owner and group: `None`, the sources' (whatever the tree as
+/// laid gives the path, [`NO_OWNER`] where it gives none); `Some`, this one.
+type Own = Option<(u32, u32)>;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Body {
@@ -96,8 +104,8 @@ enum Body {
 enum Rec {
     /// A path of the sources removed, and all under it.
     Gone,
-    Dir { mode: u32, mtime: i64, xattrs: Xattrs },
-    Link { target: String },
+    Dir { mode: u32, mtime: i64, xattrs: Xattrs, owner: Own },
+    Link { target: String, owner: Own },
     /// A file of the sources, its mode changed (read from older stores;
     /// [`Rec::Attrs`] is written instead).
     Mode { mode: u32 },
@@ -106,19 +114,25 @@ enum Rec {
     /// attributes: laid over the sources' file, or over the layer's when it
     /// is laid again ([`late_laid`]), so a site's newer file keeps what was
     /// set on the old one (a `user.gex.mem64` record).
-    Attrs { mode: u32, xattrs: Xattrs },
+    Attrs { mode: u32, xattrs: Xattrs, owner: Own },
     /// `ino` names the file among this generation's records (hard links).
-    File { ino: u64, mode: u32, mtime: i64, body: Body, xattrs: Xattrs },
+    File { ino: u64, mode: u32, mtime: i64, body: Body, xattrs: Xattrs, owner: Own },
 }
 
 /// A record as the walk finds it, its file's bytes not yet taken.
 enum Pre {
     Gone,
-    Dir { mode: u32, mtime: i64, xattrs: Xattrs },
-    Link { target: String },
-    Attrs { mode: u32, xattrs: Xattrs },
-    File { node: Arc<FileNode>, mode: u32, xattrs: Xattrs },
+    Dir { mode: u32, mtime: i64, xattrs: Xattrs, owner: Own },
+    Link { target: String, owner: Own },
+    Attrs { mode: u32, xattrs: Xattrs, owner: Own },
+    File { node: Arc<FileNode>, mode: u32, xattrs: Xattrs, owner: Own },
 }
+
+/// The records that carry an owner are written as their older kind's tag
+/// (1, 2, 5, 4) with none, and as that tag plus [`OWNED`] with one, its
+/// user and group after the rest: a store with no owner in it reads as it
+/// did before owners were kept.
+const OWNED: u8 = 8;
 
 #[derive(Default)]
 struct W(Vec<u8>);
@@ -144,32 +158,45 @@ impl W {
             self.bytes(v);
         }
     }
+    /// A record's kind, `OWNED` added when it names an owner.
+    fn kind(&mut self, tag: u8, owner: &Own) {
+        self.u8(if owner.is_some() { tag + OWNED } else { tag });
+    }
+    fn owner(&mut self, owner: &Own) {
+        if let Some((u, g)) = owner {
+            self.u32(*u);
+            self.u32(*g);
+        }
+    }
     fn rec(&mut self, path: &str, r: &Rec) {
         self.u8(TAG_PUT);
         self.bytes(path.as_bytes());
         match r {
             Rec::Gone => self.u8(0),
-            Rec::Dir { mode, mtime, xattrs } => {
-                self.u8(1);
+            Rec::Dir { mode, mtime, xattrs, owner } => {
+                self.kind(1, owner);
                 self.u32(*mode);
                 self.u64(*mtime as u64);
                 self.xattrs(xattrs);
+                self.owner(owner);
             }
-            Rec::Link { target } => {
-                self.u8(2);
+            Rec::Link { target, owner } => {
+                self.kind(2, owner);
                 self.bytes(target.as_bytes());
+                self.owner(owner);
             }
             Rec::Mode { mode } => {
                 self.u8(3);
                 self.u32(*mode);
             }
-            Rec::Attrs { mode, xattrs } => {
-                self.u8(5);
+            Rec::Attrs { mode, xattrs, owner } => {
+                self.kind(5, owner);
                 self.u32(*mode);
                 self.xattrs(xattrs);
+                self.owner(owner);
             }
-            Rec::File { ino, mode, mtime, body, xattrs } => {
-                self.u8(4);
+            Rec::File { ino, mode, mtime, body, xattrs, owner } => {
+                self.kind(4, owner);
                 self.u64(*ino);
                 self.u32(*mode);
                 self.u64(*mtime as u64);
@@ -193,6 +220,7 @@ impl W {
                         self.u64(*size);
                     }
                 }
+                self.owner(owner);
             }
         }
     }
@@ -230,14 +258,19 @@ impl R<'_> {
         let n = self.u32()?;
         (0..n).map(|_| Ok((self.str()?, self.bytes()?))).collect()
     }
+    /// The owner after a record of kind `tag` ([`OWNED`] added: one).
+    fn owner(&mut self, tag: u8) -> Result<Own, Errno> {
+        Ok(if tag > OWNED { Some((self.u32()?, self.u32()?)) } else { None })
+    }
     fn rec(&mut self) -> Result<Rec, Errno> {
-        Ok(match self.u8()? {
+        let tag = self.u8()?;
+        Ok(match tag {
             0 => Rec::Gone,
-            1 => Rec::Dir { mode: self.u32()?, mtime: self.u64()? as i64, xattrs: self.xattrs()? },
-            2 => Rec::Link { target: self.str()? },
+            1 | 9 => Rec::Dir { mode: self.u32()?, mtime: self.u64()? as i64, xattrs: self.xattrs()?, owner: self.owner(tag)? },
+            2 | 10 => Rec::Link { target: self.str()?, owner: self.owner(tag)? },
             3 => Rec::Mode { mode: self.u32()? },
-            5 => Rec::Attrs { mode: self.u32()?, xattrs: self.xattrs()? },
-            4 => {
+            5 | 13 => Rec::Attrs { mode: self.u32()?, xattrs: self.xattrs()?, owner: self.owner(tag)? },
+            4 | 12 => {
                 let (ino, mode, mtime, xattrs) = (self.u64()?, self.u32()?, self.u64()? as i64, self.xattrs()?);
                 let body = match self.u8()? {
                     0 => Body::Inline(self.bytes()?),
@@ -249,7 +282,7 @@ impl R<'_> {
                     2 => Body::Lazy(self.str()?, self.u64()?),
                     _ => return Err(Errno::EIO),
                 };
-                Rec::File { ino, mode, mtime, body, xattrs }
+                Rec::File { ino, mode, mtime, body, xattrs, owner: self.owner(tag)? }
             }
             _ => return Err(Errno::EIO),
         })
@@ -304,8 +337,12 @@ impl Sb {
 struct State {
     fs: TmpFs,
     exclude: Vec<String>,
-    /// The sources' tree as laid: path to its signature (kind, mode, target).
+    /// The sources' tree as laid: path to its signature (kind, mode,
+    /// target, owner, extended attributes).
     seed: HashMap<String, u64>,
+    /// The owners the sources gave, where they gave one ([`NO_OWNER`]
+    /// elsewhere): what a record's owner is told apart from.
+    seed_owners: HashMap<String, (u32, u32)>,
     /// What the last generation holds: path to its record's signature.
     committed: HashMap<String, u64>,
     sb: Sb,
@@ -323,15 +360,18 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// boot (a site's tar added once the system runs) lays them again later,
 /// and [`late_laid`] puts what was kept on each as it does. Taken under the
 /// tree's lock, never the other way round; never under [`STATE`] first.
-static LATE: Mutex<BTreeMap<String, (u32, Xattrs)>> = Mutex::new(BTreeMap::new());
+static LATE: Mutex<BTreeMap<String, (u32, Xattrs, Own)>> = Mutex::new(BTreeMap::new());
 
 /// A layer laid `path` (inode `ino`) after boot: the mode and extended
 /// attributes kept for it ([`LATE`]), if any, go on it. Called with the
 /// tree locked, by the laying itself.
 pub(super) fn late_laid(inner: &mut Inner, path: &str, ino: u64) {
-    let Some((mode, xattrs)) = LATE.lock().unwrap().remove(path) else { return };
+    let Some((mode, xattrs, owner)) = LATE.lock().unwrap().remove(path) else { return };
     let _ = inner.chmod(path, mode);
     set_xattrs(inner, ino, &xattrs);
+    if let Some(o) = owner {
+        set_owner(inner, path, o);
+    }
 }
 /// Generations written, records put, paths dropped (k_fs_persist_stats).
 pub static GENS: AtomicU64 = AtomicU64::new(0);
@@ -390,23 +430,42 @@ pub enum Found {
     Unreadable,
 }
 
-fn sig_dir(mode: u32, x: &Xattrs) -> u64 {
+/// An owner into a signature: the tree's (the sources' as laid, or the
+/// path's now), so that a `chown` and nothing else is a change, and a
+/// rebuilt archive's new owner one too.
+fn sig_owner(h: u64, o: (u32, u32)) -> u64 {
+    fnv(fnv(h, &o.0.to_le_bytes()), &o.1.to_le_bytes())
+}
+fn sig_dir(mode: u32, x: &Xattrs, o: (u32, u32)) -> u64 {
     let mut h = fnv(FNV0, &[1]);
     h = fnv(h, &mode.to_le_bytes());
     for (k, v) in x {
         h = fnv(fnv(h, k.as_bytes()), v);
     }
-    h
+    sig_owner(h, o)
 }
-fn sig_link(t: &str) -> u64 {
-    fnv(fnv(FNV0, &[2]), t.as_bytes())
+fn sig_link(t: &str, o: (u32, u32)) -> u64 {
+    sig_owner(fnv(fnv(FNV0, &[2]), t.as_bytes()), o)
 }
-fn sig_file_seed(mode: u32, x: &Xattrs) -> u64 {
+fn sig_file_seed(mode: u32, x: &Xattrs, o: (u32, u32)) -> u64 {
     let mut h = fnv(fnv(FNV0, &[3]), &mode.to_le_bytes());
     for (k, v) in x {
         h = fnv(fnv(h, k.as_bytes()), v);
     }
-    h
+    sig_owner(h, o)
+}
+
+fn owner_of(inner: &Inner, p: &str) -> (u32, u32) {
+    inner.owners.get(p).copied().unwrap_or(NO_OWNER)
+}
+
+/// `p` is `o`'s: kept sparsely, as the tree keeps owners.
+fn set_owner(inner: &mut Inner, p: &str, o: (u32, u32)) {
+    if o == NO_OWNER {
+        inner.owners.remove(p);
+    } else {
+        inner.owners.insert(p.to_string(), o);
+    }
 }
 
 fn within(p: &str, at: &str) -> bool {
@@ -430,21 +489,23 @@ fn mode_of(inner: &Inner, p: &str, node: &Node) -> u32 {
     inner.modes.get(p).copied().unwrap_or(default) & 0o7777
 }
 
-/// The tree's signatures, as the sources laid it.
-fn seed_of(fs: &TmpFs) -> HashMap<String, u64> {
+/// The tree's signatures, as the sources laid it, and the owners they gave.
+fn seed_of(fs: &TmpFs) -> (HashMap<String, u64>, HashMap<String, (u32, u32)>) {
     let inner = fs.inner.read().unwrap();
     let mut out = HashMap::with_capacity(inner.nodes.len());
     for (p, n) in inner.nodes.iter() {
         let ino = inner.inos.get(p).copied().unwrap_or(0);
+        let o = owner_of(&inner, p);
         let s = match n {
-            Node::Dir => sig_dir(mode_of(&inner, p, n), &xattrs_of(&inner, ino)),
-            Node::Symlink(t) => sig_link(t),
-            Node::File(f) => sig_file_seed(mode_of(&inner, p, n), &xattrs_of(&inner, f.ino)),
+            Node::Dir => sig_dir(mode_of(&inner, p, n), &xattrs_of(&inner, ino), o),
+            Node::Symlink(t) => sig_link(t, o),
+            Node::File(f) => sig_file_seed(mode_of(&inner, p, n), &xattrs_of(&inner, f.ino), o),
             Node::Socket | Node::Fifo(_) => continue,
         };
         out.insert(p.clone(), s);
     }
-    out
+    let owners = inner.owners.iter().filter(|(p, _)| out.contains_key(*p)).map(|(p, o)| (p.clone(), *o)).collect();
+    (out, owners)
 }
 
 impl State {
@@ -464,33 +525,37 @@ impl State {
             let ino = inner.inos.get(p).copied().unwrap_or(0);
             let mode = mode_of(&inner, p, n);
             let seed = self.seed.get(p);
+            // Its owner now, and what a record says of it: none where it is
+            // the one the sources gave.
+            let own = owner_of(&inner, p);
+            let owner = (own != self.seed_owners.get(p).copied().unwrap_or(NO_OWNER)).then_some(own);
             match n {
                 Node::Dir => {
                     let xattrs = xattrs_of(&inner, ino);
-                    if seed == Some(&sig_dir(mode, &xattrs)) {
+                    if seed == Some(&sig_dir(mode, &xattrs, own)) {
                         continue;
                     }
-                    out.push((p.clone(), Pre::Dir { mode, mtime: inner.mtimes.get(p).copied().unwrap_or(0), xattrs }));
+                    out.push((p.clone(), Pre::Dir { mode, mtime: inner.mtimes.get(p).copied().unwrap_or(0), xattrs, owner }));
                 }
                 Node::Symlink(t) => {
-                    if seed == Some(&sig_link(t)) {
+                    if seed == Some(&sig_link(t, own)) {
                         continue;
                     }
-                    out.push((p.clone(), Pre::Link { target: t.clone() }));
+                    out.push((p.clone(), Pre::Link { target: t.clone(), owner }));
                 }
                 Node::Socket | Node::Fifo(_) => {}
                 Node::File(f) => {
                     let xattrs = xattrs_of(&inner, f.ino);
                     if f.written.load(Ordering::Relaxed) {
-                        out.push((p.clone(), Pre::File { node: Arc::clone(f), mode, xattrs }));
+                        out.push((p.clone(), Pre::File { node: Arc::clone(f), mode, xattrs, owner }));
                     } else if let Some(&s) = seed {
-                        if s != sig_file_seed(mode, &xattrs) {
-                            out.push((p.clone(), Pre::Attrs { mode, xattrs }));
+                        if s != sig_file_seed(mode, &xattrs, own) {
+                            out.push((p.clone(), Pre::Attrs { mode, xattrs, owner }));
                         }
                     } else if !xattrs.is_empty() {
                         // (a layer laid after boot: its bytes are the
                         // layer's, laid again by the next boot's)
-                        out.push((p.clone(), Pre::Attrs { mode, xattrs }));
+                        out.push((p.clone(), Pre::Attrs { mode, xattrs, owner }));
                     }
                     // Not written and not the sources': a layer laid after
                     // boot, laid again by the next one.
@@ -498,9 +563,9 @@ impl State {
             }
         }
         // Kept for a layer not laid again yet.
-        for (p, (mode, xattrs)) in LATE.lock().unwrap().iter() {
+        for (p, (mode, xattrs, owner)) in LATE.lock().unwrap().iter() {
             if !inner.nodes.contains_key(p) && !self.excluded(p) {
-                out.push((p.clone(), Pre::Attrs { mode: *mode, xattrs: xattrs.clone() }));
+                out.push((p.clone(), Pre::Attrs { mode: *mode, xattrs: xattrs.clone(), owner: *owner }));
             }
         }
         // Removed: the topmost of what the sources had.
@@ -628,12 +693,14 @@ impl State {
 /// A record's signature: whether it changed since the last generation,
 /// without reading a file's bytes (its count of changes says).
 fn sig_of(pre: &Pre) -> u64 {
+    // (A record's owner as it names one: none, or the one it names.)
+    let own = |o: &Own| o.unwrap_or((u32::MAX - 1, u32::MAX - 1));
     match pre {
         Pre::Gone => fnv(FNV0, &[9]),
-        Pre::Dir { mode, xattrs, .. } => sig_dir(*mode, xattrs),
-        Pre::Link { target } => sig_link(target),
-        Pre::Attrs { mode, xattrs } => fnv(sig_file_seed(*mode, xattrs), &[8]),
-        Pre::File { node, mode, xattrs } => {
+        Pre::Dir { mode, xattrs, owner, .. } => sig_dir(*mode, xattrs, own(owner)),
+        Pre::Link { target, owner } => sig_link(target, own(owner)),
+        Pre::Attrs { mode, xattrs, owner } => fnv(sig_file_seed(*mode, xattrs, own(owner)), &[8]),
+        Pre::File { node, mode, xattrs, owner } => {
             let mut h = fnv(FNV0, &[4]);
             h = fnv(h, &(Arc::as_ptr(node) as usize as u64).to_le_bytes());
             h = fnv(h, &mode.to_le_bytes());
@@ -643,7 +710,7 @@ fn sig_of(pre: &Pre) -> u64 {
             for (k, v) in xattrs {
                 h = fnv(fnv(h, k.as_bytes()), v);
             }
-            h
+            sig_owner(h, own(owner))
         }
     }
 }
@@ -654,10 +721,10 @@ fn sig_of(pre: &Pre) -> u64 {
 fn take(pre: &Pre) -> Rec {
     match pre {
         Pre::Gone => Rec::Gone,
-        Pre::Dir { mode, mtime, xattrs } => Rec::Dir { mode: *mode, mtime: *mtime, xattrs: xattrs.clone() },
-        Pre::Link { target } => Rec::Link { target: target.clone() },
-        Pre::Attrs { mode, xattrs } => Rec::Attrs { mode: *mode, xattrs: xattrs.clone() },
-        Pre::File { node, mode, xattrs } => {
+        Pre::Dir { mode, mtime, xattrs, owner } => Rec::Dir { mode: *mode, mtime: *mtime, xattrs: xattrs.clone(), owner: *owner },
+        Pre::Link { target, owner } => Rec::Link { target: target.clone(), owner: *owner },
+        Pre::Attrs { mode, xattrs, owner } => Rec::Attrs { mode: *mode, xattrs: xattrs.clone(), owner: *owner },
+        Pre::File { node, mode, xattrs, owner } => {
             let mtime = node.mtime.load(Ordering::Relaxed);
             let lazy = node.lazy.lock().unwrap().as_ref().map(|l| (l.url.clone(), l.size));
             let body = if let Some((url, size)) = lazy {
@@ -670,7 +737,7 @@ fn take(pre: &Pre) -> Rec {
                     None => Body::Inline(node.data.lock().unwrap().clone()),
                 }
             };
-            Rec::File { ino: node.ino, mode: *mode, mtime, body, xattrs: xattrs.clone() }
+            Rec::File { ino: node.ino, mode: *mode, mtime, body, xattrs: xattrs.clone(), owner: *owner }
         }
     }
 }
@@ -817,6 +884,10 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
     };
     // In path order: a directory before what is in it.
     for (p, r) in recs {
+        // The owner the sources gave the path, which a record that names
+        // none leaves it (a node made again would otherwise lose it).
+        let was = owner_of(&inner, p);
+        let own = |inner: &mut Inner, owner: &Own| set_owner(inner, p, owner.unwrap_or(was));
         match r {
             Rec::Gone => {}
             Rec::Mode { mode } => {
@@ -824,19 +895,20 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                     let _ = inner.chmod(p, *mode);
                 }
             }
-            Rec::Attrs { mode, xattrs } => match inner.nodes.get(p.as_str()) {
+            Rec::Attrs { mode, xattrs, owner } => match inner.nodes.get(p.as_str()) {
                 Some(Node::File(f)) => {
                     let ino = f.ino;
                     let _ = inner.chmod(p, *mode);
                     set_xattrs(&mut inner, ino, xattrs);
+                    own(&mut inner, owner);
                 }
                 // Not laid yet: a layer after boot lays it.
                 None => {
-                    LATE.lock().unwrap().insert(p.clone(), (*mode, xattrs.clone()));
+                    LATE.lock().unwrap().insert(p.clone(), (*mode, xattrs.clone(), *owner));
                 }
                 Some(_) => {}
             },
-            Rec::Dir { mode, mtime, xattrs } => {
+            Rec::Dir { mode, mtime, xattrs, owner } => {
                 if !matches!(inner.nodes.get(p.as_str()), Some(Node::Dir) | None) {
                     remove_tree(&mut inner, p);
                 }
@@ -852,16 +924,18 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                 inner.inferred.remove(p.as_str());
                 let ino = inner.inos.get(p.as_str()).copied().unwrap_or(0);
                 set_xattrs(&mut inner, ino, xattrs);
+                own(&mut inner, owner);
             }
-            Rec::Link { target } => {
+            Rec::Link { target, owner } => {
                 remove_tree(&mut inner, p);
                 TmpFs::ensure_parents(&mut inner, p);
                 let ino = inner.next_ino;
                 inner.next_ino += 1;
                 inner.set_ino(p.clone(), ino);
                 inner.nodes.insert(p.clone(), Node::Symlink(target.clone()));
+                own(&mut inner, owner);
             }
-            Rec::File { ino, mode, mtime, body, xattrs } => {
+            Rec::File { ino, mode, mtime, body, xattrs, owner } => {
                 remove_tree(&mut inner, p);
                 TmpFs::ensure_parents(&mut inner, p);
                 let node = match files.get(ino) {
@@ -896,6 +970,7 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                 inner.nodes.insert(p.clone(), Node::File(Arc::clone(&node)));
                 let _ = inner.chmod(p, *mode);
                 set_xattrs(&mut inner, node.ino, xattrs);
+                own(&mut inner, owner);
             }
         }
     }
@@ -907,7 +982,7 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
 /// (no leading `/`).
 pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
     let fs = TmpFs { inner: Arc::clone(&fs.inner) };
-    let seed = seed_of(&fs);
+    let (seed, seed_owners) = seed_of(&fs);
     let bs = blocks::block() as u32;
     let mut head = vec![0u8; bs as usize];
     let read = blocks::raw(blocks::OP_READ, 0, &mut head);
@@ -922,7 +997,7 @@ pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
     let any = slots.iter().any(|s| s.is_some());
     let max_gen = ok.first().map_or(0, |s| s.gen);
     let mut found = if any { Found::Unreadable } else { Found::Fresh };
-    let mut st = State { fs, exclude, seed, committed: HashMap::new(), sb: Sb { gen: max_gen, ..Default::default() }, chain: Vec::new(), seen: 0, since: None };
+    let mut st = State { fs, exclude, seed, seed_owners, committed: HashMap::new(), sb: Sb { gen: max_gen, ..Default::default() }, chain: Vec::new(), seen: 0, since: None };
     let mut used = vec![true];
     for (i, sb) in ok.iter().enumerate() {
         let Ok((stream, chain)) = read_chain(sb) else { continue };
@@ -1281,6 +1356,116 @@ mod tests {
         reset();
     }
 
+    /// Owners kept across boots: a `chown` and nothing else is a change
+    /// worth a generation (on a file of the sources, a directory of them and
+    /// a link of them), a file a user made is hers, and the sources' owner
+    /// stays where no program changed one.
+    #[test]
+    #[ignore]
+    fn owners_are_kept_and_a_chown_alone_is_a_change() {
+        STORE_FILE.lock().unwrap().clear();
+        let owner = |fs: &TmpFs, p: &str| fs.metadata_nofollow(p).unwrap().owner.unwrap();
+        // The sources: a file of root's, one of a service's (an archive's
+        // owners laid as a trusted one lays them).
+        let sources = || {
+            let fs = boot();
+            fs.add_dir("var/lib/apt/lists/partial");
+            fs.chown("var/lib/apt/lists/partial", 42, 0).unwrap();
+            fs
+        };
+        let fs = sources();
+        start(&fs, vec!["tmp".into()]);
+        let gen = || STATE.lock().unwrap().as_ref().unwrap().sb.gen;
+        let g0 = gen();
+        assert_eq!(exited().unwrap(), 0);
+        fs.chown("etc/seed", 1000, 1000).unwrap();
+        assert_eq!(exited().unwrap(), 1, "a chown alone writes a generation");
+        assert_eq!(gen(), g0 + 1);
+        fs.chown("var/old", 7, 7).unwrap();
+        fs.chown("usr/link", 8, 8).unwrap();
+        fs.mkdir("home", 0o755).unwrap();
+        fs.mkdir("home/alice", 0o700).unwrap();
+        fs.chown("home/alice", 501, 20).unwrap();
+        write(&fs, "home/alice/note", b"hers");
+        fs.chown("home/alice/note", 501, 20).unwrap();
+        sync().unwrap();
+        assert_eq!(gen(), g0 + 2);
+
+        let fs = sources();
+        assert_eq!(start(&fs, vec!["tmp".into()]), Found::Restored);
+        assert_eq!(owner(&fs, "etc/seed"), (1000, 1000));
+        assert_eq!(read(&fs, "etc/seed").unwrap(), b"seeded", "its bytes the sources' still");
+        assert_eq!(owner(&fs, "var/old"), (7, 7));
+        assert_eq!(owner(&fs, "usr/link"), (8, 8));
+        assert_eq!(fs.read_link("usr/link").unwrap(), "bin/tool");
+        assert_eq!(owner(&fs, "home/alice"), (501, 20));
+        assert_eq!(fs.metadata("home/alice").unwrap().mode & 0o777, 0o700);
+        assert_eq!(owner(&fs, "home/alice/note"), (501, 20));
+        assert_eq!(read(&fs, "home/alice/note").unwrap(), b"hers");
+        assert_eq!(owner(&fs, "var/lib/apt/lists/partial"), (42, 0), "the sources' owner, kept by no record");
+        assert_eq!(owner(&fs, "etc/big"), NO_OWNER);
+        // Nothing changed since: no generation.
+        let g = gen();
+        sync().unwrap();
+        assert_eq!(gen(), g);
+
+        // Given back to the first user: kept as that, not as the change.
+        fs.chown("etc/seed", crate::vfs::BASE_ID, crate::vfs::BASE_ID).unwrap();
+        sync().unwrap();
+        assert_eq!(gen(), g + 1);
+        let fs = sources();
+        assert_eq!(start(&fs, vec!["tmp".into()]), Found::Restored);
+        assert_eq!(owner(&fs, "etc/seed"), NO_OWNER);
+        assert_eq!(owner(&fs, "home/alice/note"), (501, 20));
+        reset();
+    }
+
+    /// A record that names no owner (every record of a store written before
+    /// owners were kept, and one whose path keeps the sources' owner)
+    /// leaves the sources' owner: a rebuilt archive's new owners show
+    /// through a file whose mode or bytes a program changed.
+    #[test]
+    #[ignore]
+    fn a_record_without_an_owner_keeps_the_sources_owner() {
+        STORE_FILE.lock().unwrap().clear();
+        let owner = |fs: &TmpFs, p: &str| fs.metadata_nofollow(p).unwrap().owner.unwrap();
+        let fs = boot();
+        start(&fs, vec![]);
+        fs.chmod("usr/bin/tool", 0o4755).unwrap();
+        write(&fs, "etc/big", b"rewritten as root");
+        fs.chmod("var/old", 0o700).unwrap();
+        sync().unwrap();
+        // The records name no owner: written as the older kinds.
+        {
+            let st = STATE.lock().unwrap();
+            let sb = st.as_ref().unwrap().sb;
+            let (stream, _) = read_chain(&sb).unwrap();
+            let recs = replay(&stream).unwrap();
+            assert!(matches!(recs["usr/bin/tool"], Rec::Attrs { owner: None, .. }));
+            assert!(matches!(recs["etc/big"], Rec::File { owner: None, .. }));
+            assert!(matches!(recs["var/old"], Rec::Dir { owner: None, .. }));
+        }
+
+        // The sources rebuilt: root's tool now a set-user-ID program of
+        // user 0's group 5, the old directory a service's.
+        let fs = boot();
+        fs.chown("usr/bin/tool", 0, 5).unwrap();
+        fs.chown("etc/big", 3, 3).unwrap();
+        fs.chown("var/old", 9, 9).unwrap();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(fs.metadata("usr/bin/tool").unwrap().mode & 0o7777, 0o4755);
+        assert_eq!(owner(&fs, "usr/bin/tool"), (0, 5));
+        assert_eq!(read(&fs, "etc/big").unwrap(), b"rewritten as root");
+        assert_eq!(owner(&fs, "etc/big"), (3, 3));
+        assert_eq!(fs.metadata("var/old").unwrap().mode & 0o777, 0o700);
+        assert_eq!(owner(&fs, "var/old"), (9, 9));
+        // And the walk sees nothing new to keep.
+        let g = STATE.lock().unwrap().as_ref().unwrap().sb.gen;
+        sync().unwrap();
+        assert_eq!(STATE.lock().unwrap().as_ref().unwrap().sb.gen, g);
+        reset();
+    }
+
     /// Many generations fold into a checkpoint, and the old records' blocks
     /// are used again rather than the store growing.
     #[test]
@@ -1303,5 +1488,34 @@ mod tests {
             assert_eq!(read(&fs, &format!("d/f{}", i % 50)).unwrap(), big(300, i as u8));
         }
         reset();
+    }
+
+    /// Each record kind that names an owner reads back as written, and one
+    /// that names none is written as its older kind's tag, byte for byte.
+    #[test]
+    fn records_with_and_without_an_owner_read_back() {
+        let recs = [
+            Rec::Dir { mode: 0o700, mtime: 5, xattrs: vec![("user.a".into(), b"1".to_vec())], owner: Some((501, 20)) },
+            Rec::Link { target: "x/y".into(), owner: Some((0, 80)) },
+            Rec::Attrs { mode: 0o4755, xattrs: vec![], owner: Some((0, 0)) },
+            Rec::File { ino: 3, mode: 0o600, mtime: 9, body: Body::Inline(b"hi".to_vec()), xattrs: vec![], owner: Some((42, 65534)) },
+            Rec::File { ino: 4, mode: 0o644, mtime: 9, body: Body::Blocks(70000, vec![1, 0, 3]), xattrs: vec![], owner: Some((1, 2)) },
+            Rec::Dir { mode: 0o755, mtime: 1, xattrs: vec![], owner: None },
+            Rec::Attrs { mode: 0o755, xattrs: vec![], owner: None },
+            Rec::Mode { mode: 0o711 },
+        ];
+        for r in &recs {
+            let mut w = W::default();
+            w.rec("p", r);
+            let mut rd = R(&w.0, 0);
+            assert_eq!(rd.u8().unwrap(), TAG_PUT);
+            assert_eq!(rd.str().unwrap(), "p");
+            assert_eq!(&rd.rec().unwrap(), r);
+            assert_eq!(rd.1, w.0.len());
+        }
+        // Without an owner: the older layout exactly.
+        let mut w = W::default();
+        w.rec("p", &Rec::Link { target: "t".into(), owner: None });
+        assert_eq!(w.0, [&[TAG_PUT][..], &1u32.to_le_bytes(), b"p", &[2], &1u32.to_le_bytes(), b"t"].concat());
     }
 }

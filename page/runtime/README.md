@@ -391,8 +391,10 @@ or a hard link between it and the rest of the tree is `EXDEV` (`mv` copies).
 A store (an `OPFSFilesystem`, or a subclass of the page's own) keeps the
 root across page loads. At boot, what it kept is laid over the sources before
 the first program. From then on it keeps what the programs change: files,
-directories, symlinks, modes, extended attributes, hard links, and
-deletions of the sources' paths. It never keeps `/tmp`, `/proc`, `/sys`,
+directories, symlinks, modes, owners (a `chown` alone is a change kept),
+extended attributes, hard links, and deletions of the sources' paths. A
+path the store kept nothing of has the sources' owner, so a rebuilt archive
+with new owners is what a reload shows, except where a program changed one. It never keeps `/tmp`, `/proc`, `/sys`,
 `/dev`, `/run`, a mount (its provider keeps its own) or the filesystem's
 `exclude`. A lazy file nobody wrote is never fetched for it.
 
