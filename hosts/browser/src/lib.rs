@@ -9555,8 +9555,10 @@ fn syscall_entry(ctx: i32, pc: i64) {
         h.kernel.block_restart = gex_kernel::signal::Restart::Never;
         h.kernel.block_pc = 0;
         // The clocks never come here (`clock_syscall`); one that does is a
-        // regression, said once, as an error every page test fails on.
-        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !exited() {
+        // regression, said once, as an error every page test fails on. (A
+        // Darwin program's all do: its `getrusage` is the canonical one here,
+        // and `clock_syscall` leaves its calls to the kernel.)
+        if is_clock_nr(h.kernel.syscall_nr) && !gex_kernel::darwin::on() && !IN_PROVIDER.with(|c| c.get()) && !exited() {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 warn_line(&format!("[gex] pid {}: clock call {} took the kernel lock\n", h.kernel.pid, h.kernel.syscall_nr));
