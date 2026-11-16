@@ -1,8 +1,9 @@
 // Just enough tar to unpack a root filesystem in one request. Handles what GNU
 // tar emits for a directory tree: ustar, the two GNU long-name extensions, the
 // `prefix` field (how ustar stores a path over 100 characters), and a pax
-// extended header's path, link target and extended attributes (`tar --xattrs`:
-// `SCHILY.xattr.user.*`, how Wine's DOS attributes travel in a prefix).
+// extended header's path, link target, owner and extended attributes (`tar
+// --xattrs`: `SCHILY.xattr.user.*`, how Wine's DOS attributes travel in a
+// prefix).
 
 const BLOCK = 512;
 
@@ -95,6 +96,12 @@ function tree() {
     // Extended attributes (`user.*`), path to { name: bytes }: what the pax
     // headers carry, for `gex_set_xattr`.
     xattrs: Object.create(null),
+    // Each entry's numeric owner and group, path to [uid, gid], for those
+    // that are not root's (0:0, what a name nobody gave an owner already is
+    // in a page): ustar's fields, a pax header's `uid` and `gid` over them.
+    // Whether they are believed is the consumer's to say (`gex_chown`; an
+    // archive an ordinary user made names that user for every file).
+    owners: Object.create(null),
   };
 }
 
@@ -112,6 +119,12 @@ function addEntry(t, root, { name, type, link, ext }, hdr, off, body) {
   const keepXattrs = (p) => {
     if (p && ext && ext.xattrs) t.xattrs[p] = ext.xattrs;
   };
+  const keepOwner = (p) => {
+    if (!p) return;
+    const uid = ext?.uid ?? octal(hdr, off + 108, 8);
+    const gid = ext?.gid ?? octal(hdr, off + 116, 8);
+    if (uid || gid) t.owners[p] = [uid, gid];
+  };
   if (type === '5') {
     const p = entryPath(root, name);
     if (p) t.dirs.push(p);
@@ -122,6 +135,7 @@ function addEntry(t, root, { name, type, link, ext }, hdr, off, body) {
     // stale when the directory looks newer
     if (p) t.mtimes[p] = octal(hdr, off + 136, 12);
     keepXattrs(p);
+    keepOwner(p);
     // A directory's mode, when it is not the VFS's 0755: a read-only one
     // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and
     // the Windows shell reads a folder's desktop.ini names only then.
@@ -130,12 +144,16 @@ function addEntry(t, root, { name, type, link, ext }, hdr, off, body) {
   } else if (type === '2') {
     const p = entryPath(root, name);
     if (p) t.links[p] = link;
+    keepOwner(p);
   } else if (type === '1') {
     // A hard link's target is relative to the root of the archive, not the
     // link's directory (a symlink's is). Resolving it like a symlink would
     // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
     const p = entryPath(root, name);
-    if (p && link) t.hard[p] = `/${link.replace(/^\.\//, '')}`;
+    if (p && link) {
+      t.hard[p] = `/${link.replace(/^\.\//, '')}`;
+      keepOwner(p);
+    }
   } else if (type === '0' || type === '\0' || type === '7') {
     const p = entryPath(root, name);
     if (p) {
@@ -144,12 +162,14 @@ function addEntry(t, root, { name, type, link, ext }, hdr, off, body) {
       if (mode & 0o111) t.modes[p] = mode;
       t.mtimes[p] = octal(hdr, off + 136, 12);
       keepXattrs(p);
+      keepOwner(p);
     }
   }
 }
 
 /**
- * Unpack a tar into `{ files, dirs, links, hard, modes }`.
+ * Unpack a tar into `{ files, dirs, links, hard, modes, mtimes, xattrs,
+ * owners }`.
  *
  * `files` maps an absolute guest path to its bytes, `dirs` lists directories
  * (so an empty one still exists), and `links` maps a symlink's path to its
@@ -315,7 +335,8 @@ export class TarStream {
 
 /**
  * A pax extended header's records (`LEN key=value\n`, LEN counting the whole
- * record): the path, the link target and the `user.` extended attributes,
+ * record): the path, the link target, the numeric owner and group (`uid`,
+ * `gid`) and the `user.` extended attributes,
  * GNU tar's (`SCHILY.xattr.NAME`, raw bytes) and libarchive's
  * (`LIBARCHIVE.xattr.NAME`, base64). Values are bytes, not text.
  */
@@ -334,6 +355,10 @@ function paxRecords(rec) {
     const value = rec.slice(eq + 1, end);
     if (key === 'path') out.path = new TextDecoder().decode(value);
     else if (key === 'linkpath') out.linkpath = new TextDecoder().decode(value);
+    else if (key === 'uid' || key === 'gid') {
+      const n = Number.parseInt(new TextDecoder().decode(value), 10);
+      if (Number.isInteger(n) && n >= 0) out[key] = n;
+    }
     else if (key.startsWith('SCHILY.xattr.user.')) (out.xattrs ??= {})[key.slice(13)] = value;
     else if (key.startsWith('LIBARCHIVE.xattr.user.')) {
       const raw = atob(new TextDecoder().decode(value));

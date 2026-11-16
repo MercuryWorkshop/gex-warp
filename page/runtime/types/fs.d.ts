@@ -10,6 +10,9 @@ export interface Stat {
   /** ms since the epoch. */
   mtime: number;
   nlink: number;
+  /** null: nobody gave it an owner (the first user's), or no owners kept. */
+  uid: number | null;
+  gid: number | null;
 }
 
 export interface WatchEvent {
@@ -76,8 +79,8 @@ export declare abstract class Filesystem extends EventTarget {
   /** An error with `code: 'ENOSPC'` when the store is full. */
   truncate(length: number): Promise<void>;
   flush(): Promise<void>;
-  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList }): Promise<unknown>;
-  addFiles(files: Record<string, Source>, options?: { mode?: number }): Promise<unknown>;
+  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList; owners?: boolean }): Promise<unknown>;
+  addFiles(files: Record<string, Source>, options?: { mode?: number; uid?: number; gid?: number }): Promise<unknown>;
   mount(path: string, provider: MountProvider): Mount;
   unmount(path: string): Promise<void>;
   mounts(): Mount[];

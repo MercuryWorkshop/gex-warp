@@ -28,7 +28,7 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
 /**
  * Options, as runProgram has always taken them:
  *   elf, args           the program's bytes and its argv (args[0] its path)
- *   files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs
+ *   files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs, owners
  *                       the bundle (tar.js `untar`'s parts, lazy files
  *                       `[path, size, url, head]`)
  *   stream              the bundle as it is unpacked instead (app.js
@@ -61,7 +61,7 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  * pid 1.
  */
 export async function runPreset(term, {
-  elf, args, files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes, xattrs, stream = null,
+  elf, args, files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes, xattrs, owners, stream = null,
   env = [], cwd = '/', uid, tty = true, filesystem,
   wl = null, wlScale = 1, onDesktop = null, hostX = false,
   gl = null, glLazy = false, glSource = null, glBackend, d3d = false,
@@ -128,7 +128,7 @@ export async function runPreset(term, {
     image[exe] = elf;
     imageModes[exe] ??= 0o755;
   }
-  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs, ...(stream ? { stream: stream.parts, streamIndex: stream.index ?? null } : {}) });
+  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs, owners, ...(stream ? { stream: stream.parts, streamIndex: stream.index ?? null } : {}) });
 
   let windows = null;
   if (wl && typeof wl.getContext === 'function') {

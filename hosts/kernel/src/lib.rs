@@ -4070,6 +4070,8 @@ pub extern "C" fn k_fs_add_lazy(path: gex_kmem::PAddr, path_len: u32, url: gex_k
 ///                [`k_fs_fill`]); a bundle's index
 ///   6 directory  mode u32, seconds i64, path
 ///   7 hard link  target, path ([`k_fs_link`])
+///   8 owner      uid u32, gid u32, path ([`k_fs_chown`], the name itself,
+///                a link not followed): an archive's owners the page trusts
 /// Each does what its own call does, results unchecked as the page leaves
 /// those calls'. The records done, or -EINVAL at the first that does not
 /// parse.
@@ -4178,6 +4180,17 @@ pub extern "C" fn k_fs_seed(at: gex_kmem::PAddr, len: u32) -> i32 {
                 let p = r.path()?;
                 let _ = rootfs().unlink(&p);
                 let _ = rootfs().link(&target, &p);
+                Some(())
+            })(),
+            8 => (|| {
+                let uid = r.u32()?;
+                let gid = r.u32()?;
+                let p = r.path()?;
+                if let Some((m, rel)) = pagefs::find(&p) {
+                    let _ = m.chown(&rel, uid, gid);
+                } else {
+                    let _ = rootfs().chown(&p, uid, gid);
+                }
                 Some(())
             })(),
             _ => None,

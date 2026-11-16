@@ -1,13 +1,14 @@
 //! A tar laid into the root from the page (page/runtime kfs.js `addTar`),
 //! sent in parts as it is fetched and unpacked (`gex_kernel::tar::Reader`):
 //! directories, files, modes, times, symbolic and hard links, extended
-//! attributes. Over whatever is there: a later tar's path wins. Seeding,
+//! attributes, and owners when the page trusts the archive's (addTar's
+//! `owners`). Over whatever is there: a later tar's path wins. Seeding,
 //! not a program's writes, so persistence does not take it.
 
 use std::sync::Mutex;
 
 use gex_kernel::tar::{Event, Header, Kind, Reader};
-use gex_kernel::vfs::{FileSystem, XattrOp};
+use gex_kernel::vfs::{FileSystem, XattrOp, BASE_ID};
 
 use crate::rootfs;
 
@@ -18,6 +19,10 @@ struct Ingest {
     /// The file whose bytes are coming.
     file: Option<(Header, Vec<u8>)>,
     files: u32,
+    /// Whether the archive's owners are the files' (the page says so:
+    /// a root built as root, Docker's). An archive an ordinary user made
+    /// names that user for every file, and is laid as having none.
+    owners: bool,
 }
 
 static INGESTS: Mutex<Vec<Option<Ingest>>> = Mutex::new(Vec::new());
@@ -30,9 +35,26 @@ fn under(at: &str, p: &str) -> String {
     }
 }
 
-/// What every entry has: its mode, time and extended attributes.
-fn finish(p: &str, h: &Header) {
+/// The entry at `p` is `h`'s owner's, when the archive's owners are
+/// trusted. Root's (0:0) is what a name nobody gave an owner already has in
+/// a page, whose first user is root, so it is not recorded, as a mode that
+/// is the default is not: only an owner left by a layer before is cleared.
+fn own(p: &str, h: &Header) {
     let fs = rootfs();
+    if h.uid != 0 || h.gid != 0 {
+        let _ = fs.chown(p, h.uid, h.gid);
+    } else if fs.metadata_nofollow(p).is_ok_and(|m| m.owner.is_some_and(|o| o != (BASE_ID, BASE_ID))) {
+        let _ = fs.chown(p, BASE_ID, BASE_ID);
+    }
+}
+
+/// What every entry has: its mode, time and extended attributes (and owner,
+/// `owners`).
+fn finish(p: &str, h: &Header, owners: bool) {
+    let fs = rootfs();
+    if owners {
+        own(p, h);
+    }
     if h.mode != 0 && h.kind != Kind::Symlink {
         let _ = fs.chmod(p, h.mode);
     }
@@ -57,11 +79,11 @@ fn entry(g: &mut Ingest, h: Header) {
             if !p.is_empty() {
                 fs.add_dir(&p);
             }
-            finish(&p, &h);
+            finish(&p, &h, g.owners);
         }
         Kind::File if h.size == 0 => {
             fs.add_file(&p, Vec::new());
-            finish(&p, &h);
+            finish(&p, &h, g.owners);
             g.files += 1;
         }
         Kind::File => g.file = Some((h, Vec::new())),
@@ -73,12 +95,16 @@ fn entry(g: &mut Ingest, h: Header) {
             if fs.symlink(&h.link, &p) == Err(gex_kernel::Errno::EEXIST) && crate::premade_gives_way(&p) {
                 let _ = fs.symlink(&h.link, &p);
             }
-            finish(&p, &h);
+            finish(&p, &h, g.owners);
         }
         Kind::Hard => {
             parent();
             let _ = fs.unlink(&p);
             let _ = fs.link(&under(&g.at, &h.link), &p);
+            // (A name's owner is kept by name: the link's as the archive says.)
+            if g.owners {
+                own(&p, &h);
+            }
         }
         Kind::Other => {}
     }
@@ -94,16 +120,17 @@ fn data(g: &mut Ingest, d: &[u8]) {
         let (h, bytes) = g.file.take().unwrap();
         let p = under(&g.at, &h.path);
         rootfs().add_file(&p, bytes);
-        finish(&p, &h);
+        finish(&p, &h, g.owners);
         g.files += 1;
     }
 }
 
-/// A tar to come, laid at `at`. Its id.
+/// A tar to come, laid at `at`; `owners` nonzero: its entries' owners are
+/// theirs (else none is recorded). Its id.
 #[no_mangle]
-pub extern "C" fn k_fs_tar_open(at: gex_kmem::PAddr, at_len: u32) -> i32 {
+pub extern "C" fn k_fs_tar_open(at: gex_kmem::PAddr, at_len: u32, owners: u32) -> i32 {
     let at = crate::path_of(at, at_len).trim_end_matches('/').to_string();
-    let g = Ingest { reader: Reader::default(), at, file: None, files: 0 };
+    let g = Ingest { reader: Reader::default(), at, file: None, files: 0, owners: owners != 0 };
     let mut t = INGESTS.lock().unwrap_or_else(|e| e.into_inner());
     match t.iter().position(Option::is_none) {
         Some(i) => {

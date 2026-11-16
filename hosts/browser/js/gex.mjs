@@ -2850,6 +2850,17 @@ export class Gex {
       this.#shim.exports.gex_set_mtime(pp, p.length, BigInt(Math.trunc(secs)));
       free?.(pp, p.length);
     }
+    // The bundle's owners (`page/src/tar.js`'s `owners`, path to [uid, gid]),
+    // given only for an archive whose owners the page believes; on the names
+    // themselves, links not followed, once they are all there.
+    for (const [path, [uid, gid]] of Object.entries(opts.owners ?? {})) {
+      if (!this.#shim.exports.gex_chown) break;
+      const p = enc.encode(path);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#shim.exports.gex_chown(pp, p.length, uid, gid);
+      free?.(pp, p.length);
+    }
     // The bundle's extended attributes (`page/src/tar.js`'s `xattrs`, path to
     // { name: bytes }): Wine's DOS attributes, hidden and system, on the
     // prefix's files and folders.

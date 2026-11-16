@@ -244,13 +244,19 @@ export class Filesystem extends EventTarget {
    * first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without
    * one) or the URL of such a list, laid with the tar (`src` may then be
    * null). A list at a URL may be `{ base, files }`, each url relative to
-   * `base`, itself relative to the list.
+   * `base`, itself relative to the list. `owners`: the archive's numeric
+   * owners and groups are its files' (a root built as root: Docker's, or
+   * one packed with its intended owners); without it none is recorded and
+   * every file is the first user's, as an archive an ordinary user made
+   * names that user for everything.
    */
-  addTar(src, { at = '/', lazy } = {}) {
+  addTar(src, { at = '/', lazy, owners = false } = {}) {
+    if (typeof owners !== 'boolean') throw new TypeError('addTar: owners is true or false');
     const p = (async () => {
       const lz = lazy ? await lazyList(lazy) : [];
       return {
         tar: src == null ? null : await tarBytes(src),
+        owners,
         at: norm(at),
         lazy: lz.map(([p, size, url, mode, mtime]) => [under(at, p), size, lazyPath(url), mode, mtime]),
       };
@@ -259,16 +265,23 @@ export class Filesystem extends EventTarget {
   }
 
   /** Single files: `{ '/path': bytes | Blob | URL | string }` (a string is
-   *  the file's text), each of `mode` (default 0644). */
-  addFiles(map, { mode } = {}) {
+   *  the file's text), each of `mode` (default 0644) and owned by `uid` and
+   *  `gid` (default: nobody given, the first user's; `gid` defaults to
+   *  `uid`'s when only it is given). */
+  addFiles(map, { mode, uid, gid } = {}) {
+    for (const [k, v] of [['uid', uid], ['gid', gid]]) {
+      if (v !== undefined && !(Number.isInteger(v) && v >= 0 && v < 0xffffffff)) throw new TypeError(`addFiles: ${k} is a user or group number`);
+    }
     const p = (async () => {
       const files = {};
       const modes = {};
+      const fileOwners = {};
       for (const [path, v] of Object.entries(map)) {
         files[norm(path)] = typeof v === 'string' ? new TextEncoder().encode(v) : await bytesOf(v, path);
         if (mode !== undefined) modes[norm(path)] = mode;
+        if (uid !== undefined || gid !== undefined) fileOwners[norm(path)] = [uid ?? 0, gid ?? uid ?? 0];
       }
-      return { files, modes };
+      return { files, modes, fileOwners };
     })();
     return this.#add(p);
   }
