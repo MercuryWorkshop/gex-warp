@@ -238,8 +238,11 @@ export const images = {
       const out = join(work, `darwin-root.${arch}.tar`);
       rmSync(out, { force: true });
       if (!existsSync(join(root, 'usr/lib/dyld'))) continue;
-      // (No `._` files for what a Mac keeps beside a file's bytes.)
-      execFileSync('tar', ['-cf', out, '-C', root, '.'], { env: { ...process.env, COPYFILE_DISABLE: '1' } });
+      // With the owners the root means its files to have (scripts/pack-root.py:
+      // pyrus's `user.gex.owner`, root:wheel elsewhere), which a test that
+      // lays it with `addTar(..., { owners: true })` believes, and others
+      // leave unread (every file the first user's, as before).
+      execFileSync('python3', ['-I', join(ROOT, 'scripts', 'pack-root.py'), out, root]);
       made++;
       // And the Mac programs a page's tests run in it, where there is a
       // compiler for them (a Mac's).
