@@ -50,7 +50,8 @@ if [ -z "${GEX_EMDAWN_DIR:-}" ] && [ -f "$MESA/wink/lib/emdawn.sh" ]; then
         echo "$emdawn_log" | tail -20 >&2
         exit 1
     }
-    EMDAWN=$(echo "$emdawn_log" | sed -n 's/^\[emdawn\] \(ready\|cached\) at //p' | tail -1)
+    # (-E: BSD sed has no \| in a basic expression.)
+    EMDAWN=$(echo "$emdawn_log" | sed -n -E 's/^\[emdawn\] (ready|cached) at //p' | tail -1)
     [ -f "$EMDAWN/webgpu/include/webgpu/webgpu.h" ] || {
         echo "$emdawn_log" | tail -20 >&2
         echo "no emdawnwebgpu from wink/build.sh" >&2
@@ -88,7 +89,7 @@ if [ -z "${GEX_MESA_TINT:-}" ] && [ -f "$MESA/wink/lib/tint.sh" ]; then
         WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=$VARIANT --until=tint \
         --cache="$WINK_CACHE" --build-dir="$WINK_CACHE/build" --jobs="${JOBS:-$(nproc)}" \
         --emsdk="$EMSDK_ROOT" 2>&1) || { echo "$tint_log" | tail -20 >&2; exit 1; }
-    TINT_OUT=$(echo "$tint_log" | sed -n "s/^\[tint\/$VARIANT\] \(ready\|cached\) at //p" | tail -1)
+    TINT_OUT=$(echo "$tint_log" | sed -n -E "s/^\[tint\/$VARIANT\] (ready|cached) at //p" | tail -1)
     [ -f "$TINT_OUT/libtint.a" ] || { echo "$tint_log" | tail -20 >&2; echo "no Tint from wink/build.sh" >&2; exit 1; }
 fi
 [ -f "$TINT_OUT/libtint.a" ] || {
@@ -269,7 +270,9 @@ if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
         cold=NO
     fi
     # The assignment only: the test beside it names YES too.
-    sed -i "s/\\(gexMesaColdSplit *= *[\"']\\)GEX_MESA_COLD_[A-Z]*/\\1GEX_MESA_COLD_$cold/" "$TGT/gex-wgpu-replay.js"
+    # (-i.tmp: BSD sed reads a bare -i's next word as the backup suffix.)
+    sed -i.tmp "s/\\(gexMesaColdSplit *= *[\"']\\)GEX_MESA_COLD_[A-Z]*/\\1GEX_MESA_COLD_$cold/" "$TGT/gex-wgpu-replay.js" &&
+        rm -f "$TGT/gex-wgpu-replay.js.tmp"
     cp "$TGT/gex-wgpu-replay.js" "$TGT/split/gex-wgpu-replay.js"
     # And over the instrumented one, for the tests that copy from here.
     cp "$TGT/split/gex-wgpu-replay.wasm" "$TGT/gex-wgpu-replay.wasm"
