@@ -877,10 +877,15 @@ impl Kernel {
             d::CHMOD_EXTENDED => self.darwin_chmod_extended(m, None, x[0], x[1] as u32, x[2] as u32, x[3] as u32, x[4]),
             d::FCHMOD_EXTENDED => self.darwin_chmod_extended(m, Some(x[0] as i32), 0, x[1] as u32, x[2] as u32, x[3] as u32, x[4]),
             _ => {
-                if !self.unimplemented.contains(&(NATIVE + code)) {
-                    self.unimplemented.push(NATIVE + code);
+                // (A MAC policy's call is said by the policy and its
+                // number, each once.)
+                let policy = (code == d::MAC_SYSCALL).then(|| (m.read_cstr(x[0], 32).map(|p| String::from_utf8_lossy(&p).into_owned()).unwrap_or_default(), x[1]));
+                let key = NATIVE + code + policy.as_ref().map_or(0, |(_, call)| (call & 0xffff) << 32);
+                if !self.unimplemented.contains(&key) {
+                    self.unimplemented.push(key);
                     if self.trace || std::env::var_os("GEX_DARWIN_UNIMPLEMENTED").is_some() {
-                        eprintln!("[gex:{}] unimplemented Darwin system call {code} ({}) -> ENOSYS", self.pid, d::name(code).unwrap_or("?"));
+                        let of = policy.map_or(String::new(), |(p, call)| format!(": {p:?} call {call:#x}"));
+                        eprintln!("[gex:{}] unimplemented Darwin system call {code} ({}{of}) -> ENOSYS", self.pid, d::name(code).unwrap_or("?"));
                     }
                 }
                 Err(Errno::ENOSYS)
