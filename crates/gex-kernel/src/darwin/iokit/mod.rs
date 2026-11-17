@@ -70,6 +70,11 @@ pub enum Client {
     /// A client with no methods of its own (a family's that nothing here
     /// drives yet): every method is unsupported.
     Plain,
+    /// AppleMobileFileIntegrity's: told a code directory's hash to trust
+    /// (method 3, CVMServer's, for the code an OpenCL build makes), which
+    /// it takes. Nothing here checks a signature, so there is nothing to
+    /// trust it for.
+    Amfi,
 }
 
 enum Obj {
@@ -681,6 +686,7 @@ impl Kernel {
                             Client::Gpu(_) => "AppleGPUWranglerUserClient",
                             Client::Surface(_) => "IOSurfaceRootUserClient",
                             Client::Plain => "IOUserClient",
+                            Client::Amfi => "AppleMobileFileIntegrityUserClient",
                         },
                         Obj::Iter(..) => "IOUserIterator",
                         Obj::Note => "IOServiceUserNotification",
@@ -990,6 +996,7 @@ impl Kernel {
                     }
                     Opens::SurfaceRoot if kind == 0 => Client::Surface(surface::Client::default()),
                     Opens::Plain => Client::Plain,
+                    Opens::Amfi => Client::Amfi,
                     Opens::HidSystem | Opens::Framebuffer | Opens::SurfaceRoot | Opens::Nothing => {
                         *said = format!("type {kind}: {class} has no such user client");
                         return no_port(id, Some(&UNSUPPORTED.to_le_bytes()));
@@ -1173,7 +1180,8 @@ impl Kernel {
                     }
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
                     Client::Gpu(g) => gpuw::method(selector, &inband, g),
-                    Client::Surface(_) | Client::Plain => Err(UNSUPPORTED),
+                    Client::Amfi if selector == 3 => Ok((Vec::new(), Vec::new())),
+                    Client::Surface(_) | Client::Plain | Client::Amfi => Err(UNSUPPORTED),
                 };
                 method_reply(m, id, result, inband_room, scalar_room, ool_out, ool_out_room)
             }

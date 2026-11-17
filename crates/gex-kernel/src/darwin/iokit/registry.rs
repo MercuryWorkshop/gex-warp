@@ -35,6 +35,8 @@ const CLASSES: &[(&str, &str)] = &[
     ("RootDomainUserClient", "IOUserClient"),
     ("IOSurfaceRootUserClient", "IOUserClient"),
     ("IOSurfaceSendRight", "IOUserClient"),
+    ("AppleMobileFileIntegrity", "IOService"),
+    ("AppleMobileFileIntegrityUserClient", "IOUserClient"),
 ];
 
 /// `class`'s superclass, if it has one (OSObject has none).
@@ -67,6 +69,8 @@ pub enum Opens {
     /// type: what a family's service is opened for when only the opening
     /// matters (the power manager's root domain).
     Plain,
+    /// Code signing's (`Client::Amfi`).
+    Amfi,
 }
 
 pub struct Entry {
@@ -221,6 +225,22 @@ impl Registry {
                 ("IOUserClientClass", Value::str("IOSurfaceRootUserClient")),
             ],
             Opens::SurfaceRoot,
+        );
+        // AppleMobileFileIntegrity, code signing's driver: CVMServer has it
+        // trust the code an OpenCL build makes before it maps it
+        // (`Client::Amfi`).
+        r.add(
+            Some(resources),
+            "AppleMobileFileIntegrity",
+            "AppleMobileFileIntegrity",
+            "",
+            vec![
+                ("IOProviderClass", Value::str("IOResources")),
+                ("IOResourceMatch", Value::str("IOKit")),
+                ("CFBundleIdentifier", Value::str("com.apple.driver.AppleMobileFileIntegrity")),
+                ("IOUserClientClass", Value::str("AppleMobileFileIntegrityUserClient")),
+            ],
+            Opens::Amfi,
         );
         // The power manager: opened to register for sleep and wake (which
         // never come), and asked of its properties.
@@ -431,6 +451,9 @@ mod tests {
         let fbs = r.matching(&Value::dict(vec![("IOProviderClass", Value::str("IOFramebuffer"))]));
         assert_eq!(fbs.iter().map(|&i| r.entries[i].class).collect::<Vec<_>>(), ["IONDRVFramebuffer"]);
         assert!(r.matching(&Value::dict(vec![("IOProviderClass", Value::str("IOUSBDevice"))])).is_empty());
+        // (IOServiceMatching("AppleMobileFileIntegrity"), CVMServer's)
+        let amfi = r.matching(&Value::dict(vec![("IOProviderClass", Value::str("AppleMobileFileIntegrity"))]));
+        assert_eq!(amfi.iter().map(|&i| r.entries[i].opens).collect::<Vec<_>>(), [Opens::Amfi]);
         // (the root is no service)
         assert!(!r.matching(&Value::dict(vec![("IOProviderClass", Value::str("IOService"))])).contains(&ROOT));
     }
