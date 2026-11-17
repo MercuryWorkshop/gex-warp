@@ -1471,8 +1471,10 @@ pub enum FlagOp {
     Setf { rn: RegSel, bits: u8 },
 }
 
-/// Which of FEAT_SHA3's and FEAT_SHA512's instructions an [`Inst::VSha3`] is.
-/// SHA-512's four read `vd` as well and have no `va` or `rot`.
+/// Which of FEAT_SHA3's, FEAT_SHA512's, FEAT_SHA1's and FEAT_SHA256's
+/// instructions an [`Inst::VSha3`] is. The SHA-512, SHA-1 and SHA-256 ones read
+/// `vd` as well and have no `va` or `rot`; the two-register ones (`sha1h`,
+/// `sha1su1`, `sha256su0`) no `vm` either.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VSha3Op {
     Eor3,
@@ -1487,6 +1489,23 @@ pub enum VSha3Op {
     Sha512Su0,
     /// `sha512su1`: the schedule's second step.
     Sha512Su1,
+    /// `sha1c`, `sha1p`, `sha1m`: four rounds with the choose, parity or
+    /// majority function, `vn`'s low word the `e` they start from.
+    Sha1C,
+    Sha1P,
+    Sha1M,
+    /// `sha1h`: the next round's `e`, `vn`'s low word rotated left 30.
+    Sha1H,
+    /// `sha1su0` and `sha1su1`: the schedule's two steps.
+    Sha1Su0,
+    Sha1Su1,
+    /// `sha256h` and `sha256h2`: four rounds, the result the `abcd` half or
+    /// the `efgh` half of the state.
+    Sha256H,
+    Sha256H2,
+    /// `sha256su0` and `sha256su1`: the schedule's two steps.
+    Sha256Su0,
+    Sha256Su1,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]

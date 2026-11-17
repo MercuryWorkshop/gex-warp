@@ -337,7 +337,9 @@ pub fn execute(raw: u32, v: &mut VRegs, fpsr: &mut u32) -> bool {
         v.set(rd, r);
         return true;
     }
-    // SHA, three registers: 0101 1110 000 Rm 0 opc 00 Rn Rd
+    // SHA, three registers: 0101 1110 000 Rm 0 opc 00 Rn Rd. (The lifter lowers SHA-1's
+    // and SHA-256's itself, these and the two-register ones below; they are here as what
+    // it is checked against.)
     if raw & 0xffe0_8c00 == 0x5e00_0000 {
         let (d, n, m) = (v.get(rd), v.get(rn), v.get(rm));
         let r = match bits(raw, 14, 12) {

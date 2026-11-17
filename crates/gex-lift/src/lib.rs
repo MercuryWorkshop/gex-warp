@@ -2551,9 +2551,17 @@ impl<'a> Lifter<'a> {
                     }
                     // SHA-512's, on doublewords: git, curl and TLS hash with them, and a host
                     // call each was most of the time such a program spent.
-                    op => {
+                    op @ (gex_isa::VSha3Op::Sha512H
+                    | gex_isa::VSha3Op::Sha512H2
+                    | gex_isa::VSha3Op::Sha512Su0
+                    | gex_isa::VSha3Op::Sha512Su1) => {
                         let d = self.b.read(GuestReg::V128(vd.0));
                         self.sha512(op, d, n, m)
+                    }
+                    // SHA-1's and SHA-256's, on words, for the same programs.
+                    op => {
+                        let d = self.b.read(GuestReg::V128(vd.0));
+                        self.sha32(op, d, n, m)
                     }
                 };
                 self.b.write(GuestReg::V128(vd.0), r);
@@ -3047,6 +3055,170 @@ impl<'a> Lifter<'a> {
         };
         let r = self.b.def(Expr::VReplace { a: d, lane: 0, lane_bytes: 8, val: lo });
         self.b.def(Expr::VReplace { a: r, lane: 1, lane_bytes: 8, val: hi })
+    }
+
+    /// SHA-1's and SHA-256's (`gex_isa::slow`'s `sha1_rounds`, `sha256_rounds` and the
+    /// schedule steps, which they are checked against), on the words of `d`, `n` and `m`:
+    /// rotates, shifts, logic and wrapping adds, then the four words put back together.
+    fn sha32(&mut self, op: gex_isa::VSha3Op, d: Value, n: Value, m: Value) -> Value {
+        use gex_isa::VSha3Op;
+        let word = |lift: &mut Self, v: Value, lane: u32| lift.b.def(Expr::VExtract { a: v, lane, lane_bytes: 4, signed: false, ty: Ty::I32 });
+        let words = |lift: &mut Self, v: Value| [0, 1, 2, 3].map(|i| word(lift, v, i));
+        let bin = |lift: &mut Self, op: BinOp, a: Value, b: Value| lift.b.bin(op, Ty::I32, a, b);
+        let ror = |lift: &mut Self, a: Value, by: u32| {
+            let k = lift.b.const_i32(by);
+            lift.b.bin(BinOp::Rotr, Ty::I32, a, k)
+        };
+        let shr = |lift: &mut Self, a: Value, by: u32| {
+            let k = lift.b.const_i32(by);
+            lift.b.bin(BinOp::ShrU, Ty::I32, a, k)
+        };
+        let add = |lift: &mut Self, a: Value, b: Value| lift.b.bin(BinOp::Add, Ty::I32, a, b);
+        // `x` rotated right by each of `a`, `b` and the third (a rotate, or with
+        // `shift` a plain shift), xored together: SHA-256's Σ and σ functions.
+        let sigma = |lift: &mut Self, x: Value, a: u32, b: u32, c: u32, shift: bool| {
+            let ra = ror(lift, x, a);
+            let rb = ror(lift, x, b);
+            let rc = if shift { shr(lift, x, c) } else { ror(lift, x, c) };
+            let ab = bin(lift, BinOp::Xor, ra, rb);
+            bin(lift, BinOp::Xor, ab, rc)
+        };
+        let not = |lift: &mut Self, a: Value| {
+            let ones = lift.b.const_i32(u32::MAX);
+            bin(lift, BinOp::Xor, a, ones)
+        };
+        let choose = |lift: &mut Self, x: Value, y: Value, z: Value| {
+            let xy = bin(lift, BinOp::And, x, y);
+            let nx = not(lift, x);
+            let nz = bin(lift, BinOp::And, nx, z);
+            bin(lift, BinOp::Xor, xy, nz)
+        };
+        let majority = |lift: &mut Self, x: Value, y: Value, z: Value| {
+            let xy = bin(lift, BinOp::And, x, y);
+            let xz = bin(lift, BinOp::And, x, z);
+            let yz = bin(lift, BinOp::And, y, z);
+            let a = bin(lift, BinOp::Xor, xy, xz);
+            bin(lift, BinOp::Xor, a, yz)
+        };
+        let out = match op {
+            // Four rounds of `abcd` (d) with `e` (n's low word) and the summed message
+            // and constant words (m); `a` rotated left 5 is a rotate right by 27.
+            VSha3Op::Sha1C | VSha3Op::Sha1P | VSha3Op::Sha1M => {
+                let mut s = words(self, d);
+                let mut e = word(self, n, 0);
+                let wk = words(self, m);
+                for w in wk {
+                    let (b, c, dd) = (s[1], s[2], s[3]);
+                    let f = match op {
+                        VSha3Op::Sha1C => choose(self, b, c, dd),
+                        VSha3Op::Sha1P => {
+                            let bc = bin(self, BinOp::Xor, b, c);
+                            bin(self, BinOp::Xor, bc, dd)
+                        }
+                        _ => majority(self, b, c, dd),
+                    };
+                    let a5 = ror(self, s[0], 27);
+                    let t = add(self, e, a5);
+                    let t = add(self, t, f);
+                    let t = add(self, t, w);
+                    e = dd;
+                    let b30 = ror(self, b, 2);
+                    s = [t, s[0], b30, c];
+                }
+                s
+            }
+            // n's low word rotated left 30, alone in the register.
+            VSha3Op::Sha1H => {
+                let x = word(self, n, 0);
+                let r = ror(self, x, 2);
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                return self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: 4, val: r });
+            }
+            // d's upper two words and n's lower two, xored with d and m: whole-register.
+            VSha3Op::Sha1Su0 => {
+                let dh = self.b.def(Expr::VExtract { a: d, lane: 1, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let nl = self.b.def(Expr::VExtract { a: n, lane: 0, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                let t = self.b.def(Expr::VReplace { a: d, lane: 0, lane_bytes: 8, val: dh });
+                let t = self.b.def(Expr::VReplace { a: t, lane: 1, lane_bytes: 8, val: nl });
+                let td = self.b.def(Expr::VBin { op: VBinOp::Xor, a: t, b: d });
+                return self.b.def(Expr::VBin { op: VBinOp::Xor, a: td, b: m });
+            }
+            // Each word of d xored with the next of n (none after n's last), rotated left
+            // 1; the last also takes the first's pre-rotation word rotated left 2.
+            VSha3Op::Sha1Su1 => {
+                let dw = words(self, d);
+                let nw = words(self, n);
+                let t = [
+                    bin(self, BinOp::Xor, dw[0], nw[1]),
+                    bin(self, BinOp::Xor, dw[1], nw[2]),
+                    bin(self, BinOp::Xor, dw[2], nw[3]),
+                    dw[3],
+                ];
+                let mut o = t.map(|x| ror(self, x, 31));
+                let t0 = ror(self, t[0], 30);
+                o[3] = bin(self, BinOp::Xor, o[3], t0);
+                o
+            }
+            // Four rounds; sha256h keeps the `abcd` half, sha256h2 the `efgh` half
+            // (which it is given in d, the other in n).
+            VSha3Op::Sha256H | VSha3Op::Sha256H2 => {
+                let (x, y) = if op == VSha3Op::Sha256H { (d, n) } else { (n, d) };
+                let mut s0 = words(self, x);
+                let mut s1 = words(self, y);
+                let wk = words(self, m);
+                for w in wk {
+                    let [a, b, c, dd] = s0;
+                    let [e, f, g, h] = s1;
+                    let ch = choose(self, e, f, g);
+                    let maj = majority(self, a, b, c);
+                    let big1 = sigma(self, e, 6, 11, 25, false);
+                    let big0 = sigma(self, a, 2, 13, 22, false);
+                    let t = add(self, h, big1);
+                    let t = add(self, t, ch);
+                    let t = add(self, t, w);
+                    let new_e = add(self, dd, t);
+                    let ta = add(self, t, big0);
+                    let new_a = add(self, ta, maj);
+                    s1 = [new_e, e, f, g];
+                    s0 = [new_a, a, b, c];
+                }
+                if op == VSha3Op::Sha256H { s0 } else { s1 }
+            }
+            // Each word plus σ0 of the one after it, n's first after d's last.
+            VSha3Op::Sha256Su0 => {
+                let dw = words(self, d);
+                let n0 = word(self, n, 0);
+                let next = [dw[1], dw[2], dw[3], n0];
+                let mut o = dw;
+                for i in 0..4 {
+                    let s = sigma(self, next[i], 7, 18, 3, true);
+                    o[i] = add(self, dw[i], s);
+                }
+                o
+            }
+            // σ1 of m's upper two words, then of this result's first two, each plus d's
+            // word and the word of `m<31:0> : n<127:32>`.
+            VSha3Op::Sha256Su1 => {
+                let dw = words(self, d);
+                let nw = words(self, n);
+                let mw = words(self, m);
+                let t = [nw[1], nw[2], nw[3], mw[0]];
+                let mut o = dw;
+                for i in 0..4 {
+                    let source = if i < 2 { mw[2 + i] } else { o[i - 2] };
+                    let s = sigma(self, source, 17, 19, 10, true);
+                    let x = add(self, s, dw[i]);
+                    o[i] = add(self, x, t[i]);
+                }
+                o
+            }
+            _ => unreachable!("SHA-3's and SHA-512's are lowered elsewhere"),
+        };
+        let mut r = d;
+        for (lane, val) in out.into_iter().enumerate() {
+            r = self.b.def(Expr::VReplace { a: r, lane: lane as u32, lane_bytes: 4, val });
+        }
+        r
     }
 
     // -- scalar floating point ---------------------------------------------

@@ -408,7 +408,25 @@ mod tests {
                                 o => panic!("not evaluated here: {o:?}"),
                             }) as u128
                         }
+                        // And words, kept in the low quarter.
+                        Expr::Bin { op, ty: gex_ir::Ty::I32, a, b } => {
+                            let (x, y) = (g(a) as u32, g(b) as u32);
+                            (match op {
+                                gex_ir::BinOp::And => x & y,
+                                gex_ir::BinOp::Or => x | y,
+                                gex_ir::BinOp::Xor => x ^ y,
+                                gex_ir::BinOp::Shl => x << (y & 31),
+                                gex_ir::BinOp::ShrU => x >> (y & 31),
+                                gex_ir::BinOp::Rotr => x.rotate_right(y & 31),
+                                gex_ir::BinOp::Add => x.wrapping_add(y),
+                                o => panic!("not evaluated here: {o:?}"),
+                            }) as u128
+                        }
                         Expr::VExtract { a, lane, lane_bytes: 8, signed: false, .. } => (g(a) >> (64 * lane)) as u64 as u128,
+                        Expr::VExtract { a, lane, lane_bytes: 4, signed: false, .. } => (g(a) >> (32 * lane)) as u32 as u128,
+                        Expr::VReplace { a, lane, lane_bytes: 4, val } => {
+                            (g(a) & !((u32::MAX as u128) << (32 * lane))) | (g(val) as u32 as u128) << (32 * lane)
+                        }
                         Expr::VReplace { a, lane, lane_bytes: 8, val } => {
                             (g(a) & !((u64::MAX as u128) << (64 * lane))) | (g(val) as u64 as u128) << (64 * lane)
                         }
@@ -880,9 +898,9 @@ mod tests {
         }
     }
 
-    /// FEAT_SHA3's `eor3`, `bcax`, `rax1` and `xar` (every rotation), and FEAT_SHA512's
-    /// `sha512h`, `sha512h2`, `sha512su0` and `sha512su1`, are lowered, and to what the
-    /// reference says of them.
+    /// FEAT_SHA3's `eor3`, `bcax`, `rax1` and `xar` (every rotation), FEAT_SHA512's
+    /// `sha512h`, `sha512h2`, `sha512su0` and `sha512su1`, and FEAT_SHA1's and
+    /// FEAT_SHA256's ten, are lowered, and to what the reference says of them.
     #[test]
     fn sha3_words_match_the_reference() {
         let mut seed = 0x243f_6a88_85a3_08d3u64;
@@ -892,7 +910,11 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let words_of = [0xce020c20u32, 0xce220c20, 0xce628c20, 0xce628020, 0xce628420, 0xce628820, 0xcec08020].into_iter().chain((0..64).map(|r| 0xce820020 | r << 10));
+        let sha2 = [0x5e020020u32, 0x5e021020, 0x5e022020, 0x5e023020, 0x5e024020, 0x5e025020, 0x5e026020, 0x5e280820, 0x5e281820, 0x5e282820];
+        let words_of = [0xce020c20u32, 0xce220c20, 0xce628c20, 0xce628020, 0xce628420, 0xce628820, 0xcec08020]
+            .into_iter()
+            .chain(sha2)
+            .chain((0..64).map(|r| 0xce820020 | r << 10));
         for raw in words_of {
             let block = lift_block(words(0x1000, &[raw]), 0x1000, BlockLimits { max_insts: 1 });
             assert!(!block.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })), "{raw:08x} goes to the host");

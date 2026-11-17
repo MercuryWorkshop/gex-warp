@@ -1496,6 +1496,37 @@ fn decode_simd_fp(raw: u32) -> Inst {
     let u = bit(raw, 29);
 
     // AES: `0100 1110 0010 1000 01 op 10 Rn Rd`.
+    // FEAT_SHA1 and FEAT_SHA256: three registers `0101 1110 000 Rm 0 opc 00
+    // Rn Rd` (sha1c, sha1p, sha1m, sha1su0, sha256h, sha256h2, sha256su1) and
+    // two `0101 1110 0010 1000 0 opc 10 Rn Rd` (sha1h, sha1su1, sha256su0).
+    if raw & 0xffe0_8c00 == 0x5e00_0000 || raw & 0xffff_8c00 == 0x5e28_0800 {
+        let three = raw & 0xffe0_8c00 == 0x5e00_0000;
+        let op = match (three, bits(raw, 14, 12)) {
+            (true, 0) => Some(VSha3Op::Sha1C),
+            (true, 1) => Some(VSha3Op::Sha1P),
+            (true, 2) => Some(VSha3Op::Sha1M),
+            (true, 3) => Some(VSha3Op::Sha1Su0),
+            (true, 4) => Some(VSha3Op::Sha256H),
+            (true, 5) => Some(VSha3Op::Sha256H2),
+            (true, 6) => Some(VSha3Op::Sha256Su1),
+            (false, 0) => Some(VSha3Op::Sha1H),
+            (false, 1) => Some(VSha3Op::Sha1Su1),
+            (false, 2) => Some(VSha3Op::Sha256Su0),
+            _ => None,
+        };
+        return match op {
+            Some(op) => Inst::VSha3 {
+                op,
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                vm: VReg(if three { bits(raw, 20, 16) as u8 } else { 0 }),
+                va: VReg(0),
+                rot: 0,
+            },
+            None => Inst::Unknown { raw },
+        };
+    }
+
     if raw & 0xffff_cc00 == 0x4e28_4800 {
         return Inst::VAes {
             op: [VAesOp::Encrypt, VAesOp::Decrypt, VAesOp::MixColumns, VAesOp::InvMixColumns][bits(raw, 13, 12) as usize],
@@ -3421,6 +3452,25 @@ mod tests {
         assert!(matches!(d(0xce628820), Inst::VSha3 { op: VSha3Op::Sha512Su1, .. }));
         assert!(matches!(d(0xcec08020), Inst::VSha3 { op: VSha3Op::Sha512Su0, .. }));
         for raw in [0xce420c20u32, 0xce42a020, 0xcec28020] {
+            assert!(matches!(d(raw), Inst::Unknown { .. }), "{raw:08x}");
+        }
+        // SHA-1's and SHA-256's, three registers and two; opcode 7 of the
+        // three and 3 of the two are nobody's.
+        assert_eq!(d(0x5e020020), Inst::VSha3 { op: VSha3Op::Sha1C, vd: v(0), vn: v(1), vm: v(2), va: v(0), rot: 0 });
+        for (raw, op) in [
+            (0x5e021020u32, VSha3Op::Sha1P),
+            (0x5e022020, VSha3Op::Sha1M),
+            (0x5e023020, VSha3Op::Sha1Su0),
+            (0x5e024020, VSha3Op::Sha256H),
+            (0x5e025020, VSha3Op::Sha256H2),
+            (0x5e026020, VSha3Op::Sha256Su1),
+            (0x5e280820, VSha3Op::Sha1H),
+            (0x5e281820, VSha3Op::Sha1Su1),
+            (0x5e282820, VSha3Op::Sha256Su0),
+        ] {
+            assert!(matches!(d(raw), Inst::VSha3 { op: o, .. } if o == op), "{raw:08x}");
+        }
+        for raw in [0x5e027020u32, 0x5e283820] {
             assert!(matches!(d(raw), Inst::Unknown { .. }), "{raw:08x}");
         }
         assert_eq!(d(0x1e7e0020), Inst::FpJsToInt { rd: RegSel::gp(0), vn: v(1) });

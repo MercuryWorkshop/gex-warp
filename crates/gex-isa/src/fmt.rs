@@ -1084,6 +1084,16 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             VSha3Op::Sha512H2 => format!("sha512h2 q{}, q{}, v{}.2d", vd.0, vn.0, vm.0),
             VSha3Op::Sha512Su0 => format!("sha512su0 v{}.2d, v{}.2d", vd.0, vn.0),
             VSha3Op::Sha512Su1 => format!("sha512su1 v{}.2d, v{}.2d, v{}.2d", vd.0, vn.0, vm.0),
+            VSha3Op::Sha1C => format!("sha1c q{}, s{}, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha1P => format!("sha1p q{}, s{}, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha1M => format!("sha1m q{}, s{}, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha1Su0 => format!("sha1su0 v{}.4s, v{}.4s, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha1H => format!("sha1h s{}, s{}", vd.0, vn.0),
+            VSha3Op::Sha1Su1 => format!("sha1su1 v{}.4s, v{}.4s", vd.0, vn.0),
+            VSha3Op::Sha256H => format!("sha256h q{}, q{}, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha256H2 => format!("sha256h2 q{}, q{}, v{}.4s", vd.0, vn.0, vm.0),
+            VSha3Op::Sha256Su0 => format!("sha256su0 v{}.4s, v{}.4s", vd.0, vn.0),
+            VSha3Op::Sha256Su1 => format!("sha256su1 v{}.4s, v{}.4s, v{}.4s", vd.0, vn.0, vm.0),
         },
         Inst::VCnt { vd, vn, q } => {
             let w = if q { "16b" } else { "8b" };
