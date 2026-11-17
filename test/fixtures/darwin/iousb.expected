@@ -1,0 +1,31 @@
+the device 1
+by its product among others 1
+not by another's 0
+opened 1
+device descriptor: USB 0x200 class 0 vendor 0x1209 product 0x2 release 0x123 strings 1 2 3, 1 configuration
+strings: pyrus tests / Test Bulk / T0002
+configuration 1 of 1 interfaces, 39 bytes, 100 mA
+by its index the same 1
+no second: 1: IOUSBHostErrorDomain 0xffffffffe00002c2
+interface 0 alternate 0 class 0xff/0x1/0x2: 0x81 (type 2, 64 bytes) 0x2 (type 2, 64 bytes) 0x83 (type 3, 8 bytes)
+vendor request in 1, 5 bytes: hello
+vendor request out 1, 3 bytes
+configured 1
+the interface 1
+its descriptor: interface 0, 3 endpoints
+pipes 0x2 0x81 0x83, of its interface 1
+no pipe 0x99: 1: IOUSBHostErrorDomain 0xffffffffe00002f0
+written 1, 6 bytes
+read 1, 6 bytes: fedcba
+enqueued write: 0, 3 bytes
+enqueued read: 0, 3 bytes: zyx
+interrupt read 0: IOUSBHostErrorDomain 0xffffffffe000404f
+stall cleared 1
+alternate 0 1, the same interface 1
+streams 0: IOUSBHostErrorDomain 0xffffffffe00002c7
+let go
+asked to leave 1
+interest: 0xe0000010
+heard it leave 1
+a request now 0: IOUSBHostErrorDomain 0xffffffffe00002c0
+no device now 1

@@ -181,10 +181,16 @@ export class Devices extends EventTarget {
     this.#devices.delete(id);
     this.#byDevice.delete(rec.device);
     if (rec.listener) rec.device.removeEventListener?.('inputreport', rec.listener);
+    const open = rec.opened.size > 0;
     for (const c of this.#conns) {
       c.opened.delete(id);
+      c.claims.delete(id);
       c.conn.send({ op: 'remove', id });
     }
+    rec.opened.clear();
+    // (A device a program had open is closed: the page may have taken it
+    // away while it is still there, and no program can let it go now.)
+    if (open) Promise.resolve().then(() => rec.device.close?.()).catch(() => {});
     this.#emit('remove', { device: rec.device, id });
     return true;
   }

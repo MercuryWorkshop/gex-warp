@@ -90,7 +90,11 @@ function usbDevice(log) {
     async releaseInterface(n) { log.push(`usb release ${n}`); },
     async selectAlternateInterface(n, a) { log.push(`usb alternate ${n} ${a}`); },
     async controlTransferIn(setup, length) { log.push(`usb control in ${setup.requestType} ${setup.recipient} ${setup.request} ${length}`); return { status: 'ok', data: new DataView(new TextEncoder().encode('hello').buffer) }; },
-    async controlTransferOut(setup, data) { log.push(`usb control out ${setup.request} ${hex(data)}`); return { status: 'ok', bytesWritten: data.length }; },
+    async controlTransferOut(setup, data) {
+      log.push(`usb control out ${setup.requestType} ${setup.recipient} ${setup.request} ${hex(data)}`);
+      if (setup.request === 0x7f) setTimeout(() => this.onLeave?.(), 50);
+      return { status: 'ok', bytesWritten: data.length };
+    },
     async transferOut(ep, data) { log.push(`usb out ${ep} ${hex(data)}`); stored = new Uint8Array(data).reverse(); return { status: 'ok', bytesWritten: data.length }; },
     async transferIn(ep, length) { log.push(`usb in ${ep} ${length}`); return ep === 3 ? { status: 'stall' } : { status: 'ok', data: new DataView(stored.slice(0, length).buffer) }; },
     async clearHalt(dir, ep) { log.push(`usb clear ${dir} ${ep}`); },
@@ -140,13 +144,15 @@ class MockNavigatorPart extends EventTarget {
 export default async function (t) {
   const { eq, check, timeout } = t;
   const arch = t.arch === 'x86' ? 'x86' : 'aarch64';
-  let prog;
+  let prog, usbProg;
   try {
     prog = await bytesOf(t.work(`darwin-iodevices.${arch}`));
+    usbProg = await bytesOf(t.work(`darwin-iousb.${arch}`));
   } catch {
     t.skip(`no Mac root or no Mac compiler for ${t.arch} (GEX_TEST_DARWIN_ROOT${t.arch === 'x86' ? '_X86' : ''}: pyrus builds one)`);
   }
   const want = readFileSync(join(import.meta.dirname, '..', 'fixtures', 'darwin', 'iodevices.expected'), 'utf8');
+  const wantUSB = readFileSync(join(import.meta.dirname, '..', 'fixtures', 'darwin', 'iousb.expected'), 'utf8');
   const { arch: _, ...debug } = t.debug();
 
   // The descriptor made again of the collections: the same items' sizes.
@@ -162,12 +168,12 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, arch, debug });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work(`darwin-root.${arch}.tar`));
-  fs.addFiles({ '/usr/local/bin/iodevices': prog }, { mode: 0o755 });
+  fs.addFiles({ '/usr/local/bin/iodevices': prog, '/usr/local/bin/iousb': usbProg }, { mode: 0o755 });
   const devices = new Devices(sys);
   const events = [];
   for (const type of ['add', 'remove', 'open', 'close']) devices.addEventListener(type, ({ id }) => events.push(`${type} ${id}`));
-  const run = async (label) => {
-    const r = await timeout(sys.run(['/usr/local/bin/iodevices'], { env: { PATH: '/usr/bin:/bin', HOME: '/' }, cwd: '/' }), 300000, `${label}: the program`);
+  const run = async (label, path = '/usr/local/bin/iodevices') => {
+    const r = await timeout(sys.run([path], { env: { PATH: '/usr/bin:/bin', HOME: '/' }, cwd: '/' }), 300000, `${label}: the program`);
     await new Promise((res) => setTimeout(res, 500));
     return r;
   };
@@ -191,9 +197,11 @@ export default async function (t) {
   devices.add(u, { kind: 'usb' });
   await timeout(sys.boot(), 120000, 'boot');
   const own = await run('own devices');
-  eq('the program, with devices of the page\'s own', own.stdout, want, own.stderr.trim().split('\n').slice(-3).join(' / '));
+  // (The platform expert is the processor's: an ACPI one's on x86-64.)
+  const expert = (s) => s.replaceAll('/AppleACPIPlatformExpert/', '/AppleARMPE/');
+  eq('the program, with devices of the page\'s own', expert(own.stdout), want, own.stderr.trim().split('\n').slice(-3).join(' / '));
   // (The feature report got once for itself, once for its element's value.)
-  eq('the pad was opened, asked, written to and closed', log, ['1 open', '1 get feature 3', '1 get feature 3', '1 output 2: 05', '3 open', '1 output 2: 06', '1 close']);
+  eq('the pad was opened, asked, written to and closed', log, ['1 open', '1 get feature 3', '1 get feature 3', '1 output 2: 05', '3 open', '1 output 2: 06', '3 close', '1 close']);
   eq('the service\'s events', events, ['add 1', 'add 2', 'open 1', 'add 3', 'open 3', 'remove 3', 'close 1']);
   eq('nothing is open after', devices.list().map((d) => d.open), [false, false]);
   for (const d of devices.list()) devices.remove(d.id);
@@ -225,7 +233,21 @@ export default async function (t) {
   // number gives it.)
   const same = (s) => s.replace(/^( {2}ReportDescriptor:) \d+ bytes$/m, '$1 made again').replace(/@00[0-9a-f]{2}0000/g, '@LOCATION').replace(/(locationID:) 0x[0-9a-f]+/g, '$1 LOCATION');
   const wanted = same(want.replace(/^ {2}(Manufacturer|SerialNumber): .*$/gm, '  $1: absent'));
-  eq('the program, with WebHID\'s and WebUSB\'s', same(web.stdout), wanted, web.stderr.trim().split('\n').slice(-3).join(' / '));
-  eq('the pad, through WebHID', wlog, ['1 open', '1 get feature 3', '1 get feature 3', '1 output 2: 05', '3 open', '1 output 2: 06', '1 close']);
+  eq('the program, with WebHID\'s and WebUSB\'s', same(expert(web.stdout)), wanted, web.stderr.trim().split('\n').slice(-3).join(' / '));
+  eq('the pad, through WebHID', wlog, ['1 open', '1 get feature 3', '1 get feature 3', '1 output 2: 05', '3 open', '1 output 2: 06', '3 close', '1 close']);
+
+  // USB through IOUSBHost: a device of the test's own, which leaves when
+  // the program asks it to.
+  for (const d of devices.list()) devices.remove(d.id);
+  const ulog = [];
+  const ud = usbDevice(ulog);
+  ud.onLeave = () => devices.remove(ud);
+  devices.add(ud, { kind: 'usb' });
+  const ur = await run('IOUSBHost', '/usr/local/bin/iousb');
+  eq('the program, with IOUSBHost', ur.stdout, wantUSB, ur.stderr.trim().split('\n').slice(-3).join(' / '));
+  eq('the device was opened, asked, written, read and let go', ulog, [
+    'usb open', 'usb control in vendor device 1 16', 'usb control out vendor device 2 01 02 03', 'usb claim 0', 'usb out 2 61 62 63 64 65 66', 'usb in 1 16',
+    'usb out 2 78 79 7a', 'usb in 1 8', 'usb in 3 8', 'usb clear in 3', 'usb alternate 0 0', 'usb release 0', 'usb close',
+    'usb open', 'usb control out vendor device 127 ', 'usb close']);
   await sys.shutdown();
 }

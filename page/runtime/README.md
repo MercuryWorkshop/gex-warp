@@ -793,7 +793,8 @@ the native host's for tests (a module beside `notify.rs`, and a line in
   `cancel` when the framework's blocking call is interrupted or times out.
   HID input reports are events. Small frames on the control path suffice
   (a frame is 72 bytes and more); a device with high-rate input reports may
-  have a stream of its own so that requests do not wait behind them.
+  have a stream of its own so that requests do not wait behind them. (Made
+  as one service of both, `devices`: [Devices](#devices), below.)
 
 ## Notifications
 
@@ -879,6 +880,128 @@ printed as `[notify]` lines, and `GEX_NOTIFY_INPUT` names a script of the
 shell's answers (`hosts/native/src/notify.rs`: `authorize grant|deny|provisional
 [APP]`, `on ID [after S] activate [ACTION] [text WORDS]`, `on ID dismiss`,
 `on * clear`, `at S settings`).
+
+## Devices
+
+`Devices` (`@gexemu/runtime/devices`): the devices the page's shell lets
+programs have, the service `devices`. A Mac program's IOKit (pyrus's) lists
+them in its registry and hears them arrive and leave as a Mac's hears a
+device plugged in and pulled out; its HID manager and IOUSBHost open them
+and move their reports and transfers through this. One seam for every
+transport: a **source** adds a device and removes it. `WebHIDSource`
+(`@gexemu/runtime/devices-webhid`) and `WebUSBSource`
+(`@gexemu/runtime/devices-webusb`) are the browser's; a test or a shell may
+add devices of its own. Without a `Devices` a program's registry has the
+system's own entries only (the platform, its resources, the power manager,
+the root volume), as a Mac with nothing plugged in.
+
+```js
+import { Devices } from '@gexemu/runtime/devices';
+import { WebHIDSource } from '@gexemu/runtime/devices-webhid';
+import { WebUSBSource } from '@gexemu/runtime/devices-webusb';
+
+const devices = new Devices(sys);
+const hid = new WebHIDSource(devices), usb = new WebUSBSource(devices);
+await hid.start();   // the devices the user granted this page before, and those that come and go
+await usb.start();
+// A browser shows its chooser only from a user's gesture: a menu item, a button.
+addDevice.onclick = () => hid.request([{ usagePage: 0x01, usage: 0x05 }]).catch(() => {});  // game pads
+addUSB.onclick = () => usb.request([{ vendorId: 0x1209 }]).catch(() => {});
+devices.addEventListener('open', ({ device, pid }) => showInUse(device, pid));
+```
+
+| Member | Does |
+| --- | --- |
+| `new Devices(sys)` | One per system, made any time. Provides the service `devices`. |
+| `add(device, { kind })` | Let programs have `device` (`kind` `'hid'` or `'usb'`, `device.kind` by default); its number for programs (the same again for one already added). Programs connected hear it arrive. |
+| `remove(device)` | Take it away (it, or its number): programs hear it leave (a HID manager's removal callback, a terminated notification, IOUSBHost's interest handler); a device a program had open is closed. |
+| `list()`, `get(id)` | `[{ id, kind, device, open }]`; the device of a number. |
+| Events | `add`, `remove` (`device`, `id`); `open`, `close` (`device`, `id`, `pid`: a program opened it, or let it go). |
+| `new WebHIDSource(devices, { hid })`, `new WebUSBSource(devices, { usb })` | The browser's (`navigator.hid`, `navigator.usb` by default, or a test's own). `start()` adds the devices granted before and follows `connect` and `disconnect`; `request(filters)`, from a user's gesture, opens the chooser and adds what was picked; `forget(device)` takes one away and forgets the grant; `available` says whether the browser has the API. `devices` may be a System, for which a `Devices` is made. |
+
+**A device** is the source's object, of a kind:
+
+| Kind | Is |
+| --- | --- |
+| `'hid'` | `{ vendorId, productId, version, product, manufacturer, serial, transport, descriptor }` (`descriptor` the report descriptor's bytes; `transport` `'USB'` by default) with `open()`, `close()`, `sendReport(type, reportId, bytes)` (`type` `'output'` or `'feature'`), `receiveReport(type, reportId)` (resolves the bytes without the ID's), as an EventTarget whose `inputreport` events carry `reportId` and `data`. `WebHIDDevice` wraps a HIDDevice so. |
+| `'usb'` | What WebUSB's USBDevice is: its fields, `configuration`, `configurations`, and `open`, `close`, `selectConfiguration`, `claimInterface`, `releaseInterface`, `selectAlternateInterface`, `controlTransferIn`, `controlTransferOut`, `transferIn`, `transferOut`, `clearHalt`, `reset`; with `deviceDescriptor` and `configurationDescriptors` (bytes) where the source has them, else they are made of its fields (`deviceDescriptor()`, `configurationDescriptor()`). |
+
+A program opens a device at most once on its connection; the device is
+opened on the first connection's open and closed after the last's close,
+and what a connection left open or claimed is let go when it closes (its
+process ended). Every number, length and name a program sends is checked;
+a report is at most 64 KiB and a transfer at most `TRANSFER_MAX` (4 MiB
+less a frame's JSON).
+
+What crosses the channel, the service `devices`, version 1 (`id` is the
+device's number):
+
+| From the program | |
+| --- | --- |
+| `{ op: 'hello', seq }` | First. Answered `{ seq, devices: [DEVICE] }`, the devices there are now, their descriptors in the frame's data. |
+| `{ op: 'open', seq, id }`, `{ op: 'close', id }` | Open it (answered `{ seq }` or `{ seq, error }`); let it go. |
+| `{ op: 'setReport', seq, id, type, report, data }` | A HID output or feature report (`report` its ID, `data` its bytes without the ID's). |
+| `{ op: 'getReport', seq, id, type, report }` | A HID feature report: answered `{ seq, data }`. |
+| `{ op: 'configure', seq, id, configuration }`, `{ op: 'claim' \| 'release', seq, id, interface }`, `{ op: 'alternate', seq, id, interface, alternate }` | A USB device's configuration, an interface claimed or let go, an interface's alternate setting. A change is told to every program as `configured`, before the answer. |
+| `{ op: 'control', seq, id, requestType, request, value, index, length, data }` | A control transfer (`requestType` bmRequestType: its direction bit says which way). Answered `{ seq, status, data }` in, `{ seq, status, length }` out; `status` `'ok'`, `'stall'` or `'babble'`. |
+| `{ op: 'transfer', seq, id, endpoint, length \| data }` | A bulk or interrupt transfer on `endpoint` (its address: 0x80 and up is in). Answered as a control transfer is. |
+| `{ op: 'clearHalt', seq, id, endpoint }`, `{ op: 'reset', seq, id }` | |
+| `{ cancel: seq }` | Withdraw a request: answered `{ seq, cancelled: true, error: 'aborted' }` at once (the browser's transfer cannot be stopped; what comes of it is dropped). |
+
+| To the program | |
+| --- | --- |
+| `{ op: 'add', device: DEVICE }`, `{ op: 'remove', id }` | A device arrived (its descriptors in the data), or left. |
+| `{ op: 'input', id, report, data }` | A HID input report (without the ID's byte), to each program that has the device open. |
+| `{ op: 'configured', id, configuration, interfaces }` | A USB device's configuration or an interface's alternate setting changed. |
+
+A DEVICE is `{ id, kind, vendorId, productId, version, product,
+manufacturer, serial }` and, for `'hid'`, `transport` and `descriptor`
+(`{at, size}`); for `'usb'`, `usbVersion`, `class`, `subclass`, `protocol`,
+`configuration` (its value now), `configurations` (`[{ value, name }]`),
+`interfaces` (the configuration's now: `[{ number, alternate, class,
+subclass, protocol, endpoints, name }]`), `deviceDescriptor` and
+`configurationDescriptors` (`{at, size}` each). An error is `'gone'`,
+`'not-open'`, `'not-found'`, `'denied'`, `'aborted'`, `'timeout'`,
+`'unsupported'`, `'bad-argument'`, `'overrun'` or `'error'` (a
+DOMException's name, made the program's).
+
+**What a browser gives, and a Mac does not have to.** These are the
+browser's, said here rather than hidden:
+
+- *Only what the user chose.* WebHID and WebUSB give a page only the
+  devices the user picked in the browser's chooser, which opens only from a
+  user's gesture (`request`); programs see those and no others, where a Mac
+  program sees every device. A grant lasts across loads of the page
+  (`start` finds it again) until it is forgotten.
+- *Classes a browser keeps from pages.* WebHID gives no keyboards, mice or
+  other devices whose reports a page must not read (FIDO keys, some
+  vendors' collections); WebUSB no device of the HID, mass storage, audio,
+  video, smart card or wireless controller classes, nor an interface of
+  them on a composite device.
+- *No descriptors' own bytes.* WebHID gives a device's collections, not its
+  report descriptor: one is written again of them (the same reports laid
+  out alike; not the same bytes). WebUSB gives fields, not descriptors: a
+  device descriptor and configuration descriptors are made of them
+  (bMaxPacketSize0 64, an endpoint's bInterval 1 for interrupt and 0 for
+  bulk, bus-powered at 100 mA). A program that asks the device itself
+  (GET_DESCRIPTOR by a control transfer) gets the device's own.
+- *No manufacturer or serial of a HID device* (WebHID has a product name
+  only), and no transport: `'USB'` is said.
+- *Isochronous transfers and USB 3 streams are not offered* (WebUSB has
+  isochronous transfers of its own, not yet used here); WebUSB cannot stop
+  a transfer under way, so a cancelled one is dropped when it ends.
+- *Safari and Firefox have neither API* (`available` is false): programs
+  see no devices there.
+- *The page's thread.* Chromium has WebHID only in a page (and an
+  extension's service worker), so `Devices` lives there; WebUSB has a
+  Worker of its own, which a high-rate USB device may want later.
+
+Natively gexc offers no devices (a stand-in for tests would be a `Service`
+of hosts/native, as `GEX_NOTIFY` is notifications'): a program's registry
+there is the system's entries alone. The page's test is
+`test/darwin/devices-page` (fixtures/darwin/iodevices.c and iousb.m, run
+with devices of the test's own and through mocked `navigator.hid` and
+`navigator.usb`).
 
 ## Audio
 
