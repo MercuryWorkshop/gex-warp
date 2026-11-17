@@ -14,6 +14,13 @@
 // the bootstrap port it was born with, as darwin/machipc does); the parent
 // maps them, and each sees the other's stores while both run, and the
 // parent's mappings keep the memory once the child is gone.
+//
+// With "whole", the same between two tasks as CVMServer has it with its
+// compiler and its clients: the child names a whole allocation of its own
+// (vm_allocate, 8 MiB, purgeable) and anonymous memory (mmap) read-only
+// with VM_SHARE, then stores to the latter; the parent maps both, stores to
+// the first, and each sees the other's. (On a guest of 4 KiB pages these
+// are on no host page's boundary, with nothing mapped past their ends.)
 #include "t.h"
 
 long t_trap8(long n, long a, long b, long c, long d, long e, long f, long g, long h);
@@ -323,6 +330,70 @@ static int child(void) {
     return status;
 }
 
+static int whole_child(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = get_special(4);
+    if (!boot) return 1;
+    int status = 0;
+    u64 sa = 0;
+    // (VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE)
+    if (TRAP(TRAP_mach_vm_allocate, task, &sa, 0x800000, 3)) return 2;
+    volatile u8 *scratch = (u8 *)sa;
+    u64 size = 0x800000;
+    u32 e1 = 0, e2 = 0;
+    if (make_entry(&size, sa, RW, &e1, 0)) return 4;
+    // (MAP_ANON | MAP_PRIVATE)
+    long h = SYS(SYS_mmap, 0, 0x10000, 3, 0x1002, -1, 0);
+    if (h < 0) return 8;
+    volatile u8 *heap = (u8 *)h;
+    size = 0x10000;
+    if (make_entry(&size, (u64)h, VM_SHARE | R, &e2, 0)) return 16;
+    heap[0x80] = 'H';
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COMPLEX | COPY_SEND, m.h.remote = boot, m.h.id = 100;
+    m.body[0] = 2;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){e1, 0, 0, MOVE_SEND, 0};
+    *(struct port_desc *)(m.body + 4) = (struct port_desc){e2, 0, 0, MOVE_SEND, 0};
+    if (msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h + 28, 0, 0, 0)) return 32;
+    if (!await(scratch + 0x100, 'S')) status |= 64;
+    if (!await(scratch + 0x700000, 'T')) status |= 128;
+    heap[0x81] = 'I';
+    if (!await(scratch + 0x101, 'D')) status |= 256;
+    return status;
+}
+
+static void whole(void) {
+    u32 boot = 0;
+    TRAP(TRAP_port_allocate, task, RIGHT_RECEIVE, &boot);
+    t_printf("set the bootstrap port: %ld\n", set_special(4, boot));
+    long pid = 0, child_flag = -1;
+    pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
+    if (pid < 0) {
+        t_printf("fork failed: %ld\n", pid);
+        return;
+    }
+    if (child_flag) t_exit(whole_child());
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    long r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, boot, 10000);
+    t_printf("received: %ld, %u entries\n", r, (m.h.bits & COMPLEX) ? m.body[0] : 0);
+    u32 e1 = ((struct port_desc *)(m.body + 1))->name, e2 = ((struct port_desc *)(m.body + 4))->name;
+    u64 a1 = 0, a2 = 0;
+    long r1 = map_entry(&a1, 0x800000, e1, 0, 0, RW), r2 = map_entry(&a2, 0x10000, e2, 0, 0, R);
+    t_printf("its allocation mapped: %ld, its anonymous memory mapped: %ld\n", r1, r2);
+    if (r1 || r2) return;
+    volatile u8 *scratch = (u8 *)a1, *heap = (u8 *)a2;
+    t_printf("the anonymous memory holds what it stored: %s\n", yes(heap[0x80] == 'H'));
+    scratch[0x100] = 'S';
+    scratch[0x700000] = 'T';
+    t_printf("and what it stores later: %s\n", yes(await(heap + 0x81, 'I')));
+    scratch[0x101] = 'D';
+    int status = -1;
+    long got = SYS(SYS_wait4, pid, &status, 0, 0);
+    t_printf("the child: %s, status %x (our stores seen there unless not 0)\n", got == pid ? "waited for" : "not waited for", status);
+}
+
 static void two_tasks(void) {
     u32 boot = 0;
     TRAP(TRAP_port_allocate, task, RIGHT_RECEIVE, &boot);
@@ -361,6 +432,8 @@ int main(int argc, char **argv, char **envp, char **apple) {
     task = (u32)TRAP(TRAP_task_self);
     if (argc > 1 && !t_strcmp(argv[1], "fork"))
         two_tasks();
+    else if (argc > 1 && !t_strcmp(argv[1], "whole"))
+        whole();
     else
         one_task();
     return 0;

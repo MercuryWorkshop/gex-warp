@@ -208,7 +208,13 @@ impl Kernel {
     fn darwin_share_in_place(&mut self, m: &mut GuestMem<'_>, lo: u64, hi: u64, parts: &[(u64, u64, u32, bool)]) -> Result<(Arc<OpenFile>, u64), u64> {
         let g = crate::mem::share_granule().max(abi::PAGE_SIZE);
         // The host's pages around the range too, where they are the task's
-        // anonymous memory and nothing's code: shared whole, or not at all.
+        // anonymous memory and nothing's code, or nothing at all: shared
+        // whole, or not at all. (A guest's 4 KiB pages: an allocation of
+        // its own is on no host page's boundary, and what is past its ends
+        // in the host's page is often no mapping. That part is taken in
+        // too, and left inaccessible as it was: else the range would be no
+        // whole host pages, and not shared at all -- CVMServer's scratch
+        // memory, which its compiler writes an OpenCL build's code into.)
         let (glo, ghi) = (lo & !(g - 1), hi.next_multiple_of(g));
         let (slo, shi) = {
             let mm = self.mem.lock();
@@ -217,7 +223,9 @@ impl Kernel {
                 while at < b {
                     match mm.vmas().iter().find(|v| v.start <= at && at < v.end) {
                         Some(v) if v.origin.is_none() && v.code.is_none() && v.prot & crate::mem::prot::EXEC == 0 => at = v.end,
-                        _ => return false,
+                        Some(_) => return false,
+                        // (A hole: to the next mapping.)
+                        None => at = mm.vmas().iter().filter(|v| v.start > at).map(|v| v.start).min().unwrap_or(b).min(b),
                     }
                 }
                 !mm.log.shared_maps.iter().any(|s| s.start < b && a < s.start + s.len)
@@ -225,9 +233,21 @@ impl Kernel {
             if plain(glo, ghi) { (glo, ghi) } else { (lo, hi) }
         };
         let mut parts = parts.to_vec();
+        let mut holes = Vec::new();
         if (slo, shi) != (lo, hi) {
             let mm = self.mem.lock();
             parts = mm.vmas().iter().filter(|v| v.start < shi && slo < v.end).map(|v| (v.start.max(slo), v.end.min(shi), v.prot & 7, true)).collect();
+            parts.sort_by_key(|p| p.0);
+            let mut at = slo;
+            for &(a, b, _, _) in &parts {
+                if a > at {
+                    holes.push((at, a));
+                }
+                at = at.max(b);
+            }
+            if at < shi {
+                holes.push((at, shi));
+            }
         }
         // The object's offsets are the host page's: `slo` is at its offset
         // in its host page.
@@ -244,6 +264,9 @@ impl Kernel {
             if p as u64 != rw {
                 let _ = self.map_io().call(m, nr::MPROTECT, [a, b - a, p as u64, 0, 0, 0]);
             }
+        }
+        for &(a, b) in &holes {
+            let _ = self.map_io().call(m, nr::MPROTECT, [a, b - a, 0, 0, 0, 0]);
         }
         Ok((file, at + (lo - slo)))
     }

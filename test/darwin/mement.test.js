@@ -17,5 +17,8 @@ export default async function (t) {
   const prog = await d.build('mement');
   await d.compare('mement', prog, [], { page: true, timeout: 60000 });
   await d.compare('mement fork', prog, ['fork'], { timeout: 60000 });
+  // Whole allocations of a task's, as CVMServer shares its scratch memory
+  // with its compiler and its heaps with its clients.
+  await d.compare('mement whole', prog, ['whole'], { timeout: 60000 });
   d.n.clean();
 }
