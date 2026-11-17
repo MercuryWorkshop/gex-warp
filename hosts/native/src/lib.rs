@@ -1074,21 +1074,128 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         },
     });
     save_framebuffer();
+    live_framebuffer();
+    hid_input();
     run_program_with(program, opts, xlate, None)
 }
 
 /// With `GEX_FRAMEBUFFER_PNG=FILE`, what a Mac's framebuffer shows (once
 /// WindowServer has mapped it) is saved there as a PNG every two seconds,
-/// for as long as gexc runs.
+/// for as long as gexc runs. With `GEX_SURFACE_PNG=DIR`, each IOSurface of
+/// 32-bit pixels there is too, as DIR/surface-ID.png: what a program drew
+/// into its window's surface, whatever WindowServer made of it.
 fn save_framebuffer() {
-    let Some(path) = std::env::var_os("GEX_FRAMEBUFFER_PNG").filter(|p| !p.is_empty()) else { return };
+    use gex_kernel::syscalls::darwin::iokit;
+    let fb = std::env::var_os("GEX_FRAMEBUFFER_PNG").filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+    let surfaces = std::env::var_os("GEX_SURFACE_PNG").filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+    if fb.is_none() && surfaces.is_none() {
+        return;
+    }
+    let save = |path: &std::path::Path, png: Vec<u8>| {
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+        if std::fs::write(&tmp, png).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    };
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        if let Some(png) = gex_kernel::syscalls::darwin::iokit::framebuffer_png() {
-            let tmp = std::path::PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-            if std::fs::write(&tmp, png).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+        if let Some(png) = fb.as_ref().and_then(|_| iokit::framebuffer_png()) {
+            save(fb.as_ref().unwrap(), png);
+        }
+        if let Some(dir) = &surfaces {
+            for (id, _) in iokit::surface::list() {
+                if let Some(png) = iokit::surface_png(id) {
+                    save(&dir.join(format!("surface-{id}.png")), png);
+                }
             }
+        }
+    });
+}
+
+/// With `GEX_FRAMEBUFFER_LIVE=FILE`, FILE is what a Mac's framebuffer
+/// shows, kept as it changes (looked at thirty times a second), for a
+/// viewer to map and show (hosts/macview): a header of 4096 bytes --
+/// `GEXFB001`, then the width, height and bytes a row (each a
+/// little-endian u32), the pixels' format (1: each a little-endian word
+/// `xxRRGGBB`), and at 24 the number of pictures written so far (a u64,
+/// written after the picture's rows) -- and the rows.
+fn live_framebuffer() {
+    let Some(path) = std::env::var_os("GEX_FRAMEBUFFER_LIVE").filter(|p| !p.is_empty()) else { return };
+    std::thread::spawn(move || {
+        use std::os::unix::fs::FileExt;
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path) else {
+            eprintln!("gex: GEX_FRAMEBUFFER_LIVE: cannot write {}", path.to_string_lossy());
+            return;
+        };
+        let mut last: Vec<u8> = Vec::new();
+        let mut seq = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(33));
+            let Some((w, h, row, buf)) = gex_kernel::syscalls::darwin::iokit::framebuffer_pixels() else { continue };
+            if buf == last {
+                continue;
+            }
+            if buf.len() != last.len() {
+                let _ = file.set_len(4096 + buf.len() as u64);
+            }
+            seq += 1;
+            let mut head = [0u8; 32];
+            head[..8].copy_from_slice(b"GEXFB001");
+            head[8..12].copy_from_slice(&w.to_le_bytes());
+            head[12..16].copy_from_slice(&h.to_le_bytes());
+            head[16..20].copy_from_slice(&(row as u32).to_le_bytes());
+            head[20..24].copy_from_slice(&1u32.to_le_bytes());
+            head[24..32].copy_from_slice(&seq.to_le_bytes());
+            if file.write_all_at(&buf, 4096).is_err() || file.write_all_at(&head, 0).is_err() {
+                return;
+            }
+            last = buf;
+        }
+    });
+}
+
+/// With `GEX_HID_INPUT=FILE`, each line written to FILE (from its start,
+/// and as it grows) is input for a Mac's HID system: the mouse and keys of
+/// a viewer, or a script's (`move X Y`, `click X Y`, `press CODE`, `sleep
+/// MS`: [`gex_kernel::syscalls::darwin::iokit::hid::Line`]).
+fn hid_input() {
+    let Some(path) = std::env::var_os("GEX_HID_INPUT").filter(|p| !p.is_empty()) else { return };
+    std::thread::spawn(move || {
+        use gex_kernel::syscalls::darwin::iokit::hid;
+        use std::io::{BufRead, BufReader};
+        let file = loop {
+            match std::fs::File::open(&path) {
+                Ok(f) => break f,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        };
+        let mut r = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            // (A line not yet ended waits for the rest of it.)
+            match r.read_line(&mut line) {
+                Ok(0) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                Ok(_) if !line.ends_with('\n') => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            match hid::Line::parse(&line) {
+                // (Their kick is a message, which a thread waiting on its
+                // port's events hears of as of a descriptor's.)
+                Ok(hid::Line::Events(events)) => {
+                    events.into_iter().for_each(hid::post);
+                    crate::ready::notify();
+                }
+                Ok(hid::Line::Sleep(ms)) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+                Err(e) => eprintln!("gex: GEX_HID_INPUT: {e}"),
+            }
+            line.clear();
         }
     });
 }

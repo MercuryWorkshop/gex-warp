@@ -186,6 +186,14 @@ impl Registry {
                 ("IOMatchCategory", Value::str("IOHID")),
                 ("CFBundleIdentifier", Value::str("com.apple.iokit.IOHIDSystem")),
                 ("HIDParameters", Value::Dict(Vec::new())),
+                // One of the HID event system's services (hidd's), the NX
+                // event router its plug-in: what is posted to the system
+                // reaches WindowServer through it, as Apple's NX events.
+                ("HIDServiceSupport", Value::Bool(true)),
+                ("HIDServiceGlobalModifiersUsage", Value::n32(1)),
+                ("PrimaryUsagePage", Value::n32(0xff00)),
+                ("PrimaryUsage", Value::n32(23)),
+                ("IOCFPlugInTypes", Value::dict(vec![("0516B563-B15B-11DA-96EB-0014519758EF", Value::str("IOHIDFamily.kext/Contents/PlugIns/IOHIDNXEventRouter.plugin"))])),
             ],
             Opens::HidSystem,
         );

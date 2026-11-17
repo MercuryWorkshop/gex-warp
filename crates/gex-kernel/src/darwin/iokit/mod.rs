@@ -160,11 +160,32 @@ impl IoKit {
 pub fn kick_hid() {
     let io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(kit) = io.as_ref() else { return };
+    let kind = kit.hid_consumer();
     for o in kit.objects.values() {
-        if let Obj::Connect(Connect { client: Client::Hid(h), notify: Some((_, port)), .. }) = &o.obj {
-            if h.kind == 0 {
-                post(port, Msg::kernel(0, Vec::new(), Vec::new(), Vec::new()));
+        if let Obj::Connect(Connect { client: Client::Hid(h), notify: Some((_, port)), pid, .. }) = &o.obj {
+            if h.kind == kind {
+                let told = post(port, Msg::kernel(0, Vec::new(), Vec::new(), Vec::new()));
+                if std::env::var_os("GEX_IOKIT_TRACE").is_some() {
+                    eprintln!("[gex:{pid}] IOKit HID: input kicked at the type {kind} connection's port{}", if told { "" } else { ", which is dead" });
+                }
             }
+        }
+    }
+}
+
+impl IoKit {
+    /// Which of the HID system's connections takes what is posted: the
+    /// event system's (3), once it has a queue mapped and a port to be
+    /// told at, or else the server's (0).
+    fn hid_consumer(&self) -> u32 {
+        let ready = self.objects.values().any(|o| {
+            matches!(&o.obj, Obj::Connect(Connect { client: Client::Hid(h), notify: Some(_), maps, .. })
+                if h.kind == 3 && h.queue.is_some_and(|(t, _)| maps.iter().any(|m| m.0 == t)))
+        });
+        if ready {
+            3
+        } else {
+            0
         }
     }
 }
@@ -209,6 +230,14 @@ static VRAM: Mutex<Option<(Arc<crate::file::OpenFile>, u64, (u32, u32, u64), Opt
 /// a framebuffer. Without a task's memory to read (a host that keeps none),
 /// the object's own bytes.
 pub fn framebuffer_png() -> Option<Vec<u8>> {
+    let (w, h, row, buf) = framebuffer_pixels()?;
+    Some(png::encode(w, h, row as usize, &buf))
+}
+
+/// What the framebuffer shows now, as it holds it: its width, height and
+/// bytes a row, and the rows (each pixel a little-endian word `xxRRGGBB`),
+/// read as [`framebuffer_png`] reads them. What a host shows live.
+pub fn framebuffer_pixels() -> Option<(u32, u32, u64, Vec<u8>)> {
     let (file, (w, h, row), live) = {
         let v = VRAM.lock().unwrap_or_else(|e| e.into_inner());
         let (f, _, shape, live) = v.as_ref()?;
@@ -218,7 +247,7 @@ pub fn framebuffer_png() -> Option<Vec<u8>> {
     if !live.is_some_and(|(vm, at)| vm.mem.read(at, &mut buf)) {
         file.handle.read_at(0, &mut buf).ok()?;
     }
-    Some(png::encode(w, h, row as usize, &buf))
+    Some((w, h, row, buf))
 }
 
 /// Surface `id`'s pixels as a PNG, when they are 32-bit.
@@ -462,14 +491,36 @@ impl Kernel {
         let now = self.darwin_abstime();
         let mut io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
         let Some(kit) = io.as_mut() else { return };
+        let consumer = kit.hid_consumer();
+        let sender = kit.reg.entries.iter().find(|e| e.class == "IOHIDSystem").map_or(0, |e| e.id);
         for o in kit.objects.values_mut() {
             let Obj::Connect(c) = &mut o.obj else { continue };
             if c.pid != self.pid {
                 continue;
             }
             let Client::Hid(h) = &mut c.client else { continue };
-            if h.kind != 0 {
+            if h.kind != consumer {
                 continue;
+            }
+            // The event system's queue: each event an entry at its tail,
+            // written before the tail is moved past it (its reader may be
+            // taking from the head meanwhile).
+            if h.kind == 3 {
+                let Some((token, _)) = h.queue else { continue };
+                let Some(&(_, at, _)) = c.maps.iter().find(|(t, _, _)| *t == token) else { continue };
+                let Ok(head) = m.read(at, hid::QUEUE_HEADER).map(|b| b.to_vec()) else { continue };
+                let word = |i: usize| u32::from_le_bytes(head[4 * i..4 * i + 4].try_into().unwrap());
+                let (size, first, tail) = (word(0), word(1), word(2));
+                let entries = h.queue_entries(&hid::take(), now, sender);
+                let (places, tail) = hid::Hid::enqueue_at(size, first, tail, &entries);
+                for (to, i) in places {
+                    let _ = m.write(at + hid::QUEUE_HEADER as u64 + to as u64, &entries[i]);
+                }
+                let _ = m.write(at + 8, &tail.to_le_bytes());
+                if self.trace || std::env::var_os("GEX_IOKIT_TRACE").is_some() {
+                    eprintln!("[gex:{}] IOKit HID: {} events into the event system's queue (head {first}, tail {tail})", self.pid, entries.len());
+                }
+                return;
             }
             let Some(&(_, at, size)) = c.maps.iter().find(|(t, _, _)| *t == 0) else { continue };
             let Ok(before) = m.read(at, size as usize).map(|b| b.to_vec()) else { continue };
@@ -908,6 +959,7 @@ impl Kernel {
                 }
                 let initial = match &c.client {
                     Client::Hid(hc) if hc.kind == 0 && kind == 0 => hid::Hid::shmem(),
+                    Client::Hid(hc) if hc.kind == 3 && hc.queue.is_some_and(|(t, _)| t == kind) => hc.queue_memory().unwrap_or_default(),
                     Client::Fb(fb) => match fb.memory(kind) {
                         Some(b) => b,
                         None => return fail(BAD_ARGUMENT),
@@ -1134,6 +1186,15 @@ impl Kernel {
             }
         };
         sc.held.insert(id, surface::Held { at, uses: 0, created });
+        // (Its pixels read where its creator, or the first task to map it,
+        // draws.)
+        if let Ok(vm) = self.procs.vm(self.pid) {
+            if let Some(s) = surface::table().as_mut().and_then(|t| t.all.get_mut(&id)) {
+                if created || s.live.is_none() {
+                    s.live = Some((vm, gex_abi::canon(at)));
+                }
+            }
+        }
         let t = surface::table();
         let s = t.as_ref().and_then(|t| t.all.get(&id)).ok_or(BAD_ARGUMENT)?;
         Ok(surface::lock_result(s, at))
@@ -1185,6 +1246,7 @@ impl Kernel {
                         holders: 1,
                         attachments: Vec::new(),
                         registry_id: 0x1_0001_0000 + id as u64,
+                        live: None,
                     };
                     let _ = file.handle.write_at(pixels, &s.shared_ro());
                     t.all.insert(id, s);

@@ -276,6 +276,10 @@ pub struct Surface {
     pub attachments: Vec<u8>,
     /// The registry id the shared part tells.
     pub registry_id: u64,
+    /// Where a task has it mapped (its creator's, or the first's): what
+    /// [`pixels`] reads, since what a task draws is in its pages and the
+    /// object's only once written back, which nothing does.
+    pub live: Option<(Arc<crate::proc::PeerVm>, u64)>,
 }
 
 impl Surface {
@@ -401,6 +405,9 @@ pub fn pixels(id: u32) -> Option<(Shape, Vec<u8>)> {
     let t = table();
     let s = t.as_ref()?.all.get(&id)?;
     let mut buf = vec![0u8; s.shape.alloc_size as usize];
+    if s.live.as_ref().is_some_and(|(vm, at)| vm.mem.read(*at, &mut buf)) {
+        return Some((s.shape.clone(), buf));
+    }
     let n = s.file.handle.read_at(0, &mut buf).ok()? as usize;
     buf.truncate(n);
     Some((s.shape.clone(), buf))
@@ -523,7 +530,7 @@ mod tests {
         assert_eq!(s.planes.len(), 2);
         assert_eq!(s.planes[1].offset, 4096);
         assert_eq!(s.alloc_size, 4096 + 2048);
-        let r = lock_result(&Surface { id: 7, shape: s, file: crate::file::OpenFile::new(Arc::new(crate::unix::MemFd::new("t")), "/memfd:t".into(), 2, true, true), pixels: 0x4000, total: 0x8000, creator: 1, values: Vec::new(), generation: 1, seed: 0, use_count: 0, holders: 1, attachments: Vec::new(), registry_id: 0 }, 0x10000);
+        let r = lock_result(&Surface { id: 7, shape: s, file: crate::file::OpenFile::new(Arc::new(crate::unix::MemFd::new("t")), "/memfd:t".into(), 2, true, true), pixels: 0x4000, total: 0x8000, creator: 1, values: Vec::new(), generation: 1, seed: 0, use_count: 0, holders: 1, attachments: Vec::new(), registry_id: 0, live: None }, 0x10000);
         assert_eq!(r.len(), LOCK_RESULT);
         assert_eq!(u32::from_le_bytes(r[24..28].try_into().unwrap()), 7);
         assert_eq!(u64::from_le_bytes(r[8..16].try_into().unwrap()), 0x14000);
