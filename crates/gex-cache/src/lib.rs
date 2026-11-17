@@ -1053,6 +1053,42 @@ mod tests {
         assert_eq!(f.call(&mut store, ()).unwrap(), 42);
     }
 
+    /// A mapped module never sees its file change under it: a store (of the
+    /// same key, as another process makes one) writes a new file and
+    /// renames it into place, and an eviction unlinks; neither writes the
+    /// mapped file in place, so the module keeps its pages and runs.
+    #[test]
+    fn a_mapped_module_survives_a_store_over_its_key_and_an_eviction() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-mapped-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::default();
+        // (func (export "f") (result i32) i32.const 42), and one giving 7.
+        let forty_two = vec![0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1, 0x66, 0, 0, 0x0a, 6, 1, 4, 0, 0x41, 0x2a, 0x0b];
+        let mut seven = forty_two.clone();
+        let n = seven.len();
+        seven[n - 2] = 7;
+        let run = |m: &Module| {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let inst = wasmtime::Instance::new(&mut store, m, &[]).unwrap();
+            inst.get_typed_func::<(), i32>(&mut store, "f").unwrap().call(&mut store, ()).unwrap()
+        };
+        let w = forty_two.clone();
+        let held = load_or_compile(&engine, &dir, "k", move || Ok((w, b"m".to_vec()))).unwrap();
+        let path = dir.join("k.cwasm");
+        let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+        let before = ino(&path);
+        // Another module stored under the same key (a racing process's).
+        store(&dir, &path, &serialize(&compile(&engine, &seven).unwrap()).unwrap());
+        assert_ne!(ino(&path), before, "a store must put a new file in place, not write the old one");
+        assert_eq!(run(&held.module), 42);
+        // Evicted: a budget of nothing removes every entry.
+        evict(&dir, 1);
+        assert!(!path.exists(), "the eviction left the entry");
+        assert_eq!(run(&held.module), 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_module_without_its_metadata_is_not_a_hit() {
         let dir = std::env::temp_dir().join(format!("gex-cache-half-{}", std::process::id()));
