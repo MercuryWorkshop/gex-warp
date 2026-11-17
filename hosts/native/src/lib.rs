@@ -3240,6 +3240,11 @@ impl gex_kernel::proc::PeerMem for PeerMemory {
         self.0.base()
     }
 
+    /// A private mapping of a sealed file's pages (`GuestMemory::map_file`).
+    fn map_file(&self, at: u64, len: u64, fd: i32, offset: u64, read: bool, write: bool) -> bool {
+        self.0.map_file(at, len, fd, offset, read, write).is_ok()
+    }
+
     fn read(&self, addr: u64, out: &mut [u8]) -> bool {
         let b = self.0.bytes();
         match usize::try_from(addr).ok().and_then(|a| Some(a..a.checked_add(out.len())?)) {

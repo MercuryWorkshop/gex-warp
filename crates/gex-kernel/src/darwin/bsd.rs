@@ -1042,10 +1042,21 @@ impl Kernel {
             Some(home) => home,
             None => addr,
         };
-        let at = self.darwin_place(addr, len, prot_bits as u32, fd != u64::MAX, 0)?;
+        let mask = if fd == u64::MAX { self.darwin_room_mask(len, 0) } else { 0 };
+        let at = self.darwin_place(addr, len, prot_bits as u32, fd != u64::MAX, mask)?;
         // The hint is honoured: the range was free a moment ago, under the
         // same lock.
         self.map_io().mmap(m, [at, len, prot_bits, kflags, fd, off]).map(gex_abi::guest_addr)
+    }
+
+    /// The alignment (`mask`) of anonymous memory placed for the dynamic
+    /// linker: a library's room, which it maps the library's segments into
+    /// at their offsets in the file, goes on a host page
+    /// ([`crate::mem::share_granule`]), so that their whole host pages can be
+    /// the file's own (`map_sealed`) as XNU maps them, rather than copies.
+    pub(super) fn darwin_room_mask(&self, len: u64, mask: u64) -> u64 {
+        let g = crate::mem::share_granule();
+        if g > abi::PAGE_SIZE && len >= g && self.map_io().from_dyld() { mask | (g - 1) } else { mask }
     }
 
     /// Where the library the dynamic linker is making room for belongs,

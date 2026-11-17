@@ -292,6 +292,9 @@ struct HostHandle {
     /// For `inotify`: the mount's key, the host path opened, and whether
     /// opened to write.
     at: (usize, PathBuf, bool),
+    /// Nothing writes the file through gex ([`FileHandle::seal`]): opened
+    /// on a read-only mount.
+    sealed: std::sync::atomic::AtomicBool,
 }
 
 /// The inode a host path names, and whether it is a directory.
@@ -365,6 +368,20 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 }
 
 impl FileHandle for HostHandle {
+    fn seal(&self) {
+        if !self.at.2 {
+            self.sealed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn map_fd(&self) -> Option<i32> {
+        use std::os::unix::io::AsRawFd;
+        if self.stream || self.at.2 || !self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.file.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
+    }
+
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -661,6 +678,7 @@ impl FileSystem for HostFs {
             file: Mutex::new(file),
             stream,
             at: (self.watch_fs(), host, want_write),
+            sealed: std::sync::atomic::AtomicBool::new(self.read_only),
         };
         if crate::inotify::any() {
             use crate::inotify::mask;

@@ -232,6 +232,7 @@ impl Kernel {
         let page = abi::PAGE_SIZE;
         let len = size.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
         if flags & VM_FLAGS_ANYWHERE != 0 {
+            let mask = self.darwin_room_mask(len, mask);
             let at = self.darwin_place(want, len, prot_bits, false, mask)?;
             self.mem.mmap_anon(m, at, len, prot_bits, 0, false, "")
         } else {

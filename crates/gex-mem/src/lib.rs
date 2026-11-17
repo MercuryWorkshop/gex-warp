@@ -174,6 +174,64 @@ impl GuestMemory {
         }
     }
 
+    /// `len` bytes at `start` of this memory made the bytes of the host
+    /// file `fd` from `offset`, copy-on-write, as a private mapping of a file
+    /// is on a Mac: the file's pages (the system's file cache, clean, shared
+    /// with every process that maps them so) until a store makes one of
+    /// them this memory's own. The host's view follows (`realias`: one
+    /// object for both views, a store through either seen in the other);
+    /// the wasm memory's pages get `read`/`write` (the mapping's protection
+    /// as [`Self::protect`] gives it). On whole host pages, inside the
+    /// file. `Err` where the host cannot (not macOS), the range or file
+    /// offset is not on host pages, or the host refuses: then nothing has
+    /// changed, or the range is zeroed private pages again.
+    ///
+    /// Only for a file nothing will shorten while it is mapped: a host page
+    /// past a file's end faults (`SIGBUS`), in the host too.
+    pub fn map_file(&self, start: u64, len: u64, fd: i32, offset: u64, read: bool, write: bool) -> Result<(), i32> {
+        let page = host_page();
+        let end = start.wrapping_add(len);
+        if start % page != 0 || offset % page != 0 || len % page != 0 || len == 0 || end > self.len() as u64 || end < start {
+            return Err(-1);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: whole host pages inside the live wasm memory, whose
+            // contents the caller replaces (a mapping it is making); the
+            // file is mapped private, so nothing reaches it.
+            let r = unsafe {
+                libc::mmap(
+                    (self.base() + start) as *mut libc::c_void,
+                    len as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE,
+                    fd,
+                    offset as libc::off_t,
+                )
+            };
+            if r == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-3));
+            }
+            if r as u64 != self.base() + start {
+                unshare_pages(self.base(), start, end);
+                return Err(-2);
+            }
+            if self.view != self.base() && !realias_checked(self.base(), self.view, start, len) {
+                // (both views their own zero pages again: the caller copies)
+                unshare_pages(self.base(), start, end);
+                return Err(-4);
+            }
+            let prot = if write { libc::PROT_READ | libc::PROT_WRITE } else if read { libc::PROT_READ } else { libc::PROT_NONE };
+            protect_pages(self.base(), self.len() as u64, self.view != self.base(), start, end, prot);
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (fd, read, write);
+            Err(-1)
+        }
+    }
+
     /// Total size in bytes. Fixed for the life of the process: gex sizes the
     /// address space up front and never grows it.
     pub fn len(&self) -> usize {
@@ -289,6 +347,32 @@ fn make_view(base: u64, len: u64) -> Option<u64> {
         let _ = (base, len);
         None
     }
+}
+
+/// [`realias`], saying whether the view could follow.
+#[cfg(target_os = "macos")]
+fn realias_checked(base: u64, view: u64, start: u64, len: u64) -> bool {
+    let mut at = view + start;
+    let (mut cur, mut max) = (0, 0);
+    // SAFETY: both ranges are inside one live memory and its view.
+    let r = unsafe {
+        mach::mach_vm_remap(
+            mach::mach_task_self_,
+            &mut at,
+            len,
+            0,
+            mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
+            mach::mach_task_self_,
+            base + start,
+            0,
+            &mut cur,
+            &mut max,
+            mach::VM_INHERIT_NONE,
+        )
+    };
+    // SAFETY: as above, the view's own range.
+    unsafe { libc::mprotect((view + start) as *mut libc::c_void, len as usize, libc::PROT_READ | libc::PROT_WRITE) };
+    r == 0 && at == view + start
 }
 
 /// `[start, start + len)` of the view at `view` made the pages the memory
@@ -489,4 +573,56 @@ mod mach {
     pub const VM_FLAGS_OVERWRITE: i32 = 0x4000;
     pub const VM_INHERIT_SHARE: u32 = 0;
     pub const VM_INHERIT_NONE: u32 = 2;
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn memory(pages: u32) -> GuestMemory {
+        let mut c = wasmtime::Config::new();
+        c.wasm_threads(true);
+        c.shared_memory(true);
+        let engine = wasmtime::Engine::new(&c).unwrap();
+        let ty = wasmtime::MemoryType::shared(pages, pages);
+        GuestMemory::new(SharedMemory::new(&engine, ty).unwrap())
+    }
+
+    /// A private mapping of a file: its bytes in both views, a store through
+    /// either seen in the other, the file untouched.
+    #[test]
+    fn a_file_mapped_private_is_one_set_of_pages_in_both_views_and_copy_on_write() {
+        use std::os::unix::io::AsRawFd;
+        let page = host_page();
+        let m = memory(64); // 4 MiB
+        assert!(m.has_view(), "no view of the host's to test with");
+        let path = std::env::temp_dir().join(format!("gex-mem-mapfile-{}", std::process::id()));
+        let data: Vec<u8> = (0..4 * page).map(|i| (i * 7 + i / 4096) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let start = 8 * page;
+        // The file's second and third pages.
+        m.map_file(start, 2 * page, f.as_raw_fd(), page, true, false).unwrap();
+        drop(f);
+        let b = m.bytes();
+        assert_eq!(&b[start as usize..(start + 2 * page) as usize], &data[page as usize..3 * page as usize]);
+        // SAFETY: the wasm memory's own pages, made readable just above.
+        let wasm = |at: u64| unsafe { std::ptr::read_volatile((m.base() + at) as *const u8) };
+        assert_eq!(wasm(start + 5), data[page as usize + 5]);
+        // A store through the host's view is the wasm memory's too.
+        b[start as usize + 5] = 0xa5;
+        assert_eq!(wasm(start + 5), 0xa5);
+        // And one into the wasm memory (made writable) the view's.
+        m.protect(start, start + 2 * page, libc::PROT_READ | libc::PROT_WRITE);
+        // SAFETY: as above, writable now.
+        unsafe { std::ptr::write_volatile((m.base() + start + page + 9) as *mut u8, 0x5a) };
+        assert_eq!(m.bytes()[(start + page + 9) as usize], 0x5a);
+        // The file is as it was.
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let _ = std::fs::remove_file(&path);
+        // Off a host page: refused, nothing changed.
+        let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        assert!(m.map_file(start + 4096, page, f.as_raw_fd(), 0, true, false).is_err());
+        assert_eq!(m.bytes()[start as usize + 5], 0xa5);
+    }
 }

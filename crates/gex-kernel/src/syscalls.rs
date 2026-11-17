@@ -5340,6 +5340,49 @@ impl MapIo<'_> {
         r
     }
 
+    /// A private mapping of a file not to be written (`len` bytes at `start`
+    /// from `offset`, mapped without `PROT_WRITE`), of a file nothing
+    /// changes ([`crate::vfs::FileHandle::map_fd`]: a library in a sealed
+    /// root): its whole host pages inside the file are the file's own,
+    /// copy-on-write ([`crate::proc::PeerMem::map_file`]), as XNU maps a
+    /// library's segments, and only the rest is read in. How many bytes of
+    /// the file it holds, or `None` where it is all to be read (no such
+    /// file, no whole host page of it, a host that cannot).
+    ///
+    /// Every process read each library it loaded into memory of its own: a
+    /// program on AppKit ~200 MB of frameworks, a daemon 25-100 MB, each of
+    /// fifty processes of a Mojave desktop a copy.
+    fn map_sealed(&self, m: &mut GuestMem<'_>, file: &OpenFile, start: u64, len: u64, offset: u64, prot_bits: u32) -> Result<Option<usize>, Errno> {
+        let g = crate::mem::share_granule();
+        let Some(fd) = file.handle.map_fd() else { return Ok(None) };
+        let Some((procs, pid)) = self.peers else { return Ok(None) };
+        let Ok(me) = procs.vm(pid) else { return Ok(None) };
+        let size = file.handle.metadata()?.size;
+        if offset >= size {
+            return Ok(None);
+        }
+        let held = len.min(size - offset);
+        let (a, b) = (start.next_multiple_of(g), (start + held) & !(g - 1));
+        if a >= b || (offset + (a - start)) % g != 0 {
+            return Ok(None);
+        }
+        let (read, write) = (prot_bits & (crate::mem::prot::READ | crate::mem::prot::EXEC) != 0, false);
+        if !me.mem.map_file(a, b - a, fd, offset + (a - start), read, write) {
+            return Ok(None);
+        }
+        // (`GEX_MEM_TRACE` says each: what a run maps rather than copies)
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("GEX_MEM_TRACE").is_some()) {
+            eprintln!("gex-mem: {} KiB of {} mapped from the file", (b - a) >> 10, file.path);
+        }
+        // What is left of the host pages either side, read as before.
+        if a > start {
+            file.pread(offset, m.read_mut(start, (a - start) as usize)?)?;
+        }
+        let tail = if start + len > b { file.pread(offset + (b - start), m.read_mut(b, (start + len - b) as usize)?)? } else { 0 };
+        Ok(Some((b - start + tail) as usize))
+    }
+
     /// A shared mapping of a file just made, `len` bytes at `start` of the
     /// file from `offset`: where another process maps the same file shared
     /// already, the part both map on whole host pages is made that
@@ -5571,7 +5614,11 @@ impl MapIo<'_> {
             // stand (`SharedMaps::recall`).
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
-            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+            let mapped = if shared || prot_bits & crate::mem::prot::WRITE != 0 { None } else { self.map_sealed(m, &file, start, len, offset, prot_bits)? };
+            let n = match mapped {
+                Some(n) => n,
+                None => file.pread(offset, m.read_mut(start, len as usize)?)? as usize,
+            };
             m.written(start, n as u64);
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where

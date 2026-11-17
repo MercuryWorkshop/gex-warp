@@ -439,6 +439,17 @@ pub trait PeerMem: Send + Sync {
         let _ = (from, from_at, at, len);
         false
     }
+    /// Make `len` bytes at `at` of this memory the bytes of the host file
+    /// `fd` (a [`crate::vfs::FileHandle::map_fd`]) from `offset`,
+    /// copy-on-write: the host's file cache, not a copy, until a store
+    /// makes a page this memory's own. Its pages get `read`/`write` where
+    /// the host mirrors protections. On whole host pages
+    /// ([`crate::mem::share_granule`]); false where the host cannot, and
+    /// then the range holds zeroes or what it held.
+    fn map_file(&self, at: u64, len: u64, fd: i32, offset: u64, read: bool, write: bool) -> bool {
+        let _ = (at, len, fd, offset, read, write);
+        false
+    }
     /// This memory as the host's own type, for [`PeerMem::share_from`].
     fn as_any(&self) -> &dyn std::any::Any;
     /// The host's name for this memory (its base): what an unshare names

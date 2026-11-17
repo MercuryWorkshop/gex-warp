@@ -326,6 +326,21 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = (owner, on);
         false
     }
+    /// The handle is on a filesystem nothing writes through
+    /// ([`readonly::ReadOnly`], a read-only host mount): its file stays as it
+    /// is for as long as it is open, so its bytes may be mapped from it
+    /// ([`FileHandle::map_fd`]). Nothing for a handle that cannot be mapped.
+    fn seal(&self) {}
+
+    /// A host descriptor the file's bytes can be mapped from, copy-on-write
+    /// (a private mapping of it shares the host's file cache rather than
+    /// copying it): only for a regular host file on a sealed filesystem
+    /// ([`FileHandle::seal`]), which no write through gex shortens -- a page
+    /// past its end would fault in the host. Valid while the handle lives.
+    fn map_fd(&self) -> Option<i32> {
+        None
+    }
+
     /// List a directory. Only directories implement this.
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)

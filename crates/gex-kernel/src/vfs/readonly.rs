@@ -84,13 +84,13 @@ impl FileSystem for ReadOnly {
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         match self.refuse_open(path, flags) {
             Some(e) => Err(e),
-            None => self.inner.open(path, flags & !oflags::O_CREAT, mode),
+            None => self.inner.open(path, flags & !oflags::O_CREAT, mode).inspect(|h| h.seal()),
         }
     }
     fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         match self.refuse_open(path, flags) {
             Some(e) => Err(e),
-            None => self.inner.open_mode(path, flags & !oflags::O_CREAT, mode),
+            None => self.inner.open_mode(path, flags & !oflags::O_CREAT, mode).inspect(|h| h.seal()),
         }
     }
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
