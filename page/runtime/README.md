@@ -855,12 +855,18 @@ and what the program's time is, and the page sends it at its `now` plus the
 difference (`output.send(data, performance.now() + (at - now) / 1e6)`).
 
 **Permissions.** `requestMIDIAccess` is what the browser asks the user for,
-and the page does not call it until a program asks (`hello`). A browser's
-second permission, for system exclusive messages, is asked for only when a
-program sends one (`sysex`), once, and the program's message waits for it;
-a program that only listens is given what the browser gives without it (a
-browser drops the system exclusive messages of an input until the second
-permission is held). `authorize` is the shell's own gate in front of both.
+and the page does not call it until a program asks (`hello`). The browser's
+second permission, for system exclusive messages, is asked for (`sysex`,
+once, however many programs and ports ask) when a program first connects an
+input port to a browser source (`listen`), so that a program that only
+listens is given the system exclusive an input sends, and when a program
+first sends a system exclusive message. The program does not wait for the
+answer: `listen` returns at once and plain messages flow meanwhile (the user
+may be being asked), system exclusive follows when the permission is given,
+and a message to be sent waits for it. If it is refused (or `sysex` is
+`'never'`), system exclusive from inputs is not delivered (the browser drops
+it) and the rest is, and nobody asks again. `authorize` is the shell's own
+gate in front of both.
 
 **What a program sees.** pyrus's CoreMIDI makes a device for each name
 among the browser's ports (the manufacturer and name Web MIDI gives; the

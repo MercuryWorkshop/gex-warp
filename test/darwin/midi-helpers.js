@@ -3,6 +3,7 @@
 // programs of fixtures/darwin/midi.c and midipeers.c in it.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+
 import { Midi } from '../../page/runtime/src/midi.js';
 import { bytesOf } from '../../page/runtime/src/internal.js';
 
@@ -12,6 +13,7 @@ export class FakePort extends EventTarget {
     super();
     Object.assign(this, { id, name, manufacturer: 'Acme', version: '1.0', type, state, connection: 'closed' });
     this.opened = 0;
+    this.gate = null; // (a browser drops system exclusive of an input until its second permission)
   }
   open() {
     this.opened++;
@@ -20,6 +22,7 @@ export class FakePort extends EventTarget {
   }
   /** A message from an input, as the browser delivers it. */
   fire(bytes) {
+    if (bytes[0] === 0xf0 && this.gate && !this.gate()) return;
     const e = new Event('midimessage');
     Object.defineProperty(e, 'data', { value: new Uint8Array(bytes) });
     Object.defineProperty(e, 'timeStamp', { value: performance.now() });
@@ -37,7 +40,7 @@ export class FakeOutput extends FakePort {
   }
 }
 
-export function fakeBrowser() {
+export function fakeBrowser({ denySysex = false } = {}) {
   const keys = new FakePort('in-keys', 'Fake Keys', 'input');
   const synth = new FakeOutput('out-synth', 'Fake Synth', 'output');
   const access = {
@@ -49,7 +52,17 @@ export function fakeBrowser() {
     },
   };
   const requests = [];
-  return { keys, synth, access, requests, request: async (o) => { requests.push({ ...o }); return access; } };
+  const b = { keys, synth, access, requests, sysexOK: false };
+  keys.gate = () => b.sysexOK;
+  b.request = async (o) => {
+    requests.push({ ...o });
+    if (o.sysex) {
+      if (denySysex) throw new Error('SecurityError');
+      b.sysexOK = true;
+    }
+    return access;
+  };
+  return b;
 }
 
 
@@ -77,3 +90,23 @@ export async function bootMidi(t, options) {
 
 export const ENV = { PATH: '/usr/bin:/bin', HOME: '/' };
 export const tail = (r) => r.stderr.trim().split('\n').slice(-3).join(' / ');
+
+/** The librarian of midi-sysex-*-page: two ports connected to the keyboard, a browser that grants the second permission or refuses it. */
+export async function listen(t, denySysex) {
+  const b = fakeBrowser({ denySysex });
+  const { sys, midi } = await bootMidi(t, { requestMIDIAccess: b.request });
+  const events = [];
+  let listens = 0, answered = false;
+  const fire = () => {
+    if (listens < 2 || !answered) return;
+    b.keys.fire([0x90, 0x3c, 0x64]);
+    b.keys.fire([0xf0, 0x7d, 0x10, 0xf7]);
+    b.keys.fire([0xb0, 0x07, 0x7f]);
+  };
+  midi.addEventListener('access', (e) => { events.push(`access ${e.sysex ? 'sysex' : 'plain'} ${e.granted}`); if (e.sysex) { answered = true; fire(); } });
+  midi.addEventListener('listen', (e) => { if (e.on) { events.push('listen'); listens++; fire(); } });
+  const r = await t.timeout(sys.run(['/usr/local/bin/midi', 'listen', denySysex ? '4' : '6'], { env: ENV, cwd: '/' }), 300000, 'the librarian');
+  await sys.shutdown();
+  return { r, b, events };
+}
+

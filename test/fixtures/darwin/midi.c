@@ -142,8 +142,52 @@ static int denied(void) {
     return 0;
 }
 
+// A librarian: it only listens. Two ports are connected to the keyboard, and
+// what they are given (system exclusive among it, when the browser's second
+// permission is held) is printed once N messages are in, and a moment more.
+static int cmp_lines(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static int listen_mode(int n) {
+    setvbuf(stdout, 0, _IONBF, 0);
+    MIDIClientRef c;
+    MIDIClientCreate(CFSTR("librarian"), 0, 0, &c);
+    MIDIEndpointRef keys = named("Fake Keys", 0);
+    printf("found: %d\n", keys != 0);
+    static char *lines[64];
+    static int nlines;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    got = dispatch_semaphore_create(0);
+    MIDIPortRef in[2];
+    for (long k = 0; k < 2; k++) {
+        MIDIInputPortCreateWithBlock(c, CFSTR("in"), &in[k], ^(const MIDIPacketList *l, void *r) {
+            const MIDIPacket *p = &l->packet[0];
+            for (unsigned i = 0; i < l->numPackets; i++, p = MIDIPacketNext(p)) {
+                char b[200];
+                int o = snprintf(b, sizeof b, "port %ld:", (long)r);
+                for (int j = 0; j < p->length; j++) o += snprintf(b + o, sizeof b - (size_t)o, " %02x", p->data[j]);
+                pthread_mutex_lock(&lock);
+                if (nlines < 64) lines[nlines++] = strdup(b);
+                pthread_mutex_unlock(&lock);
+                dispatch_semaphore_signal(got);
+            }
+        });
+        printf("connect %ld: %d\n", k + 1, (int)MIDIPortConnectSource(in[k], keys, (void *)(k + 1)));
+    }
+    for (int i = 0; i < n; i++)
+        if (dispatch_semaphore_wait(got, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC))) {
+            printf("only %d came\n", i);
+            break;
+        }
+    usleep(500000);
+    pthread_mutex_lock(&lock);
+    qsort(lines, (size_t)nlines, sizeof *lines, cmp_lines);
+    for (int i = 0; i < nlines; i++) printf("%s\n", lines[i]);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "denied")) return denied();
+    if (argc > 2 && !strcmp(argv[1], "listen")) return listen_mode(atoi(argv[2]));
     setvbuf(stdout, 0, _IONBF, 0);
     __block int arrived = 0, left = 0;
     MIDIClientRef c;
