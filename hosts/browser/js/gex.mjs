@@ -1070,7 +1070,8 @@ function memCapPages() {
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
 /** The spans of a map blob (`vma_blob` in the shim: u32 count, then per
- *  region u64 start, u64 end, u32 prot, a name and a code identity). */
+ *  region u64 start, u64 end, u32 prot, a name, a code identity and its
+ *  u64 stamp). */
 function vmaRegions(blob) {
   const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
   const out = [];
@@ -1082,7 +1083,7 @@ function vmaRegions(blob) {
     p += 20;
     p += 4 + dv.getUint32(p, true);
     const code = dv.getUint32(p, true);
-    p += 4 + code + 8;
+    p += 4 + code + 8 + 8;
     out.push({ start, end, prot });
   }
   return out;

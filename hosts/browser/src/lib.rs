@@ -808,6 +808,7 @@ pub(crate) fn refresh_ident_snapshot(p: &Px<'_>) {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut hasher);
         root_salt(&mut hasher, p.ns, id);
+        stamp_salt(&mut hasher, v.code_stamp);
         snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
@@ -6466,7 +6467,7 @@ pub extern "C" fn gex_vma_count() -> i32 {
 ///
 ///   u32 count, then per region:
 ///   u64 start, u64 end, u32 prot,
-///   u32 name_len, name, u32 code_len, code, u64 code_off
+///   u32 name_len, name, u32 code_len, code, u64 code_off, u64 code_stamp
 ///
 /// A zero `code_len` means no code identity. `origin` is deliberately absent:
 /// it is a claim about *this* process's mappings, not something to inherit.
@@ -6493,6 +6494,7 @@ fn vma_blob() -> Vec<u8> {
                 out.extend_from_slice(&0u64.to_le_bytes());
             }
         }
+        out.extend_from_slice(&v.code_stamp.to_le_bytes());
     }
     out
 }
@@ -6552,8 +6554,13 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 p += 8;
                 Some((id, off))
             };
+            if p + 8 > raw.len() {
+                return -1;
+            }
+            let stamp = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap());
+            p += 8;
             ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
-            mm.lock().adopt(start, end, prot, &name, code);
+            mm.lock().adopt(start, end, prot, &name, code, stamp);
         }
         0
     }
@@ -6971,6 +6978,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             let w = IMAGE_PROGRAM.0.borrow();
             (!w.is_empty()).then(|| w.clone())
         });
+        // (stamped as `do_exec` stamps what it reads, when the root has the
+        // file: `Vma::code_stamp`)
+        let stamp = whose.as_deref().map_or(0, |f| kernel.code_stamp_of(f));
         kernel.mem.lock().insert_loaded(
             seg.vaddr,
             seg.vaddr + seg.mem_size,
@@ -6978,6 +6988,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             "[image]",
             whose.map(|f| (f, seg.vaddr)),
         );
+        kernel.mem.lock().stamp_code(seg.vaddr, seg.vaddr + seg.mem_size, stamp);
     }
 
     // argv arrives as a NUL-separated blob in the shim's own region.
@@ -12923,7 +12934,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // space, and it goes back byte for byte.
     // (By the name every root has for it: two roots have a `/bin/sh`.)
     let key = snap_key(&h.kernel.vfs.outer_path(path), envp);
-    let linked = snap_lookup(key);
+    let linked = snap_lookup(key).filter(|blob| snap_files_current(&h.kernel, blob));
     // Headers only: each segment is read from its file straight into place
     // below, once the old image is gone. Reading the whole executable and its
     // interpreter into the heap, parsing their symbols and dynamic tables and
@@ -13118,6 +13129,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let mut data = guest();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
+    let mut stamps: Vec<(&str, u64)> = Vec::new();
     for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let len = len as usize;
         if !fresh && data.zero_dirty(seg.vaddr, seg.mem_size as usize).is_err() {
@@ -13150,6 +13162,20 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             "[image]",
             Some((from.unwrap_or(path).to_string(), seg.vaddr)),
         );
+        // And which contents of the file it was read from, as an `mmap` of
+        // it says: a program replaced at the path is other code by the same
+        // name, whose pages must not take the translations of the old one's
+        // (`Vma::code_stamp`).
+        let file = from.unwrap_or(path);
+        let stamp = match stamps.iter().find(|(f, _)| *f == file) {
+            Some(&(_, s)) => s,
+            None => {
+                let s = h.kernel.code_stamp_of(file);
+                stamps.push((file, s));
+                s
+            }
+        };
+        h.kernel.mem.lock().stamp_code(seg.vaddr, seg.vaddr + seg.mem_size, stamp);
     }
 
     // A wasm32 program is published before it runs: its magic, read where
@@ -13802,7 +13828,23 @@ static SNAP_FACTS: SingleThreaded<(u64, u64, u64, u64)> =
 /// `.data`, TLS template); read-only text is stored as a path to re-read.
 fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(b"SNP1");
+    out.extend_from_slice(b"SNP2");
+    // The files the space's code was read from, and which contents of each
+    // (`Vma::code_stamp`): a recording of a program, or of a library it
+    // links, since replaced at its path is not put back (`snap_files_current`).
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for v in h.kernel.mem.lock().vmas() {
+        if let Some((id, _)) = &v.code {
+            if v.code_stamp != 0 && !files.iter().any(|(f, s)| f == id && *s == v.code_stamp) {
+                files.push((id.clone(), v.code_stamp));
+            }
+        }
+    }
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (f, stamp) in &files {
+        snap_write_str(&mut out, f);
+        out.extend_from_slice(&stamp.to_le_bytes());
+    }
     out.extend_from_slice(&entry.to_le_bytes());
     let (phdr, phent, phnum, interp_base) = *SNAP_FACTS.0.borrow();
     for v in [phdr, phent, phnum, interp_base] {
@@ -13825,7 +13867,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     // arguments the next process has rather than carried, and the catcher
     // stub belongs to the process that recorded, not to the one that
     // restores.
-    let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, Option<(String, u64)>)> = h
+    let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, u64, Option<(String, u64)>)> = h
         .kernel
         .mem
         .lock()
@@ -13839,6 +13881,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 v.prot,
                 v.name.clone(),
                 v.code.clone(),
+                v.code_stamp,
                 // Re-readable only if never writable (the `origin` invariant,
                 // re-checked here): re-reading a page the linker wrote gives a
                 // restored process an unrelocated GOT.
@@ -13850,7 +13893,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
         .collect();
     out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
     let data = guest();
-    for (start, end, prot, name, code, origin) in regions {
+    for (start, end, prot, name, code, stamp, origin) in regions {
         out.extend_from_slice(&start.to_le_bytes());
         out.extend_from_slice(&end.to_le_bytes());
         out.extend_from_slice(&prot.to_le_bytes());
@@ -13860,6 +13903,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 out.extend_from_slice(&1u32.to_le_bytes());
                 snap_write_str(&mut out, id);
                 out.extend_from_slice(&off.to_le_bytes());
+                out.extend_from_slice(&stamp.to_le_bytes());
             }
             None => out.extend_from_slice(&0u32.to_le_bytes()),
         }
@@ -13915,10 +13959,15 @@ pub extern "C" fn gex_link_cost(out: u32) -> u32 {
 /// the caller loads the program the long way.
 fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     let mut p = 0usize;
-    if raw.get(0..4)? != b"SNP1" {
+    if raw.get(0..4)? != b"SNP2" {
         return None;
     }
     p += 4;
+    // (the files, which `snap_files_current` asked about)
+    for _ in 0..snap_read_u32(raw, &mut p)? {
+        snap_read_str(raw, &mut p)?;
+        snap_read_u64(raw, &mut p)?;
+    }
     let entry = snap_read_u64(raw, &mut p)?;
     let phdr = snap_read_u64(raw, &mut p)?;
     let phent = snap_read_u64(raw, &mut p)?;
@@ -13944,11 +13993,12 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let end = snap_read_u64(raw, &mut p)?;
         let prot = snap_read_u32(raw, &mut p)?;
         let name = snap_read_str(raw, &mut p)?;
-        let code = if snap_read_u32(raw, &mut p)? == 1 {
+        let (code, stamp) = if snap_read_u32(raw, &mut p)? == 1 {
             let id = snap_read_str(raw, &mut p)?;
-            Some((id, snap_read_u64(raw, &mut p)?))
+            let off = snap_read_u64(raw, &mut p)?;
+            (Some((id, off)), snap_read_u64(raw, &mut p)?)
         } else {
-            None
+            (None, 0)
         };
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
@@ -13973,6 +14023,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             let take = (b - a).min(bytes.len().saturating_sub(off as usize));
             data.write(a as u64, &bytes[off as usize..off as usize + take]).ok()?;
             h.kernel.mem.lock().insert_from(start, end, prot, &name, Some((path, off)));
+            h.kernel.mem.lock().stamp_code(start, end, stamp);
         } else {
             let len = snap_read_u32(raw, &mut p)? as usize;
             let pages = len.div_ceil(4096);
@@ -14004,7 +14055,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
                 }
             }
             wmark(a as u64, (b - a) as u64);
-            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
+            h.kernel.mem.lock().adopt(start, end, prot, &name, code, stamp);
             ms_copy += now_ns() - began;
             n_copy += end - start;
         }
@@ -14017,6 +14068,25 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         ms_copy / 1_000_000,
     );
     Some(LinkedImage { entry, phdr, phent, phnum, interp_base, x, sp, tpidr })
+}
+
+/// Whether every file a recorded address space's code was read from is
+/// still the file it was then ([`snap_take`]'s list): one replaced at its
+/// path since (a program or a library rebuilt, `cp` over it) is not put
+/// back, and the program is loaded the long way.
+fn snap_files_current(k: &Kernel, raw: &[u8]) -> bool {
+    let mut p = 4usize;
+    if raw.get(0..4) != Some(b"SNP2") {
+        return false;
+    }
+    let Some(n) = snap_read_u32(raw, &mut p) else { return false };
+    for _ in 0..n {
+        let (Some(f), Some(stamp)) = (snap_read_str(raw, &mut p), snap_read_u64(raw, &mut p)) else { return false };
+        if k.code_stamp_of(&f) != stamp {
+            return false;
+        }
+    }
+    true
 }
 
 /// Fetch the linked image of `key` out of the global kernel.
@@ -14128,6 +14198,7 @@ fn object_identity_mode(p: &Px<'_>, addr: u64, alt: bool) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     root_salt(&mut hasher, p.ns, id);
+    stamp_salt(&mut hasher, v.code_stamp);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);
     let key = hasher.finish();
@@ -14195,6 +14266,20 @@ fn root_salt(h: &mut impl std::hash::Hasher, ns: &gex_kernel::vfs::Namespace, id
     if root != "/" && !id.starts_with(gex_kernel::mem::CONTENT_ID) {
         h.write_u8(0x2f);
         h.write(root.as_bytes());
+    }
+}
+
+/// Which contents of the file in a code identity ([`gex_kernel::mem::Vma::code_stamp`]):
+/// a program or library replaced at its path is other code by the same
+/// name, and keyed apart, its pages given no base and no module the old
+/// file's code was translated into (they ran the old program's
+/// translations, and died). Every process that maps the file unchanged
+/// stamps it alike, so they still share. Nothing for code with no stamp
+/// (named by its bytes, or loaded where nothing asked the file).
+fn stamp_salt(h: &mut impl std::hash::Hasher, stamp: u64) {
+    if stamp != 0 {
+        h.write_u8(0x5e);
+        h.write_u64(stamp);
     }
 }
 
@@ -14621,6 +14706,7 @@ fn page_identity_mode(p: &Px<'_>, page: u64, alt: bool) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     root_salt(&mut hasher, p.ns, id);
+    stamp_salt(&mut hasher, v.code_stamp);
     (off + (page - v.start)).hash(&mut hasher);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);

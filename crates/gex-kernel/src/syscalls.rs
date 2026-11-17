@@ -5525,15 +5525,17 @@ impl MapIo<'_> {
             // The path and offset travel with the mapping. Two processes
             // that map the same library at the same address then agree that
             // the code is the same, which is what lets them share the
-            // dispatch slots it was translated into.
-            let start = self.mem.lock().mmap_from(
-                addr,
-                len_aligned,
-                prot_bits,
-                flags,
-                &name,
-                Some((name.clone(), offset)),
-            )?;
+            // dispatch slots it was translated into. And which contents of
+            // the file, asked before they are read (outside the lock: file
+            // I/O): a file replaced at the path is other code by the same
+            // name (`Vma::code_stamp`).
+            let stamp = file.handle.metadata_changes().map_or(0, |(md, changes)| crate::mem::code_stamp(&md, changes));
+            let start = {
+                let mut mm = self.mem.lock();
+                let start = mm.mmap_from(addr, len_aligned, prot_bits, flags, &name, Some((name.clone(), offset)))?;
+                mm.stamp_code(start, start + len_aligned, stamp);
+                start
+            };
             if let Some((path, base)) = pinned {
                 // Said as it happens: the end-of-run report is lost when the
                 // process is killed (a run ended by its timeout).
@@ -11599,6 +11601,17 @@ impl Kernel {
             done += n;
         }
         Some(done)
+    }
+
+    /// [`crate::mem::code_stamp`] of `path` as it is now: what a loader that
+    /// reads code out of it rather than mapping it stamps its mappings with
+    /// (`MemoryMap::stamp_code`). 0 when there is no such file.
+    pub fn code_stamp_of(&self, path: &str) -> u64 {
+        self.vfs
+            .open(path, 0, 0)
+            .ok()
+            .and_then(|h| h.metadata_changes().ok())
+            .map_or(0, |(md, changes)| crate::mem::code_stamp(&md, changes))
     }
 
     /// The first `n` bytes of `path` (fewer for a shorter file).
