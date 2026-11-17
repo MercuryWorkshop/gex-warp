@@ -873,6 +873,13 @@ impl Kernel {
             // and one entered by name (call 1): there is each, and it is
             // entered, as above.
             d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && (x[1] == 1 || x[1] == 22) => Ok(0),
+            // Quarantine's: what quarantine a process (calls 0x54, itself,
+            // and 0x55, another), a file by path or descriptor (0x50, 0x52)
+            // or a volume (0x58) has: none, ENOATTR, which libquarantine
+            // takes for "not quarantined" -- nothing here is. (Not there,
+            // ENOSYS, it hands back as a failure, and colorsyncd, asking
+            // for its own as it enters its sandbox, gives up.)
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Quarantine") && matches!(x[1], 0x50 | 0x52 | 0x54 | 0x55 | 0x58) => Err(abi::K_ENOATTR),
             d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
             d::GETATTRLISTBULK => self.darwin_getattrlistbulk(m, x[0] as i32, x[1], x[2], x[3], x[4]),
