@@ -371,11 +371,16 @@ impl Kernel {
         // The kernel's and a process's page shift.
         page[0x4d] = 12;
         page[0x4e] = 12;
-        // The counter is the wall clock in nanoseconds; the kernel's clock
-        // is that less where it began.
-        let (secs, nanos) = (self.clock)();
+        // The counter is the host's wall clock in nanoseconds (the time
+        // stamp counter as the translation reads it); the kernel's clock is
+        // that less where it began. (The host's: the guest's own date,
+        // GEX_DATE, is the time of day's below, and a base of it would put
+        // every absolute time read from the counter years from the
+        // kernel's, and no timer would ever come.)
+        let (host_secs, host_nanos) = (self.clock)();
         let now = clock_ns(self.clock, 1);
-        let base = (secs * 1_000_000_000 + nanos as u64).wrapping_sub(now);
+        let base = (host_secs * 1_000_000_000 + host_nanos as u64).wrapping_sub(now);
+        let (secs, nanos) = crate::syscalls::guest_wall((host_secs, host_nanos));
         page[0x50..0x58].copy_from_slice(&base.to_le_bytes());
         page[0x58..0x5c].copy_from_slice(&0x8000_0000u32.to_le_bytes());
         page[0x5c..0x60].copy_from_slice(&1u32.to_le_bytes());

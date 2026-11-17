@@ -533,7 +533,7 @@ impl Kernel {
                     if x[3] as u32 != 0 {
                         ns
                     } else {
-                        let (secs, nanos) = (self.clock)();
+                        let (secs, nanos) = crate::syscalls::guest_wall((self.clock)());
                         ns.saturating_sub(secs * 1_000_000_000 + nanos as u64)
                     }
                 });
@@ -795,7 +795,7 @@ impl Kernel {
             }
             d::SIGALTSTACK => self.darwin_sigaltstack(m, x[0], x[1]),
             d::GETTIMEOFDAY => {
-                let (secs, nanos) = (self.clock)();
+                let (secs, nanos) = crate::syscalls::guest_wall((self.clock)());
                 if x[0] != 0 {
                     m.write_u64(x[0], secs)?;
                     m.write_u64(x[0] + 8, (nanos / 1000) as u64)?;

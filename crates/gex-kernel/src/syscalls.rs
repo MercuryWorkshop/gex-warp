@@ -1335,8 +1335,9 @@ pub fn set_guest_clock(scale: f64, wall_shift: i64) {
     WALL_SHIFT.store(wall_shift, Ordering::Relaxed);
 }
 
-/// The wall clock as the guest reads it: see [`set_guest_clock`].
-fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
+/// The wall clock as the guest reads it: see [`set_guest_clock`] and
+/// [`set_guest_date`].
+pub fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
     let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
     (secs.wrapping_sub(shift as u64), nanos)
 }
@@ -10222,18 +10223,14 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
     set_result(m, ctx_addr, v as u64).is_ok()
 }
 
-/// Seconds the guest's wall clock is behind the host's: 0, or what
-/// [`set_guest_date`] made it.
-static DATE_SHIFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
 /// The guest's wall clock starts at `epoch_secs` (and runs at real time
 /// from there): a system of another time sees its own, as an old macOS
-/// whose code-signing certificates have expired since needs to. Set it
-/// before anything reads a clock (the monotonic clocks take their base
-/// from the first reading).
+/// whose code-signing certificates have expired since needs to. Only the
+/// wall clock ([`guest_wall`]): the monotonic clocks, and every deadline
+/// and wait on them, are as they were.
 pub fn set_guest_date(epoch_secs: i64) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    DATE_SHIFT.store(now - epoch_secs, std::sync::atomic::Ordering::Relaxed);
+    WALL_SHIFT.store(now - epoch_secs, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A date as `GEX_DATE` gives it: seconds since the epoch, or a day
@@ -10262,8 +10259,7 @@ pub fn system_clock() -> (u64, u32) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let shift = DATE_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
-        (now.as_secs().saturating_add_signed(-shift), now.subsec_nanos())
+        (now.as_secs(), now.subsec_nanos())
     }
     // Standing still is wrong but it is not a panic, and a host that cares
     // replaces this.

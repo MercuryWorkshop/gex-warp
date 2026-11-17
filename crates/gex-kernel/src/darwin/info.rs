@@ -741,7 +741,7 @@ impl Kernel {
             "kern.clockrate" => Bytes([100i32, 10000, 0, 100, 100].iter().flat_map(|v| v.to_le_bytes()).collect()),
             // A `struct timeval`: when the monotonic clock was zero.
             "kern.boottime" => {
-                let (secs, nanos) = (self.clock)();
+                let (secs, nanos) = crate::syscalls::guest_wall((self.clock)());
                 let boot = (secs * 1_000_000_000 + nanos as u64).saturating_sub(clock_ns(self.clock, 1));
                 let mut b = (boot / 1_000_000_000).to_le_bytes().to_vec();
                 b.extend_from_slice(&(boot % 1_000_000_000 / 1000).to_le_bytes());
