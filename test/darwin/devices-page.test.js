@@ -144,15 +144,17 @@ class MockNavigatorPart extends EventTarget {
 export default async function (t) {
   const { eq, check, timeout } = t;
   const arch = t.arch === 'x86' ? 'x86' : 'aarch64';
-  let prog, usbProg;
+  let prog, usbProg, libProg;
   try {
     prog = await bytesOf(t.work(`darwin-iodevices.${arch}`));
     usbProg = await bytesOf(t.work(`darwin-iousb.${arch}`));
+    libProg = await bytesOf(t.work(`darwin-iousblib.${arch}`));
   } catch {
     t.skip(`no Mac root or no Mac compiler for ${t.arch} (GEX_TEST_DARWIN_ROOT${t.arch === 'x86' ? '_X86' : ''}: pyrus builds one)`);
   }
   const want = readFileSync(join(import.meta.dirname, '..', 'fixtures', 'darwin', 'iodevices.expected'), 'utf8');
   const wantUSB = readFileSync(join(import.meta.dirname, '..', 'fixtures', 'darwin', 'iousb.expected'), 'utf8');
+  const wantLib = readFileSync(join(import.meta.dirname, '..', 'fixtures', 'darwin', 'iousblib.expected'), 'utf8');
   const { arch: _, ...debug } = t.debug();
 
   // The descriptor made again of the collections: the same items' sizes.
@@ -168,7 +170,7 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, arch, debug });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work(`darwin-root.${arch}.tar`));
-  fs.addFiles({ '/usr/local/bin/iodevices': prog, '/usr/local/bin/iousb': usbProg }, { mode: 0o755 });
+  fs.addFiles({ '/usr/local/bin/iodevices': prog, '/usr/local/bin/iousb': usbProg, '/usr/local/bin/iousblib': libProg }, { mode: 0o755 });
   const devices = new Devices(sys);
   const events = [];
   for (const type of ['add', 'remove', 'open', 'close']) devices.addEventListener(type, ({ id }) => events.push(`${type} ${id}`));
@@ -249,5 +251,15 @@ export default async function (t) {
     'usb open', 'usb control in vendor device 1 16', 'usb control out vendor device 2 01 02 03', 'usb claim 0', 'usb out 2 61 62 63 64 65 66', 'usb in 1 16',
     'usb out 2 78 79 7a', 'usb in 1 8', 'usb in 3 8', 'usb clear in 3', 'usb alternate 0 0', 'usb release 0', 'usb close',
     'usb open', 'usb control out vendor device 127 ', 'usb close']);
+
+  // USB through IOUSBLib's plug-in interfaces, as libusb uses them.
+  const llog = [];
+  const ld = usbDevice(llog);
+  devices.add(ld, { kind: 'usb' });
+  const lr = await run('IOUSBLib', '/usr/local/bin/iousblib');
+  eq('the program, with IOUSBLib', lr.stdout, wantLib, lr.stderr.trim().split('\n').slice(-3).join(' / '));
+  eq('the device, through IOUSBLib', llog, [
+    'usb open', 'usb control in vendor device 1 16', 'usb claim 0', 'usb out 2 68 65 6c 6c 6f 21', 'usb in 1 32', 'usb out 2 61 73 79 6e 63', 'usb in 1 32',
+    'usb in 3 8', 'usb clear in 3', 'usb release 0', 'usb close']);
   await sys.shutdown();
 }

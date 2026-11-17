@@ -886,8 +886,9 @@ shell's answers (`hosts/native/src/notify.rs`: `authorize grant|deny|provisional
 `Devices` (`@gexemu/runtime/devices`): the devices the page's shell lets
 programs have, the service `devices`. A Mac program's IOKit (pyrus's) lists
 them in its registry and hears them arrive and leave as a Mac's hears a
-device plugged in and pulled out; its HID manager and IOUSBHost open them
-and move their reports and transfers through this. One seam for every
+device plugged in and pulled out; its HID manager, IOUSBHost and IOUSBLib's
+plug-in interfaces (libusb's way in) open them and move their reports and
+transfers through this. One seam for every
 transport: a **source** adds a device and removes it. `WebHIDSource`
 (`@gexemu/runtime/devices-webhid`) and `WebUSBSource`
 (`@gexemu/runtime/devices-webusb`) are the browser's; a test or a shell may
@@ -999,9 +1000,9 @@ browser's, said here rather than hidden:
 Natively gexc offers no devices (a stand-in for tests would be a `Service`
 of hosts/native, as `GEX_NOTIFY` is notifications'): a program's registry
 there is the system's entries alone. The page's test is
-`test/darwin/devices-page` (fixtures/darwin/iodevices.c and iousb.m, run
-with devices of the test's own and through mocked `navigator.hid` and
-`navigator.usb`).
+`test/darwin/devices-page` (fixtures/darwin/iodevices.c, iousb.m and
+iousblib.c, run with devices of the test's own and through mocked
+`navigator.hid` and `navigator.usb`).
 
 ## Audio
 
