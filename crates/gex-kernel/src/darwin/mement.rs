@@ -29,6 +29,11 @@
 //!   whole range is on pages a host can share.
 //! - `MAP_MEM_VM_COPY` names a copy of the memory as it is now.
 //! - A parent entry: a range of its object.
+//! - `MAP_MEM_USE_DATA_ADDR` (and `MAP_MEM_4K_DATA_ADDR`, the same with
+//!   the guest's pages 4 KiB): the offset is the data's address, and the
+//!   entry keeps where in its page the data begins, which a mapping asked
+//!   for with `VM_FLAGS_RETURN_DATA_ADDR` adds to the address it answers
+//!   (CoreAnimation names a layer's backing so, for WindowServer to map).
 //!
 //! A mapping of an entry is placed so that its address is on the host's
 //! page where its offset in the object is, and covers the object's host
@@ -66,6 +71,8 @@ pub(super) struct Entry {
     pub offset: u64,
     pub size: u64,
     pub prot: u32,
+    /// Where in its first page the data begins (`MAP_MEM_USE_DATA_ADDR`).
+    pub data: u64,
 }
 
 /// The entries, by the handle their port carries ([`Kind::MemEntry`]); one
@@ -122,20 +129,23 @@ impl Kernel {
         let page = abi::PAGE_SIZE;
         let mut prot = permission & 7;
         let masked = permission & VM_PROT_IS_MASK != 0;
-        if permission & (MAP_MEM_ONLY | MAP_MEM_USE_DATA_ADDR | MAP_MEM_4K_DATA_ADDR) != 0 {
-            // (A change of caching, and an entry that keeps the data's own
-            // offset in its page: none asks for these yet.)
+        if permission & MAP_MEM_ONLY != 0 {
+            // (A change of caching: none asks for one yet.)
             return Err(KERN_INVALID_ARGUMENT);
         }
         let start = offset & !(page - 1);
         let end = offset.checked_add(size).and_then(|e| e.checked_next_multiple_of(page)).ok_or(KERN_INVALID_ARGUMENT)?;
         let len = end - start;
+        // The data's place in its page, kept by an entry that asks; its
+        // size is then from there (XNU's `size - data_offset`).
+        let data = if permission & (MAP_MEM_USE_DATA_ADDR | MAP_MEM_4K_DATA_ADDR) != 0 { offset - start } else { 0 };
+        let made = |e: Entry| -> Result<(Arc<Port>, u64), u64> { Ok((port_for(Entry { data, ..e }), len - data)) };
         if permission & MAP_MEM_NAMED_CREATE != 0 {
             if permission & MAP_MEM_PURGABLE != 0 && prot & crate::mem::prot::WRITE == 0 {
                 return Err(KERN_INVALID_ARGUMENT);
             }
             let file = new_object(len)?;
-            return Ok((port_for(Entry { file, offset: 0, size: len, prot }), len));
+            return made(Entry { file, offset: 0, size: len, prot, data: 0 });
         }
         // A range of a parent entry's object.
         if let Some(parent) = parent {
@@ -149,8 +159,7 @@ impl Kernel {
             } else if prot & p.prot != prot {
                 return Err(KERN_PROTECTION_FAILURE);
             }
-            let e = Entry { file: p.file.clone(), offset: p.offset + start, size: len, prot };
-            return Ok((port_for(e), len));
+            return made(Entry { file: p.file.clone(), offset: p.offset + start, size: len, prot, data: 0 });
         }
         // The task's own memory: every page of it mapped, with what the
         // entry is to allow.
@@ -181,16 +190,16 @@ impl Kernel {
             mm.log.shared_maps.iter().find(|s| s.start <= lo && hi <= s.start + s.len).map(|s| (s.file.clone(), s.offset + (lo - s.start)))
         };
         if let Some((file, offset)) = mapped {
-            return Ok((port_for(Entry { file, offset, size: len, prot }), len));
+            return made(Entry { file, offset, size: len, prot, data: 0 });
         }
         let bytes = m.read(lo, len as usize).map_err(|_| KERN_INVALID_ADDRESS)?.to_vec();
         if permission & MAP_MEM_VM_COPY != 0 {
             let file = new_object(len)?;
             file.handle.write_at(0, &bytes).map_err(|_| KERN_RESOURCE_SHORTAGE)?;
-            return Ok((port_for(Entry { file, offset: 0, size: len, prot }), len));
+            return made(Entry { file, offset: 0, size: len, prot, data: 0 });
         }
         let (file, offset) = self.darwin_share_in_place(m, lo, hi, &parts)?;
-        Ok((port_for(Entry { file, offset, size: len, prot }), len))
+        made(Entry { file, offset, size: len, prot, data: 0 })
     }
 
     /// The task's private memory `[lo, hi)` (its mappings `parts`: start,
@@ -248,6 +257,9 @@ impl Kernel {
     pub(super) fn darwin_map_entry(&mut self, m: &mut GuestMem<'_>, e: &Entry, want: u64, size: u64, mask: u64, flags: u64, offset: u64, copy: bool, cur: u32) -> Result<u64, u64> {
         const VM_FLAGS_ANYWHERE: u64 = 1;
         const VM_FLAGS_OVERWRITE: u64 = 0x4000;
+        // The address answered is the data's, where the entry keeps it.
+        const VM_FLAGS_RETURN_DATA_ADDR: u64 = 0x10_0000;
+        let data = if flags & VM_FLAGS_RETURN_DATA_ADDR != 0 { e.data } else { 0 };
         let page = abi::PAGE_SIZE;
         if offset % page != 0 || offset > e.size {
             return Err(KERN_INVALID_ARGUMENT);
@@ -311,6 +323,6 @@ impl Kernel {
             Ok(at + (foff - flo))
         })();
         let _ = self.fds.close(fd);
-        r.map(gex_abi::guest_addr)
+        r.map(|at| gex_abi::guest_addr(at) + data)
     }
 }

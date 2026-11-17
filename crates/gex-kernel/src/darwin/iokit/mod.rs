@@ -983,7 +983,7 @@ impl Kernel {
                             }
                             Arc::clone(&v.as_ref().unwrap().0)
                         };
-                        let e = super::mement::Entry { file, offset: 0, size, prot: 3 };
+                        let e = super::mement::Entry { file, offset: 0, size, prot: 3, data: 0 };
                         let at = match self.darwin_map_entry(m, &e, 0, size, 0, 1, 0, false, 3) {
                             Ok(at) => at,
                             Err(_) => return fail(0xe000_02bd_u32 as i32),
@@ -1137,7 +1137,7 @@ static COMM_PAGE: Mutex<Option<Arc<crate::file::OpenFile>>> = Mutex::new(None);
 impl Kernel {
     /// Surface `s`'s memory mapped into this task, shared: its address.
     fn darwin_map_surface(&mut self, m: &mut GuestMem<'_>, file: &Arc<crate::file::OpenFile>, total: u64) -> Result<u64, i32> {
-        let e = super::mement::Entry { file: Arc::clone(file), offset: 0, size: total, prot: 3 };
+        let e = super::mement::Entry { file: Arc::clone(file), offset: 0, size: total, prot: 3, data: 0 };
         self.darwin_map_entry(m, &e, 0, total, 0, 1, 0, false, 3).map_err(|_| surface::NO_MEMORY)
     }
 
@@ -1481,7 +1481,7 @@ impl Kernel {
                         Arc::clone(c.as_ref().unwrap())
                     };
                     let size = page.next_multiple_of(crate::mem::share_granule().max(page));
-                    let e = super::mement::Entry { file, offset: 0, size, prot: 1 };
+                    let e = super::mement::Entry { file, offset: 0, size, prot: 1, data: 0 };
                     sc.comm_page = self.darwin_map_entry(m, &e, 0, size, 0, 1, 0, false, 1).map_err(|_| surface::NO_MEMORY)?;
                 }
                 Ok((vec![sc.comm_page], Vec::new()))

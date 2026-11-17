@@ -41,6 +41,9 @@ enum { SEND_MSG = 1, RCV_MSG = 2, RCV_TIMEOUT = 0x100 };
 #define RCV_INTERRUPTED 0x10004005
 #define NAMED_CREATE 0x20000u
 #define VM_COPY 0x200000u
+#define VM_SHARE 0x400000u
+#define USE_DATA_ADDR 0x100000u
+#define RETURN_DATA_ADDR 0x100000u
 #define R 1u
 #define RW 3u
 
@@ -108,9 +111,9 @@ static long make_entry(u64 *size, u64 offset, u32 permission, u32 *entry, u32 pa
     return 0;
 }
 
-// mach_vm_map(task, &address, size, 0, VM_FLAGS_ANYWHERE, entry, offset,
-// copy, cur, cur, VM_INHERIT_DEFAULT).
-static long map_entry(u64 *address, u64 size, u32 entry, u64 offset, u32 copy, u32 cur) {
+// mach_vm_map(task, &address, size, 0, flags, entry, offset, copy, cur,
+// cur, VM_INHERIT_DEFAULT); map_entry with VM_FLAGS_ANYWHERE.
+static long map_entry_flags(u64 *address, u64 size, u32 entry, u64 offset, u32 copy, u32 cur, u32 flags) {
     static struct message m;
     t_memset(&m, 0, sizeof m);
     m.h.id = 4811, m.h.bits = COMPLEX;
@@ -120,7 +123,7 @@ static long map_entry(u64 *address, u64 size, u32 entry, u64 offset, u32 copy, u
     put64(m.body + 6, 0);
     put64(m.body + 8, size);
     put64(m.body + 10, 0);
-    m.body[12] = 1;
+    m.body[12] = flags;
     put64(m.body + 13, offset);
     m.body[15] = copy, m.body[16] = cur, m.body[17] = cur, m.body[18] = 1;
     long r = rpc(&m, sizeof m.h + 76);
@@ -128,6 +131,10 @@ static long map_entry(u64 *address, u64 size, u32 entry, u64 offset, u32 copy, u
     if (m.body[2]) return (long)m.body[2];
     *address = get64(m.body + 3);
     return 0;
+}
+
+static long map_entry(u64 *address, u64 size, u32 entry, u64 offset, u32 copy, u32 cur) {
+    return map_entry_flags(address, size, entry, offset, copy, cur, 1);
 }
 
 // mach_vm_read(task, address, size, &data, &count).
@@ -182,6 +189,20 @@ static void one_task(void) {
     }
     t_printf("a range past the entry's end: %ld\n", map_entry(&cp, PAGE, e, PAGE, 0, RW));
     t_printf("more than the whole entry: %ld\n", map_entry(&cp, 2 * PAGE, e, 0, 0, RW));
+
+    // An entry of the data's address (MAP_MEM_VM_SHARE and
+    // MAP_MEM_USE_DATA_ADDR, as CoreAnimation names a layer's backing for
+    // WindowServer), and a mapping of it that answers the data's address
+    // (VM_FLAGS_RETURN_DATA_ADDR).
+    size = 100;
+    u32 de = 0;
+    r = make_entry(&size, (u64)base + PAGE + 48, RW | VM_SHARE | USE_DATA_ADDR, &de, 0);
+    t_printf("an entry of the data's address: %ld, its size from the data to its page's end: %s\n", r, yes(!r && size == PAGE - 48));
+    if (!r) {
+        u64 da = 0;
+        r = map_entry_flags(&da, size, de, 0, 0, RW, 1 | RETURN_DATA_ADDR);
+        t_printf("mapped for the data's address: %ld, the data there: %s\n", r, yes(!r && (da & (PAGE - 1)) == 48 && ((u8 *)da)[0] == 'b'));
+    }
 
     // Memory made for the entry, of a size that is not whole pages.
     u32 made = 0;
