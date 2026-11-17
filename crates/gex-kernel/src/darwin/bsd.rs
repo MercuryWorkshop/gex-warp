@@ -854,9 +854,18 @@ impl Kernel {
             // Any other policy or call is not there.
             // (Its arguments begin with where the answer goes: nothing
             // denied.)
+            // But a file System Integrity Protection keeps is one nobody
+            // may write, sandboxed or not: a check of writing one by its
+            // path is denied. libsystem_sandbox's `rootless_check_trusted`
+            // (and `gpu_bundle_is_path_trusted`) asks so of launchd (pid 1)
+            // and takes a file it may not write for trusted. The system's
+            // own files are kept (`sip_protected`): CVMServer loads a
+            // compiler plug-in of OpenCL's only from a trusted path, and
+            // fails every CPU build otherwise.
             d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && x[1] == 2 => {
                 let out = m.read_u64(x[2])?;
-                m.write_u64(out, 0).map(|_| 0)
+                let denied = self.darwin_rootless_denies(m, x[2])?;
+                m.write_u64(out, denied as u64).map(|_| 0)
             }
             // And rootless_convert_to_datavault (0x104): a directory made a
             // data vault, which nothing here protects, is taken as made one
@@ -933,6 +942,22 @@ impl Kernel {
     /// numbers (`<sys/unistd.h>`).
     /// `pathconf`'s answers for a file on a filesystem that looks names up
     /// without regard to case, or not.
+    /// Whether a sandbox check (`__mac_syscall("Sandbox", 2, args)`) is
+    /// of writing a protected file, and so denied. The arguments, a word
+    /// each: where the answer goes, the process asked about, the operation
+    /// ("file-write-data"), the filter's type (1, a path) and the path.
+    fn darwin_rootless_denies(&self, m: &GuestMem<'_>, args: u64) -> Result<bool, Errno> {
+        if m.read_u64(args + 24)? != 1 {
+            return Ok(false);
+        }
+        let op = m.read_cstr(m.read_u64(args + 16)?, 64)?;
+        if !op.starts_with(b"file-write") {
+            return Ok(false);
+        }
+        let path = m.read_cstr(m.read_u64(args + 32)?, 4096)?;
+        Ok(sip_protected(&path))
+    }
+
     fn darwin_pathconf(&mut self, name: u64, case_insensitive: bool) -> SysResult {
         Ok(match name {
             1 => 32767,       // _PC_LINK_MAX
@@ -1389,5 +1414,36 @@ impl Kernel {
             m.write_u64(basep, before)?;
         }
         Ok(out.len() as u64)
+    }
+}
+
+/// Whether System Integrity Protection keeps a file, by its absolute path:
+/// what is in /System, /usr (but /usr/local), /bin and /sbin, as macOS
+/// 10.14's rootless configuration has it. (A path with ".." in it is not
+/// taken for one.)
+pub(crate) fn sip_protected(path: &[u8]) -> bool {
+    let Ok(path) = std::str::from_utf8(path) else { return false };
+    if !path.starts_with('/') || path.split('/').any(|c| c == "..") {
+        return false;
+    }
+    let under = |dir: &str| path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    (under("/System") || under("/usr") || under("/bin") || under("/sbin")) && !under("/usr/local")
+}
+
+#[cfg(test)]
+mod sip_tests {
+    use super::sip_protected;
+
+    #[test]
+    fn the_system_is_protected() {
+        assert!(sip_protected(b"/System/Library/Frameworks/OpenCL.framework/Libraries/libCLVMCPUPlugin.dylib"));
+        assert!(sip_protected(b"/usr/lib/libSystem.B.dylib"));
+        assert!(sip_protected(b"/bin/sh"));
+        assert!(sip_protected(b"/System"));
+        assert!(!sip_protected(b"/usr/local/lib/x.dylib"));
+        assert!(!sip_protected(b"/Library/GPUBundles/x.bundle"));
+        assert!(!sip_protected(b"/Systemic"));
+        assert!(!sip_protected(b"/System/../tmp/x"));
+        assert!(!sip_protected(b"System/Library"));
     }
 }
