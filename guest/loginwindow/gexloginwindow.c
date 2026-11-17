@@ -28,12 +28,17 @@
 //   ordered in above this one's: the desktop's level is WindowServer's
 //   own to draw, and shows nothing of a window put there.)
 //
-//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-t SECS] [-- PROGRAM [ARG...]]
+//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-t SECS] [-w SECS] [-- PROGRAM [ARG...]]
 //
 // -s starts a program of the session's own first, as the user, and does
 // not wait for it: the Dock, SystemUIServer and the Finder, as loginwindow
 // has the session's launchd start them (their jobs offered by gexlaunchd
 // -o, for them to check in to).
+//
+// -w SECS looks at WindowServer's windows every SECS and says them, each
+// time they have changed: whose they are, where, their level, whether they
+// are on the screen (whether an application's window was made and ordered
+// in).
 //
 // It says what it does on stdout, a line each, and then stays, as
 // loginwindow does: the session ends with it.
@@ -66,6 +71,53 @@ enum {
     kBackingBuffered = 2,
     kOrderAbove = 1,
 };
+
+// The windows WindowServer has, a line each (`CGWindowListCopyWindowInfo`
+// of them all), said when they are not as they were the last time.
+static char *windows_said;
+
+static void say_windows(void) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID);
+    size_t cap = 256, len = 0;
+    char *out = malloc(cap);
+    out[0] = 0;
+    CFIndex n = list ? CFArrayGetCount(list) : 0;
+    for (CFIndex i = 0; i < n; i++) {
+        CFDictionaryRef w = CFArrayGetValueAtIndex(list, i);
+        int number = 0, pid = 0, layer = 0, onscreen = 0;
+        double alpha = 0;
+        CFNumberRef v;
+        if ((v = CFDictionaryGetValue(w, kCGWindowNumber))) CFNumberGetValue(v, kCFNumberIntType, &number);
+        if ((v = CFDictionaryGetValue(w, kCGWindowOwnerPID))) CFNumberGetValue(v, kCFNumberIntType, &pid);
+        if ((v = CFDictionaryGetValue(w, kCGWindowLayer))) CFNumberGetValue(v, kCFNumberIntType, &layer);
+        if ((v = CFDictionaryGetValue(w, kCGWindowAlpha))) CFNumberGetValue(v, kCFNumberDoubleType, &alpha);
+        CFBooleanRef on = CFDictionaryGetValue(w, kCGWindowIsOnscreen);
+        onscreen = on && CFBooleanGetValue(on);
+        CGRect r = CGRectZero;
+        CFDictionaryRef b = CFDictionaryGetValue(w, kCGWindowBounds);
+        if (b) CGRectMakeWithDictionaryRepresentation(b, &r);
+        char owner[64] = "", title[64] = "";
+        CFStringRef s = CFDictionaryGetValue(w, kCGWindowOwnerName);
+        if (s) CFStringGetCString(s, owner, sizeof owner, kCFStringEncodingUTF8);
+        s = CFDictionaryGetValue(w, kCGWindowName);
+        if (s) CFStringGetCString(s, title, sizeof title, kCFStringEncodingUTF8);
+        char line[256];
+        int k = snprintf(line, sizeof line, "gexloginwindow: window %d of %d (%s) \"%s\": %.0fx%.0f at %.0f,%.0f, layer %d, alpha %.2f, %s\n", number, pid,
+                         owner, title, r.size.width, r.size.height, r.origin.x, r.origin.y, layer, alpha, onscreen ? "on screen" : "off screen");
+        if (k < 0) continue;
+        if (len + (size_t)k + 1 > cap) out = realloc(out, cap = (len + k + 1) * 2);
+        memcpy(out + len, line, (size_t)k + 1);
+        len += (size_t)k;
+    }
+    if (list) CFRelease(list);
+    if (windows_said && !strcmp(windows_said, out)) {
+        free(out);
+        return;
+    }
+    printf("gexloginwindow: %ld windows\n%s", (long)n, out);
+    free(windows_said);
+    windows_said = out;
+}
 
 static void say_session(const char *when) {
     auditinfo_addr_t ai;
@@ -104,7 +156,7 @@ int main(int argc, char **argv) {
     char **program = NULL;
     const char *session[8];
     int nsession = 0;
-    int ticks = 0;
+    int ticks = 0, looks = 0;
     for (int i = 1; i < argc; i += 2) {
         if (!strcmp(argv[i], "--")) {
             if (i + 1 < argc) program = argv + i + 1;
@@ -118,6 +170,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-n")) name = argv[i + 1];
         else if (!strcmp(argv[i], "-s") && nsession < 8) session[nsession++] = argv[i + 1];
         else if (!strcmp(argv[i], "-t")) ticks = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "-w")) looks = atoi(argv[i + 1]);
     }
     say_session("at the start");
 
@@ -218,6 +271,15 @@ int main(int argc, char **argv) {
             printf("gexloginwindow: tick %d, the square %s\n", n, n % 2 ? "black" : "white");
         });
         dispatch_resume(timer);
+    }
+    if (looks > 0) {
+        say_windows();
+        dispatch_source_t look = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(look, dispatch_time(DISPATCH_TIME_NOW, (int64_t)looks * NSEC_PER_SEC), (uint64_t)looks * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+        dispatch_source_set_event_handler(look, ^{
+            say_windows();
+        });
+        dispatch_resume(look);
     }
     if (!program) dispatch_main();
     pid_t pid = start_as(program, user, group, name, home, pw);
