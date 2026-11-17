@@ -5340,12 +5340,13 @@ impl MapIo<'_> {
         r
     }
 
-    /// A private mapping of a file not to be written (`len` bytes at `start`
-    /// from `offset`, mapped without `PROT_WRITE`), of a file nothing
-    /// changes ([`crate::vfs::FileHandle::map_fd`]: a library in a sealed
-    /// root): its whole host pages inside the file are the file's own,
-    /// copy-on-write ([`crate::proc::PeerMem::map_file`]), as XNU maps a
-    /// library's segments, and only the rest is read in. How many bytes of
+    /// A private mapping (`len` bytes at `start` from `offset`) of a file
+    /// nothing changes ([`crate::vfs::FileHandle::map_fd`]: a library in a
+    /// sealed root): its whole host pages inside the file are the file's
+    /// own, copy-on-write ([`crate::proc::PeerMem::map_file`]), as XNU maps
+    /// a library's segments -- a writable one's (`__DATA`) too, a page this
+    /// process's own only once it is written -- and only the rest is read
+    /// in. How many bytes of
     /// the file it holds, or `None` where it is all to be read (no such
     /// file, no whole host page of it, a host that cannot).
     ///
@@ -5366,7 +5367,8 @@ impl MapIo<'_> {
         if a >= b || (offset + (a - start)) % g != 0 {
             return Ok(None);
         }
-        let (read, write) = (prot_bits & (crate::mem::prot::READ | crate::mem::prot::EXEC) != 0, false);
+        let write = prot_bits & crate::mem::prot::WRITE != 0;
+        let read = write || prot_bits & (crate::mem::prot::READ | crate::mem::prot::EXEC) != 0;
         if !me.mem.map_file(a, b - a, fd, offset + (a - start), read, write) {
             return Ok(None);
         }
@@ -5614,7 +5616,7 @@ impl MapIo<'_> {
             // stand (`SharedMaps::recall`).
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
-            let mapped = if shared || prot_bits & crate::mem::prot::WRITE != 0 { None } else { self.map_sealed(m, &file, start, len, offset, prot_bits)? };
+            let mapped = if shared { None } else { self.map_sealed(m, &file, start, len, offset, prot_bits)? };
             let n = match mapped {
                 Some(n) => n,
                 None => file.pread(offset, m.read_mut(start, len as usize)?)? as usize,

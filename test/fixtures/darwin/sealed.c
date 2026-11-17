@@ -44,6 +44,15 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_check("not the file's", c == buf[HP + 7]);
     t_check("not the other mapping's", two[7] == buf[HP + 7] && two[2 * HP - 1] == buf[3 * HP - 1]);
 
+    // Mapped writable from the start: its stores its own too.
+    u8 *w = (u8 *)mmap_(0, 3 * HP, PROT_READ | PROT_WRITE, MAP_PRIVATE, (int)fd, HP);
+    t_check("a writable mapping", (long)w > 0 && !t_memcmp(w, buf + HP, 3 * HP));
+    w[9] = 'w', w[2 * HP + 1] = 'v';
+    t_check("has its stores", w[9] == 'w' && w[2 * HP + 1] == 'v' && w[10] == buf[HP + 10]);
+    SYS(SYS_pread, fd, &c, 1, HP + 9);
+    t_check("which are not the file's", c == buf[HP + 9]);
+    t_check("nor the other mappings'", two[9] == buf[HP + 9] && at[HP + 9] == buf[HP + 9]);
+
     // A child has the parent's bytes, and its stores are its own.
     long child = 0;
     long pid = t_syscall2(&child, SYS_fork, 0, 0, 0);
