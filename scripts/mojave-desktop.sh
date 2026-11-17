@@ -30,6 +30,12 @@
 #          and is checked again otherwise
 #   VIEW=1 open a window on the display (hosts/macview), its mouse and keys
 #          the guest's. Nothing is shown otherwise.
+#   LEAVE_OUT  more jobs to leave out, by label (space-separated); LEAN=1
+#          leaves out the ones an app's window does not wait for, which
+#          otherwise run beside it (each costs the host memory and time):
+#          spindump, symptomsd, locationd, airportd, timed, mobileassetd,
+#          nsurlsessiond, nsurlstoraged, nehelper, dasd, coreduetd,
+#          contextstored and the UserEventAgents
 #   GEX_DSMOS_KEY  the key the system's protected programs are encrypted
 #          with, gex's to know and never this script's: with it gexlaunchd
 #          offers their jobs, and the desktop's own programs are started
@@ -107,6 +113,13 @@ if [ "${VIEW:-}" = 1 ]; then
   sh "$T/hosts/macview/build.sh" "$O/macview"
   "$O/macview" "$O/fb.live" "$O/input" &
 fi
+# The jobs left out (LEAVE_OUT, LEAN).
+lean="com.apple.spindump com.apple.spindump_agent com.apple.symptomsd com.apple.locationd com.apple.airportd
+  com.apple.timed com.apple.mobileassetd com.apple.nsurlsessiond com.apple.nsurlsessiond_privileged
+  com.apple.nsurlstoraged com.apple.nehelper com.apple.dasd com.apple.coreduetd com.apple.contextstored
+  com.apple.UserEventAgent-System com.apple.UserEventAgent-Aqua com.apple.UserEventAgent-LoginWindow"
+out=
+for l in ${LEAVE_OUT:-} $([ "${LEAN:-}" = 1 ] && echo $lean); do out="$out -x $l"; done
 # (Not the daemons that would write into the root itself: the network's
 # configuration, the disks', the log's housekeeping. LaunchServices' two
 # lsd, the system's and the user's, from the start: each registers every
@@ -125,7 +138,7 @@ OS_ACTIVITY_DT_MODE=YES GEX_FRAMEBUFFER_PNG="$O/fb.png" GEX_FRAMEBUFFER_LIVE="$O
   --bind "$O/gl=/gex" --bind "$O/lw/x86_64=/gex-login" --bind "$O/jobs=/gex-jobs" \
   --env OS_ACTIVITY_DT_MODE=YES \
   "$O/gl/gexlaunchd.x86_64" -v -x com.apple.configd -x com.apple.diskarbitrationd -x com.apple.aslmanager \
-  -a 501:20 -j /System/Library/LaunchDaemons -j /System/Library/LaunchAgents -j /gex-jobs -r com.gex.loginwindow -r com.apple.lsd $desktop \
+  -a 501:20 -j /System/Library/LaunchDaemons -j /System/Library/LaunchAgents -j /gex-jobs -r com.gex.loginwindow -r com.apple.lsd $desktop $out \
   -- /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon > "$O/run.out" 2> "$O/run.err" &
 run=$!
 # It goes on until SECS after the app has started, or the app ends.
