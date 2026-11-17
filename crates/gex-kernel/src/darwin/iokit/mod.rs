@@ -247,7 +247,90 @@ pub fn framebuffer_pixels() -> Option<(u32, u32, u64, Vec<u8>)> {
     if !live.is_some_and(|(vm, at)| vm.mem.read(at, &mut buf)) {
         file.handle.read_at(0, &mut buf).ok()?;
     }
+    draw_cursor(w, h, row, &mut buf);
     Some((w, h, row, buf))
+}
+
+/// Where the framebuffer's server has its shared cursor (`StdFBShmem_t`
+/// and the frames' images): its memory, the address, the size, and the
+/// widest frame asked room for, and the server's pid.
+#[allow(clippy::type_complexity)]
+static CURSOR: Mutex<Option<(Arc<crate::proc::PeerVm>, u64, u64, u32, i32)>> = Mutex::new(None);
+
+/// What gex last said of the shared cursor (GEX_IOKIT_TRACE), so as to
+/// say it again only when it changes.
+static CURSOR_SAID: Mutex<Option<(i32, u8, u8, (u16, u16), (i32, i32))>> = Mutex::new(None);
+
+/// The shared cursor drawn over the pixels, as IOFramebuffer draws it on a
+/// framebuffer with no cursor of its own (its software cursor): the frame
+/// `StdFBShmem_t` names, of the size and hot spot CoreDisplay put in it,
+/// its image at 236 + frame * (widest * widest * 4), 32-bit premultiplied
+/// pixels a row its width; at the pointer, where the HID system has it;
+/// while it is shown (`cursorShow` 0) and not obscured.
+fn draw_cursor(w: u32, h: u32, row: u64, buf: &mut [u8]) {
+    let Some((vm, at, len, widest, _)) = CURSOR.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+    let mut head = [0u8; 236];
+    if len < 236 || !vm.mem.read(at, &mut head) {
+        return;
+    }
+    let frame = i32::from_le_bytes(head[4..8].try_into().unwrap());
+    let (show, obscured) = (head[8], head[9]);
+    let slot = if frame != 0 { 1 } else { 0 };
+    let size = (u16::from_le_bytes([head[204 + 4 * slot], head[205 + 4 * slot]]), u16::from_le_bytes([head[206 + 4 * slot], head[207 + 4 * slot]]));
+    let hot = (i16::from_le_bytes([head[220 + 4 * slot], head[221 + 4 * slot]]) as i32, i16::from_le_bytes([head[222 + 4 * slot], head[223 + 4 * slot]]) as i32);
+    let pointer = {
+        let io = IOKIT.lock().unwrap_or_else(|e| e.into_inner());
+        io.as_ref().and_then(|kit| {
+            kit.objects.values().find_map(|o| match &o.obj {
+                Obj::Connect(Connect { client: Client::Hid(hc), .. }) if hc.kind == 0 => Some(hc.at),
+                _ => None,
+            })
+        })
+    };
+    let Some(pointer) = pointer else { return };
+    if std::env::var_os("GEX_IOKIT_TRACE").is_some() {
+        let now = (frame, show, obscured, size, pointer);
+        let mut said = CURSOR_SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if *said != Some(now) {
+            eprintln!("[gex] IOKit cursor: frame {frame}, show {show}, obscured {obscured}, {}x{} hot {},{}, at {},{}", size.0, size.1, hot.0, hot.1, pointer.0, pointer.1);
+            *said = Some(now);
+        }
+    }
+    let (cw, ch) = (size.0 as u64, size.1 as u64);
+    if show != 0 || obscured != 0 || cw == 0 || ch == 0 || cw > widest as u64 || ch > widest as u64 || frame < 0 {
+        return;
+    }
+    let frame_bytes = widest as u64 * widest as u64 * 4;
+    let start = 236 + frame as u64 * frame_bytes;
+    if start + cw * ch * 4 > len {
+        return;
+    }
+    let mut img = vec![0u8; (cw * ch * 4) as usize];
+    if !vm.mem.read(at + start, &mut img) {
+        return;
+    }
+    let (x0, y0) = (pointer.0 - hot.0, pointer.1 - hot.1);
+    for y in 0..ch as i32 {
+        let sy = y0 + y;
+        if sy < 0 || sy >= h as i32 {
+            continue;
+        }
+        for x in 0..cw as i32 {
+            let sx = x0 + x;
+            if sx < 0 || sx >= w as i32 {
+                continue;
+            }
+            let s = &img[((y as u64 * cw + x as u64) * 4) as usize..][..4];
+            let a = s[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let d = &mut buf[(sy as u64 * row + sx as u64 * 4) as usize..][..4];
+            for c in 0..3 {
+                d[c] = (s[c] as u32 + d[c] as u32 * (255 - a) / 255).min(255) as u8;
+            }
+        }
+    }
 }
 
 /// Surface `id`'s pixels as a PNG, when they are 32-bit.
@@ -1014,6 +1097,15 @@ impl Kernel {
                 if m.write(at, &initial).is_err() {
                     return fail(ERROR);
                 }
+                // (The server's shared cursor: where gex reads it, to draw
+                // it as IOFramebuffer's software cursor does.)
+                if let Client::Fb(fb) = &c.client {
+                    if kind == display::CURSOR_MEMORY && fb.kind == 0 {
+                        if let Ok(vm) = self.procs.vm(self.pid) {
+                            *CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some((vm, gex_abi::canon(at), initial.len() as u64, fb.cursor.0, self.pid));
+                        }
+                    }
+                }
                 c.maps.push((kind, at, initial.len() as u64));
                 *said = format!("{said} -> {at:#x}+{:#x}", initial.len());
                 let mut b = at.to_le_bytes().to_vec();
@@ -1057,7 +1149,21 @@ impl Kernel {
                 let Some(Object { obj: Obj::Connect(c), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) else { return fail(BAD_ARGUMENT) };
                 let result = match &mut c.client {
                     Client::Hid(hc) => {
+                        let was = hc.cursor;
                         let r = hc.method(selector, &scalars, &inband);
+                        // The cursor enabled or disabled (setCursorEnable):
+                        // the framebuffer's shared cursor shown or hidden
+                        // by one, as IOHIDSystem has IOFramebuffer do --
+                        // `cursorShow` is a count of hidings, WindowServer
+                        // keeps its own in it, and it is shown at 0.
+                        if selector == 2 && hc.kind == 0 && was != hc.cursor {
+                            let mine = CURSOR.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|c| c.4 == self.pid).map(|c| c.1);
+                            if let Some(at) = mine {
+                                if let Ok(b) = m.read(at + 8, 1).map(|b| b[0]) {
+                                    let _ = m.write(at + 8, &[if hc.cursor { b.saturating_sub(1) } else { b.saturating_add(1) }]);
+                                }
+                            }
+                        }
                         // (Where the pointer is put: WindowServer's cursor,
                         // having taken an event.)
                         if selector == 4 && hc.kind <= 1 {
