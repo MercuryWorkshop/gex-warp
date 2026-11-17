@@ -165,11 +165,44 @@ for (const [queue, width] of [[jobs.filter((j) => !lone(j)), Math.max(1, Number(
   }));
 }
 cdp?.close();
-chrome?.kill();
+await stopBrowser(chrome);
 await server?.close();
-if (!o.work) rmSync(WORK, { recursive: true, force: true });
 log(bad ? `${bad} of ${jobs.length} not ok` : `all ${jobs.length} ok`);
+if (!o.work && !(await removeWork(WORK))) bad ||= 1;
 process.exit(bad ? 1 : 0);
+
+/** Chromium ended, and waited for: its profile is in the work directory,
+ *  which it (and its crash handler) goes on writing to until it has gone.
+ *  Asked to end, then killed if it has not within ten seconds. */
+async function stopBrowser(chrome) {
+  if (!chrome || chrome.exitCode !== null || chrome.signalCode !== null) return;
+  const gone = new Promise((r) => chrome.once('exit', r));
+  chrome.kill('SIGTERM');
+  if (await Promise.race([gone.then(() => true), sleep(10000).then(() => false)])) return;
+  chrome.kill('SIGKILL');
+  await Promise.race([gone, sleep(10000)]);
+}
+
+/** The work directory removed, retried while something that outlived the
+ *  run is still finishing writing into it (`ENOTEMPTY`: Chromium's crash
+ *  handler is a process of its own, and ends after the browser). An error
+ *  that outlasts the retries is said, not thrown past the run's results,
+ *  and the run is not ok: false. */
+async function removeWork(dir) {
+  for (let i = 0; ; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return true;
+    } catch (e) {
+      if (i < 20 && ['ENOTEMPTY', 'EBUSY', 'EPERM'].includes(e?.code)) {
+        await sleep(500);
+        continue;
+      }
+      log(`the work directory ${dir} could not be removed: ${e?.message ?? e}`);
+      return false;
+    }
+  }
+}
 
 async function runJob({ test, host, arch }) {
   const t0 = Date.now();
