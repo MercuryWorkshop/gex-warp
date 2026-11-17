@@ -88,6 +88,14 @@ fn real_main() -> Result<ExitCode> {
     let _ = gex_kernel::stdio::STDIN_READY.set(stdin_ready);
     match argv[1].as_str() {
         "run" => {
+            // `GEX_DATE=YYYY-MM-DD` (or seconds since the epoch): the guest's
+            // wall clock starts then, before anything reads a clock.
+            if let Ok(d) = std::env::var("GEX_DATE") {
+                match gex_kernel::syscalls::parse_guest_date(&d) {
+                    Some(secs) => gex_kernel::syscalls::set_guest_date(secs),
+                    None => eprintln!("gexc: GEX_DATE={d}: not a date (YYYY-MM-DD, or seconds since the epoch)"),
+                }
+            }
             // On a thread with a guest-sized stack: the first guest thread
             // runs here (`gex_native::guest_thread_stack`).
             let args = argv[2..].to_vec();

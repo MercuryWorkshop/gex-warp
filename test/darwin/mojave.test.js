@@ -171,7 +171,9 @@ export default async function (t) {
       '-a', '501:20', '-j', '/System/Library/LaunchDaemons', '-j', '/System/Library/LaunchAgents', '-j', '/gex-jobs', '-r', 'com.gex.loginwindow',
       '--', '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer', '-daemon'],
     // (It serves from then on, and is stopped.)
-    { timeout: 2400000, env: { GEX_IOKIT_TRACE: '1', GEX_FRAMEBUFFER_PNG: fb }, until: (out) => (/^gexloginwindow: \/.*: (signal|exit) \d+$/m.test(out) && ++after > 8) || (/^gexloginwindow: started /m.test(out) && ++since > 600) },
+    // (In 2020: the root's code-signing certificates have expired since,
+    // and each signature checked would fail and be checked again.)
+    { timeout: 2400000, env: { GEX_IOKIT_TRACE: '1', GEX_FRAMEBUFFER_PNG: fb, GEX_DATE: '2020-01-15' }, until: (out) => (/^gexloginwindow: \/.*: (signal|exit) \d+$/m.test(out) && ++after > 8) || (/^gexloginwindow: started /m.test(out) && ++since > 600) },
   );
   const said = server.stderr;
   const iokit = said.split('\n').filter((l) => /^\[gex:\d+\] IOKit /.test(l));

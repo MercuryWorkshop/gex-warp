@@ -24,6 +24,10 @@
 #          keeps this run's there when it ends: LaunchServices' databases,
 #          trustd's caches, the home. Without one each run registers every
 #          application again, which takes a quarter of an hour.
+#   GEX_DATE  the guest's date (default 2020-01-15): Mojave's code-signing
+#          certificates have expired since (the leaf in 2021, Apple's code
+#          signing CA in October 2026), and every signature it checks fails
+#          and is checked again otherwise
 #   VIEW=1 open a window on the display (hosts/macview), its mouse and keys
 #          the guest's. Nothing is shown otherwise.
 #   GEX_DSMOS_KEY  the key the system's protected programs are encrypted
@@ -43,6 +47,7 @@ SECS=${SECS:-600}
 [ -x "$G" ] || { echo "no gexc at $G (make gexc)" >&2; exit 1; }
 [ -e "$R/usr/lib/dyld" ] || { echo "$R is not a Mac root" >&2; exit 1; }
 export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-1073741824}
+export GEX_DATE=${GEX_DATE:-2020-01-15}
 ulimit -f 2097152
 
 sh "$T/guest/launchd/build.sh" "$O/gl" x86_64
@@ -102,7 +107,10 @@ if [ "${VIEW:-}" = 1 ]; then
   "$O/macview" "$O/fb.live" "$O/input" &
 fi
 # (Not the daemons that would write into the root itself: the network's
-# configuration, the disks', the log's housekeeping.)
+# configuration, the disks', the log's housekeeping. LaunchServices' two
+# lsd, the system's and the user's, from the start: each registers every
+# application the first time, which takes a while, and the app waits for
+# the user's.)
 OS_ACTIVITY_DT_MODE=YES GEX_FRAMEBUFFER_PNG="$O/fb.png" GEX_FRAMEBUFFER_LIVE="$O/fb.live" GEX_HID_INPUT="$O/input" \
   taskpolicy -c utility "$G" run --uid 0 --sysroot "$R" --bind-ro "$R=/" \
   --bind "$E/etc/passwd=/etc/passwd" --bind "$E/etc/master.passwd=/etc/master.passwd" \
@@ -115,7 +123,7 @@ OS_ACTIVITY_DT_MODE=YES GEX_FRAMEBUFFER_PNG="$O/fb.png" GEX_FRAMEBUFFER_LIVE="$O
   --bind "$O/gl=/gex" --bind "$O/lw/x86_64=/gex-login" --bind "$O/jobs=/gex-jobs" \
   --env OS_ACTIVITY_DT_MODE=YES \
   "$O/gl/gexlaunchd.x86_64" -v -x com.apple.configd -x com.apple.diskarbitrationd -x com.apple.aslmanager \
-  -a 501:20 -j /System/Library/LaunchDaemons -j /System/Library/LaunchAgents -j /gex-jobs -r com.gex.loginwindow $desktop \
+  -a 501:20 -j /System/Library/LaunchDaemons -j /System/Library/LaunchAgents -j /gex-jobs -r com.gex.loginwindow -r com.apple.lsd $desktop \
   -- /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon > "$O/run.out" 2> "$O/run.err" &
 run=$!
 # It goes on until SECS after the app has started, or the app ends.

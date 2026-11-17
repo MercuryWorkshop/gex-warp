@@ -10222,13 +10222,48 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
     set_result(m, ctx_addr, v as u64).is_ok()
 }
 
+/// Seconds the guest's wall clock is behind the host's: 0, or what
+/// [`set_guest_date`] made it.
+static DATE_SHIFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The guest's wall clock starts at `epoch_secs` (and runs at real time
+/// from there): a system of another time sees its own, as an old macOS
+/// whose code-signing certificates have expired since needs to. Set it
+/// before anything reads a clock (the monotonic clocks take their base
+/// from the first reading).
+pub fn set_guest_date(epoch_secs: i64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    DATE_SHIFT.store(now - epoch_secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A date as `GEX_DATE` gives it: seconds since the epoch, or a day
+/// (`YYYY-MM-DD`, its midnight UTC).
+pub fn parse_guest_date(s: &str) -> Option<i64> {
+    if let Ok(secs) = s.trim().parse::<i64>() {
+        return Some(secs);
+    }
+    let mut p = s.trim().splitn(3, '-').map(|v| v.parse::<i64>().ok());
+    let (y, m, d) = (p.next()??, p.next()??, p.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days since 1970-01-01 of a proleptic Gregorian date.
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400)
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        (now.as_secs(), now.subsec_nanos())
+        let shift = DATE_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        (now.as_secs().saturating_add_signed(-shift), now.subsec_nanos())
     }
     // Standing still is wrong but it is not a panic, and a host that cares
     // replaces this.
@@ -13319,7 +13354,7 @@ impl Kernel {
 
     /// Where a traced thread that is to wait was called from: its program
     /// counter and the return addresses its frame pointers chain through
-    /// (at most 16), each as the file it is in and the offset there (what
+    /// (at most 32), each as the file it is in and the offset there (what
     /// a wait that never ends was waiting for).
     pub fn traced_frames(&self, m: &GuestMem<'_>, pc: u64) -> String {
         let fp_slot = if gex_abi::X86 { ctx::x(5) } else { ctx::x(29) };
@@ -13345,7 +13380,7 @@ impl Kernel {
         };
         let mut out = format!(" at {}", at(pc));
         let mut fp = m.read_u64(self.ctx_addr + fp_slot as u64).unwrap_or(0);
-        for _ in 0..16 {
+        for _ in 0..32 {
             let (Ok(next), Ok(ret)) = (m.read_u64(fp), m.read_u64(fp + 8)) else { break };
             if fp == 0 || ret == 0 {
                 break;
@@ -15228,6 +15263,17 @@ fn exec_ids_for(creds: &Creds, md: &crate::vfs::Metadata) -> (Option<u32>, Optio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_guest_date_is_a_day_or_seconds() {
+        use super::parse_guest_date;
+        assert_eq!(parse_guest_date("1970-01-01"), Some(0));
+        assert_eq!(parse_guest_date("2000-03-01"), Some(951_868_800));
+        assert_eq!(parse_guest_date("2020-01-15"), Some(1_579_046_400));
+        assert_eq!(parse_guest_date(" 1234 "), Some(1234));
+        assert_eq!(parse_guest_date("2020-13-01"), None);
+        assert_eq!(parse_guest_date("soon"), None);
+    }
+
     use super::*;
     use crate::vfs::TmpFs;
 
