@@ -12935,6 +12935,17 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         // (what the arena is asked is answered once the old image is gone)
         match arena_asks(|arena| gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, arena, &read_at)) {
             (Ok((p, r)), asks) => (Some(p), r, asks),
+            // An Apple program whose `__TEXT` is encrypted: refused, by name,
+            // as gexc refuses it without a key (gex_ld::dsmos). Planned, its
+            // segments would be read from the file into place as they are
+            // and run encrypted. The page has no key to decrypt them with.
+            (Err(gex_ld::elf::LoadError::ProtectedBinary), _) => {
+                warn_line(&format!(
+                    "gex: {path}: a protected program (its segments are encrypted, SG_PROTECTED_VERSION_1), \
+                     which this host has no key to decrypt: it is not run\n"
+                ));
+                return 0;
+            }
             (Err(_), _) => return 0,
         }
     };

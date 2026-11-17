@@ -847,6 +847,19 @@ fn guest_slice_of(table: &[u8]) -> Result<(usize, usize), LoadError> {
     guest_slice_in(table, end)
 }
 
+/// A plan's image with a protected segment (`SG_PROTECTED_VERSION_1`, an
+/// Apple program whose `__TEXT` is encrypted): refused as [`place`] refuses
+/// one it has no key for. A plan leaves the segments' bytes in the file, to
+/// be read straight into place, where nothing decrypts them -- loaded so, the
+/// program ran its encrypted pages as code. Refused whether or not a key is
+/// configured: only a whole load ([`load_program`]) decrypts.
+fn refuse_protected(m: &MachO) -> Result<(), LoadError> {
+    if m.mapped().any(|s| s.flags & crate::dsmos::SG_PROTECTED_VERSION_1 != 0) {
+        return Err(LoadError::ProtectedBinary);
+    }
+    Ok(())
+}
+
 /// [`load_program`] for `execve`, from headers alone, as
 /// [`crate::plan_program`] plans an ELF program: the program with its
 /// segments' bytes left in the files, and where in each file they are --
@@ -863,6 +876,7 @@ pub fn plan_program(
     if m.filetype != MH_EXECUTE {
         return Err(LoadError::UnsupportedType(m.filetype as u16));
     }
+    refuse_protected(&m)?;
     let image = place(&m, None, slide_for(&m, exe_base(&m, pie_base, interp_base, arena))?)?;
     crate::dynamic::check_clear_of_stack(&image)?;
     let mut ranges: crate::elf::FileRanges = m.mapped().map(|s| (off + s.fileoff, s.filesize)).collect();
@@ -881,6 +895,7 @@ pub fn plan_program(
     if lm.filetype != MH_DYLINKER || !matches!(lm.entry, Some(Entry::Thread { .. })) {
         return Err(bad("the dynamic linker is not one"));
     }
+    refuse_protected(&lm)?;
     let interp = place(&lm, None, slide_for(&lm, linker_base(&image, &lm, interp_base, arena))?)?;
     check_apart(&image, &interp)?;
     ranges.extend(lm.mapped().map(|s| (loff + s.fileoff, s.filesize)));
@@ -1221,6 +1236,41 @@ mod tests {
             assert_eq!(&f[o as usize..(o + n) as usize], &l.bytes[..]);
         }
         assert!(plan_program("/nope", 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &read_at).is_err());
+    }
+
+    /// A program whose `__TEXT` is marked protected (`SG_PROTECTED_VERSION_1`;
+    /// its bytes here are not encrypted, only marked): with no key, a whole
+    /// load refuses it, and `execve`'s plan, which reads segments straight
+    /// from the file and so cannot decrypt them, refuses it with or without.
+    #[test]
+    fn a_protected_program_is_refused_where_it_cannot_be_decrypted() {
+        let mut exe = image(MH_EXECUTE, MH_PIE, BASE, &[main_cmd(0x123), string_cmd(LC_LOAD_DYLINKER, "/usr/lib/dyld")]);
+        let dyld = image(MH_DYLINKER, 0, 0, &[thread(0x40)]);
+        // The second segment command (after `__PAGEZERO`'s 72 bytes): its flags.
+        assert_eq!(&exe[32 + 72 + 8..32 + 72 + 14], b"__TEXT");
+        put32(&mut exe, 32 + 72 + 68, crate::dsmos::SG_PROTECTED_VERSION_1);
+        let exe = std::cell::RefCell::new(exe);
+        let file = |path: &str| match path {
+            "/exe" => Some(exe.borrow().clone()),
+            "/usr/lib/dyld" => Some(dyld.clone()),
+            _ => None,
+        };
+        let read_at = |path: &str, off: u64, out: &mut [u8]| {
+            let f = file(path)?;
+            let from = (off as usize).min(f.len());
+            let n = out.len().min(f.len() - from);
+            out[..n].copy_from_slice(&f[from..from + n]);
+            Some(n)
+        };
+        let planned = plan_program("/exe", 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &read_at);
+        assert_eq!(planned.err(), Some(LoadError::ProtectedBinary));
+        if !crate::dsmos::key_configured() {
+            let loaded = load_program(&exe.borrow(), 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &|p| file(p));
+            assert_eq!(loaded.err(), Some(LoadError::ProtectedBinary));
+        }
+        // Unmarked, the same program plans.
+        put32(&mut exe.borrow_mut(), 32 + 72 + 68, 0);
+        assert!(plan_program("/exe", 0x2000_0000, 0x3000_0000, &mut crate::no_arena, &read_at).is_ok());
     }
 
     #[test]
