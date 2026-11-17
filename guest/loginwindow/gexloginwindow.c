@@ -28,7 +28,12 @@
 //   ordered in above this one's: the desktop's level is WindowServer's
 //   own to draw, and shows nothing of a window put there.)
 //
-//   gexloginwindow [-u UID[:GID]] [-n NAME] [-- PROGRAM [ARG...]]
+//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-- PROGRAM [ARG...]]
+//
+// -s starts a program of the session's own first, as the user, and does
+// not wait for it: the Dock, SystemUIServer and the Finder, as loginwindow
+// has the session's launchd start them (their jobs offered by gexlaunchd
+// -o, for them to check in to).
 //
 // It says what it does on stdout, a line each, and then stays, as
 // loginwindow does: the session ends with it.
@@ -66,12 +71,35 @@ static void say_session(const char *when) {
            r ? strerror(errno) : "ok", (int)ai.ai_auid, (unsigned long long)ai.ai_flags);
 }
 
+// `argv` run as the user, in this session, from the home: its pid. (A
+// program that cannot be run says so, and ends with 127.)
+static pid_t start_as(char **argv, uid_t user, gid_t group, const char *name, const char *home, struct passwd *pw) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setgid(group) || initgroups(name, (int)group) || setuid(user)) {
+            printf("gexloginwindow: becoming %d: %s\n", (int)user, strerror(errno));
+            _exit(126);
+        }
+        setenv("HOME", home, 1);
+        setenv("USER", name, 1);
+        setenv("LOGNAME", name, 1);
+        setenv("SHELL", pw && pw->pw_shell ? pw->pw_shell : "/bin/sh", 1);
+        if (chdir(home)) (void)!chdir("/");
+        execv(argv[0], argv);
+        printf("gexloginwindow: %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    return pid;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     uid_t user = 501;
     gid_t group = 20;
     const char *name = "gex";
     char **program = NULL;
+    const char *session[8];
+    int nsession = 0;
     for (int i = 1; i < argc; i += 2) {
         if (!strcmp(argv[i], "--")) {
             if (i + 1 < argc) program = argv + i + 1;
@@ -83,6 +111,7 @@ int main(int argc, char **argv) {
             user = (uid_t)strtoul(argv[i + 1], &end, 10);
             if (*end == ':') group = (gid_t)strtoul(end + 1, NULL, 10);
         } else if (!strcmp(argv[i], "-n")) name = argv[i + 1];
+        else if (!strcmp(argv[i], "-s") && nsession < 8) session[nsession++] = argv[i + 1];
     }
     say_session("at the start");
 
@@ -149,26 +178,18 @@ int main(int argc, char **argv) {
         printf("gexloginwindow: shown: no image (%p)\n", (void *)shown);
     }
     printf("gexloginwindow: up\n");
-    if (!program) for (;;) pause();
 
-    // The user's session: the program, as the user.
+    // The user's session: the session's own programs, then the program,
+    // each as the user.
     struct passwd *pw = getpwuid(user);
     const char *home = pw && pw->pw_dir ? pw->pw_dir : "/";
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (setgid(group) || initgroups(name, (int)group) || setuid(user)) {
-            printf("gexloginwindow: becoming %d: %s\n", (int)user, strerror(errno));
-            _exit(126);
-        }
-        setenv("HOME", home, 1);
-        setenv("USER", name, 1);
-        setenv("LOGNAME", name, 1);
-        setenv("SHELL", pw && pw->pw_shell ? pw->pw_shell : "/bin/sh", 1);
-        if (chdir(home)) (void)!chdir("/");
-        execv(program[0], program);
-        printf("gexloginwindow: %s: %s\n", program[0], strerror(errno));
-        _exit(127);
+    for (int i = 0; i < nsession; i++) {
+        char *one[] = {(char *)session[i], NULL};
+        pid_t p = start_as(one, user, group, name, home, pw);
+        printf("gexloginwindow: started %s as %d, pid %d (the session's)\n", session[i], (int)user, (int)p);
     }
+    if (!program) for (;;) pause();
+    pid_t pid = start_as(program, user, group, name, home, pw);
     printf("gexloginwindow: started %s as %d, pid %d\n", program[0], (int)user, (int)pid);
     int status;
     while (pid > 0 && waitpid(pid, &status, 0) < 0 && errno == EINTR) {}

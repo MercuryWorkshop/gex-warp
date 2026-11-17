@@ -24,16 +24,18 @@
 // token), as launchd's do, and comes from a process running as root, which
 // libxpc insists on of a bootstrap server that is not process 1.
 //
-//   gexlaunchd [-v] [-u UID[:GID]] [-a UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [--] PROGRAM [ARG...]
+//   gexlaunchd [-v] [-u UID[:GID]] [-a UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [-o LABEL]... [--] PROGRAM [ARG...]
 //
 // starts PROGRAM with this server as its bootstrap port and exits when it
 // does, with its status, ending the jobs it started. -j adds a directory of
 // job plists (default: /System/Library/LaunchDaemons and
 // /System/Library/LaunchAgents); -x leaves a job out; -r starts a job along
 // with PROGRAM, as launchd starts one that is to run at load (loginwindow
-// beside WindowServer); -v says what is asked and answered; -u is the user
-// PROGRAM and the agents run as; -a the agents' user alone, the program
-// staying root (WindowServer, with the console user's agents beside it).
+// beside WindowServer); -o offers a job's services but leaves starting its
+// program to another (gexloginwindow's -s); -v says what is asked and
+// answered; -u is the user PROGRAM and the agents run as; -a the agents'
+// user alone, the program staying root (WindowServer, with the console
+// user's agents beside it).
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -133,6 +135,12 @@ static const char *skipped[64] = {"com.apple.logd", "com.apple.opendirectoryd", 
 static int nskipped = 4;
 static const char *at_load[16];
 static int nat_load;
+// Jobs whose program another starts (-o): their services are offered, and
+// a lookup does not start them; the program checks in when it is up
+// (gexloginwindow starting the Dock in the login's session, as loginwindow
+// has its session's launchd do).
+static const char *outside[16];
+static int noutside;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void say(const char *fmt, ...) {
@@ -392,6 +400,8 @@ static int wake[2];
 
 static void want_job(struct job *j) {
     if (j->pid > 0 || j->wanted) return;
+    for (int i = 0; i < noutside; i++)
+        if (!strcmp(outside[i], j->label)) return;
     j->wanted = 1;
     char c = 1;
     (void)!write(wake[1], &c, 1);
@@ -620,6 +630,7 @@ int main(int argc, char **argv) {
                 if (!strcmp(skipped[k], in)) skipped[k--] = skipped[--nskipped];
         }
         else if (!strcmp(argv[i], "-r") && i + 1 < argc && nat_load < 16) at_load[nat_load++] = argv[++i];
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc && noutside < 16) outside[noutside++] = argv[++i];
         else if (!strcmp(argv[i], "-u") && i + 1 < argc) {
             char *end;
             user = (uid_t)strtoul(argv[++i], &end, 10);

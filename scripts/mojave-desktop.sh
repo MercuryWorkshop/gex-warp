@@ -75,18 +75,25 @@ echo 'gex:*:501:20:gex:/Users/gex:/bin/sh' >> "$E/etc/passwd"
 echo 'gex:*:501:20::0:0:gex:/Users/gex:/bin/sh' >> "$E/etc/master.passwd"
 [ -n "${SEED:-}" ] && [ -d "$SEED/home" ] || "$G" run --uid 0 --sysroot "$R" --bind-ro "$R=/" --bind "$E/home=/Users/gex" "$R/usr/sbin/chown" -R 501:20 /Users/gex
 
-# gexloginwindow's job, and with the key the desktop's programs at load.
+# gexloginwindow's job; with the key, the desktop's own programs are the
+# session's, started by it in the login's session as the user (their jobs'
+# services offered, for them to check in to).
+desktop="" session=""
+if [ -n "${GEX_DSMOS_KEY+set}" ]; then
+  desktop="-o com.apple.Dock.agent -o com.apple.SystemUIServer.agent"
+  for p in Dock SystemUIServer Finder; do
+    session="$session<string>-s</string><string>/System/Library/CoreServices/$p.app/Contents/MacOS/$p</string>"
+  done
+fi
 mkdir -p "$O/jobs"
 cat > "$O/jobs/com.gex.loginwindow.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.gex.loginwindow</string>
-<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string><string>--</string><string>$APP</string></array>
+<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string>$session<string>--</string><string>$APP</string></array>
 </dict></plist>
 PL
-desktop=""
-[ -n "${GEX_DSMOS_KEY+set}" ] && desktop="-r com.apple.Dock.agent -r com.apple.SystemUIServer.agent -r com.apple.Finder"
 
 : > "$O/input"
 rm -f "$O/fb.live"
