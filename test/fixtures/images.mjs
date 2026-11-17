@@ -22,7 +22,8 @@
 //            cross gcc), darwin-metalecho.ARCH
 //            (fixtures/darwin/metalecho.c: darwin/metal-page's program),
 //            and darwin-services.ARCH (fixtures/darwin/services.c:
-//            darwin/services-page's), and darwin-high.ARCH with
+//            darwin/services-page's), darwin-iodevices.ARCH
+//            (fixtures/darwin/iodevices.c: darwin/devices-page's), and darwin-high.ARCH with
 //            darwin-high.ARCH.mac (fixtures/darwin/high.c, and what
 //            this Mac printed: darwin/high's).
 //   mink     mink/: what darwin/metal-page runs of mink's, copied from a
@@ -262,6 +263,14 @@ export const images = {
         const prog = join(work, `darwin-services.${arch}`);
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'services.c')], { stdio: 'ignore' });
+      }
+      // And the `devices` service's (darwin/devices-page): IOKit's, linked
+      // with the SDK's IOKit as a Mac program is.
+      {
+        const prog = join(work, `darwin-iodevices.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-Wno-deprecated-declarations', '-o', prog, join(HERE, 'darwin', 'iodevices.c'),
+          '-framework', 'IOKit', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
       }
       // And darwin/high's (fixtures/darwin/high.c: where a Mac program's
       // addresses are), with what this Mac says of them beside it
