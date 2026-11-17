@@ -28,7 +28,7 @@
 //   ordered in above this one's: the desktop's level is WindowServer's
 //   own to draw, and shows nothing of a window put there.)
 //
-//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-- PROGRAM [ARG...]]
+//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-t SECS] [-- PROGRAM [ARG...]]
 //
 // -s starts a program of the session's own first, as the user, and does
 // not wait for it: the Dock, SystemUIServer and the Finder, as loginwindow
@@ -100,6 +100,7 @@ int main(int argc, char **argv) {
     char **program = NULL;
     const char *session[8];
     int nsession = 0;
+    int ticks = 0;
     for (int i = 1; i < argc; i += 2) {
         if (!strcmp(argv[i], "--")) {
             if (i + 1 < argc) program = argv + i + 1;
@@ -112,6 +113,7 @@ int main(int argc, char **argv) {
             if (*end == ':') group = (gid_t)strtoul(end + 1, NULL, 10);
         } else if (!strcmp(argv[i], "-n")) name = argv[i + 1];
         else if (!strcmp(argv[i], "-s") && nsession < 8) session[nsession++] = argv[i + 1];
+        else if (!strcmp(argv[i], "-t")) ticks = atoi(argv[i + 1]);
     }
     say_session("at the start");
 
@@ -188,14 +190,35 @@ int main(int argc, char **argv) {
         pid_t p = start_as(one, user, group, name, home, pw);
         printf("gexloginwindow: started %s as %d, pid %d (the session's)\n", session[i], (int)user, (int)p);
     }
-    if (!program) for (;;) pause();
+    // -t SECS: the square drawn again every SECS, in turn white and
+    // black, for as long as this runs: whether what WindowServer shows
+    // follows a window's drawing after the first.
+    if (ticks > 0 && c) {
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ticks * NSEC_PER_SEC), (uint64_t)ticks * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+        __block int n = 0;
+        dispatch_source_set_event_handler(timer, ^{
+            n++;
+            CGFloat v = n % 2 ? 0 : 1;
+            CGContextSetRGBFillColor(c, v, v, v, 1);
+            CGContextFillRect(c, CGRectMake(100, 100, 200, 200));
+            CGContextFlush(c);
+            printf("gexloginwindow: tick %d, the square %s\n", n, n % 2 ? "black" : "white");
+        });
+        dispatch_resume(timer);
+    }
+    if (!program) dispatch_main();
     pid_t pid = start_as(program, user, group, name, home, pw);
     printf("gexloginwindow: started %s as %d, pid %d\n", program[0], (int)user, (int)pid);
-    int status;
-    while (pid > 0 && waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    if (pid > 0) {
-        if (WIFSIGNALED(status)) printf("gexloginwindow: %s: signal %d\n", program[0], WTERMSIG(status));
-        else printf("gexloginwindow: %s: exit %d\n", program[0], WEXITSTATUS(status));
-    }
-    for (;;) pause();
+    // (Its end waited for on a thread of its own: the main one serves
+    // the ticks.)
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int status;
+        while (pid > 0 && waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        if (pid > 0) {
+            if (WIFSIGNALED(status)) printf("gexloginwindow: %s: signal %d\n", program[0], WTERMSIG(status));
+            else printf("gexloginwindow: %s: exit %d\n", program[0], WEXITSTATUS(status));
+        }
+    });
+    dispatch_main();
 }
