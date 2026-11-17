@@ -860,7 +860,7 @@ second permission, for system exclusive messages, is asked for only when a
 program sends one (`sysex`), once, and the program's message waits for it;
 a program that only listens is given what the browser gives without it (a
 browser drops the system exclusive messages of an input until the second
-permission is held). `authorize` is the shell\'s own gate in front of both.
+permission is held). `authorize` is the shell's own gate in front of both.
 
 **What a program sees.** pyrus's CoreMIDI makes a device for each name
 among the browser's ports (the manufacturer and name Web MIDI gives; the
