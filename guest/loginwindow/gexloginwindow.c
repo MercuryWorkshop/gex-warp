@@ -74,6 +74,12 @@ CGError SLSSetSystemDefinedCursor(int cid, int cursor);
 CGError SLSShowCursor(int cid);
 bool SLCursorIsVisible(void);
 CGError SLSGetCurrentCursorLocation(int cid, CGPoint *at);
+CGError SLSWindowIsOrderedIn(int cid, uint32_t wid, bool *in);
+CFArrayRef SLSCopySpacesForWindows(int cid, int mask, CFArrayRef windows);
+uint64_t SLSGetActiveSpace(int cid);
+CGError SLPSGetFrontProcess(ProcessSerialNumber *psn);
+CGError SLSGetConnectionIDForPSN(int cid, const ProcessSerialNumber *psn, int *owner);
+CGError SLSConnectionGetPID(int cid, pid_t *pid);
 
 enum {
     kBackingBuffered = 2,
@@ -81,10 +87,14 @@ enum {
 };
 
 // The windows WindowServer has, a line each (`CGWindowListCopyWindowInfo`
-// of them all), said when they are not as they were the last time.
+// of them all), said when they are not as they were the last time: and
+// which is ordered in, the spaces each is on, the space shown, and the
+// front process (whose windows an application's ordered "conditionally"
+// go in front of).
 static char *windows_said;
 
 static void say_windows(void) {
+    int cid = SLSMainConnectionID();
     CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID);
     size_t cap = 256, len = 0;
     char *out = malloc(cap);
@@ -109,15 +119,42 @@ static void say_windows(void) {
         if (s) CFStringGetCString(s, owner, sizeof owner, kCFStringEncodingUTF8);
         s = CFDictionaryGetValue(w, kCGWindowName);
         if (s) CFStringGetCString(s, title, sizeof title, kCFStringEncodingUTF8);
-        char line[256];
-        int k = snprintf(line, sizeof line, "gexloginwindow: window %d of %d (%s) \"%s\": %.0fx%.0f at %.0f,%.0f, layer %d, alpha %.2f, %s\n", number, pid,
-                         owner, title, r.size.width, r.size.height, r.origin.x, r.origin.y, layer, alpha, onscreen ? "on screen" : "off screen");
+        bool in = false;
+        SLSWindowIsOrderedIn(cid, (uint32_t)number, &in);
+        char spaces[64] = "";
+        CFNumberRef one = CFNumberCreate(NULL, kCFNumberIntType, &number);
+        CFArrayRef ids = CFArrayCreate(NULL, (const void **)&one, 1, &kCFTypeArrayCallBacks);
+        CFArrayRef where = ids ? SLSCopySpacesForWindows(cid, 7, ids) : NULL;
+        for (CFIndex k = 0; where && k < CFArrayGetCount(where) && strlen(spaces) < sizeof spaces - 24; k++) {
+            long long space = 0;
+            CFNumberGetValue(CFArrayGetValueAtIndex(where, k), kCFNumberLongLongType, &space);
+            snprintf(spaces + strlen(spaces), sizeof spaces - strlen(spaces), "%s%lld", k ? "," : "", space);
+        }
+        if (where) CFRelease(where);
+        if (ids) CFRelease(ids);
+        CFRelease(one);
+        char line[320];
+        int k = snprintf(line, sizeof line, "gexloginwindow: window %d of %d (%s) \"%s\": %.0fx%.0f at %.0f,%.0f, layer %d, alpha %.2f, %s, %s, spaces [%s]\n", number, pid,
+                         owner, title, r.size.width, r.size.height, r.origin.x, r.origin.y, layer, alpha, onscreen ? "on screen" : "off screen",
+                         in ? "ordered in" : "not ordered in", spaces);
         if (k < 0) continue;
         if (len + (size_t)k + 1 > cap) out = realloc(out, cap = (len + k + 1) * 2);
         memcpy(out + len, line, (size_t)k + 1);
         len += (size_t)k;
     }
     if (list) CFRelease(list);
+    ProcessSerialNumber front = {0, 0};
+    int front_cid = 0;
+    pid_t front_pid = -1;
+    if (!SLPSGetFrontProcess(&front) && !SLSGetConnectionIDForPSN(cid, &front, &front_cid)) SLSConnectionGetPID(front_cid, &front_pid);
+    char tail[160];
+    int k = snprintf(tail, sizeof tail, "gexloginwindow: space %llu shown; front process %u/%u (pid %d)\n", (unsigned long long)SLSGetActiveSpace(cid),
+                     (unsigned)front.highLongOfPSN, (unsigned)front.lowLongOfPSN, (int)front_pid);
+    if (k > 0) {
+        if (len + (size_t)k + 1 > cap) out = realloc(out, cap = (len + k + 1) * 2);
+        memcpy(out + len, tail, (size_t)k + 1);
+        len += (size_t)k;
+    }
     if (windows_said && !strcmp(windows_said, out)) {
         free(out);
         return;
