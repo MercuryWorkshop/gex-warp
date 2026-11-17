@@ -28,7 +28,7 @@
 //   ordered in above this one's: the desktop's level is WindowServer's
 //   own to draw, and shows nothing of a window put there.)
 //
-//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-t SECS] [-w SECS] [-- PROGRAM [ARG...]]
+//   gexloginwindow [-u UID[:GID]] [-n NAME] [-s PROGRAM]... [-t SECS] [-w SECS] [-o SECS] [-- PROGRAM [ARG...]]
 //
 // -s starts a program of the session's own first, as the user, and does
 // not wait for it: the Dock, SystemUIServer and the Finder, as loginwindow
@@ -39,6 +39,14 @@
 // time they have changed: whose they are, where, their level, whether they
 // are on the screen (whether an application's window was made and ordered
 // in).
+//
+// -o SECS sends PROGRAM the open-application Apple Event ('oapp') every
+// SECS until it takes one, as loginwindow's launch of an application
+// through LaunchServices hands it one: AppKit finishes launching an
+// application (applicationDidFinishLaunching, where Calculator orders its
+// window in) on its first open event. (AE.framework makes one up for an
+// application nobody launched with one, unless appleeventsd says one is to
+// come; here none came.)
 //
 // It says what it does on stdout, a line each, and then stays, as
 // loginwindow does: the session ends with it.
@@ -156,7 +164,7 @@ int main(int argc, char **argv) {
     char **program = NULL;
     const char *session[8];
     int nsession = 0;
-    int ticks = 0, looks = 0;
+    int ticks = 0, looks = 0, opens = 0;
     for (int i = 1; i < argc; i += 2) {
         if (!strcmp(argv[i], "--")) {
             if (i + 1 < argc) program = argv + i + 1;
@@ -171,6 +179,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-s") && nsession < 8) session[nsession++] = argv[i + 1];
         else if (!strcmp(argv[i], "-t")) ticks = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-w")) looks = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "-o")) opens = atoi(argv[i + 1]);
     }
     say_session("at the start");
 
@@ -284,6 +293,30 @@ int main(int argc, char **argv) {
     if (!program) dispatch_main();
     pid_t pid = start_as(program, user, group, name, home, pw);
     printf("gexloginwindow: started %s as %d, pid %d\n", program[0], (int)user, (int)pid);
+    if (opens > 0 && pid > 0) {
+        // Its open event, sent until it is taken (an application not yet
+        // up to receive one: procNotFound, or the send times out).
+        dispatch_source_t open = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(open, dispatch_time(DISPATCH_TIME_NOW, (int64_t)opens * NSEC_PER_SEC), (uint64_t)opens * NSEC_PER_SEC, NSEC_PER_SEC);
+        __block int tries = 0;
+        dispatch_source_set_event_handler(open, ^{
+            AEAddressDesc target;
+            AppleEvent event = {typeNull, NULL};
+            OSStatus e = AECreateDesc(typeKernelProcessID, &pid, sizeof pid, &target);
+            if (e == noErr) {
+                e = AECreateAppleEvent(kCoreEventClass, kAEOpenApplication, &target, kAutoGenerateReturnID, kAnyTransactionID, &event);
+                AEDisposeDesc(&target);
+            }
+            if (e == noErr) {
+                e = AESendMessage(&event, NULL, kAENoReply, 60 * 60);
+                AEDisposeDesc(&event);
+            }
+            tries++;
+            if (e == noErr || tries % 10 == 1) printf("gexloginwindow: open event to %d: %d (try %d)\n", (int)pid, (int)e, tries);
+            if (e == noErr) dispatch_source_cancel(open);
+        });
+        dispatch_resume(open);
+    }
     // (Its end waited for on a thread of its own: the main one serves
     // the ticks.)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
