@@ -10,10 +10,10 @@
 // (bootstrap_check_in, and an XPC listener's check-in). This is that part.
 //
 // It reads the job descriptions (LaunchDaemons and LaunchAgents plists:
-// Label, Program or ProgramArguments, MachServices), makes a port for each
-// Mach service, and serves requests on the bootstrap port it hands to every
-// process it starts. A job is started when one of its services is first
-// looked up; it checks in and is given the receive right; when it ends, its
+// Label, Program or ProgramArguments, MachServices, EnvironmentVariables),
+// makes a port for each Mach service, and serves requests on the bootstrap
+// port it hands to every process it starts. A job is started when one of
+// its services is first looked up; it checks in and is given the receive right; when it ends, its
 // services get new ports and it can be started again.
 //
 // The requests arrive as libxpc sends them, an XPC pipe routine
@@ -118,6 +118,10 @@ struct job {
     // runs it: appleeventsd as _appleevents, whose forwarded events an
     // application takes only from that user. NULL: root's.
     char *user_name, *group_name;
+    // Its EnvironmentVariables, "NAME=value" each, NULL-ended (or NULL):
+    // set in its process as launchd sets them. talagent will not run
+    // without its NSRunningFromLaunchd.
+    char **env;
 };
 
 static struct service *services;
@@ -278,7 +282,17 @@ static void add_job(const char *path) {
     if (program) argv[n + 1] = program;  // (the file, kept past the arguments)
     jobs = realloc(jobs, (njobs + 1) * sizeof *jobs);
     jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL,
-                               dup_string(xpc_dictionary_get_value(plist, "UserName")), dup_string(xpc_dictionary_get_value(plist, "GroupName"))};
+                               dup_string(xpc_dictionary_get_value(plist, "UserName")), dup_string(xpc_dictionary_get_value(plist, "GroupName")), NULL};
+    xpc_object_t env = xpc_dictionary_get_value(plist, "EnvironmentVariables");
+    if (env && xpc_get_type(env) == XPC_TYPE_DICTIONARY && xpc_dictionary_get_count(env)) {
+        char **e = calloc(xpc_dictionary_get_count(env) + 1, sizeof *e);
+        __block size_t k = 0;
+        xpc_dictionary_apply(env, ^bool(const char *name, xpc_object_t v) {
+            if (xpc_get_type(v) == XPC_TYPE_STRING && asprintf(&e[k], "%s=%s", name, xpc_string_get_string_ptr(v)) >= 0) k++;
+            return true;
+        });
+        jobs[njobs].env = e;
+    }
     // (Each job has its own place: services point to it by index below.)
     if (mach) xpc_dictionary_apply(mach, ^bool(const char *name, xpc_object_t v) {
         (void)v;
@@ -397,13 +411,13 @@ static int agents_own;
 // launchd honoured it.
 static int daemons_root;
 
-static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name);
+static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name, char **env);
 
 static pid_t start(char **argv, const char *file, int as_user) {
-    return start_as_named(argv, file, as_user, NULL, NULL);
+    return start_as_named(argv, file, as_user, NULL, NULL, NULL);
 }
 
-static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name) {
+static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name, char **env) {
     pid_t pid = fork();
     if (pid == 0) {
         uid_t u = as_user == 2 && agents_own ? agent_user : as_user ? user : 0;
@@ -427,6 +441,7 @@ static pid_t start_as_named(char **argv, const char *file, int as_user, const ch
                 setenv("SHELL", pw->pw_shell, 1);
             }
         }
+        for (; env && *env; env++) putenv(*env);
         execv(file ? file : argv[0], argv);
         fprintf(stderr, "gexlaunchd: %s: %s\n", file ? file : argv[0], strerror(errno));
         _exit(127);
@@ -456,7 +471,7 @@ static void start_job(struct job *j) {
     while (j->argv[n]) n++;
     // (A Program kept past the arguments, after the null that ends them.)
     const char *file = j->argv[n + 1];
-    j->pid = start_as_named(j->argv, file, j->agent ? 2 : 0, j->user_name, j->group_name);
+    j->pid = start_as_named(j->argv, file, j->agent ? 2 : 0, j->user_name, j->group_name, j->env);
     j->started++;
     say("started %s, pid %d", j->label, j->pid);
 }

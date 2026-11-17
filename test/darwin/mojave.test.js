@@ -71,6 +71,26 @@ export default async function (t) {
   const notes = await session('notifyutil -1 com.gex.ping & sleep 3; notifyutil -p com.gex.ping; wait');
   t.check('notifyutil: a post reaches a waiter through notifyd', notes.code === 0 && notes.stdout.trim() === 'com.gex.ping', `exit ${notes.code}, said ${JSON.stringify(notes.stdout.trim())}`);
 
+  // A job's EnvironmentVariables are its process's, as launchd sets them
+  // (talagent will not run without its NSRunningFromLaunchd): a job of the
+  // test's own, started at load (-r), says them.
+  const jobs = join(d, 'jobs');
+  mkdirSync(jobs, { recursive: true });
+  writeFileSync(join(jobs, 'com.gex.envtest.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.gex.envtest</string>
+<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo "envtest: $GEX_ENVTEST_A $GEX_ENVTEST_B"</string></array>
+<key>EnvironmentVariables</key><dict><key>GEX_ENVTEST_A</key><string>one</string><key>GEX_ENVTEST_B</key><string>two words</string></dict>
+</dict></plist>
+`);
+  const env = await n.gexc(
+    ['run', '--uid', '0', ...sysroot, '--bind', `${gl}=/gex`, '--bind', `${jobs}=/gex-jobs`, ...sessionBinds,
+      join(gl, 'gexlaunchd.x86_64'), '-v', '-j', '/gex-jobs', '-r', 'com.gex.envtest', '--', '/bin/sleep', '3'],
+    { timeout: 300000 },
+  );
+  t.check('gexlaunchd: a job has its EnvironmentVariables', /^envtest: one two words$/m.test(env.stdout), `exit ${env.code}, said ${JSON.stringify(env.stdout.trim())}`);
+
   // WindowServer, as far as it goes: run as its own job's program under
   // gexlaunchd, with the directories it and the daemons it starts write
   // bound to the test's own (copies of the root's where it has some). It
