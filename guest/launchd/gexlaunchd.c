@@ -24,7 +24,7 @@
 // token), as launchd's do, and comes from a process running as root, which
 // libxpc insists on of a bootstrap server that is not process 1.
 //
-//   gexlaunchd [-v] [-u UID[:GID]] [-a UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [-o LABEL]... [--] PROGRAM [ARG...]
+//   gexlaunchd [-v] [-R] [-u UID[:GID]] [-a UID[:GID]] [-j DIR]... [-x LABEL]... [-r LABEL]... [-o LABEL]... [--] PROGRAM [ARG...]
 //
 // starts PROGRAM with this server as its bootstrap port and exits when it
 // does, with its status, ending the jobs it started. -j adds a directory of
@@ -35,7 +35,8 @@
 // program to another (gexloginwindow's -s); -v says what is asked and
 // answered; -u is the user PROGRAM and the agents run as; -a the agents'
 // user alone, the program staying root (WindowServer, with the console
-// user's agents beside it).
+// user's agents beside it). A daemon runs as the user its job names
+// (UserName, GroupName), as launchd runs it; -R runs every daemon as root.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -113,6 +114,10 @@ struct job {
     int wanted;
     // An agent, the user's, run as the user.
     int agent;
+    // A daemon's own user and group (UserName, GroupName), as launchd
+    // runs it: appleeventsd as _appleevents, whose forwarded events an
+    // application takes only from that user. NULL: root's.
+    char *user_name, *group_name;
 };
 
 static struct service *services;
@@ -272,7 +277,8 @@ static void add_job(const char *path) {
     }
     if (program) argv[n + 1] = program;  // (the file, kept past the arguments)
     jobs = realloc(jobs, (njobs + 1) * sizeof *jobs);
-    jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL};
+    jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL,
+                               dup_string(xpc_dictionary_get_value(plist, "UserName")), dup_string(xpc_dictionary_get_value(plist, "GroupName"))};
     // (Each job has its own place: services point to it by index below.)
     if (mach) xpc_dictionary_apply(mach, ^bool(const char *name, xpc_object_t v) {
         (void)v;
@@ -387,11 +393,30 @@ static uid_t user, agent_user;
 static gid_t group, agent_group;
 static int agents_own;
 
+// Daemons run as root, whatever their UserName (-R): as before gex's
+// launchd honoured it.
+static int daemons_root;
+
+static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name);
+
 static pid_t start(char **argv, const char *file, int as_user) {
+    return start_as_named(argv, file, as_user, NULL, NULL);
+}
+
+static pid_t start_as_named(char **argv, const char *file, int as_user, const char *user_name, const char *group_name) {
     pid_t pid = fork();
     if (pid == 0) {
         uid_t u = as_user == 2 && agents_own ? agent_user : as_user ? user : 0;
         gid_t g = as_user == 2 && agents_own ? agent_group : group;
+        // A daemon's own user, by name (its group the user's own unless
+        // it names one).
+        struct passwd *named = !as_user && user_name && !daemons_root ? getpwnam(user_name) : NULL;
+        if (named) {
+            u = named->pw_uid;
+            g = named->pw_gid;
+            struct group *gr = group_name ? getgrnam(group_name) : NULL;
+            if (gr) g = gr->gr_gid;
+        }
         if (u) {
             struct passwd *pw = getpwuid(u);
             if (setgid(g) || (pw && initgroups(pw->pw_name, (int)g)) || setuid(u)) _exit(126);
@@ -431,7 +456,7 @@ static void start_job(struct job *j) {
     while (j->argv[n]) n++;
     // (A Program kept past the arguments, after the null that ends them.)
     const char *file = j->argv[n + 1];
-    j->pid = start(j->argv, file, j->agent ? 2 : 0);
+    j->pid = start_as_named(j->argv, file, j->agent ? 2 : 0, j->user_name, j->group_name);
     j->started++;
     say("started %s, pid %d", j->label, j->pid);
 }
@@ -677,6 +702,7 @@ int main(int argc, char **argv) {
     int ndirs = 0, i = 1;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!strcmp(argv[i], "-R")) daemons_root = 1;
         else if (!strcmp(argv[i], "-x") && i + 1 < argc && nskipped < 64) skipped[nskipped++] = argv[++i];
         // A job left out by default offered after all.
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
