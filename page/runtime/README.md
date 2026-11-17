@@ -795,6 +795,89 @@ the native host's for tests (a module beside `notify.rs`, and a line in
   (a frame is 72 bytes and more); a device with high-rate input reports may
   have a stream of its own so that requests do not wait behind them.
 
+### MIDI
+
+`Midi` (`page/runtime/src/midi.js`): the page's shell gives programs the
+browser's Web MIDI, as the service `midi`. A program's framework (pyrus's
+CoreMIDI) sees the browser's MIDI inputs and outputs as devices, hears them
+come and go, receives what the inputs send and sends to the outputs. One
+per system, made any time:
+
+```js
+const midi = new Midi(sys, {
+  requestMIDIAccess: (o) => navigator.requestMIDIAccess(o), // the default
+  authorize: async ({ pid, sysex }) => true,   // may this program have MIDI (and system exclusive)?
+  sysex: 'ask',                                // or 'never', or 'always'
+});
+midi.addEventListener('send', ({ pid, port, data, at }) => {});
+```
+
+| Member | Does |
+| --- | --- |
+| `requestMIDIAccess(options)` | The browser's `navigator.requestMIDIAccess` (a test gives its own). It is called with `{ sysex: false }` when a program first connects, and with `{ sysex: true }` only when a program first sends a system exclusive message. |
+| `authorize({ pid, sysex })` | Decides whether a program may have MIDI, and then (`sysex: true`) system exclusive; a boolean, or a promise of one; a throw is a refusal. Without it every program is allowed. A refusal is `access` with `state: "denied"` to the program, which then has no devices. |
+| `sysex` | `'ask'` (the default: the second permission when a program sends system exclusive), `'always'` (`{ sysex: true }` with the first request) or `'never'` (system exclusive from a program is dropped, and its request answered `granted: false`). |
+| `midi.ports()`, `midi.programs()` | The ports the browser has, as programs are told them (`{ id, name, manufacturer, version, type, state, connection }`, frozen, text bounded); the pids of the programs connected. |
+| `midi.removePort(id)` | The browser took a port away (Web MIDI never does; its ports go `disconnected`): the programs are told `removed`. |
+
+Events: `connect` and `disconnect` (`pid`), `access` (`pid`, `sysex`,
+`granted`), `listen` (`pid`, `port`, `on`: a program began or ended
+listening to an input) and `send` (`pid`, `port`, `data` a `Uint8Array`,
+`at` the browser's `performance.now()` time it is for, or `null`: a message
+a program sent, before it is given to the output).
+
+**Messages.** The connection is to the service `midi`, version 1; a
+program's first message is `hello`. Numbers are JSON numbers; a message's
+bytes are the frame's data.
+
+| From the program | | The page answers or says |
+| --- | --- | --- |
+| `{"op": "hello", "sysex": false}` | The program wants MIDI. | `{"op": "access", "state": "granted" \| "denied" \| "unavailable", "sysex": bool}`, then, if granted, `{"op": "ports", "ports": [PORT...]}`. `unavailable`: the browser has no Web MIDI. |
+| `{"op": "listen", "port": ID, "on": bool}` | Start or stop receiving what input `ID` sends. | `{"op": "message", ...}` below, for each message, while any connection listens. |
+| `{"op": "send", "port": ID, "now": NS, "at": NS}` + the message | One MIDI message to output `ID` (a note, a controller, a system message, or a whole system exclusive message from F0 to F7), bytes in the data. `now` is the program's host time in nanoseconds and `at` the time the message is for (0 for now). | `{"op": "failed", "port": ID, "reason": TEXT}` if the browser threw. |
+| `{"op": "clear", "port": ID}` | Drop what output `ID` holds to send later. | |
+| `{"op": "sysex", "seq": N}` | The program is about to send system exclusive. | `{"op": "sysex", "seq": N, "granted": bool}` once the second permission is decided; `{"op": "access", "state": "granted", "sysex": true}` is said to every program when it is given. |
+
+| From the page | |
+| --- | --- |
+| `{"op": "port", "change": "added" \| "changed" \| "removed", ...PORT}` | A port came, changed state (`state` is `connected` or `disconnected`) or went. |
+| `{"op": "message", "port": ID, "t": MS, "now": MS}` + the message | What input `ID` sent: `t` is the event's `timeStamp` and `now` the page's `performance.now()` as it is sent. |
+
+A PORT is `{"id", "name", "manufacturer", "version", "type": "input" \|
+"output", "state", "connection"}`, strings, as Web MIDI has them.
+
+**Time** crosses as differences, not as one clock's reading: the page's
+`performance.now()` and a program's host time (`mach_absolute_time`) are
+not the same clock. A message from an input says how long before the
+frame it happened (`now - t`), and the program takes that from its own
+`now`; a message to an output says when it is for in the program's own time
+and what the program's time is, and the page sends it at its `now` plus the
+difference (`output.send(data, performance.now() + (at - now) / 1e6)`).
+
+**Permissions.** `requestMIDIAccess` is what the browser asks the user for,
+and the page does not call it until a program asks (`hello`). A browser's
+second permission, for system exclusive messages, is asked for only when a
+program sends one (`sysex`), once, and the program's message waits for it;
+a program that only listens is given what the browser gives without it (a
+browser drops the system exclusive messages of an input until the second
+permission is held). `authorize` is the shell's own gate in front of both.
+
+**What a program sees.** pyrus's CoreMIDI makes a device for each name
+among the browser's ports (the manufacturer and name Web MIDI gives; the
+model is the name), an entity for each input and output of that name that
+pair, and a source or destination for each port; an unplugged port is the
+device `offline`, as on a Mac, and does not leave the lists of devices. The
+unique ids are made from the port ids, so they are the same in every
+process. With no `midi` service (a host that has none, or a page that did
+not make a `Midi`) or one that refuses, a program is on a Mac with no MIDI
+hardware; its virtual sources and destinations, which it makes with
+CoreMIDI, work between its own clients and between processes (over sockets
+and a file of each process's under `/private/tmp/.pyrus-midi`) with no
+service at all. `test/darwin/midi-page` (a studio's program, with a browser
+whose ports move), `midi-denied-page`, `midi-nosvc-page` and
+`midi-peers-page` check it. Natively (gexc) there is no stand-in `midi`
+service yet: a program there has virtual endpoints only.
+
 ## Notifications
 
 `Notifications` (`@gexemu/runtime/notifications`): the page's shell

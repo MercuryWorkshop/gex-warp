@@ -1,0 +1,14 @@
+client: 0
+spawn: 0
+the child's endpoints: source 1, destination 1
+its name: Child Source
+its id: 0 nonzero 1
+found by id: 0 1 2
+connect: 0
+child got: 90 3c 64
+from the child's source: b0 07 7f
+to the parent's destination: 80 3c 00
+child got from the parent's source: e0 00 40
+the child: exit 0
+its endpoints are gone: 1 1
+exit 0
