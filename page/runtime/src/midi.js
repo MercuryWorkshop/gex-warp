@@ -67,6 +67,7 @@ export class Midi extends EventTarget {
   #sysexPending = null;
   #ports = new Map();  // id -> port as the browser has it
   #hooked = new Set(); // inputs whose messages are listened to
+  #attached = new WeakSet(); // the port objects a listener is on (a new access has new ones)
 
   constructor(sys, { requestMIDIAccess = null, authorize = null, sysex = 'ask' } = {}) {
     super();
@@ -177,6 +178,8 @@ export class Midi extends EventTarget {
       const now = globalThis.performance?.now() ?? 0;
       for (const c of this.#conns) if (c.listening.has(id)) c.conn.send({ op: 'message', port: id, t: e.timeStamp ?? now, now }, data);
     };
+    if (this.#attached.has(p)) return;
+    this.#attached.add(p);
     if (typeof p.addEventListener === 'function') p.addEventListener('midimessage', listener);
     else p.onmidimessage = listener;
     // (An input is opened by listening to it; the browser's open() is
