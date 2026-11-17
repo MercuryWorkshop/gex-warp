@@ -17,23 +17,24 @@ import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { Codecs } from '../../page/runtime/src/codecs.js';
 import { bytesOf } from '../../page/runtime/src/internal.js';
-import { CASES, CLIPS } from '../fixtures/darwin/codecs-cases.mjs';
+import { CASES, CLIPS, IMAGES, argsOf } from '../fixtures/darwin/codecs-cases.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['a64', 'x86'], images: ['darwin-root'], timeout: 3600 };
 
 const text = (b) => new TextDecoder().decode(b);
 // A frame line without its planes' hashes (for a measured case).
-const unhashed = (s) => s.replace(/:[0-9a-f]{16}/g, ':#').replace(/ [0-9a-f]{16}( |$)/g, ' #$1');
+const unhashed = (s) => s.replace(/:[0-9a-f]{16}/g, ':#').replace(/ [0-9a-f]{16}(?=\s|$)/gm, ' #');
 const unordered = (s) => s.split('\n').filter((l) => !l.startsWith('came in order')).join('\n');
 
 export default async function (t) {
   const { eq, check, timeout } = t;
   const arch = t.arch === 'x86' ? 'x86' : 'aarch64';
   const dir = `darwin-codecs.${arch}`;
-  let decode, encode;
+  let decode, encode, images;
   try {
     decode = await bytesOf(t.work(`${dir}/vtdecode`));
     encode = await bytesOf(t.work(`${dir}/vtencode`));
+    images = await bytesOf(t.work(`${dir}/iiodecode`)).catch(() => null);
   } catch {
     t.skip(`no Mac root, no pyrus test/media, or no Mac compiler for ${t.arch} (GEX_TEST_DARWIN_ROOT${t.arch === 'x86' ? '_X86' : ''}, GEX_TEST_PYRUS_MEDIA)`);
   }
@@ -52,11 +53,14 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, arch, debug, services: { bulk: 4 } });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work(`darwin-root.${arch}.tar`));
-  fs.addFiles({ '/usr/local/bin/vtdecode': decode, '/usr/local/bin/vtencode': encode }, { mode: 0o755 });
+  fs.addFiles({ '/usr/local/bin/vtdecode': decode, '/usr/local/bin/vtencode': encode, ...(images ? { '/usr/local/bin/iiodecode': images } : {}) }, { mode: 0o755 });
   const clips = {};
-  for (const c of CLIPS) clips[`/clips/${c}`] = await bytesOf(t.work(`darwin-codecs/${c}`));
+  for (const c of [...CLIPS, ...IMAGES]) {
+    const b = await bytesOf(t.work(`darwin-codecs/${c}`)).catch(() => null);
+    if (b) clips[`/clips/${c}`] = b;
+  }
   fs.addFiles(clips);
-  new Codecs(sys);
+  const codecs = new Codecs(sys);
   await timeout(sys.boot(), 120000, 'boot');
   check('programs have the service node', sys.services.available);
 
@@ -80,13 +84,15 @@ export default async function (t) {
       t.say(`${c.name}: no output of this Mac's to compare with`);
       continue;
     }
-    const args = c.prog === 'vtdecode' ? [`/clips/${c.args[0]}`, ...c.args.slice(1)] : c.args;
-    const env = { PATH: '/usr/bin:/bin', HOME: '/', ...(c.measure ? { VTDECODE_DUMP: `/tmp/${c.name}.raw` } : {}) };
+    const args = argsOf(c, '/clips');
+    const env = { PATH: '/usr/bin:/bin', HOME: '/', ...(c.measure ? { VTDECODE_DUMP: `/tmp/${c.name}.raw`, IIODECODE_DUMP: `/tmp/${c.name}.raw` } : {}) };
     const t0 = performance.now();
     const r = await timeout(sys.run([`/usr/local/bin/${c.prog}`, ...args], { env, cwd: '/' }), 600000, c.name);
     t.record(c.name, Math.round(performance.now() - t0));
     const tail = r.stderr.trim().split('\n').slice(-3).join(' / ');
-    if (c.order) {
+    if (c.unless && !(await ImageDecoder.isTypeSupported(c.unless).catch(() => false))) {
+      eq(`${c.name}: this browser has no ${c.unless}: known, and not made`, r.stdout, c.absent, tail);
+    } else if (c.order) {
       eq(`${c.name}: as on the Mac, but for the order frames came in`, unordered(r.stdout), unordered(want), tail);
       const got = r.stdout.split('\n').find((l) => l.startsWith('came in order')) ?? '';
       t.say(`${c.name}: ${got} (the Mac's: ${want.split('\n').find((l) => l.startsWith('came in order'))})`);
@@ -113,9 +119,20 @@ export default async function (t) {
         t.record(`${c.name} ${plane} max difference`, max);
         if (within < 255) check(`${c.name} ${plane}: within ${within} of the Mac's, and ${most * 100}% within 1`, n > 0 && max <= within && near >= most * n, `by ${max} at most`);
       }
+    } else if (c.differs?.[t.arch]) {
+      t.known(`${c.name}: as on the Mac`, r.stdout === want, tail, c.differs[t.arch]);
     } else {
       eq(`${c.name}: as on the Mac`, r.stdout, want, tail);
     }
+  }
+  // The same service in a Worker of the page's: a decoding and an encoding
+  // again, through it.
+  codecs.stop();
+  new Codecs(sys, { worker: new Worker(new URL('../fixtures/darwin/codecs-worker.mjs', import.meta.url), { type: 'module' }) });
+  for (const c of CASES.filter((c) => c.name === 'bframes-sync' || c.name === 'encode-h264')) {
+    const want = text(await bytesOf(t.work(`${dir}/${c.name}.mac`)).catch(() => new Uint8Array()));
+    const r = await timeout(sys.run([`/usr/local/bin/${c.prog}`, ...argsOf(c, '/clips')], { env: { PATH: '/usr/bin:/bin', HOME: '/' }, cwd: '/' }), 600000, `${c.name} in a Worker`);
+    eq(`${c.name}, served in a Worker: as on the Mac`, r.stdout, want, r.stderr.trim().split('\n').slice(-3).join(' / '));
   }
   await sys.shutdown();
 }
