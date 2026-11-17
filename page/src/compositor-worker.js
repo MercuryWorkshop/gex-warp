@@ -2249,6 +2249,9 @@ async function startGl(m, canvas) {
     api: m.api || 'core',
     env: m.mesaEnv,
     capture: m.glCapture,
+    // A full recording goes to the page (compositor.js), which saves it
+    // where its embedder says or POSTs it to the server.
+    ...(m.glCapture ? { onCapture: (bytes) => post({ kind: 'gl-capture', bytes }, [bytes.buffer]) } : {}),
     wgslCache: m.wgslCache,
     wgpuStats: m.wgpuStats,
     glTrace: m.glTrace,

@@ -265,6 +265,7 @@ export class MesaGlDevice {
   // into a device that no longer existed. Small demos never showed it because
   // they finish before a collection runs.
   #adapter = null;
+  #onCapture = null;
   #device = null;
   #module = null;
   #submit = null;
@@ -403,6 +404,10 @@ export class MesaGlDevice {
       if (rc !== 0) out.#failed = `Mesa/WebGPU initialization failed (${rc})`;
       out.#description = `Mesa st/mesa + gex_wgpu on WebGPU (${api})`;
       out.capture = captureIfRequested(PROTOCOL_VERSION, canvas.width, canvas.height, options.capture);
+      // Where a full recording goes: `options.onCapture(bytes)` (the
+      // compositor worker hands it to its page), the embedder's sink in the
+      // page's realm, else a POST to whoever serves the page.
+      out.#onCapture = options.onCapture ?? null;
     } catch (e) {
       out.#failed = e?.message || String(e);
     }
@@ -540,7 +545,11 @@ export class MesaGlDevice {
       this.capture.posted = true;
       const bytes = this.capture.toBytes();
       this.capture = null;
-      fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
+      // In the page's own realm (the DOM compositor), the embedder's
+      // `onGlCapture` (app.js) takes it directly.
+      const sink = this.#onCapture ?? globalThis.__gexGlCaptureSink;
+      if (sink) sink(bytes);
+      else fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
     }
 
     const timed = d3d && this.statsOn;

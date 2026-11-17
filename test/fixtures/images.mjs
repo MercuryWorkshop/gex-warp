@@ -131,6 +131,31 @@ const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 
 
 export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 'linux-gtk': ['linux-gtk.tar'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'mount-fork.x86', 'mount-fork.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
+/** A site's rest bundle in `dir` (eject-site.mjs's layout): rest.bin, raw
+ *  zstd frames of 64 KiB, its index rest.bin.json (hash `h`), and lazy.json
+ *  naming /data/f0, the first frame's bytes, in it. */
+function restBundle(dir, h) {
+  const FRAME = 64 << 10, N = 6;
+  mkdirSync(dir, { recursive: true });
+  const frames = [], parts = [];
+  let at = 0;
+  for (let k = 0; k < N; k++) {
+    const z = Buffer.alloc(12 + FRAME);
+    z.writeUInt32LE(0xfd2fb528, 0);
+    z[4] = 0xa0; // single segment, a 4-byte content size
+    z.writeUInt32LE(FRAME, 5);
+    const bh = 1 | (FRAME << 3); // the last block, raw
+    z[9] = bh & 0xff; z[10] = (bh >> 8) & 0xff; z[11] = (bh >> 16) & 0xff;
+    z.fill(0x61 + k, 12);
+    frames.push([at, z.length]);
+    parts.push(z);
+    at += z.length;
+  }
+  writeFileSync(join(dir, 'rest.bin'), Buffer.concat(parts));
+  writeFileSync(join(dir, 'rest.bin.json'), JSON.stringify({ frame: FRAME, size: FRAME * N, h, frames }));
+  writeFileSync(join(dir, 'lazy.json'), JSON.stringify({ base: `/__t/work/${h}/`, files: [['/data/f0', FRAME, 'rest.bin#0', 1700000000]] }));
+}
+
 export const images = {
   // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
   // gex-wasm targets (GEX_TEST_MESA_BUILD, default target/web-build: its
@@ -364,6 +389,10 @@ export const images = {
     // The same for core/runprogram, which reads it, apart from core/dir-times's
     // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
+    // A rest bundle for page/rest-ahead (one copy for each setting, so the
+    // page's cache of one is not the other's): six 64 KiB zstd frames, one
+    // lazy file in its first.
+    for (const name of ['ra-off', 'ra-on']) restBundle(join(work, name), name);
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.

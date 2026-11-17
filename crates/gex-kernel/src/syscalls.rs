@@ -1073,6 +1073,12 @@ struct Outgrow {
     /// gex's own memory for it ran out in the lowered memory
     /// ([`note_runtime_short`]): it ends for that, whatever its status.
     runtime: bool,
+    /// Whether Wine's core module has a memory64 build beside it, once it
+    /// is loaded, and the first other module that has none
+    /// ([`outgrow_module`]): with both, a 64-bit memory cannot run the
+    /// process, so it is never recorded for one.
+    core_m64: Option<bool>,
+    no64: Option<String>,
 }
 
 static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
@@ -1160,6 +1166,27 @@ pub fn note_runtime_short(pid: i32, len: u64, wasm32: bool) -> bool {
     true
 }
 
+/// Process `pid` loaded native module `file` (a skeleton's), with a
+/// memory64 build beside it (`<file>.m64`) or not (`m64`). Wine's core
+/// (`winepe.wasm`) with one says the install has a 64-bit memory to move
+/// to; any other module without one then cannot move with it (a program's
+/// own, built for a wasm32 memory only), so outgrowing the lowered memory
+/// ends the process for good, saying so, and never records it for one
+/// ([`outgrow_ending`]). The first such module is the one named. Takes no
+/// other lock.
+pub fn outgrow_module(pid: i32, file: &str, m64: bool) {
+    if gex_abi::mem64() {
+        return;
+    }
+    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == pid) {
+        if file.rsplit('/').next() == Some("winepe.wasm") {
+            o.core_m64.get_or_insert(m64);
+        } else if !m64 {
+            o.no64.get_or_insert_with(|| file.to_string());
+        }
+    }
+}
+
 /// Whether [`note_runtime_short`] would record process `pid`, and its host
 /// can move it to a 64-bit memory. No lock but the record's, tried.
 pub fn outgrow_armed(pid: i32, wasm32: bool) -> bool {
@@ -1201,7 +1228,19 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
         let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
         procs.set_crash_unless_said(pid, why.as_bytes());
     }
-    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS || !(host.reachable)() {
+    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS {
+        return;
+    }
+    // a module with no memory64 build: a 64-bit memory would not run it
+    if let (Some(true), Some(m)) = (rec.core_m64, &rec.no64) {
+        (host.say)(&format!(
+            "{} ran out of memory (2 GiB); {m} has no 64-bit memory build ({m}.m64), so it cannot move to a 64-bit memory\n",
+            rec.image.as_deref().unwrap_or("")
+        ));
+        procs.add_crash_line(pid, "ran out of memory (2 GiB); this program has no 64-bit memory build");
+        return;
+    }
+    if !(host.reachable)() {
         return;
     }
     let set = match &rec.image {
@@ -11536,13 +11575,13 @@ impl Kernel {
             || image.as_deref().and_then(|p| self.read_head(p, 4096)).is_some_and(|h| pe_is_32bit(&h));
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
-            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None },
             Some(o) => {
                 if o.image.is_none() {
                     o.image = image;
                 }
             }
-            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false }),
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None }),
         }
     }
 

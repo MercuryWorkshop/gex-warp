@@ -301,6 +301,53 @@ impl Home {
         }
     }
 
+    /// The names the `name` section of the wasm module at `path` gives the
+    /// functions `want` holds, read through a window of 1 MiB: a large
+    /// program's name section is tens of MiB (41 MiB of a 290 MiB one), and
+    /// only its table's functions are asked for. Empty without a name
+    /// section; `None` if `path` is not a wasm module or ends inside one.
+    pub(crate) fn wasm_func_names(&self, path: &str, want: &std::collections::HashSet<u32>) -> Option<std::collections::HashMap<u32, String>> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut r = Chunks { f: &*f, off: 8, buf: Vec::new(), at: 0 };
+        let mut out = std::collections::HashMap::new();
+        let mut magic = [0u8; 8];
+        if f.read_at(0, &mut magic).ok()? != 8 || !magic.starts_with(b"\0asm") {
+            return None;
+        }
+        loop {
+            let Some(id) = r.byte_or_end()? else { return Some(out) };
+            let len = r.leb()?;
+            let end = r.pos() + len;
+            if id == 0 {
+                let n = r.leb()?;
+                if n == 4 && r.take(4)? == b"name" {
+                    // subsections: id, size, then for functions (1) a
+                    // vector of (index, name)
+                    while r.pos() < end {
+                        let sub = r.byte()?;
+                        let size = r.leb()?;
+                        let stop = r.pos() + size;
+                        if sub == 1 {
+                            for _ in 0..r.leb()? {
+                                let idx = r.leb()? as u32;
+                                let l = r.leb()?;
+                                if want.contains(&idx) {
+                                    out.insert(idx, String::from_utf8_lossy(r.take(l as usize)?).into_owned());
+                                } else {
+                                    r.skip_to(r.pos() + l);
+                                }
+                            }
+                            return Some(out);
+                        }
+                        r.skip_to(stop);
+                    }
+                    return Some(out);
+                }
+            }
+            r.skip_to(end);
+        }
+    }
+
     /// The whole of `path` when it is an ELF object, for the scans that parse
     /// one (its symbols, `.eh_frame`, segments); None for anything else,
     /// read no further than its magic. An executable mapping of a Windows
@@ -747,4 +794,85 @@ pub(crate) fn timer_in_ns() -> Option<u64> {
     }
     let (secs, nanos) = (home.clock)();
     home.sig.timer_in_ns(secs as u128 * 1_000_000_000 + nanos as u128)
+}
+
+/// A file read forward through a window of at most 1 MiB (plus the longest
+/// single item taken), for [`Home::wasm_func_names`].
+struct Chunks<'a> {
+    f: &'a dyn gex_kernel::vfs::FileHandle,
+    /// The file offset of `buf[0]`.
+    off: u64,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl Chunks<'_> {
+    fn pos(&self) -> u64 {
+        self.off + self.at as u64
+    }
+
+    /// At least `n` bytes from `at` in the window, unless the file ends first.
+    fn fill(&mut self, n: usize) -> Option<()> {
+        if self.buf.len() - self.at >= n {
+            return Some(());
+        }
+        self.buf.drain(..self.at);
+        self.off += self.at as u64;
+        self.at = 0;
+        let have = self.buf.len();
+        let want = n.max(1 << 20);
+        self.buf.resize(want, 0);
+        let mut done = have;
+        while done < want {
+            let got = self.f.read_at(self.off + done as u64, &mut self.buf[done..]).ok()? as usize;
+            if got == 0 {
+                break;
+            }
+            done += got;
+        }
+        self.buf.truncate(done);
+        Some(())
+    }
+
+    fn byte_or_end(&mut self) -> Option<Option<u8>> {
+        self.fill(1)?;
+        Some(self.buf.get(self.at).copied().inspect(|_| self.at += 1))
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.byte_or_end()?
+    }
+
+    fn leb(&mut self) -> Option<u64> {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let b = self.byte()?;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b < 0x80 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        self.fill(n)?;
+        let s = self.buf.get(self.at..self.at + n)?;
+        self.at += n;
+        Some(s)
+    }
+
+    /// On to file offset `to`, reading nothing in between.
+    fn skip_to(&mut self, to: u64) {
+        if to >= self.off && to <= self.off + self.buf.len() as u64 {
+            self.at = (to - self.off) as usize;
+        } else {
+            self.off = to;
+            self.buf.clear();
+            self.at = 0;
+        }
+    }
 }

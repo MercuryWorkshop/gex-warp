@@ -2883,7 +2883,7 @@ fn native_call_spent(gm: &GuestMem, c: u64) -> Option<&'static str> {
 }
 
 /// A call-out the glue opens inside others when the host's stack has no room
-/// for one more (`#callOutSteps`): a native Wine module's guest call (64-bit
+/// for one more (`#callOut`): a native Wine module's guest call (64-bit
 /// native Wine's `__gexw_guest_call64`), whose native frames no trap drops, as
 /// a handler that faults in every dispatch makes them without end. The
 /// process ends as one whose stack is spent, never with the host's stack
@@ -3056,7 +3056,7 @@ thread_local! {
 /// body directly (gexrt `__gexw_guest_call`), and the body is still inside
 /// one of these call-outs: an exception the callee raised was handled in
 /// the body's own function, whose code then ran on tier-1 and returned. The
-/// call-outs leave (JS's nested loops, `#callOutSteps`), the bodies leave
+/// call-outs leave (JS's nested loops, `#callOut`), the bodies leave
 /// with them, and the native caller's `run_until` finds the guest at its
 /// return. Without call-outs open nothing is waiting there: it stays a
 /// breakpoint.
@@ -3202,6 +3202,14 @@ pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_ref_mode(pc: i64, alt: i32) -> i64 {
     dispatch_ref(pc as u64, alt != 0)
+}
+
+/// Whether dispatch to `pc` in mode `alt` still goes through `table`'s entry
+/// `index` ([`gex_dispatch_ref_mode`] compared, with no 64-bit value back):
+/// what a call-out's watch checks on every arming.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_ref_is(pc: i64, alt: i32, table: i32, index: i32) -> i32 {
+    (dispatch_ref(pc as u64, alt != 0) == (((table as i64) << 32) | index as u32 as i64)) as i32
 }
 
 fn dispatch_ref(pc: u64, alt: bool) -> i64 {

@@ -1291,12 +1291,81 @@ fn translate_seeded(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
-    // Code in the process's other mode: its own pages and directory.
-    let mut page_table = page_table;
-    page_table.set_alt(other_mode());
-    let (mut blocks, mut stats) = discover(
+    let (blocks, stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, MISS_CODE_BUDGET, intrinsics,
     );
+    finish_runtime(memory, entry, blocks, stats, executable, known, page_table, limits, shared_memory, intrinsics)
+}
+
+/// What a miss on a page being rewritten while it runs lifts: the block at
+/// `entry` and the straight-line run after it -- a goto's target, a
+/// conditional branch's fall-through -- while that stays in `entry`'s
+/// dispatch page and is not translated already, up to `max_blocks` blocks,
+/// ending at a return, an indirect branch, a call or a system call. One
+/// module for what one pass through rewritten code is likely to run next,
+/// where discovery would lift everything reachable (and the next rewrite
+/// throw it away). Every block still checks its bytes on entry.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_runtime_run(
+    memory: &[u8],
+    entry: u64,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    page_table: PageTable,
+    limits: BlockLimits,
+    max_blocks: usize,
+    shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
+) -> (TranslatedModule, Stats) {
+    let mut stats = Stats::default();
+    let mut blocks: Vec<Block> = Vec::new();
+    let page = gex_abi::dispatch_page(entry);
+    let mut at = Some(entry);
+    while let Some(a) = at.take() {
+        let block = match intrinsics.get(&a) {
+            Some(&k) => intrinsic::block(a, k),
+            None => lift_one(a, memory, executable, limits).0,
+        };
+        stats.blocks += 1;
+        stats.instructions += ((block.end - block.start) / INST_ALIGN) as usize;
+        if matches!(block.term, Term::Illegal { .. }) {
+            stats.illegal_blocks += 1;
+        }
+        let next = match block.term {
+            Term::Goto { target } if block.call_return.is_none() => Some(target),
+            Term::Branch { not_taken, .. } => Some(not_taken),
+            _ => None,
+        };
+        blocks.push(block);
+        at = next.filter(|&n| {
+            blocks.len() < max_blocks
+                && gex_abi::dispatch_page(n) == page
+                && fetchable(memory, executable, n)
+                && !known(n)
+                && !blocks.iter().any(|b| b.start == n)
+        });
+    }
+    blocks.sort_unstable_by_key(|b| b.start);
+    stats.dead_flag_stmts = eliminate_dead_flags(&mut blocks);
+    finish_runtime(memory, entry, blocks, stats, executable, known, page_table, limits, shared_memory, intrinsics)
+}
+
+/// A runtime miss's blocks, as one module.
+#[allow(clippy::too_many_arguments)]
+fn finish_runtime(
+    memory: &[u8],
+    entry: u64,
+    mut blocks: Vec<Block>,
+    mut stats: Stats,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    mut page_table: PageTable,
+    limits: BlockLimits,
+    shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
+) -> (TranslatedModule, Stats) {
+    // Code in the process's other mode: its own pages and directory.
+    page_table.set_alt(other_mode());
     // A dispatch slot spans more bytes than an instruction (x86-64): every
     // block already translated that shares a slot with one of these has to be
     // in the same module, or this module's slot write would hide it. Lift

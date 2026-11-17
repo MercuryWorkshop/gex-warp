@@ -174,6 +174,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     for (unsigned i = 0; i < FT->getNumParams(); i++)
       if (Type *BT = CB.getParamByValType(i))
         name += ".bv" + std::to_string(i) + "_" + std::to_string(DL.getTypeAllocSize(BT));
+    // and so does a struct return (a pointer the stub writes, not a value):
+    // `void f(int *, int)` and `struct s12 f(int)` are one wasm type, and a
+    // stub of the other's layout dropped or shifted an argument
+    if (FT->getNumParams() && CB.paramHasAttr(0, Attribute::StructRet))
+      name += ".sr" + std::to_string(DL.getTypeAllocSize(CB.getParamStructRetType(0)));
     if (Function *F = M.getFunction(name)) return F;
 
     LLVMContext &C = M.getContext();

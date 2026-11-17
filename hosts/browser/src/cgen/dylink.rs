@@ -207,15 +207,17 @@ pub(super) fn read(path: &str) -> Option<Vec<u8>> {
     crate::sigs::proc_home().read_file(path).map(checked)
 }
 
-/// A library's bytes for its `Info` only, when the page has its content key
-/// (a process hashed this file, `wasmprog::shed_known`): the sections
-/// `Info::parse` reads, and what stands for the rest, which the page
-/// compiled from or will read again. Otherwise the whole file ([`read`]).
-/// Plasma's processes each read 150 to 200 MiB of libraries to parse 10.
+/// A library's bytes for its `Info` only: the sections `Info::parse`
+/// reads, and what stands for the rest (its content key from the file in
+/// pieces or the system-wide cache, `wasmprog::shed_file`), which the page
+/// compiled from or reads from the file. The whole file ([`read`]) only
+/// for checked calls, which rewrite it. Plasma's processes each read 150 to
+/// 200 MiB of libraries to parse 10.
 fn read_lib(path: &str, skel: &std::cell::RefCell<HashMap<String, Shed>>) -> Option<Vec<u8>> {
     if !CHECKED.load(Ordering::Relaxed) {
-        if let Some(s) = super::wasmprog::shed_known(path) {
-            if let Some(b) = crate::sigs::proc_home().read_wasm_parts(path, Info::reads_section) {
+        // (not a module, a file the search steps over: never hashed)
+        if let Some(b) = crate::sigs::proc_home().read_wasm_parts(path, Info::reads_section) {
+            if let Some(s) = super::wasmprog::shed_file(path) {
                 skel.borrow_mut().insert(path.to_string(), s);
                 return Some(b);
             }
@@ -231,6 +233,12 @@ fn read_lib(path: &str, skel: &std::cell::RefCell<HashMap<String, Shed>>) -> Opt
 /// with before the call; JS gives the guard `gex.dl_stale` and
 /// `gex.dl_size`. Off, nothing is rewritten and nothing costs.
 static CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`CHECKED`] is on: a library's bytes are then its file's
+/// rewritten, never the file's.
+pub(super) fn checked_on() -> bool {
+    CHECKED.load(Ordering::Relaxed)
+}
 
 #[no_mangle]
 pub extern "C" fn gex_set_dl_checked(on: i32) {

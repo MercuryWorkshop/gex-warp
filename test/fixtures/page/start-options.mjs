@@ -28,6 +28,7 @@ ok({ container: {}, size: 'fit', args: ['C:\\winlogon.exe'], env: { GEX_WIN_STAT
 ok({ container: {}, onProgress: () => {}, wisp: 'ws://localhost:6001' });
 ok({ size: '800x600', env: ['A=1', 'B='], strace: 42, hostx: 'rootful', debug: { cgen: 1 } });
 ok({ strace: true, uid: 0, ready: 'manual', compositor: false, args: undefined, env: null });
+ok({ restAhead: true }); ok({ restAhead: false });
 ok(Object.fromEntries(OPTIONS.map((k) => [k, undefined])));
 ok({ filesystem: 'memory' });
 ok({ filesystem: { kind: 'memory', max: 1 << 30 } });
@@ -52,6 +53,7 @@ no({ env: 'A=1' }, "['NAME=value', ...]");
 no({ strace: 'yes' }, 'true (every process) or a pid');
 no({ wisp: 'anura.pro' }, 'ws://... or wss://...');
 no({ hostx: 'yes' }, "true, false or 'rootful'");
+no({ restAhead: 'yes' }, 'true or false');
 no({ persist: { dir: '/home', db: 'x' } }, "filesystem: { kind: 'opfs', name }");
 no({ onExit: 'done' }, 'start({ onExit: "done" }): a function');
 no({ uid: -1 }, 'a user id');

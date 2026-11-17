@@ -13,7 +13,8 @@
 // so the record must be made before anything can see the first gone:
 // on the page, a run of copies started that way, each found recorded.
 // One whose thread gex has no memory of its own for (outgrow thread)
-// outgrows it the same way.
+// outgrows it the same way. One built as a native wasm32 module, with no
+// memory64 build, is never moved: it ends saying so.
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -25,6 +26,7 @@ export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 const SRC = fileURLToPath(new URL('../fixtures/wine/src/outgrow.c', import.meta.url));
 const SAID = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
 const NOTICE = /needs 64-bit memory; it will get it the next time it starts/;
+const NO64 = /outgrow\.exe ran out of memory \(2 GiB\); \S*outgrow\.exe\.wasm has no 64-bit memory build/;
 const lines = (out) => out.replace(/\r/g, '').split('\n').filter((l) => l.startsWith('outgrow ')).join('\n');
 // (where the fallback's blocks ended is checked on the page only)
 const fell = (out) => lines(out).split('\n').filter((l) => l !== 'outgrow reached 2g').join('\n');
@@ -91,5 +93,23 @@ export default async function (t) {
   t.check('page: a thread gex has no memory for ends the first start', run[0] === 'outgrow filling' && /^outgrow child exit (?!00000000)/.test(run[1] ?? ''), w.detail(pr));
   t.eq('page: and its next start, in a 64-bit memory, runs the thread', run.slice(2).join('\n'), 'outgrow filling\noutgrow thread ran\noutgrow child exit 00000000', w.detail(pr));
   t.check("page: gex says its own memory for it could not grow", /outgrow\.exe needs 64-bit memory \(gex's own memory for it could not grow by 0x[0-9a-f]+ bytes\); it gets it from its next start/.test(pr.out), w.detail(pr));
+  // a program built as a native wasm32 module (gexcc-win, no memory64
+  // build beside it) cannot move: it ends saying so, is not recorded, and
+  // its next start is in the lowered memory again (GEX_TEST_GEXCC_WIN)
+  const nexe = await w.gexccWin(SRC, 'native/outgrow.exe', ['-O1']);
+  const nfiles = { '/t/outgrow.exe': nexe, '/t/outgrow.exe.wasm': `${nexe}.wasm` };
+  const pn = await w.page(['/t/outgrow.exe', 'twice', 'crash'], { files: nfiles, name: 'page-no64', timeout: 600000 });
+  t.eq('page: a program with no memory64 build falls short both times, never moved', lines(pn.out),
+    'outgrow short\noutgrow child exit c0000005\noutgrow short\noutgrow child exit c0000005', w.detail(pn));
+  t.check('page: gex says it has no 64-bit memory build', NO64.test(pn.out) && !SAID.test(pn.out), w.detail(pn));
+  // (its skeleton names its module outgrow.exe.wasm, found beside it)
+  const nkeep = join(t.workDir, 'outgrow-keep-native');
+  mkdirSync(nkeep, { recursive: true });
+  copyFileSync(nexe, join(nkeep, 'outgrow.exe'));
+  copyFileSync(`${nexe}.wasm`, join(nkeep, 'outgrow.exe.wasm'));
+  const nn = await w.native([dos(join(nkeep, 'outgrow.exe')), 'crash'], { name: 'native-no64' });
+  t.eq('native: a program with no memory64 build falls short and crashes', lines(nn.out), 'outgrow short', w.detail(nn));
+  t.check('native: its crash says it has no 64-bit memory build', /ran out of memory \(2 GiB\); this program has no 64-bit memory build/.test(nn.out + (nn.err ?? '')), w.detail(nn));
+  t.eq('native: and it is not recorded', recorded(join(nkeep, 'outgrow.exe')), null, w.detail(nn));
   w.clean();
 }
