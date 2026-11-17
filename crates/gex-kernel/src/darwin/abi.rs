@@ -302,6 +302,15 @@ pub fn mmap_flags(f: u64) -> u64 {
 /// 4 KiB on x86-64. (`vm_page_size`, what its allocator and its dynamic
 /// linker round to.)
 pub const PAGE_SIZE: u64 = if gex_abi::X86 { 0x1000 } else { 0x4000 };
+/// Which word of a page of the kernel's wait words in a task (its Mach
+/// ports', its psynch's, its work queue's) index `i` waits on (a port
+/// name's index, a thread's id): the page has PAGE_SIZE / 4 of them -- an
+/// x86 page 1024, not the 4096 the indexes were taken modulo, and a name
+/// or thread past them waited on, and woke, whatever lay after the page.
+/// (Two that share a word wake each other, and look again.)
+pub fn word_at(page: u64, i: u64) -> u64 {
+    page + 4 * (i % (PAGE_SIZE / 4))
+}
 
 /// Darwin's `struct stat` with 64-bit inode numbers, the only one an arm64
 /// process has (`stat64` on x86-64), 144 bytes:
@@ -530,6 +539,15 @@ pub fn siginfo_child(l: &[u8]) -> [u8; 104] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wait_word_is_in_its_page_whatever_the_index() {
+        for i in [0u64, 3, 1023, 1024, 4095, 0x4c8, 0xfffff] {
+            let at = super::word_at(0x10000, i);
+            assert!(at >= 0x10000 && at + 4 <= 0x10000 + super::PAGE_SIZE, "{i:#x} at {at:#x}");
+        }
+        assert_eq!(super::word_at(0x10000, 3), 0x1000c);
+    }
+
     use super::*;
 
     #[test]

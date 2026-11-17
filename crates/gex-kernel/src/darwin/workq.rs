@@ -287,7 +287,7 @@ impl Kernel {
             let Some(work) = wq.pending.pop_front() else { break };
             wq.workers.get_mut(&t).unwrap().given = Some(work);
             if wq.words != 0 {
-                let at = wq.words + 4 * (t as u64 & 0xfff);
+                let at = abi::word_at(wq.words, t as u64);
                 let v = m.read_u32(at).unwrap_or(0);
                 let _ = m.write_u32(at, v.wrapping_add(1));
                 let _ = self.sys_futex(m, [at, crate::futex::op::WAKE as u64, i32::MAX as u64, 0, 0, 0]);
@@ -386,7 +386,7 @@ impl Kernel {
         if wq.words == 0 || self.mem.lock().vma_at(wq.words).is_none() {
             wq.words = self.mem.mmap_anon(m, 0, abi::PAGE_SIZE, 3, 0, false, "[workq]")?;
         }
-        Ok(wq.words + 4 * (tid as u64 & 0xfff))
+        Ok(abi::word_at(wq.words, tid as u64))
     }
 
     /// Wake thread `tid` from its word.

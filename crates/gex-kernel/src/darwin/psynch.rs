@@ -1280,7 +1280,7 @@ impl Kernel {
         if ps.words == 0 || self.mem.lock().vma_at(ps.words).is_none() {
             ps.words = self.mem.mmap_anon(m, 0, abi::PAGE_SIZE, 3, 0, false, "[psynch]")?;
         }
-        Ok(ps.words + 4 * (tid as u64 & 0xfff))
+        Ok(abi::word_at(ps.words, tid as u64))
     }
 
     /// Put this thread to sleep as `w`: the canonical call that waits on
@@ -1308,7 +1308,7 @@ impl Kernel {
             return;
         }
         for tid in wake {
-            let at = ps.words + 4 * (tid as u64 & 0xfff);
+            let at = abi::word_at(ps.words, tid as u64);
             let v = m.read_u32(at).unwrap_or(0);
             let _ = m.write_u32(at, v.wrapping_add(1));
             let _ = self.sys_futex(m, [at, crate::futex::op::WAKE as u64, i32::MAX as u64, 0, 0, 0]);

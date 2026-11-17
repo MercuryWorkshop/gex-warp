@@ -317,7 +317,7 @@ impl Rx {
             return;
         }
         for &name in names {
-            self.futex.wake(gex_abi::canon(words + 4 * ((name as u64 >> 8) & 0xfff)), i32::MAX as u32);
+            self.futex.wake(gex_abi::canon(abi::word_at(words, name as u64 >> 8)), i32::MAX as u32);
         }
     }
 
@@ -1150,7 +1150,7 @@ impl Kernel {
             sp.words = self.mem.mmap_anon(m, 0, abi::PAGE_SIZE, 3, 0, false, "[mach ports]")?;
             sp.words_at.store(sp.words, std::sync::atomic::Ordering::SeqCst);
         }
-        Ok(sp.words + 4 * ((name as u64 >> 8) & 0xfff))
+        Ok(abi::word_at(sp.words, name as u64 >> 8))
     }
 
     /// `port` has something: whoever waits on it is told, in this task
