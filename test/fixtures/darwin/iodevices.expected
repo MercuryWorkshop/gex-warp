@@ -1,0 +1,77 @@
+AppleUserHIDDevice (AppleUserHIDDevice) at IOService:/IOResources/IOHIDResource/AppleUserHIDDevice
+  VendorID: 0x1209
+  ProductID: 0x1
+  Product: Test Pad
+  Manufacturer: pyrus tests
+  SerialNumber: P0001
+  Transport: USB
+  PrimaryUsagePage: 0x1
+  PrimaryUsage: 0x5
+  DeviceUsagePairs: (0x1, 0x5)
+  MaxInputReportSize: 0x4
+  MaxOutputReportSize: 0x2
+  MaxFeatureReportSize: 0x3
+  ReportDescriptor: 81 bytes
+  an IOHIDDevice 1, an IOService 1
+Test Bulk (IOUSBHostDevice) at IOService:/AppleARMPE/AppleUSBXHCI@00000000/Test Bulk@00120000
+  idVendor: 0x1209
+  idProduct: 0x2
+  bcdDevice: 0x123
+  bcdUSB: 0x200
+  bDeviceClass: 0
+  kUSBVendorString: pyrus tests
+  kUSBProductString: Test Bulk
+  kUSBSerialNumberString: T0002
+  bNumConfigurations: 0x1
+  kUSBCurrentConfiguration: 0x1
+  locationID: 0x120000
+  an IOUSBDevice 1
+IOUSBHostInterface (IOUSBHostInterface) at IOService:/AppleARMPE/AppleUSBXHCI@00000000/Test Bulk@00120000/IOUSBHostInterface@0
+  bInterfaceNumber: 0
+  bAlternateSetting: 0
+  bInterfaceClass: 0xff
+  bInterfaceSubClass: 0x1
+  bInterfaceProtocol: 0x2
+  bNumEndpoints: 0x3
+  bConfigurationValue: 0x1
+  idVendor: 0x1209
+more than the USB device without its class 1
+a game pad by its usage 1
+a keyboard by its usage 0
+first matched already: 1
+the manager's devices: 1
+opened 0
+matched Test Pad (0x1), conforms to a game pad 1, a keyboard 0
+elements: 17
+  cookie 1 type 513 page 0x1 usage 0x5 report 0 size 0 count 0 logical 0..0 (top)
+  cookie 2 type 2 page 0x9 usage 0x1 report 1 size 1 count 1 logical 0..1
+  cookie 3 type 2 page 0x9 usage 0x2 report 1 size 1 count 1 logical 0..1
+  cookie 4 type 2 page 0x9 usage 0x3 report 1 size 1 count 1 logical 0..1
+  cookie 5 type 2 page 0x9 usage 0x4 report 1 size 1 count 1 logical 0..1
+  cookie 6 type 2 page 0x9 usage 0x5 report 1 size 1 count 1 logical 0..1
+  cookie 7 type 2 page 0x9 usage 0x6 report 1 size 1 count 1 logical 0..1
+  cookie 8 type 2 page 0x9 usage 0x7 report 1 size 1 count 1 logical 0..1
+  cookie 9 type 2 page 0x9 usage 0x8 report 1 size 1 count 1 logical 0..1
+  cookie 10 type 3 page 0x1 usage 0x30 report 1 size 8 count 1 logical -127..127
+  cookie 11 type 3 page 0x1 usage 0x31 report 1 size 8 count 1 logical -127..127
+  cookie 12 type 129 page 0x8 usage 0x1 report 2 size 1 count 1 logical 0..1
+  cookie 13 type 129 page 0x8 usage 0x2 report 2 size 1 count 1 logical 0..1
+  cookie 14 type 129 page 0x8 usage 0x3 report 2 size 1 count 1 logical 0..1
+  cookie 15 type 129 page 0x8 usage 0x4 report 2 size 1 count 1 logical 0..1
+  cookie 16 type 257 page 0xff00 usage 0x1 report 3 size 8 count 1 logical 0..255
+  cookie 17 type 257 page 0xff00 usage 0x1 report 3 size 8 count 1 logical 0..255
+buttons: 8
+feature report 3: 0, 3 bytes: 03 11 22
+its element's value 17
+output report 2: 0
+input report 1 (0), 4 bytes: 01 01 fb 07
+its values:
+  page 0x9 usage 0x1 value 1
+  page 0x1 usage 0x30 value -5
+  page 0x1 usage 0x31 value 7
+the second pad: matched by the manager 1, first matched 1
+the manager's devices: 2
+output report 2: 0
+the second pad: removed 1, terminated 1
+the manager's devices: 1
+closed 0
