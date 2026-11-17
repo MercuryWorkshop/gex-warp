@@ -1,6 +1,7 @@
-// `Codecs`: the browser's video codecs (WebCodecs' VideoDecoder and
-// VideoEncoder) for programs, the service `codecs` of /dev/gex-services
-// (services.js). A Mac program's VideoToolbox (pyrus's) is its first user:
+// `Codecs`: the browser's codecs (WebCodecs' VideoDecoder and VideoEncoder,
+// AudioDecoder and AudioEncoder) for programs, the service `codecs` of
+// /dev/gex-services (services.js). A Mac program's VideoToolbox and
+// AudioToolbox (pyrus's) are its users:
 // a decompression or compression session is a connection of its own (the
 // bulk node where the page reserved one, else the ordinary node), which
 // configures one decoder or encoder, gives it samples or frames in order,
@@ -9,6 +10,9 @@
 // before it has come out. Capability questions (isConfigSupported) are a
 // short connection's. The README's Services section, Codecs, is the
 // reference for the messages.
+//
+// An audio session is the same, its samples float32 interleaved both ways
+// (AudioData copied out at once, in the decoder's order, and closed).
 //
 // What a decoder makes is copied out of its VideoFrame at once (copyTo, in
 // the format the program asked for: NV12, I420 or BGRA) into one buffer
@@ -38,6 +42,8 @@ export const LIMITS = Object.freeze({
   side: 16384, replayBytes: 64 << 20, replayChunks: 2048,
   // Frames' bytes waiting for the program before the decoder is fed more.
   buffered: 3,
+  // An audio session's channels.
+  channels: 32,
 });
 
 const FORMATS = new Set(['NV12', 'I420', 'BGRA', 'RGBA']);
@@ -88,6 +94,223 @@ function encoderConfig(m) {
   if (/^(avc1|avc3)\./.test(codec)) c.avc = { format: format === 'annexb' ? 'annexb' : 'avc' };
   if (/^(hvc1|hev1)\./.test(codec)) c.hevc = { format: format === 'annexb' ? 'annexb' : 'hevc' };
   return { config: c };
+}
+
+/** An audio decoder's or encoder's configuration, or a reason it is none. */
+function audioConfig(m, data, encoder) {
+  const codec = codecString(m.codec);
+  if (!codec) return { why: 'no codec' };
+  const rate = m.sampleRate, channels = m.channels;
+  if (!Number.isInteger(rate) || rate < 1 || rate > 768000 || !Number.isInteger(channels) || channels < 1 || channels > LIMITS.channels) return { why: 'no rate or channels' };
+  const c = { codec, sampleRate: rate, numberOfChannels: channels };
+  if (!encoder) {
+    if (m.description) {
+      const d = slice(m.description, data);
+      if (!d) return { why: 'a description outside its frame' };
+      c.description = d.slice();
+    }
+    return { config: c };
+  }
+  if (Number.isFinite(m.bitrate) && m.bitrate > 0) c.bitrate = Math.round(m.bitrate);
+  if (['constant', 'variable'].includes(m.bitrateMode)) c.bitrateMode = m.bitrateMode;
+  if (codec === 'opus') {
+    const o = {};
+    // (A packet's duration, in microseconds: Opus's 2.5 to 120 ms.)
+    if (Number.isInteger(m.frameDuration) && m.frameDuration >= 2500 && m.frameDuration <= 120000) o.frameDuration = m.frameDuration;
+    if (Number.isInteger(m.complexity) && m.complexity >= 0 && m.complexity <= 10) o.complexity = m.complexity;
+    if (['audio', 'voip', 'lowdelay'].includes(m.application)) o.application = m.application;
+    c.opus = { format: 'opus', ...o };
+  }
+  // (AAC as raw access units, its AudioSpecificConfig the description.)
+  if (codec.startsWith('mp4a.')) c.aac = { format: 'aac' };
+  return { config: c };
+}
+
+/** A decoded AudioData's samples, float32 interleaved. */
+function audioBytes(a) {
+  const n = a.numberOfFrames, ch = a.numberOfChannels;
+  const out = new Float32Array(n * ch);
+  if (a.format === 'f32') a.copyTo(out, { planeIndex: 0 });
+  else if (a.format === 'f32-planar') {
+    const plane = new Float32Array(n);
+    for (let c = 0; c < ch; c++) {
+      a.copyTo(plane, { planeIndex: c });
+      for (let i = 0; i < n; i++) out[i * ch + c] = plane[i];
+    }
+  } else a.copyTo(out, { planeIndex: 0, format: 'f32' });
+  return out;
+}
+
+/** One program's audio decoding session: packets in, in order; their
+ *  samples out as the decoder makes them. */
+class AudioDecodeSession {
+  #conn; #decoder = null; #config = null; #closed = false;
+
+  constructor(conn) {
+    this.#conn = conn;
+  }
+
+  configure(m, data) {
+    const { config, why } = audioConfig(m, data, false);
+    if (!config) return this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: why });
+    if (!has('AudioDecoder')) return this.#conn.send({ seq: m.seq, ok: false, error: 'unsupported', message: 'no WebCodecs here' });
+    AudioDecoder.isConfigSupported(config).then((r) => {
+      if (this.#closed) return;
+      if (!r.supported) return this.#conn.send({ seq: m.seq, ok: false, error: 'unsupported', message: `${config.codec} cannot be decoded here` });
+      this.#close();
+      this.#config = config;
+      try {
+        this.#open();
+      } catch (e) {
+        return this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: String(e?.message ?? e) });
+      }
+      this.#conn.send({ seq: m.seq, ok: true, codec: config.codec });
+    }, (e) => this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: String(e?.message ?? e) }));
+  }
+
+  #open() {
+    this.#decoder = new AudioDecoder({ output: (a) => this.#got(a), error: (e) => this.#failed(e) });
+    this.#decoder.configure(this.#config);
+  }
+
+  #close() {
+    try { this.#decoder?.close(); } catch {}
+    this.#decoder = null;
+  }
+
+  #got(a) {
+    try {
+      const b = audioBytes(a);
+      this.#conn.send({ op: 'audio', id: a.timestamp, frames: a.numberOfFrames, channels: a.numberOfChannels, rate: a.sampleRate, data: { at: 0, size: b.byteLength } },
+        new Uint8Array(b.buffer));
+    } catch (e) {
+      this.#conn.send({ op: 'dropped', id: a.timestamp, error: String(e?.message ?? e) });
+    } finally {
+      a.close();
+    }
+  }
+
+  #failed(e) {
+    this.#decoder = null;
+    this.#conn.send({ op: 'error', ids: [], message: String(e?.message ?? e) });
+  }
+
+  decode(m, data) {
+    const bytes = slice(m.data, data);
+    if (!bytes || !Number.isSafeInteger(m.id) || m.id < 0) return this.#conn.send({ op: 'dropped', id: m.id ?? -1, error: 'a packet without its data' });
+    if (!this.#config) return this.#conn.send({ op: 'dropped', id: m.id, error: 'not configured' });
+    try {
+      if (!this.#decoder || this.#decoder.state === 'closed') this.#open();
+      // (Every audio packet stands alone, as WebCodecs' audio codecs have it.)
+      this.#decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: m.id, data: bytes }));
+    } catch (e) {
+      this.#conn.send({ op: 'dropped', id: m.id, error: String(e?.message ?? e) });
+    }
+  }
+
+  flush(m) {
+    const d = this.#decoder;
+    if (!d || d.state !== 'configured') return this.#conn.send({ seq: m.seq, op: 'flushed', dropped: [] });
+    d.flush().catch(() => {}).then(() => this.#conn.send({ seq: m.seq, op: 'flushed', dropped: [] }));
+  }
+
+  reset(m) {
+    this.#close();
+    try {
+      if (this.#config) this.#open();
+    } catch {}
+    this.#conn.send({ seq: m.seq, op: 'reset', dropped: [] });
+  }
+
+  end() {
+    this.#closed = true;
+    this.#close();
+  }
+}
+
+/** One program's audio encoding session: samples in, packets out. */
+class AudioEncodeSession {
+  #conn; #encoder = null; #config = null; #closed = false; #sentDescription = null;
+
+  constructor(conn) {
+    this.#conn = conn;
+  }
+
+  configure(m, data) {
+    const { config, why } = audioConfig(m, data, true);
+    if (!config) return this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: why });
+    if (!has('AudioEncoder')) return this.#conn.send({ seq: m.seq, ok: false, error: 'unsupported', message: 'no WebCodecs here' });
+    AudioEncoder.isConfigSupported(config).then((r) => {
+      if (this.#closed) return;
+      if (!r.supported) return this.#conn.send({ seq: m.seq, ok: false, error: 'unsupported', message: `${config.codec} cannot be encoded here` });
+      try {
+        try { this.#encoder?.close(); } catch {}
+        this.#encoder = new AudioEncoder({ output: (c, meta) => this.#got(c, meta), error: (e) => this.#failed(e) });
+        this.#encoder.configure(config);
+        this.#config = config;
+        this.#sentDescription = null;
+        this.#conn.send({ seq: m.seq, ok: true, codec: config.codec });
+      } catch (e) {
+        this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: String(e?.message ?? e) });
+      }
+    }, (e) => this.#conn.send({ seq: m.seq, ok: false, error: 'invalid', message: String(e?.message ?? e) }));
+  }
+
+  #got(chunk, meta) {
+    const bytes = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(bytes);
+    const m = { op: 'chunk', id: chunk.timestamp, key: true, duration: chunk.duration ?? null };
+    let out = bytes;
+    const d = meta?.decoderConfig?.description;
+    if (d) {
+      const desc = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+      const same = this.#sentDescription && this.#sentDescription.length === desc.length && this.#sentDescription.every((v, i) => v === desc[i]);
+      if (!same) {
+        this.#sentDescription = desc.slice();
+        out = new Uint8Array(bytes.length + desc.length);
+        out.set(bytes);
+        out.set(desc, bytes.length);
+        m.description = { at: bytes.length, size: desc.length };
+      }
+    }
+    if (meta?.decoderConfig) m.rate = meta.decoderConfig.sampleRate, m.channels = meta.decoderConfig.numberOfChannels;
+    m.data = { at: 0, size: bytes.length };
+    this.#conn.send(m, out);
+  }
+
+  #failed(e) {
+    this.#encoder = null;
+    this.#conn.send({ op: 'error', message: String(e?.message ?? e) });
+  }
+
+  encode(m, data) {
+    const id = m.id;
+    if (!Number.isSafeInteger(id) || id < 0) return;
+    if (!this.#encoder || this.#encoder.state !== 'configured') return this.#conn.send({ op: 'dropped', id, error: 'not configured' });
+    const bytes = slice(m.data, data), ch = this.#config.numberOfChannels, n = m.frames;
+    if (!bytes || !Number.isInteger(n) || n < 1 || bytes.length !== n * ch * 4) return this.#conn.send({ op: 'dropped', id, error: 'samples that are not' });
+    let a;
+    try {
+      // (Copied: the frame's data is the connection's.)
+      a = new AudioData({ format: 'f32', sampleRate: this.#config.sampleRate, numberOfFrames: n, numberOfChannels: ch, timestamp: id, data: bytes.slice() });
+      this.#encoder.encode(a);
+    } catch (e) {
+      this.#conn.send({ op: 'dropped', id, error: String(e?.message ?? e) });
+    } finally {
+      a?.close();
+    }
+  }
+
+  flush(m) {
+    if (!this.#encoder || this.#encoder.state !== 'configured') return this.#conn.send({ seq: m.seq, op: 'flushed' });
+    this.#encoder.flush().catch(() => {}).then(() => this.#conn.send({ seq: m.seq, op: 'flushed' }));
+  }
+
+  end() {
+    this.#closed = true;
+    try { this.#encoder?.close(); } catch {}
+    this.#encoder = null;
+  }
 }
 
 /** A VideoFrame's colour, as code points (ISO/IEC 23091-2) a program's
@@ -453,7 +676,11 @@ async function query(configs, data) {
   const out = [];
   for (const q of Array.isArray(configs) ? configs.slice(0, 64) : []) {
     try {
-      if (q?.kind === 'encoder') {
+      if (q?.kind === 'audio-decoder' || q?.kind === 'audio-encoder') {
+        const enc = q.kind === 'audio-encoder', { config } = audioConfig(q, data, enc);
+        const api = enc ? 'AudioEncoder' : 'AudioDecoder';
+        out.push({ supported: !!config && has(api) && !!(await globalThis[api].isConfigSupported(config)).supported });
+      } else if (q?.kind === 'encoder') {
         const { config } = encoderConfig(q);
         out.push({ supported: !!config && has('VideoEncoder') && !!(await VideoEncoder.isConfigSupported(config)).supported });
       } else if (q?.kind === 'image') {
@@ -527,16 +754,17 @@ export function codecsProvider() {
           return;
         }
         if (m.op === 'configure') {
-          const kind = m.kind === 'encoder' ? EncodeSession : DecodeSession;
+          const kind = { encoder: EncodeSession, 'audio-decoder': AudioDecodeSession, 'audio-encoder': AudioEncodeSession }[m.kind] ?? DecodeSession;
           if (session && !(session instanceof kind)) return conn.send({ seq: m.seq, ok: false, error: 'invalid', message: 'a session is a decoder or an encoder' });
           session ??= new kind(conn);
           return session.configure(m, data);
         }
         if (!session) return m.seq != null && conn.send({ seq: m.seq, ok: false, error: 'invalid', message: 'not configured' });
-        if (m.op === 'decode' && session instanceof DecodeSession) session.decode(m, data);
-        else if (m.op === 'encode' && session instanceof EncodeSession) session.encode(m, data);
+        const decoder = session instanceof DecodeSession || session instanceof AudioDecodeSession;
+        if (m.op === 'decode' && decoder) session.decode(m, data);
+        else if (m.op === 'encode' && !decoder) session.encode(m, data);
         else if (m.op === 'flush') session.flush(m);
-        else if (m.op === 'reset' && session instanceof DecodeSession) session.reset(m);
+        else if (m.op === 'reset' && decoder) session.reset(m);
       });
       conn.addEventListener('close', () => session?.end());
     },
