@@ -290,6 +290,20 @@ fn dump(why: &str) {
     busy.sort_by(|a, b| b.1.cmp(&a.1));
     let busy: Vec<String> = busy.iter().map(|(n, d)| format!("{n} {d}")).collect();
     let mut out = format!("[gex-stall] {t:.3} s: {why}; other threads' cpu ms/200: {}\n", busy.join(", "));
+    {
+        // What translation has made, and what the stores hold of it: every
+        // thread's store instantiates every unit of its process.
+        use crate::jit_stats as j;
+        use std::sync::atomic::Ordering::Relaxed;
+        out.push_str(&format!(
+            "  jit: {} units published ({} blocks), {} instantiated in stores, cache {} hits {} misses\n",
+            j::PUBLISHED.load(Relaxed),
+            j::BLOCKS.load(Relaxed),
+            j::INSTALLS.load(Relaxed),
+            j::CACHE_HITS.load(Relaxed),
+            j::CACHE_MISSES.load(Relaxed)
+        ));
+    }
     for (_, _, l) in lines {
         out.push_str(&l);
         out.push('\n');
