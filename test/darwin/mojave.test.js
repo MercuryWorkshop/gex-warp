@@ -74,9 +74,9 @@ export default async function (t) {
   // A job's EnvironmentVariables are its process's, as launchd sets them
   // (talagent will not run without its NSRunningFromLaunchd): a job of the
   // test's own, started at load (-r), says them.
-  const jobs = join(d, 'jobs');
-  mkdirSync(jobs, { recursive: true });
-  writeFileSync(join(jobs, 'com.gex.envtest.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+  const envJobs = join(d, 'envjobs');
+  mkdirSync(envJobs, { recursive: true });
+  writeFileSync(join(envJobs, 'com.gex.envtest.plist'), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.gex.envtest</string>
@@ -85,7 +85,7 @@ export default async function (t) {
 </dict></plist>
 `);
   const env = await n.gexc(
-    ['run', '--uid', '0', ...sysroot, '--bind', `${gl}=/gex`, '--bind', `${jobs}=/gex-jobs`, ...sessionBinds,
+    ['run', '--uid', '0', ...sysroot, '--bind', `${gl}=/gex`, '--bind', `${envJobs}=/gex-jobs`, ...sessionBinds,
       join(gl, 'gexlaunchd.x86_64'), '-v', '-j', '/gex-jobs', '-r', 'com.gex.envtest', '--', '/bin/sleep', '3'],
     { timeout: 300000 },
   );
