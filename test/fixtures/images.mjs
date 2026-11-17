@@ -354,6 +354,30 @@ export const images = {
           }
         }
       }
+      // And darwin/audio-codecs-page's (fixtures/darwin/audio-cases.mjs):
+      // pyrus's test/media/atcodec.c and its sounds, from the same tree, each
+      // case run here against this Mac's AudioToolbox (darwin-audio.ARCH/CASE.mac).
+      {
+        const media = process.env.GEX_TEST_PYRUS_MEDIA || join(root, '..', '..', 'test', 'media');
+        const dir = join(work, `darwin-audio.${arch}`);
+        rmSync(dir, { recursive: true, force: true });
+        if (existsSync(join(media, 'atcodec.c'))) {
+          mkdirSync(join(work, 'darwin-audio'), { recursive: true });
+          mkdirSync(dir, { recursive: true });
+          const { CASES, SOUNDS, argsOf } = await import('./darwin/audio-cases.mjs');
+          for (const f of SOUNDS) copyFileSync(join(media, 'sounds', f), join(work, 'darwin-audio', f));
+          const exe = join(dir, 'atcodec');
+          spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-w', '-o', exe, join(media, 'atcodec.c'), '-framework', 'AudioToolbox', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+          const run = (args, env = process.env) => (arch === 'x86' ? spawnSync('arch', ['-x86_64', exe, ...args], { encoding: 'utf8', env }) : spawnSync(exe, args, { encoding: 'utf8', env }));
+          if (existsSync(exe))
+            for (const c of CASES) {
+              // (Packets of this Mac's encoder, made first, for its decoder and the page's.)
+              if (c.make) run(c.make, { ...process.env, ATCODEC_WRITE: join(dir, c.packets) });
+              const r = run(argsOf(c, join(work, 'darwin-audio'), dir));
+              if (r.status === 0) writeFileSync(join(dir, `${c.name}.mac`), r.stdout);
+            }
+        }
+      }
       // And darwin/high's (fixtures/darwin/high.c: where a Mac program's
       // addresses are), with what this Mac says of them beside it
       // (darwin-high.ARCH.mac).
