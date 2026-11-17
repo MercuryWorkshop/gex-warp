@@ -83,10 +83,15 @@ static dispatch_semaphore_t got, completed;
 static volatile int nmessages;
 static MIDISysexSendRequest req;
 static Byte sysex[] = {0xf0, 0x7d, 0x01, 0x02, 0xf7};
+static int done_complete;
+static unsigned done_left;
+// (Told on a thread of CoreMIDI's: the program says so when it has waited.)
 static void sysex_done(MIDISysexSendRequest *r) {
-    printf("sysex sent: complete %d, %u left\n", r->complete, (unsigned)r->bytesToSend);
+    done_complete = r->complete;
+    done_left = r->bytesToSend;
     dispatch_semaphore_signal(completed);
 }
+static void report_sysex(void) { printf("sysex sent: complete %d, %u left\n", done_complete, done_left); }
 
 static int denied(void) {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -132,6 +137,7 @@ static int denied(void) {
         MIDISendSysex(&req);
         dispatch_semaphore_wait(got, DISPATCH_TIME_FOREVER);
         dispatch_semaphore_wait(completed, DISPATCH_TIME_FOREVER);
+        report_sysex();
     }
     return 0;
 }
@@ -218,6 +224,7 @@ int main(int argc, char **argv) {
         req.completionProc = sysex_done;
         printf("send system exclusive: %d\n", (int)MIDISendSysex(&req));
         dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+        report_sysex();
     }
     // Hear what comes and goes.
     printf("waiting for a device to come and one to go\n");
