@@ -1130,6 +1130,20 @@ pub(super) fn get32(b: &[u8], at: usize) -> u32 {
 }
 
 impl Kernel {
+    /// Whether this process's messages are traced: `GEX_MACH_TRACE=1` for
+    /// every process's, or `GEX_MACH_TRACE=NAME[,NAME...]` for those of
+    /// the programs of those file names (the one a busy system's trace is
+    /// about).
+    fn mach_traced(&self) -> bool {
+        let Some(v) = std::env::var_os("GEX_MACH_TRACE") else { return false };
+        let v = v.to_string_lossy();
+        if v == "1" {
+            return true;
+        }
+        let me = self.argv.first().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or("");
+        v.split(',').any(|n| n == me)
+    }
+
     /// The task's space, told at its first use how this task is woken
     /// and what it is called ([`Rx`]).
     pub(super) fn darwin_space(&self) -> Arc<Mutex<Space>> {
@@ -2009,7 +2023,7 @@ impl Kernel {
             put32(&mut out, 20, msg.id);
             // The trailer: format 0, as long as was asked.
             out[size as usize..].copy_from_slice(&trailer(options, &msg.sender, context));
-            if std::env::var_os("GEX_MACH_TRACE").is_some() {
+            if self.mach_traced() {
                 eprintln!("[gex:{}.{}] mach: received {} on {name:#x} (port {:p})", self.pid, self.tid, msg.id, std::sync::Arc::as_ptr(&port));
             }
             return match m.write(rcv_at, &out) {
@@ -2025,7 +2039,7 @@ impl Kernel {
     /// destination is the kernel's, for the routine it asks for.
     fn darwin_send(&mut self, m: &mut GuestMem<'_>, sp: &mut Space, c: &MsgCall) -> u64 {
         let r = self.darwin_send_of(m, sp, c);
-        if r != MACH_MSG_SUCCESS && std::env::var_os("GEX_MACH_TRACE").is_some() {
+        if r != MACH_MSG_SUCCESS && self.mach_traced() {
             eprintln!("[gex:{}.{}] mach: send {} to {:#x} (reply {:#x}, bits {:#x}) failed: {r:#x}", self.pid, self.tid, c.id, c.remote, c.local, c.bits);
         }
         self.darwin_told(m, sp);
@@ -2161,7 +2175,7 @@ impl Kernel {
         let sender = self.darwin_audit_token();
         let msg = Msg { id: c.id, body, complex, once: dest_got == disp::MOVE_SEND_ONCE, reply, ports, memory, port_arrays, sender };
         // `GEX_MACH_TRACE`: each message sent, by its number, to what.
-        if std::env::var_os("GEX_MACH_TRACE").is_some() {
+        if self.mach_traced() {
             // (A task's port by where it is, the same in its sender's
             // trace and its receiver's.)
             eprintln!("[gex:{}.{}] mach: send {} to {:?} {:p} ({} bytes, {} rights, {} out of line)", self.pid, self.tid, msg.id, dest.kind, std::sync::Arc::as_ptr(&dest), msg.body.len(), msg.ports.len(), msg.memory.len());
