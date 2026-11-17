@@ -43,6 +43,18 @@ pub mod flags {
 /// ([`MemoryMap::name_by_content`]).
 pub const CONTENT_ID: &str = "content:";
 
+/// What [`Vma::code_stamp`] says of a file: its inode, length, change count
+/// and modification time, as the filesystem holding it reports them, hashed
+/// (never 0, which is no stamp). What changes when the file is written,
+/// truncated or replaced, and nothing a read or a `chmod` changes, so every
+/// process that maps the same unchanged file stamps it alike.
+pub fn code_stamp(md: &crate::vfs::Metadata, changes: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (md.ino, md.size, md.mtime, md.times.mtime_ns, changes).hash(&mut h);
+    h.finish().max(1)
+}
+
 /// How many times one address's code is named by its bytes: a loader makes a
 /// section executable once or twice (after reading it, after relocating it);
 /// a code generator flips its buffers between writable and executable without
@@ -121,6 +133,14 @@ pub struct Vma {
     /// has touched it), which is a different question from whether the code is
     /// the same code.
     pub code: Option<(String, u64)>,
+    /// Which contents of `code`'s file the bytes were loaded from: a
+    /// [`code_stamp`] of the file as it was mapped, 0 where none was taken
+    /// (code named by its bytes, a mapping made outside the kernel's
+    /// `mmap`). A file replaced at the same path (`cp` over it, or another
+    /// file renamed onto it) is other code under the same name, and the
+    /// translations kept by the name are not of it: the stamp keys them
+    /// apart, while two processes that map the file unchanged agree.
+    pub code_stamp: u64,
     /// How many times this mapping's code has been named by its bytes
     /// ([`MemoryMap::name_by_content`]); a new mapping starts from none.
     pub namings: u32,
@@ -163,6 +183,7 @@ impl Vma {
                 .code
                 .as_ref()
                 .map(|(id, off)| (id.clone(), off + (start - self.start))),
+            code_stamp: self.code_stamp,
             namings: self.namings,
             patched: self.patched,
         }
@@ -1626,14 +1647,14 @@ impl MemoryMap {
     /// parent's name and code identity so the child can still find the code in
     /// the shared store instead of re-translating from cold. No `origin`: that
     /// is a claim about a mapping this process made, not one to inherit.
-    pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
-        let r = self.adopt_unpublished(start, end, prot, name, code);
+    pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>, code_stamp: u64) {
+        let r = self.adopt_unpublished(start, end, prot, name, code, code_stamp);
         self.publish();
         r
     }
 
     /// [`Self::adopt`] before it is published.
-    fn adopt_unpublished(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
+    fn adopt_unpublished(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>, code_stamp: u64) {
         self.generation += 1;
         self.mark_dirty(page_align_down(start), page_align_up(end));
         self.vmas.push(Vma {
@@ -1643,6 +1664,7 @@ impl MemoryMap {
             name: name.to_string(),
             origin: None,
             code,
+            code_stamp,
             namings: 0,
             patched: false,
         });
@@ -1705,6 +1727,7 @@ impl MemoryMap {
             prot,
             name: name.to_string(),
             code,
+            code_stamp: 0,
             origin,
             namings: 0,
             patched: false,
@@ -2210,6 +2233,7 @@ impl MemoryMap {
                 continue;
             }
             v.code = fresh.map(|id| (id, 0));
+            v.code_stamp = 0;
             changed = true;
         }
         if changed {
@@ -2233,11 +2257,28 @@ impl MemoryMap {
             }
             debug_assert!(v.start >= start && v.end <= end, "forget_code after the protect that split the range");
             v.code = None;
+            v.code_stamp = 0;
             changed = true;
         }
         if changed {
             self.generation += 1;
             self.publish();
+        }
+    }
+
+    /// Stamp the code of the mappings inside `[start, end)` with what their
+    /// file was when it was read into them ([`Vma::code_stamp`]): the caller
+    /// that mapped them, from the file it read.
+    pub fn stamp_code(&mut self, start: u64, end: u64, stamp: u64) {
+        let mut changed = false;
+        for v in self.vmas.iter_mut() {
+            if v.start >= start && v.end <= end && v.code.is_some() && v.code_stamp != stamp {
+                v.code_stamp = stamp;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation += 1;
         }
     }
 
@@ -2430,11 +2471,38 @@ mod tests {
     fn writable_code_loses_its_file_name() {
         let mut m = MemoryMap::new(0x100_0000);
         let at = MMAP_BOTTOM;
-        m.adopt(at, at + 0x2000, prot::READ | prot::EXEC, "/lib/x.so", Some(("/lib/x.so".into(), 0)));
+        m.adopt(at, at + 0x2000, prot::READ | prot::EXEC, "/lib/x.so", Some(("/lib/x.so".into(), 0)), 0);
         m.protect(at, 0x1000, prot::READ | prot::WRITE).unwrap();
         m.forget_code(at, at + 0x1000);
         let code: Vec<_> = m.vmas().iter().map(|v| (v.start, v.code.clone())).collect();
         assert_eq!(code, vec![(at, None), (at + 0x1000, Some(("/lib/x.so".into(), 0x1000)))]);
+    }
+
+    /// Which contents of a file a mapping's code was read from: the stamp
+    /// stays with every piece of the mapping (an `mprotect` that splits it),
+    /// goes with the code (made writable), and is the same for a file
+    /// unchanged and another for one written or replaced.
+    #[test]
+    fn code_keeps_the_stamp_of_the_file_it_was_read_from() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let at = MMAP_BOTTOM;
+        let anon = flags::PRIVATE | flags::FIXED;
+        m.mmap_from(at, 0x3000, prot::READ | prot::EXEC, anon, "/lib/x.so", Some(("/lib/x.so".into(), 0))).unwrap();
+        let gen = m.generation();
+        m.stamp_code(at, at + 0x3000, 77);
+        assert!(m.generation() > gen, "a stamp is a change the identity snapshot must see");
+        m.protect(at + 0x1000, 0x1000, prot::READ).unwrap();
+        m.protect(at + 0x2000, 0x1000, prot::READ | prot::WRITE).unwrap();
+        m.forget_code(at + 0x2000, at + 0x3000);
+        let stamps: Vec<_> = m.vmas().iter().map(|v| (v.start, v.code_stamp)).collect();
+        assert_eq!(stamps, vec![(at, 77), (at + 0x1000, 77), (at + 0x2000, 0)]);
+        let md = crate::vfs::Metadata { ino: 9, mtime: 100, ..crate::vfs::Metadata::regular(4096) };
+        assert_ne!(code_stamp(&md, 0), 0);
+        assert_eq!(code_stamp(&md, 3), code_stamp(&md.clone(), 3));
+        assert_ne!(code_stamp(&md, 3), code_stamp(&md, 4), "written");
+        assert_ne!(code_stamp(&md, 3), code_stamp(&crate::vfs::Metadata { ino: 10, ..md.clone() }, 3), "another file at the path");
+        assert_ne!(code_stamp(&md, 3), code_stamp(&crate::vfs::Metadata { size: 8192, ..md.clone() }, 3), "another length");
+        assert_eq!(code_stamp(&md, 3), code_stamp(&crate::vfs::Metadata { mode: 0o600, nlink: 2, ..md.clone() }, 3), "a chmod or a link is the same contents");
     }
 
     /// A refused large mapping explains what holds the space, once, without

@@ -897,6 +897,13 @@ fn install_module(
     memory: &gex_mem::GuestMemory,
 ) -> Result<Arc<WinePe>> {
     let t0 = std::time::Instant::now();
+    // whether it has a memory64 build: the outgrow record's (a program's
+    // own module, built for a wasm32 memory only, cannot move)
+    if !gex_abi::mem64() {
+        let m64 = file.file_name().is_some_and(|n| file.with_file_name(format!("{}.m64", n.to_string_lossy())).is_file());
+        let pid = state.with_kernel(|k| k.pid);
+        gex_kernel::syscalls::outgrow_module(pid, &file.to_string_lossy(), m64);
+    }
     let alt = module_alt(is64);
     if alt {
         crate::ensure_alt_dir_in(state, shared)?;

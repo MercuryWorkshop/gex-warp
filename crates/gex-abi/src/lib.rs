@@ -1281,6 +1281,13 @@ pub const fn ctx_addr(slot: u32) -> u64 {
 pub const IMPORT_MODULE: &str = "gex";
 
 /// Names of the functions translated code imports from the host.
+/// Where an instruction fetch at `pc` that `imports::BRK_FETCH_FAULT`
+/// reports faults: the first byte past `pc`'s 4 KiB page, the memory the
+/// instruction runs onto.
+pub fn fetch_fault_addr(pc: u64) -> u64 {
+    (pc | 0xfff).wrapping_add(1)
+}
+
 pub mod imports {
     /// `svc #0`. Signature `(ctx: i32, pc: i64) -> ()`. Reads the number and
     /// args from the context, writes the result to `x0`. Guest exit is
@@ -1367,6 +1374,14 @@ pub mod imports {
     /// the access violation is delivered in place where the host can, under
     /// the native frames the code was called from, and the import returns.
     pub const BRK_KUSER_UNFOLDED_RESUMABLE: i32 = -9;
+
+    /// Not a `brk`: a `Stmt::Trap` for an instruction at a block's start
+    /// whose bytes run onto memory that is not executable (the next page
+    /// unmapped or not executable). As a processor's instruction fetch, an
+    /// access violation, executing, at the first byte past `pc`'s page
+    /// (Windows' ExceptionInformation 8 and that address; SIGSEGV with it
+    /// on Linux). The host does not return.
+    pub const BRK_FETCH_FAULT: i32 = -10;
 
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
@@ -1504,6 +1519,11 @@ pub mod cache_op {
     /// host lets tier-1 have the address: the miss that follows translates
     /// it and its block takes the slot.
     pub const FTAB_TIER1: i32 = 14;
+    /// Not a cache operation: the block at `pc` found its code bytes changed
+    /// since it was lifted (its self-modifying-code guard), and `addr` is its
+    /// module, as for [`PAGE_STALE`]. The host retires that block, or its
+    /// page, and the block then dispatches to `pc` again.
+    pub const GUARD_HIT: i32 = 15;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's

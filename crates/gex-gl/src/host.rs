@@ -462,6 +462,8 @@ pub struct Gl {
     frame: Option<Frame>,
     /// PRESENTs so far.
     pub presents: u64,
+    /// The window default still owed (see [`WindowDefault`]).
+    window_default: WindowDefault,
     /// `op::CLIENT_ARRAY`'s bytes by slot: GL keeps the pointer, so they
     /// stay until the slot's next one.
     client_arrays: std::collections::HashMap<u32, Vec<u8>>,
@@ -667,6 +669,7 @@ impl Gl {
                 keep_frames: false,
                 frame: None,
                 presents: 0,
+                window_default: WindowDefault::default(),
                 client_arrays: std::collections::HashMap::new(),
                 op_times: None,
             })
@@ -694,6 +697,7 @@ impl Gl {
             self.width = width;
             self.height = height;
         }
+        self.window_default.apply(width, height);
         Ok(())
     }
 
@@ -944,9 +948,11 @@ impl Gl {
     /// stream the host cannot keep reading.
     fn one(&mut self, opcode: u32, body: &[u8], reply: &mut Reply) -> bool {
         let mut a = Args::new(body);
+        self.window_default.guest_sets(opcode);
         unsafe {
             match opcode {
                 op::CONTEXT_CREATE => {
+                    self.window_default = WindowDefault::default();
                     // This host brings up a GLES context at startup; a guest
                     // that asks for desktop GL gets a desktop compatibility
                     // context in its place.
@@ -986,8 +992,20 @@ impl Gl {
                 }
                 // This host has one drawable, the pbuffer: every surface
                 // draws into it, and a frame is what it holds at a PRESENT.
-                op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
+                // The drawable keeps its size, so a surface bound here owes the
+                // window default now at that size, and again at its own
+                // SURFACE_RESIZE.
+                op::SURFACE_ATTACH | op::SURFACE_CURRENT => {
+                    let handle = if opcode == op::SURFACE_ATTACH { a.u32(); a.u32(); a.u32(); a.u32() } else { a.u32() };
+                    if let Some(h) = handle {
+                        if self.window_default.bound(h) {
+                            self.window_default.apply(self.width, self.height);
+                        }
+                    }
+                }
+                op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
                 op::PRESENT => {
+                    self.window_default.drawn();
                     self.presents += 1;
                     present_meter(self.presents);
                     if self.keep_frames && readback_due(self.presents) {
@@ -1871,6 +1889,85 @@ impl Header {
     pub const SIZE: usize = 32;
 }
 
+/// GL's window default: a context's viewport and scissor box take the size of
+/// the window it is first made current on. Here the context is current on a
+/// drawable of the size it last had before the guest's window says its own
+/// (SURFACE_RESIZE, after the bind in the same batch), so GL's own default is
+/// the old size -- 1x1 on a fresh host -- and a program that never calls
+/// glViewport draws into a corner of its window. So each is set again, to
+/// the window's size, at the binds and resizes up to the context's first
+/// PRESENT after it is bound to a surface it has not drawn to before (a
+/// context made on a hidden window and then moved to the real one is the
+/// common case), and never once the guest has set it itself: a program that
+/// sets the scissor box but not the viewport keeps its scissor box.
+#[derive(Default)]
+pub(crate) struct WindowDefault {
+    /// Still owed: the viewport, the scissor box.
+    viewport: bool,
+    scissor: bool,
+    /// The guest set it since the context was bound to its latest new surface.
+    guest_viewport: bool,
+    guest_scissor: bool,
+    /// The surfaces this context has been bound to.
+    seen: Vec<u32>,
+    /// The latest new surface has been drawn to (a PRESENT since it was bound).
+    drawn: bool,
+}
+
+impl WindowDefault {
+    /// The commands that set the viewport or the scissor box: the hand-written
+    /// op, GL 4.4's and the compatibility profile's (glViewport, glScissor and
+    /// their indexed and array forms).
+    pub(crate) const VIEWPORT_OPS: [u32; 7] = [op::VIEWPORT, 1563, 1564, 1565, 11407, 11411, 11414];
+    pub(crate) const SCISSOR_OPS: [u32; 7] = [op::SCISSOR, 1389, 1390, 1391, 10511, 10517, 10520];
+
+    pub(crate) fn guest_sets(&mut self, opcode: u32) {
+        if Self::VIEWPORT_OPS.contains(&opcode) {
+            self.guest_viewport = true;
+            self.viewport = false;
+        } else if Self::SCISSOR_OPS.contains(&opcode) {
+            self.guest_scissor = true;
+            self.scissor = false;
+        }
+    }
+
+    /// The context is now bound to `handle`; true when that opens the window
+    /// default again (a surface it was never bound to, or none drawn yet).
+    pub(crate) fn bound(&mut self, handle: u32) -> bool {
+        if !self.seen.contains(&handle) {
+            self.seen.push(handle);
+            self.drawn = false;
+            self.guest_viewport = false;
+            self.guest_scissor = false;
+        }
+        if self.drawn {
+            return false;
+        }
+        self.viewport = !self.guest_viewport;
+        self.scissor = !self.guest_scissor;
+        self.viewport || self.scissor
+    }
+
+    /// A PRESENT: the size the program drew its frame at is its window's.
+    pub(crate) fn drawn(&mut self) {
+        self.drawn = true;
+        self.viewport = false;
+        self.scissor = false;
+    }
+
+    /// Set what is still owed to a `width` x `height` window.
+    pub(crate) fn apply(&self, width: i32, height: i32) {
+        unsafe {
+            if self.viewport {
+                glViewport(0, 0, width, height);
+            }
+            if self.scissor {
+                glScissor(0, 0, width, height);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2128,6 +2225,117 @@ mod tests {
 
     fn read_back(b: &mut Batch) {
         b.cmd(op::READ_PIXELS, &[0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0]);
+    }
+
+    /// A desktop context on a host drawable of `size`, or None (no host GL).
+    fn desktop_on(size: i32) -> Option<Gl> {
+        let mut gl = Gl::new(size, size).ok()?;
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        gl.is_desktop().then_some(gl)
+    }
+
+    /// Clear to black, then a white triangle strip over the whole viewport.
+    fn fill_viewport(b: &mut Batch) {
+        const GL_TRIANGLE_STRIP: u32 = 0x0005;
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::BEGIN, &[GL_TRIANGLE_STRIP]);
+        for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            b.cmd(op::VERTEX3F, &[x.to_bits(), y.to_bits(), 0]);
+        }
+        b.cmd(op::END, &[]);
+    }
+
+    fn pixels_of(gl: &mut Gl, mut b: Batch) -> Vec<u8> {
+        read_back(&mut b);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let mut at = 0;
+        let _offset = read_u32(reply.bytes(), &mut at);
+        read_blob(reply.bytes(), &mut at)
+    }
+
+    /// A program that never calls glViewport draws over its whole window: the
+    /// viewport is the window's size, not the size the host's drawable had
+    /// when the context was bound to it (a 1x1 corner before), and a context
+    /// moved to a new window gets that window's size too.
+    #[test]
+    fn the_viewport_is_the_window_a_context_is_bound_to() {
+        let _serial = gl_lock();
+        let Some(mut gl) = desktop_on(2) else {
+            eprintln!("skipping: no desktop host GL");
+            return;
+        };
+        // Bound, then sized: the order a guest sends them in.
+        let mut b = Batch::new();
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 1, 1), (255, 255, 255, 255), "the corner");
+        assert_eq!(pixel16(&px, 8, 8), (255, 255, 255, 255), "the middle, outside the 2x2 drawable it was bound to");
+        assert_eq!(pixel16(&px, 15, 15), (255, 255, 255, 255), "the far corner");
+
+        // A viewport of its own, a frame, and then a new window: the window's
+        // size again, though the program set one for the first.
+        let mut b = Batch::new();
+        b.cmd(op::VIEWPORT, &[0, 0, 4, 4]);
+        b.cmd(op::PRESENT, &[]);
+        b.cmd(op::SURFACE_ATTACH, &[0, 8, 1, 2]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 12, 12), (255, 255, 255, 255), "the new window's viewport is its whole size");
+
+        // Back on the first window after drawing on it: its program's state
+        // stays, as GL keeps it after the first bind.
+        let mut b = Batch::new();
+        b.cmd(op::PRESENT, &[]);
+        b.cmd(op::VIEWPORT, &[0, 0, 4, 4]);
+        b.cmd(op::SURFACE_CURRENT, &[1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 1, 1), (255, 255, 255, 255), "inside the program's viewport");
+        assert_eq!(pixel16(&px, 12, 12), (0, 0, 0, 255), "outside it: the program's viewport was kept");
+    }
+
+    /// The scissor box is the window's too, unless the program set its own:
+    /// a program that sets the scissor box but not the viewport keeps its box.
+    #[test]
+    fn a_scissor_box_the_program_set_is_kept() {
+        let _serial = gl_lock();
+        const GL_SCISSOR_TEST: u32 = 0x0C11;
+        let Some(mut gl) = desktop_on(2) else {
+            eprintln!("skipping: no desktop host GL");
+            return;
+        };
+        let mut b = Batch::new();
+        // Set after the bind and before the window's size arrives.
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SCISSOR, &[0, 0, 8, 16]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::ENABLE, &[GL_SCISSOR_TEST]);
+        b.cmd(op::CLEAR_COLOR, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 3, 8), (255, 255, 255, 255), "inside the program's box");
+        assert_eq!(pixel16(&px, 12, 8), (0, 0, 0, 255), "outside it");
+
+        // The scissor box with no box of the program's: the whole window.
+        let Some(mut gl) = desktop_on(2) else { return };
+        let mut b = Batch::new();
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        b.cmd(op::ENABLE, &[GL_SCISSOR_TEST]);
+        b.cmd(op::CLEAR_COLOR, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 12, 12), (255, 255, 255, 255), "the default box is the whole window");
     }
 
     /// A guest asking for desktop GL gets a compatibility context: immediate

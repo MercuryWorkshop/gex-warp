@@ -1,0 +1,33 @@
+an IOUSBDevice 1
+its address and session 1 1
+an interface's plug-in of it 0xe00002c7
+its plug-in 0
+a device interface 1, not an interface's 1
+opened 0, again 0xe00002c5
+class 0/0/0 vendor 0x1209 product 0x2 release 0x123 speed 2 configurations 1, in 1, strings 1 2 3, located 1
+configuration descriptor 0: 39 bytes, value 1, 1 interfaces
+no second 0xe00002c2
+vendor request 0, 5 bytes: hello
+configured 0
+interfaces 0, one 1, more 0
+of the HID class 0
+its interface 0 1
+opened 0
+interface 0 alternate 0 class 0xff, 3 endpoints
+  pipe 0: 0 direction 3 number 0 type 0 size 64 interval 0
+  pipe 1: 0 direction 1 number 1 type 2 size 64 interval 0
+  pipe 2: 0 direction 0 number 2 type 2 size 64 interval 0
+  pipe 3: 0 direction 1 number 3 type 3 size 8 interval 1
+  pipe 4: 0xe0004061
+written 0
+read 0, 6 bytes: !olleh
+written the wrong way 0xe00002c2
+an async read before its source 0xe000405f
+its event source 0
+async write: 0, 5 bytes
+async read: 0, 5 bytes: cnysa
+interrupt read 0xe000404f
+stall cleared 0
+isochronous 0xe00002c7
+closed 0 0
+closed again 0xe00002cd

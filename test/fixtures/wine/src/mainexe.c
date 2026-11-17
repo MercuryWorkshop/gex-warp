@@ -33,8 +33,11 @@ int main(void)
     check(snap != INVALID_HANDLE_VALUE, "the process list is readable");
     sprintf(buf, "no start.exe process (%d)", starts);
     check(!starts, buf);
-    sprintf(buf, "the image at %p, not its preferred base %#llx", (void *)self, (unsigned long long)nt->OptionalHeader.ImageBase);
-    check((ULONG_PTR)self != nt->OptionalHeader.ImageBase, buf);
+    sprintf(buf, "the image at %p, not its preferred base 0x140000000", (void *)self);
+    check((ULONG_PTR)self != 0x140000000, buf);
+    /* (relocated as it was mapped, as Windows maps an image: its header says where) */
+    sprintf(buf, "its header's ImageBase %#llx is where it is", (unsigned long long)nt->OptionalHeader.ImageBase);
+    check((ULONG_PTR)self == nt->OptionalHeader.ImageBase, buf);
     check(fn(21) == 42, "a relocated function pointer");
     check(!lstrcmpA(msg, "relocated"), "a relocated string pointer");
     if (!fail) printf("mainexe ok\n");

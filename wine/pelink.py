@@ -84,6 +84,117 @@ def enc_name(s):
     return enc_leb(len(b)) + b
 
 
+def wasm_data_segments(path):
+    """A wasm file's data segments as (name, bytes): named by the name
+    section's data segment names in a linked module, by the linking
+    section's segment info in an object. Not a wasm file: none."""
+    b = open(path, 'rb').read()
+    if b[:4] != b'\0asm':
+        return []
+
+    def leb(i):
+        r = sh = 0
+        while True:
+            x = b[i]
+            i += 1
+            r |= (x & 0x7f) << sh
+            sh += 7
+            if x < 0x80:
+                return r, i
+
+    def expr(i):
+        # a constant expression: i32/i64.const (signed LEB) or global.get, then end
+        while b[i] != 0x0b:
+            op = b[i]
+            i += 1
+            if op in (0x41, 0x42, 0x23):
+                _, i = leb(i)
+            else:
+                raise ValueError(f'{path}: data segment offset opcode {op:#x}')
+        return i + 1
+
+    def string(i):
+        n, i = leb(i)
+        return b[i:i + n].decode(errors='replace'), i + n
+
+    datas, names, i = [], {}, 8
+    while i < len(b):
+        sid = b[i]
+        size, i = leb(i + 1)
+        end = i + size
+        if sid == 11:
+            n, j = leb(i)
+            for _ in range(n):
+                flag, j = leb(j)
+                if flag == 2:
+                    _, j = leb(j)
+                if flag != 1:
+                    j = expr(j)
+                ln, j = leb(j)
+                datas.append(b[j:j + ln])
+                j += ln
+        elif sid == 0:
+            name, j = string(i)
+            if name == 'name':
+                while j < end:
+                    sub, j = b[j], j + 1
+                    ln, j = leb(j)
+                    if sub == 9:
+                        n, k = leb(j)
+                        for _ in range(n):
+                            idx, k = leb(k)
+                            names[idx], k = string(k)
+                    j += ln
+            elif name == 'linking':
+                _, j = leb(j)
+                while j < end:
+                    sub, j = b[j], j + 1
+                    ln, j = leb(j)
+                    if sub == 5:
+                        n, k = leb(j)
+                        for idx in range(n):
+                            names[idx], k = string(k)
+                            _, k = leb(k)
+                            _, k = leb(k)
+                    j += ln
+        i = end
+    return [(names.get(k, ''), d) for k, d in enumerate(datas)]
+
+
+def check_record_runs(out, inputs, secs, width):
+    """The link kept every record its inputs had of each section of `secs`
+    ({ section: (words a record, whether an all-zero record is a loss) }):
+    the section's bytes in `out` are no fewer than in `inputs` together, and,
+    where it counts, no record is all zero save gexrt's anchor of
+    gexw_entries (a declaration's pair may name no function, so
+    gexw_entries_decl's do not count). A record the final link collects goes
+    silently otherwise (a function handed out with no entry thunk): `wasm-ld
+    -r` drops the segments' retain flag, so a run lives only while something
+    else keeps it. A loss fails the link here."""
+    had = {sec: 0 for sec in secs}
+    anchors = 0
+    for o in inputs:
+        for name, d in wasm_data_segments(o):
+            if name in had:
+                had[name] += len(d)
+        anchors += o.endswith(('.o', '.a')) and b'gexw_entries_anchor' in open(o, 'rb').read()
+    got = {sec: b'' for sec in secs}
+    for name, d in wasm_data_segments(out):
+        if name in got:
+            got[name] += d
+    bad = []
+    for sec, (words, zero_counts) in secs.items():
+        rec = words * width
+        recs = [got[sec][k:k + rec] for k in range(0, len(got[sec]) - rec + 1, rec)]
+        zero = sum(1 for r in recs if not any(r)) if zero_counts else 0
+        allowed = anchors if sec == 'gexw_entries' else 0
+        if len(got[sec]) < had[sec] - allowed * rec or zero > allowed:
+            bad.append(f'{sec}: {len(got[sec])} bytes linked of {had[sec]} in its inputs, '
+                       f'{zero} all-zero records (allowed {allowed})')
+    if bad:
+        sys.exit(f'pelink: {out}: the link lost records: ' + '; '.join(bad))
+
+
 def makefile_var(path, var):
     try:
         text = open(path).read().replace('\\\n', ' ')
@@ -1811,6 +1922,8 @@ static void *gexw_ntdll_proc(const char *name)
             cmd.insert(cmd.index(f'@{rsp}') + 1, obj)
             subprocess.check_call(cmd)
             print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
+        check_record_runs(out, objs[g] + ([gexrt] if gexrt else []),
+                          {'gexw_entries': (2, True), 'gexw_entries_decl': (2, False)}, 8 if WINE64 else 4)
         # Each DLL's table slots and data (`gexw.dllslots`), read from the
         # link as it is: wasm-opt keeps slots and data offsets, not function
         # numbers.

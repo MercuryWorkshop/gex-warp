@@ -808,6 +808,7 @@ pub(crate) fn refresh_ident_snapshot(p: &Px<'_>) {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut hasher);
         root_salt(&mut hasher, p.ns, id);
+        stamp_salt(&mut hasher, v.code_stamp);
         snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
@@ -3464,6 +3465,119 @@ const PER_MISS_N: usize = 16;
 /// call returns and folded call targets breadth-first up to this). 1 lifts
 /// only the block that missed, so the blocks lifted are the blocks run.
 static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+
+/// The hot-rewrite mode: a page whose byte guards (`Block::guard`) fire
+/// [`SMC_HOT_HITS`] times running, each within [`SMC_HOT_QUIET_NS`] of the
+/// one before (a JIT patching a constant into its code before each pass),
+/// has a miss there lift only the block that missed, not the blocks
+/// discovery reaches from it: each hit retires the page, and the next pass
+/// lifts again what it runs, one block or a few, where it lifted hundreds.
+/// Every block still checks its bytes on entry, as on any page written
+/// while executable. A page whose guards stay quiet that long leaves the
+/// mode at its next miss.
+const SMC_HOT_HITS: u32 = 8;
+const SMC_HOT_QUIET_NS: u64 = 2_000_000_000;
+/// The most blocks one miss on a hot page lifts: the block that missed and
+/// the straight-line run after it on its page (`translate_runtime_run`).
+const SMC_HOT_RUN: usize = 8;
+
+/// Per page key: guard hits running, the last one's time (`now_ns`), and
+/// (`?jitdiag=1`) the nanoseconds and blocks its hot lifts took. See
+/// [`SMC_HOT_HITS`].
+static SMC_HOT: std::sync::Mutex<Option<std::collections::HashMap<u64, SmcHot>>> = std::sync::Mutex::new(None);
+
+/// On a hot page, a block whose guard fires is retired alone (its slot
+/// moves to its new translation; the page's other blocks stay installed,
+/// each checking its own bytes). Every this many of those the page is
+/// retired whole all the same, so the modules holding the old copies of its
+/// blocks, which nothing dispatches to any more, can go.
+const SMC_HOT_PAGE_RETIRE: u32 = 256;
+
+#[derive(Default, Clone, Copy)]
+struct SmcHot {
+    hits: u32,
+    /// Blocks retired alone since the page was last retired whole.
+    alone: u32,
+    last: u64,
+    lifts: u64,
+    lift_ns: u64,
+    blocks: u64,
+}
+
+/// A guard on `page` fired. Whether to retire only the block (the page
+/// is hot, and not due its whole retire: [`SMC_HOT_PAGE_RETIRE`]).
+fn smc_hit(page: u64) -> bool {
+    let now = now_ns();
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let h = m.get_or_insert_with(Default::default).entry(page).or_default();
+    let quiet = h.last != 0 && now.saturating_sub(h.last) > SMC_HOT_QUIET_NS;
+    let was = *h;
+    if quiet {
+        *h = SmcHot::default();
+    }
+    h.hits = h.hits.saturating_add(1);
+    h.last = now;
+    let alone = h.hits > SMC_HOT_HITS && h.alone < SMC_HOT_PAGE_RETIRE;
+    h.alone = if alone { h.alone + 1 } else { 0 };
+    let h = *h;
+    drop(m);
+    if quiet && was.hits >= SMC_HOT_HITS {
+        smc_cooled(page, was.hits);
+    }
+    if jit_diag() && h.hits == SMC_HOT_HITS {
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): a block whose bytes change is retired alone, and a miss there lifts only its block and the run after it\n", my_pid()));
+    }
+    if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x}: {} guard hits running, {} hot lifts of {} blocks in {} us\n",
+            my_pid(),
+            h.hits,
+            h.lifts,
+            h.blocks,
+            h.lift_ns / 1000
+        ));
+    }
+    alone
+}
+
+/// Whether a miss on `page` lifts only its block (the hot-rewrite mode); a
+/// page that has been quiet long enough leaves the mode here.
+fn smc_hot(page: u64) -> bool {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = m.as_mut() else { return false };
+    let Some(h) = map.get(&page).copied() else { return false };
+    if h.hits < SMC_HOT_HITS {
+        return false;
+    }
+    if now_ns().saturating_sub(h.last) <= SMC_HOT_QUIET_NS {
+        return true;
+    }
+    map.remove(&page);
+    drop(m);
+    smc_cooled(page, h.hits);
+    false
+}
+
+/// `page` left the hot-rewrite mode, quiet after `hits` guard hits.
+fn smc_cooled(page: u64, hits: u32) {
+    if jit_diag() {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x} quiet for {} ms after {hits} guard hits: misses there lift as before\n",
+            my_pid(),
+            SMC_HOT_QUIET_NS / 1_000_000
+        ));
+    }
+}
+
+/// `?jitdiag=1`: what a hot lift on `page` took.
+fn smc_lifted(page: u64, ns: u64, blocks: u64) {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = m.as_mut().and_then(|m| m.get_mut(&page)) {
+        h.lifts += 1;
+        h.lift_ns += ns;
+        h.blocks += blocks;
+    }
+}
 
 /// What the runtime translator did in this process, for `gex_xlate_stat`:
 /// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
@@ -6353,7 +6467,7 @@ pub extern "C" fn gex_vma_count() -> i32 {
 ///
 ///   u32 count, then per region:
 ///   u64 start, u64 end, u32 prot,
-///   u32 name_len, name, u32 code_len, code, u64 code_off
+///   u32 name_len, name, u32 code_len, code, u64 code_off, u64 code_stamp
 ///
 /// A zero `code_len` means no code identity. `origin` is deliberately absent:
 /// it is a claim about *this* process's mappings, not something to inherit.
@@ -6380,6 +6494,7 @@ fn vma_blob() -> Vec<u8> {
                 out.extend_from_slice(&0u64.to_le_bytes());
             }
         }
+        out.extend_from_slice(&v.code_stamp.to_le_bytes());
     }
     out
 }
@@ -6439,8 +6554,13 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 p += 8;
                 Some((id, off))
             };
+            if p + 8 > raw.len() {
+                return -1;
+            }
+            let stamp = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap());
+            p += 8;
             ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
-            mm.lock().adopt(start, end, prot, &name, code);
+            mm.lock().adopt(start, end, prot, &name, code, stamp);
         }
         0
     }
@@ -6858,6 +6978,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             let w = IMAGE_PROGRAM.0.borrow();
             (!w.is_empty()).then(|| w.clone())
         });
+        // (stamped as `do_exec` stamps what it reads, when the root has the
+        // file: `Vma::code_stamp`)
+        let stamp = whose.as_deref().map_or(0, |f| kernel.code_stamp_of(f));
         kernel.mem.lock().insert_loaded(
             seg.vaddr,
             seg.vaddr + seg.mem_size,
@@ -6865,6 +6988,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             "[image]",
             whose.map(|f| (f, seg.vaddr)),
         );
+        kernel.mem.lock().stamp_code(seg.vaddr, seg.vaddr + seg.mem_size, stamp);
     }
 
     // argv arrives as a NUL-separated blob in the shim's own region.
@@ -12810,7 +12934,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // space, and it goes back byte for byte.
     // (By the name every root has for it: two roots have a `/bin/sh`.)
     let key = snap_key(&h.kernel.vfs.outer_path(path), envp);
-    let linked = snap_lookup(key);
+    let linked = snap_lookup(key).filter(|blob| snap_files_current(&h.kernel, blob));
     // Headers only: each segment is read from its file straight into place
     // below, once the old image is gone. Reading the whole executable and its
     // interpreter into the heap, parsing their symbols and dynamic tables and
@@ -12822,6 +12946,17 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         // (what the arena is asked is answered once the old image is gone)
         match arena_asks(|arena| gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, arena, &read_at)) {
             (Ok((p, r)), asks) => (Some(p), r, asks),
+            // An Apple program whose `__TEXT` is encrypted: refused, by name,
+            // as gexc refuses it without a key (gex_ld::dsmos). Planned, its
+            // segments would be read from the file into place as they are
+            // and run encrypted. The page has no key to decrypt them with.
+            (Err(gex_ld::elf::LoadError::ProtectedBinary), _) => {
+                warn_line(&format!(
+                    "gex: {path}: a protected program (its segments are encrypted, SG_PROTECTED_VERSION_1), \
+                     which this host has no key to decrypt: it is not run\n"
+                ));
+                return 0;
+            }
             (Err(_), _) => return 0,
         }
     };
@@ -12994,6 +13129,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let mut data = guest();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
+    let mut stamps: Vec<(&str, u64)> = Vec::new();
     for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let len = len as usize;
         if !fresh && data.zero_dirty(seg.vaddr, seg.mem_size as usize).is_err() {
@@ -13026,6 +13162,20 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             "[image]",
             Some((from.unwrap_or(path).to_string(), seg.vaddr)),
         );
+        // And which contents of the file it was read from, as an `mmap` of
+        // it says: a program replaced at the path is other code by the same
+        // name, whose pages must not take the translations of the old one's
+        // (`Vma::code_stamp`).
+        let file = from.unwrap_or(path);
+        let stamp = match stamps.iter().find(|(f, _)| *f == file) {
+            Some(&(_, s)) => s,
+            None => {
+                let s = h.kernel.code_stamp_of(file);
+                stamps.push((file, s));
+                s
+            }
+        };
+        h.kernel.mem.lock().stamp_code(seg.vaddr, seg.vaddr + seg.mem_size, stamp);
     }
 
     // A wasm32 program is published before it runs: its magic, read where
@@ -13678,7 +13828,23 @@ static SNAP_FACTS: SingleThreaded<(u64, u64, u64, u64)> =
 /// `.data`, TLS template); read-only text is stored as a path to re-read.
 fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(b"SNP1");
+    out.extend_from_slice(b"SNP2");
+    // The files the space's code was read from, and which contents of each
+    // (`Vma::code_stamp`): a recording of a program, or of a library it
+    // links, since replaced at its path is not put back (`snap_files_current`).
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for v in h.kernel.mem.lock().vmas() {
+        if let Some((id, _)) = &v.code {
+            if v.code_stamp != 0 && !files.iter().any(|(f, s)| f == id && *s == v.code_stamp) {
+                files.push((id.clone(), v.code_stamp));
+            }
+        }
+    }
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (f, stamp) in &files {
+        snap_write_str(&mut out, f);
+        out.extend_from_slice(&stamp.to_le_bytes());
+    }
     out.extend_from_slice(&entry.to_le_bytes());
     let (phdr, phent, phnum, interp_base) = *SNAP_FACTS.0.borrow();
     for v in [phdr, phent, phnum, interp_base] {
@@ -13701,7 +13867,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     // arguments the next process has rather than carried, and the catcher
     // stub belongs to the process that recorded, not to the one that
     // restores.
-    let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, Option<(String, u64)>)> = h
+    let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, u64, Option<(String, u64)>)> = h
         .kernel
         .mem
         .lock()
@@ -13715,6 +13881,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 v.prot,
                 v.name.clone(),
                 v.code.clone(),
+                v.code_stamp,
                 // Re-readable only if never writable (the `origin` invariant,
                 // re-checked here): re-reading a page the linker wrote gives a
                 // restored process an unrelocated GOT.
@@ -13726,7 +13893,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
         .collect();
     out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
     let data = guest();
-    for (start, end, prot, name, code, origin) in regions {
+    for (start, end, prot, name, code, stamp, origin) in regions {
         out.extend_from_slice(&start.to_le_bytes());
         out.extend_from_slice(&end.to_le_bytes());
         out.extend_from_slice(&prot.to_le_bytes());
@@ -13736,6 +13903,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 out.extend_from_slice(&1u32.to_le_bytes());
                 snap_write_str(&mut out, id);
                 out.extend_from_slice(&off.to_le_bytes());
+                out.extend_from_slice(&stamp.to_le_bytes());
             }
             None => out.extend_from_slice(&0u32.to_le_bytes()),
         }
@@ -13791,10 +13959,15 @@ pub extern "C" fn gex_link_cost(out: u32) -> u32 {
 /// the caller loads the program the long way.
 fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     let mut p = 0usize;
-    if raw.get(0..4)? != b"SNP1" {
+    if raw.get(0..4)? != b"SNP2" {
         return None;
     }
     p += 4;
+    // (the files, which `snap_files_current` asked about)
+    for _ in 0..snap_read_u32(raw, &mut p)? {
+        snap_read_str(raw, &mut p)?;
+        snap_read_u64(raw, &mut p)?;
+    }
     let entry = snap_read_u64(raw, &mut p)?;
     let phdr = snap_read_u64(raw, &mut p)?;
     let phent = snap_read_u64(raw, &mut p)?;
@@ -13820,11 +13993,12 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let end = snap_read_u64(raw, &mut p)?;
         let prot = snap_read_u32(raw, &mut p)?;
         let name = snap_read_str(raw, &mut p)?;
-        let code = if snap_read_u32(raw, &mut p)? == 1 {
+        let (code, stamp) = if snap_read_u32(raw, &mut p)? == 1 {
             let id = snap_read_str(raw, &mut p)?;
-            Some((id, snap_read_u64(raw, &mut p)?))
+            let off = snap_read_u64(raw, &mut p)?;
+            (Some((id, off)), snap_read_u64(raw, &mut p)?)
         } else {
-            None
+            (None, 0)
         };
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
@@ -13849,6 +14023,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             let take = (b - a).min(bytes.len().saturating_sub(off as usize));
             data.write(a as u64, &bytes[off as usize..off as usize + take]).ok()?;
             h.kernel.mem.lock().insert_from(start, end, prot, &name, Some((path, off)));
+            h.kernel.mem.lock().stamp_code(start, end, stamp);
         } else {
             let len = snap_read_u32(raw, &mut p)? as usize;
             let pages = len.div_ceil(4096);
@@ -13880,7 +14055,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
                 }
             }
             wmark(a as u64, (b - a) as u64);
-            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
+            h.kernel.mem.lock().adopt(start, end, prot, &name, code, stamp);
             ms_copy += now_ns() - began;
             n_copy += end - start;
         }
@@ -13893,6 +14068,25 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         ms_copy / 1_000_000,
     );
     Some(LinkedImage { entry, phdr, phent, phnum, interp_base, x, sp, tpidr })
+}
+
+/// Whether every file a recorded address space's code was read from is
+/// still the file it was then ([`snap_take`]'s list): one replaced at its
+/// path since (a program or a library rebuilt, `cp` over it) is not put
+/// back, and the program is loaded the long way.
+fn snap_files_current(k: &Kernel, raw: &[u8]) -> bool {
+    let mut p = 4usize;
+    if raw.get(0..4) != Some(b"SNP2") {
+        return false;
+    }
+    let Some(n) = snap_read_u32(raw, &mut p) else { return false };
+    for _ in 0..n {
+        let (Some(f), Some(stamp)) = (snap_read_str(raw, &mut p), snap_read_u64(raw, &mut p)) else { return false };
+        if k.code_stamp_of(&f) != stamp {
+            return false;
+        }
+    }
+    true
 }
 
 /// Fetch the linked image of `key` out of the global kernel.
@@ -14004,6 +14198,7 @@ fn object_identity_mode(p: &Px<'_>, addr: u64, alt: bool) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     root_salt(&mut hasher, p.ns, id);
+    stamp_salt(&mut hasher, v.code_stamp);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);
     let key = hasher.finish();
@@ -14071,6 +14266,20 @@ fn root_salt(h: &mut impl std::hash::Hasher, ns: &gex_kernel::vfs::Namespace, id
     if root != "/" && !id.starts_with(gex_kernel::mem::CONTENT_ID) {
         h.write_u8(0x2f);
         h.write(root.as_bytes());
+    }
+}
+
+/// Which contents of the file in a code identity ([`gex_kernel::mem::Vma::code_stamp`]):
+/// a program or library replaced at its path is other code by the same
+/// name, and keyed apart, its pages given no base and no module the old
+/// file's code was translated into (they ran the old program's
+/// translations, and died). Every process that maps the file unchanged
+/// stamps it alike, so they still share. Nothing for code with no stamp
+/// (named by its bytes, or loaded where nothing asked the file).
+fn stamp_salt(h: &mut impl std::hash::Hasher, stamp: u64) {
+    if stamp != 0 {
+        h.write_u8(0x5e);
+        h.write_u64(stamp);
     }
 }
 
@@ -14497,6 +14706,7 @@ fn page_identity_mode(p: &Px<'_>, page: u64, alt: bool) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     root_salt(&mut hasher, p.ns, id);
+    stamp_salt(&mut hasher, v.code_stamp);
     (off + (page - v.start)).hash(&mut hasher);
     flavour_salt(&mut hasher);
     mode_salt(&mut hasher, alt);
@@ -16582,6 +16792,13 @@ mod fault_code {
 /// when the process has no hook.
 #[must_use]
 fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
+    hook_fault_kind(pc, code, addr, 0, resumable)
+}
+
+/// [`hook_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+#[must_use]
+fn hook_fault_kind(pc: u64, code: u32, addr: u64, kind: u32, resumable: bool) -> bool {
     if cgen::fault_hook() == 0 {
         return false;
     }
@@ -16589,10 +16806,10 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     let mut gm = guest();
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
-    if resumable && cgen::fault_in_place(c, code, addr, 0) {
+    if resumable && cgen::fault_in_place(c, code, addr, kind) {
         return true;
     }
-    cgen::fault_stage(code, addr, 0);
+    cgen::fault_stage(code, addr, kind);
     set_resume(pc);
     set_resume_ctx(c);
     trap();
@@ -16783,6 +17000,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
             hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
+        } else if raw == i::BRK_FETCH_FAULT {
+            hook_fault_kind(pc, fault_code::ACCESS_VIOLATION, gex_abi::fetch_fault_addr(pc), 8, resumable)
         } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
             hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
         } else {
@@ -16849,6 +17068,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             pc
         ));
         set_exit(128 + 8);
+        trap();
+    }
+    // An instruction running onto memory that is not executable: SIGSEGV
+    // at the first byte of it there, for the program's handler if it has one.
+    if raw == gex_abi::imports::BRK_FETCH_FAULT {
+        segv_at(pc as u64, gex_abi::fetch_fault_addr(pc as u64));
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
@@ -17313,6 +17538,33 @@ pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// which are not a bug.
 pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `?jitdiag=1`: a block's guard found its bytes changed. Its first 32 bytes
+/// now, and whether they are the ones its last guard hit saw, at the 1st,
+/// 8th, 64th and 512th hit: bytes that are the same hit after hit were not
+/// rewritten since the last lift, and the translation, not the program, is
+/// what keeps disagreeing with them.
+fn guard_bytes_say(addr: u64, pc: u64) {
+    thread_local!(static SEEN: std::cell::RefCell<std::collections::HashMap<u64, (u32, Vec<u8>, u32)>> = Default::default());
+    let now = guest().read(addr, 32).map(|b| b.to_vec()).unwrap_or_default();
+    let said = SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(addr).or_insert((0, Vec::new(), 0));
+        e.0 += 1;
+        if e.1 == now {
+            e.2 += 1;
+        }
+        e.1 = now.clone();
+        matches!(e.0, 1 | 8 | 64 | 512).then(|| (e.0, e.2))
+    });
+    if let Some((n, same)) = said {
+        let hex: String = now.iter().map(|b| format!("{b:02x}")).collect();
+        warn_line(&format!(
+            "gex: pid {} guard hit {n} at {addr:#x} (block {pc:#x}): bytes now {hex}; {same} of the hits saw the bytes the one before did\n",
+            my_pid()
+        ));
+    }
+}
+
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
@@ -17618,6 +17870,48 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         with_jit_only(|j| {
             j.translated.remove(&(addr as u64));
         });
+        return;
+    }
+    if op == gex_abi::cache_op::GUARD_HIT {
+        // A block's self-modifying-code guard found its bytes changed: `pc`
+        // is the block, `addr` its module (dense base, id; as `PAGE_STALE`).
+        let start = _pc as u64;
+        let alt = thread_alt();
+        if jit_diag() {
+            guard_bytes_say(start, start);
+        }
+        // On a hot page, with dense numbering (a slot map word per block that
+        // every Worker reads), only this block: its translation again, into
+        // the slot. A Worker that has not instantiated the new module finds
+        // the miss stub at its index and catches up first (`dense::missing`);
+        // one that runs another block of the page meanwhile runs a block
+        // whose bytes did not change, or whose own guard sends it here.
+        // Otherwise (classic numbering, or a page not hot) the page, below.
+        if smc_hit(gex_abi::page_key(start, alt)) && dense::on() {
+            let again = with_jit_only(|j| {
+                // The slot already names a newer block than this module's
+                // (this copy was reached by a direct jump from a sibling of
+                // its own module, which keeps jumping to it): dispatch below
+                // goes there, or catches this Worker up to it.
+                let (base, _) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
+                let elsewhere = base != 0 && {
+                    let d = dense::index(start);
+                    d != 0 && j.module_dense.get(&base).is_some_and(|&n| d < base || d >= base + n)
+                };
+                if !elsewhere {
+                    let key = gex_abi::addr_key(start, alt);
+                    j.translated.remove(&key);
+                    j.provider.remove(&key);
+                }
+                !elsewhere
+            });
+            if again {
+                xlate_add(3, 1);
+                gex_dispatch_miss(_ctx, start as i64);
+            }
+            return;
+        }
+        gex_cache_op(_ctx, _pc, gex_abi::cache_op::IC_INVALIDATE, _pc);
         return;
     }
     if op == gex_abi::cache_op::IC_INVALIDATE {
@@ -19155,7 +19449,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
     let cs = if gex_abi::X86 { guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
-    let (mut unit, stats) = gex_xlate::translate_runtime(
+    // (or the block runs onto it: the block before a rewritten page fails
+    // its page check at each of the page's retires, and is lifted again)
+    let hot_page = gex_abi::page_key(pc, alt);
+    let hot = smc_hot(hot_page) || smc_hot(gex_abi::page_key(pc + gex_abi::DISPATCH_PAGE, alt));
+    let lift_t0 = if hot && jit_diag() { now_ns() } else { 0 };
+    // Hot: the block and its straight-line run on the page, in one module
+    // (`SMC_HOT_RUN`); else what discovery reaches.
+    let lift: fn(&[u8], u64, &(dyn Fn(u64) -> bool + Sync), &(dyn Fn(u64) -> bool + Sync), _, _, usize, bool, &_) -> _ =
+        if hot { gex_xlate::translate_runtime_run } else { gex_xlate::translate_runtime };
+    let (mut unit, stats) = lift(
             // SAFETY: the translator takes the whole memory (`guest_whole`).
             unsafe { guest_whole() },
             pc,
@@ -19165,7 +19468,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+            if hot { SMC_HOT_RUN } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -19175,6 +19478,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The translator is the shim's deepest caller: recursive over the
         // control-flow graph of up to `LIFT_MAX` blocks.
         stack_tripwire("the end of a translation");
+        if lift_t0 != 0 {
+            smc_lifted(hot_page, now_ns().saturating_sub(lift_t0), stats.blocks as u64);
+        }
         note_kuser_folds(pc);
         if pwatched(gex_abi::dispatch_page(pc)) {
             let pg = gex_abi::dispatch_page(pc);
@@ -19533,9 +19839,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// The whole process: a status set for this thread alone left the others
 /// running and its parent waiting.
 fn branch_fault(pc: u64) {
+    segv_at(pc, pc)
+}
+
+/// SIGSEGV at `pc` for an access at `addr`: the program's handler, or the
+/// process ends.
+fn segv_at(pc: u64, addr: u64) {
     let c = my_ctx();
     let mut gm = guest();
-    match sigs::fault(&mut gm, c, 11, pc, pc) {
+    match sigs::fault(&mut gm, c, 11, pc, addr) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;

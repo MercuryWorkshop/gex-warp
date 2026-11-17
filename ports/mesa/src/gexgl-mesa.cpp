@@ -579,6 +579,71 @@ bool last_reject_detailed = false;
  * they are; swapping maps is a pointer exchange each, and it happens once per
  * batch at most.
  */
+/* GL's window default: a context's viewport and scissor box take the size of
+ * the window it is first made current on. Here the bind (SURFACE_ATTACH or
+ * SURFACE_CURRENT) comes before the window's size (SURFACE_RESIZE, in the
+ * same batch), so GL's own default is the size the drawable had before -- a
+ * corner of the window for a program that never calls glViewport. So each is
+ * set again, to the window's size, at the binds and resizes up to the first
+ * PRESENT after the context is bound to a surface it has not drawn to before
+ * (a context made on a hidden window, then moved to the real one, is the
+ * common case), and never once the guest has set it itself: a program that
+ * sets the scissor box but not the viewport keeps its scissor box. The same
+ * rule as gex-gl's native host (`WindowDefault`). */
+struct window_default_state {
+    bool viewport = false, scissor = false;
+    bool guest_viewport = false, guest_scissor = false;
+    bool drawn = false;
+    std::vector<uint32_t> seen;
+};
+window_default_state window_default;
+
+/* glViewport and glScissor: the hand-written ops, GL 4.4's and the
+ * compatibility profile's (with their indexed and array forms). */
+void window_default_guest_sets(uint32_t op) {
+    switch (op) {
+    case VIEWPORT: case 1563: case 1564: case 1565: case 11407: case 11411: case 11414:
+        window_default.guest_viewport = true;
+        window_default.viewport = false;
+        break;
+    case SCISSOR: case 1389: case 1390: case 1391: case 10511: case 10517: case 10520:
+        window_default.guest_scissor = true;
+        window_default.scissor = false;
+        break;
+    default: break;
+    }
+}
+
+/* Bound to `handle`: true when that owes the default again. */
+bool window_default_bound(uint32_t handle) {
+    window_default_state& d = window_default;
+    if (std::find(d.seen.begin(), d.seen.end(), handle) == d.seen.end()) {
+        d.seen.push_back(handle);
+        d.drawn = false;
+        d.guest_viewport = false;
+        d.guest_scissor = false;
+    }
+    if (d.drawn) return false;
+    d.viewport = !d.guest_viewport;
+    d.scissor = !d.guest_scissor;
+    return d.viewport || d.scissor;
+}
+
+void window_default_drawn() {
+    window_default.drawn = true;
+    window_default.viewport = false;
+    window_default.scissor = false;
+}
+
+/* Set what the window default still owes, to the current surface's size. */
+void window_default_apply() {
+    if (!mesa_context || !sur) return;
+    const GLsizei w = (GLsizei)sur->drawable.width, h = (GLsizei)sur->drawable.height;
+    if (w <= 0 || h <= 0) return;
+    if (window_default.viewport) glViewport(0, 0, w, h);
+    if (window_default.scissor) glScissor(0, 0, w, h);
+}
+
 struct client_state {
     std::unordered_map<uint32_t, GLuint> buffers, textures, shaders, programs,
         vertex_arrays, framebuffers, renderbuffers, samplers, queries,
@@ -608,6 +673,7 @@ struct client_state {
     struct st_visual backend_visual = {};
     std::map<uint32_t, gex_surface> surfaces;
     uint32_t current_surface = 0;
+    window_default_state window_default;
 };
 
 std::map<uint32_t, client_state> clients;
@@ -655,6 +721,7 @@ void swap_client_state(client_state& other) {
     std::swap(backend_visual, other.backend_visual);
     std::swap(surfaces, other.surfaces);
     std::swap(current_surface, other.current_surface);
+    std::swap(window_default, other.window_default);
 }
 
 /* GEX_GL_COUNTS=1 (`?mesaenv=GEX_GL_COUNTS=1`): a line per PRESENT decoded,
@@ -1994,8 +2061,10 @@ std::string fit_glsl_version(std::string src) {
 }
 
 bool one(uint32_t op, Reader& a) {
+    window_default_guest_sets(op);
     switch (op) {
     case CONTEXT_CREATE: {
+        window_default = window_default_state{};
         // The client API the application selected with eglBindAPI, and the
         // version it asked for. Only the guest knows these, which is why they
         // are on the wire; see crates/gex-gl/src/proto.rs.
@@ -2067,6 +2136,7 @@ bool one(uint32_t op, Reader& a) {
     case SURFACE_RESIZE: {
         const int width = a.i32(), height = a.i32();
         resize_drawable(width, height);
+        window_default_apply();
         break;
     }
     /* Which window on the page's screen the frames after this one belong
@@ -2087,6 +2157,7 @@ bool one(uint32_t op, Reader& a) {
          * that drawable current: this is `eglCreateWindowSurface` finishing,
          * and what the client draws next belongs to this window. */
         use_surface(handle);
+        if (window_default_bound(handle)) window_default_apply();
         sur->kind = kind;
         sur->id = id;
         sur->token = token;
@@ -2097,6 +2168,7 @@ bool one(uint32_t op, Reader& a) {
         const unsigned handle = a.u32();
         if (!a.ok) break;
         use_surface(handle);
+        if (window_default_bound(handle)) window_default_apply();
         break;
     }
     case CONTEXT_DESTROY: {
@@ -2137,6 +2209,7 @@ bool one(uint32_t op, Reader& a) {
      * guest paces itself against: a client swapping one window must not be
      * released by another window's frame reaching the screen. */
     case PRESENT:
+        window_default_drawn();
         present_backend();
         if (gl_counts()) {
             ++gl_client_counts[current_client].second;

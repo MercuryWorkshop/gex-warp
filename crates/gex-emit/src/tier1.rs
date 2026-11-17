@@ -5714,9 +5714,10 @@ impl<'a> Emitter<'a> {
     }
 
     /// The self-modifying-code guard (`Block::guard`): compare the block's
-    /// code bytes with what was lifted; on a difference tell the host to
-    /// re-lift the page (`cache_op` IC_INVALIDATE, the same path `ic ivau`
-    /// takes on AArch64) and dispatch to this address again, which now misses.
+    /// code bytes with what was lifted; on a difference tell the host
+    /// (`cache_op` GUARD_HIT, with this module), which retires the block or
+    /// its page, and dispatch to this address again, which now reaches the
+    /// bytes as they are.
     fn emit_guard(&mut self, start: u64, bytes: &[u8]) {
         self.f.i64_const(0);
         self.f.local_set(self.scratch_i64);
@@ -5744,8 +5745,8 @@ impl<'a> Emitter<'a> {
         self.f.if_void();
         self.f.local_get(self.ctx_local);
         self.f.i64_const(start as i64);
-        self.f.i32_const(gex_abi::cache_op::IC_INVALIDATE);
-        self.f.i64_const(start as i64);
+        self.f.i32_const(gex_abi::cache_op::GUARD_HIT);
+        self.module_arg();
         self.f.call(self.cx.cache_op);
         // The dispatch below now misses, and a miss translates the address in
         // the context's PC: this one, not the last one stored (a direct jump
@@ -5814,20 +5815,7 @@ impl<'a> Emitter<'a> {
             // another, modules restored from the translation cache), so ids
             // repeat; it only decides whether to translate again, never
             // whether to resume from JavaScript (`gex_cache_op`).
-            match self.cx.module_id_global {
-                Some(g) => {
-                    self.f.global_get(g);
-                    self.f.byte(0xad); // i64.extend_i32_u
-                }
-                None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
-            }
-            if let Some(g) = self.cx.dense_global {
-                self.f.global_get(g);
-                self.f.byte(0xad); // i64.extend_i32_u
-                self.f.i64_const(32);
-                self.f.byte(0x86); // i64.shl
-                self.f.byte(0x84); // i64.or
-            }
+            self.module_arg();
             self.f.call(self.cx.cache_op);
         }
         self.store_pc(start);
@@ -5840,6 +5828,26 @@ impl<'a> Emitter<'a> {
         }
         self.emit_dispatch_tail_call();
         self.f.end();
+    }
+
+    /// This module, as `PAGE_STALE` and `GUARD_HIT` name it: its dense base
+    /// (high half, read at run time: where its blocks are in the process
+    /// running it, unique there by construction) and its id (low half).
+    fn module_arg(&mut self) {
+        match self.cx.module_id_global {
+            Some(g) => {
+                self.f.global_get(g);
+                self.f.byte(0xad); // i64.extend_i32_u
+            }
+            None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
+        }
+        if let Some(g) = self.cx.dense_global {
+            self.f.global_get(g);
+            self.f.byte(0xad); // i64.extend_i32_u
+            self.f.i64_const(32);
+            self.f.byte(0x86); // i64.shl
+            self.f.byte(0x84); // i64.or
+        }
     }
 
     fn emit_dispatch_tail_call(&mut self) {

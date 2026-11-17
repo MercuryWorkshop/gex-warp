@@ -54,8 +54,9 @@ export class Compositor {
       this.#worker.addEventListener('message', onMessage);
       // `?mesaenv=K=V,K=V`: environment for Mesa in the GL worker
       // (MESA_DEBUG=incomplete_fbo, say), for finding what it refuses.
-      // `?glcapture=BYTES`: record the GL stream in the worker and POST it
-      // to /__gex_capture when the ceiling is reached (gl-capture.js).
+      // `?glcapture=BYTES`: record the GL stream in the worker and hand it
+      // over when the ceiling is reached (gl-capture.js, the 'gl-capture'
+      // message below).
       const q = pageParams();
       const mesaEnv = q?.get('mesaenv');
       const glCapture = q?.get('glcapture');
@@ -129,6 +130,13 @@ export class Compositor {
       } else if (m.kind === 'describe' || m.kind === 'wgsl-cache' || m.kind === 'readout' || m.kind === 'window-at') {
         this.#pending.get(m.id)?.(m.kind === 'wgsl-cache' ? { blob: m.blob, stats: m.stats } : m.state);
         this.#pending.delete(m.id);
+      } else if (m.kind === 'gl-capture') {
+        // `?glcapture=BYTES`'s recording, full: to the embedder's
+        // `onGlCapture` (app.js), else POSTed to the server, as a test
+        // harness serving the page takes it.
+        const sink = globalThis.__gexGlCaptureSink;
+        if (sink) sink(m.bytes);
+        else fetch('/__gex_capture', { method: 'POST', body: m.bytes }).catch(() => {});
       } else if (m.kind === 'error') {
         console.error('[compositor]', m.error);
       }

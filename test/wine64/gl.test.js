@@ -7,6 +7,8 @@
 // - glnulldrv: GL on a null driver window (win32u's framebuffer surface);
 // - glwindow: the four quadrants and the white square drawn with GL, its
 //   frames checked;
+// - gltri: a triangle in immediate mode by a program that never sets its
+//   viewport, in the middle of its window at its size (GL's window default);
 // - glbig: a window taller than the screen keeps its GDI strip while its GL
 //   child presents (the last of the window's own frames has the strip);
 // - d2dsize: COM methods that return a struct, from a gexcc-win C++
@@ -24,6 +26,7 @@ const CASES = [
   { name: 'wglnoctx', want: allOk, exe: 'wglnoctx.exe', wayland: {} },
   { name: 'glnulldrv', want: /(ok [^\n]*\n|  pixel [^\n]*\n)+0 failures/, exe: 'glnulldrv.exe', nullDriver: true },
   { name: 'glwindow', want: frames3, exe: 'glwindow.exe', args: ['3'], wayland: { colors: ['220,40,40', '40,200,60', '40,80,220', '230,210,40', '255,255,255:100'] } },
+  { name: 'gltri', want: frames3, exe: 'gltri.exe', args: ['3'], wayland: { colors: ['230,210,40:8000', '51,51,51:50000'] } },
   { name: 'glbig', want: frames3, exe: 'glbig.exe', args: ['3'], wayland: { colors: ['200,30,30:5000'], skip: '590x370', last: 1 } },
 ];
 

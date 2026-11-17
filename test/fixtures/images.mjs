@@ -22,7 +22,12 @@
 //            cross gcc), darwin-metalecho.ARCH
 //            (fixtures/darwin/metalecho.c: darwin/metal-page's program),
 //            and darwin-services.ARCH (fixtures/darwin/services.c:
-//            darwin/services-page's), and darwin-high.ARCH with
+//            darwin/services-page's), darwin-midi.ARCH and
+//            darwin-midipeers.ARCH (fixtures/darwin/midi.c and
+//            midipeers.c: darwin/midi-page's), darwin-iodevices.ARCH,
+//            darwin-iousb.ARCH and darwin-iousblib.ARCH
+//            (fixtures/darwin/iodevices.c, iousb.m and iousblib.c:
+//            darwin/devices-page's), and darwin-high.ARCH with
 //            darwin-high.ARCH.mac (fixtures/darwin/high.c, and what
 //            this Mac printed: darwin/high's).
 //   mink     mink/: what darwin/metal-page runs of mink's, copied from a
@@ -125,6 +130,31 @@ const MEDIA = {
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
 export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 'linux-gtk': ['linux-gtk.tar'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'mount-fork.x86', 'mount-fork.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+
+/** A site's rest bundle in `dir` (eject-site.mjs's layout): rest.bin, raw
+ *  zstd frames of 64 KiB, its index rest.bin.json (hash `h`), and lazy.json
+ *  naming /data/f0, the first frame's bytes, in it. */
+function restBundle(dir, h) {
+  const FRAME = 64 << 10, N = 6;
+  mkdirSync(dir, { recursive: true });
+  const frames = [], parts = [];
+  let at = 0;
+  for (let k = 0; k < N; k++) {
+    const z = Buffer.alloc(12 + FRAME);
+    z.writeUInt32LE(0xfd2fb528, 0);
+    z[4] = 0xa0; // single segment, a 4-byte content size
+    z.writeUInt32LE(FRAME, 5);
+    const bh = 1 | (FRAME << 3); // the last block, raw
+    z[9] = bh & 0xff; z[10] = (bh >> 8) & 0xff; z[11] = (bh >> 16) & 0xff;
+    z.fill(0x61 + k, 12);
+    frames.push([at, z.length]);
+    parts.push(z);
+    at += z.length;
+  }
+  writeFileSync(join(dir, 'rest.bin'), Buffer.concat(parts));
+  writeFileSync(join(dir, 'rest.bin.json'), JSON.stringify({ frame: FRAME, size: FRAME * N, h, frames }));
+  writeFileSync(join(dir, 'lazy.json'), JSON.stringify({ base: `/__t/work/${h}/`, files: [['/data/f0', FRAME, 'rest.bin#0', 1700000000]] }));
+}
 
 export const images = {
   // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
@@ -263,6 +293,67 @@ export const images = {
         rmSync(prog, { force: true });
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', 'services.c')], { stdio: 'ignore' });
       }
+      // And CoreMIDI's (darwin/midi-page): a studio's program, and a pair of
+      // processes that make virtual endpoints between them. Both link the
+      // root's CoreMIDI, which a Mac's compiler finds in its SDK.
+      for (const name of ['midi', 'midipeers']) {
+        const prog = join(work, `darwin-${name}.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-o', prog, join(HERE, 'darwin', `${name}.c`), '-framework', 'CoreMIDI', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+      }
+      // And the `devices` service's (darwin/devices-page): IOKit's, linked
+      // with the SDK's IOKit as a Mac program is.
+      {
+        const prog = join(work, `darwin-iodevices.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-Wno-deprecated-declarations', '-o', prog, join(HERE, 'darwin', 'iodevices.c'),
+          '-framework', 'IOKit', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+      }
+      {
+        const prog = join(work, `darwin-iousb.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-fobjc-arc', '-Wno-deprecated-declarations', '-o', prog, join(HERE, 'darwin', 'iousb.m'),
+          '-framework', 'Foundation', '-framework', 'IOUSBHost', '-framework', 'IOKit'], { stdio: 'ignore' });
+      }
+      {
+        const prog = join(work, `darwin-iousblib.${arch}`);
+        rmSync(prog, { force: true });
+        spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-Wno-deprecated-declarations', '-o', prog, join(HERE, 'darwin', 'iousblib.c'),
+          '-framework', 'IOKit', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+      }
+      // And darwin/codecs-page's (fixtures/darwin/codecs-cases.mjs): pyrus's
+      // test/media programs and clips, from the pyrus tree the root was made
+      // in (GEX_TEST_PYRUS_MEDIA, else the root's own tree's test/media),
+      // each case run here against this Mac's VideoToolbox: what it printed
+      // (darwin-codecs.ARCH/CASE.mac), and for a case that is measured, its
+      // frames' bytes (CASE.mac.raw).
+      {
+        const media = process.env.GEX_TEST_PYRUS_MEDIA || join(root, '..', '..', 'test', 'media');
+        const dir = join(work, `darwin-codecs.${arch}`);
+        rmSync(dir, { recursive: true, force: true });
+        if (existsSync(join(media, 'vtdecode.c'))) {
+          mkdirSync(join(work, 'darwin-codecs'), { recursive: true });
+          mkdirSync(dir, { recursive: true });
+          const { CASES, CLIPS, IMAGES, argsOf } = await import('./darwin/codecs-cases.mjs');
+          for (const c of CLIPS) copyFileSync(join(media, 'clips', c), join(work, 'darwin-codecs', c));
+          for (const c of IMAGES) if (existsSync(join(media, 'images', c))) copyFileSync(join(media, 'images', c), join(work, 'darwin-codecs', c));
+          const a = arch === 'x86' ? 'x86_64' : 'arm64';
+          for (const prog of ['vtdecode', 'vtencode', 'iiodecode'])
+            if (existsSync(join(media, `${prog}.c`)))
+              spawnSync('xcrun', ['clang', '-arch', a, '-O1', '-w', '-o', join(dir, prog), join(media, `${prog}.c`), '-framework', 'CoreMedia', '-framework', 'VideoToolbox',
+                '-framework', 'CoreVideo', '-framework', 'ImageIO', '-framework', 'CoreGraphics', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+          for (const c of CASES) {
+            const exe = join(dir, c.prog);
+            if (!existsSync(exe)) continue;
+            const args = argsOf(c, join(work, 'darwin-codecs'));
+            const raw = join(dir, `${c.name}.mac.raw`);
+            const env = { ...process.env, ...(c.measure ? { VTDECODE_DUMP: raw, IIODECODE_DUMP: raw } : {}) };
+            const r = arch === 'x86' ? spawnSync('arch', ['-x86_64', exe, ...args], { encoding: 'utf8', env }) : spawnSync(exe, args, { encoding: 'utf8', env });
+            // (Said as the page's run says it: the clip by its name alone.)
+            if (r.status === 0) writeFileSync(join(dir, `${c.name}.mac`), r.stdout);
+          }
+        }
+      }
       // And darwin/high's (fixtures/darwin/high.c: where a Mac program's
       // addresses are), with what this Mac says of them beside it
       // (darwin-high.ARCH.mac).
@@ -331,6 +422,10 @@ export const images = {
     // The same for core/runprogram, which reads it, apart from core/dir-times's
     // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
+    // A rest bundle for page/rest-ahead (one copy for each setting, so the
+    // page's cache of one is not the other's): six 64 KiB zstd frames, one
+    // lazy file in its first.
+    for (const name of ['ra-off', 'ra-on']) restBundle(join(work, name), name);
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.

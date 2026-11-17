@@ -268,7 +268,9 @@ export function wow64(t, { mono = false } = {}) {
 }
 
 /** 64-bit Wine for a 64-bit program; `door` its WINEGEX_DOOR (the LP64
- *  door call, as the page has it; 0: none; null: not set). `native`: the install with the
+ *  door call, as the page has it; 0: none; null: not set). An install with an i386 side
+ *  (lib/wine/i386-windows) also takes 32-bit programs, as the site and wine/run.sh do
+ *  (WINEGEX_WOW64). `native`: the install with the
  *  native PE core GEX_TEST_WINE64_NATIVE in place of its own (a skip
  *  without it). `mem64`: the memory64 flavour's install and prefix,
  *  GEX_TEST_WINE64_M64_DIST and _PREFIX. */
@@ -278,7 +280,7 @@ export function wine64(t, { door = 1, native = false, mem64 = false } = {}) {
   const distSrc = env[D] || t.skip(`${D}: a 64-bit Wine install (wine/dist.sh${mem64 ? ', WINE64_MEM64=1' : ''})`);
   const pfxSrc = env[P] || t.skip(`${P}: its prefix (wine/dist.sh's WINE64_PREFIX)`);
   const nativeSrc = native ? (env.GEX_TEST_WINE64_NATIVE || t.skip('GEX_TEST_WINE64_NATIVE: a native PE core (wine/dist.sh\'s WINE64_NATIVE)')) : null;
-  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, ...(door !== null && { WINEGEX_DOOR: String(door) }) }, mount: '/wine64', mingwTriple: 'x86_64' });
+  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, ...(door !== null && { WINEGEX_DOOR: String(door) }), ...(existsSync(join(distSrc, 'lib/wine/i386-windows')) && { WINEGEX_WOW64: '1' }) }, mount: '/wine64', mingwTriple: 'x86_64' });
 }
 
 function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, wineEnv: WENV, mount, mingwTriple }) {

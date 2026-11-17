@@ -15,7 +15,7 @@ import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { HostWindows, shortcutLabel } from '../../page/runtime/src/windows/host.js';
 import { bytesOf } from '../../page/runtime/src/internal.js';
 
-export const meta = { hosts: ['browser'], arches: ['a64', 'x86'], images: ['darwin-root'], timeout: 300 };
+export const meta = { hosts: ['browser'], arches: ['a64', 'x86'], images: ['darwin-root'], timeout: 480 };
 
 const TITLE = 'Menus of a Mac program';
 
@@ -77,13 +77,21 @@ export default async function (t) {
     check('the line that counts is disabled', file[3]?.enabled === false && file[1]?.state === 'off');
 
     // Opened: the program brings File up to date before the page has it.
+    // Its answer is what `openMenu` waits for (a minute at most: a loaded
+    // machine runs the program slowly); the line it prints after answering
+    // comes by its output, which may arrive after the answer, so it is
+    // waited for too.
+    const OPEN_WAIT = 60000;
+    const said = (re, what) => until(() => re.test(text), what, OPEN_WAIT).catch(() => {});
     let changes = 0;
     menu?.addEventListener('change', () => changes++);
-    const opened = await timeout(menu.openMenu(1, { timeout: 20000 }), 30000, 'openMenu');
+    const opened = await timeout(menu.openMenu(1, { timeout: OPEN_WAIT }), OPEN_WAIT + 10000, 'openMenu');
+    await said(/^window: menu 1 about to open$/m, 'the program said it was asked');
     check('opening a menu waits for the program\'s word', /^window: menu 1 about to open$/m.test(text), text.slice(-300));
     check('and gives its items as the program then has them', titles(opened) === 'Save|Wrap|-|Opened 1 times' && opened[1].state === 'on', JSON.stringify(opened));
     check('with a change event, and the same numbers for the items', changes >= 1 && menu.item(11) === opened[1] && opened[0].id === 10, `${changes}`);
-    await timeout(menu.openMenu(2), 30000, 'openMenu');
+    await timeout(menu.openMenu(2, { timeout: OPEN_WAIT }), OPEN_WAIT + 10000, 'openMenu');
+    await said(/^window: menu 2 about to open$/m, 'the program said it was asked');
     check('a menu with nothing to change is answered too', /^window: menu 2 about to open$/m.test(text), text.slice(-300));
     menu.closeMenu(2);
     // Chosen, with Shift and the logo key held (the page's own event's names).
@@ -93,7 +101,7 @@ export default async function (t) {
     menu.closeMenu(1);
     await until(() => /^window: menu 1 closed$/m.test(text), 'the close reached the program', 30000).catch(() => {});
     check('and that the menu was put away', /^window: menu 2 closed$/m.test(text) && /^window: menu 1 closed$/m.test(text), text.slice(-300));
-    const again = await timeout(menu.openMenu(1, { timeout: 20000 }), 30000, 'openMenu');
+    const again = await timeout(menu.openMenu(1, { timeout: OPEN_WAIT }), OPEN_WAIT + 10000, 'openMenu');
     check('opened again, it is brought up to date again', titles(again) === 'Save|Wrap|-|Opened 2 times' && again[1].state === 'off', JSON.stringify(again));
     await t.screenshot?.('menu');
     let closed = false;
