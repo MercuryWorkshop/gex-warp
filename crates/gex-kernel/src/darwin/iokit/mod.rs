@@ -1056,7 +1056,15 @@ impl Kernel {
                 }
                 let Some(Object { obj: Obj::Connect(c), .. }) = h.and_then(|h| kit.objects.get_mut(&h)) else { return fail(BAD_ARGUMENT) };
                 let result = match &mut c.client {
-                    Client::Hid(hc) => hc.method(selector, &scalars, &inband),
+                    Client::Hid(hc) => {
+                        let r = hc.method(selector, &scalars, &inband);
+                        // (Where the pointer is put: WindowServer's cursor,
+                        // having taken an event.)
+                        if selector == 4 && hc.kind <= 1 {
+                            *said = format!("{said}: the pointer to {},{}", hc.at.0, hc.at.1);
+                        }
+                        r
+                    }
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
                     Client::Gpu(g) => gpuw::method(selector, &inband, g),
                     Client::Surface(_) | Client::Plain => Err(UNSUPPORTED),

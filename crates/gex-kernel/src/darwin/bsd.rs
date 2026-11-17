@@ -866,6 +866,13 @@ impl Kernel {
             // entered, and nothing denied, as above. (WindowServer will not
             // go on outside its own.)
             d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && x[1] == 0 => Ok(0),
+            // And the profiles the kernel has by name (sandbox_init of a
+            // named one asks, call 22, whether there is one, and compiles
+            // it from a file if not, of which there is none for most:
+            // colorsyncd's is the kernel's, and it gives up without it),
+            // and one entered by name (call 1): there is each, and it is
+            // entered, as above.
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Sandbox") && (x[1] == 1 || x[1] == 22) => Ok(0),
             d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
             d::GETATTRLISTBULK => self.darwin_getattrlistbulk(m, x[0] as i32, x[1], x[2], x[3], x[4]),
