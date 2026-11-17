@@ -26,6 +26,7 @@ mod reclaim;
 pub mod restart;
 pub mod root;
 mod bsd;
+mod fileport;
 pub mod info;
 pub mod iokit;
 pub mod kqueue;

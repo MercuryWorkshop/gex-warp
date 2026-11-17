@@ -163,6 +163,9 @@ pub enum Kind {
     /// An audit session's port (`audit_session_self`), by the session's
     /// id: a name for the session, to be joined by whoever holds it.
     AuditSession(u32),
+    /// An open file (`fileport_makeport`), by its handle in
+    /// [`super::fileport`]'s table: a descriptor for whoever has it.
+    FilePort(u32),
 }
 
 /// What `mach_port_get_attributes` says of the port a name is a right to,
@@ -277,6 +280,9 @@ impl Drop for Port {
     fn drop(&mut self) {
         if let Kind::MemEntry(h) = self.kind {
             super::mement::forget(h);
+        }
+        if let Kind::FilePort(h) = self.kind {
+            super::fileport::forget(h);
         }
     }
 }
@@ -834,7 +840,8 @@ impl Space {
     fn send_refs(&mut self, name: u32, now: u32) {
         let Some(e) = self.names.get_mut(&name) else { return };
         let was = e.send;
-        if !e.port.counted() && e.port.kind != Kind::Semaphore {
+        // (A file port's are counted too: its file goes with the last.)
+        if !e.port.counted() && !matches!(e.port.kind, Kind::Semaphore | Kind::FilePort(_)) {
             return;
         }
         e.send = now;

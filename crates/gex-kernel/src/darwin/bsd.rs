@@ -633,6 +633,8 @@ impl Kernel {
             d::SETAUID => self.darwin_setauid(m, x),
             d::AUDIT_SESSION_SELF => self.darwin_audit_session_self(),
             d::AUDIT_SESSION_JOIN => self.darwin_audit_session_join(x),
+            d::FILEPORT_MAKEPORT => self.darwin_fileport_makeport(m, x[0], x[1]),
+            d::FILEPORT_MAKEFD => self.darwin_fileport_makefd(x[0]),
             d::AUDIT_SESSION_PORT => self.darwin_audit_session_port(m, x),
             // `__initgroups(ngroups, gidset, gmuid)`: libc's `initgroups` is
             // this, which sets the groups as `setgroups` does (the membership
