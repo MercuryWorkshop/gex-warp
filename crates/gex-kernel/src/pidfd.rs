@@ -52,9 +52,9 @@ impl PidFd {
     /// (exited, reaped): whether the process has exited, and whether it is
     /// gone from the table too.
     fn state(&self) -> (bool, bool) {
-        match self.procs.entries().into_iter().find(|e| e.pid == self.pid) {
+        match self.procs.exited(self.pid) {
             None => (true, true),
-            Some(e) => (e.zombie || self.exited.load(Ordering::Acquire), false),
+            Some(zombie) => (zombie || self.exited.load(Ordering::Acquire), false),
         }
     }
 

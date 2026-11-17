@@ -892,7 +892,7 @@ impl Kernel {
                     // Another process's, as it last published them: its
                     // arguments (the first for its file's name, which is
                     // not kept apart), and none of its environment.
-                    let e = self.procs.entries().into_iter().find(|e| e.pid == pid).ok_or(Errno::EINVAL)?;
+                    let e = self.procs.entry(pid).ok_or(Errno::EINVAL)?;
                     let argv: Vec<&[u8]> = e.cmdline().split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
                     let mut b = Vec::new();
                     if counted {
@@ -1109,7 +1109,7 @@ impl Kernel {
         let path = if pid == 0 || pid == self.pid {
             self.exe_path.clone()
         } else {
-            let e = self.procs.entries().into_iter().find(|e| e.pid == pid)?;
+            let e = self.procs.entry(pid)?;
             let first = e.cmdline().split(|&b| b == 0).next()?.to_vec();
             String::from_utf8(first).ok().filter(|p| p.starts_with('/'))?
         };
@@ -1263,7 +1263,7 @@ impl Kernel {
                 let other = if pid == self.pid {
                     None
                 } else {
-                    Some(self.procs.entries().into_iter().find(|e| e.pid == pid && !e.zombie).ok_or(Errno::ESRCH)?)
+                    Some(self.procs.entry(pid).filter(|e| !e.zombie).ok_or(Errno::ESRCH)?)
                 };
                 let creds = crate::syscalls::Creds::new(0, 0);
                 creds.restore(&other.as_ref().map_or_else(|| self.creds.save(), |e| e.creds.clone()));

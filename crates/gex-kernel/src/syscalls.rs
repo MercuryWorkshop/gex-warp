@@ -1453,7 +1453,7 @@ fn rusage_ns(who: u64, self_ns: impl FnOnce() -> u128, child_ns: impl FnOnce() -
 
 /// The time `pid`'s reaped children used, as the process table keeps it.
 pub fn child_cpu_of(procs: &ProcTable, pid: i32) -> u128 {
-    procs.entries().into_iter().find(|e| e.pid == pid).map_or(0, |e| e.usage.child_cpu_ns as u128)
+    procs.entry(pid).map_or(0, |e| e.usage.child_cpu_ns as u128)
 }
 
 /// A call's answer as the word its result register holds: the value, or
@@ -8428,7 +8428,7 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 Ok(0)
             }
             16 => {
-                let e = procs.entries().into_iter().find(|e| e.pid == io.pid);
+                let e = procs.entry(io.pid);
                 let name = e.map_or_else(|| "gex".to_string(), |e| e.task_comm(tid));
                 let mut out = [0u8; 16];
                 let b = name.as_bytes();

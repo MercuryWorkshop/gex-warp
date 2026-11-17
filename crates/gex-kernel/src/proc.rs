@@ -1683,6 +1683,40 @@ impl ProcTable {
         self.lock().procs.iter().any(|p| p.pid == pid)
     }
 
+    /// One process's row of [`ProcTable::entries`]: `pid`'s alone, built
+    /// with the table held only for its own (what the calls about one
+    /// process ask: `proc_pidinfo`, `sysctl` of `KERN_PROC_PID`).
+    pub fn entry(&self, pid: i32) -> Option<ProcEntry> {
+        if self.remote.is_some() {
+            return self.entries().into_iter().find(|e| e.pid == pid);
+        }
+        let (mut e, st) = {
+            let t = self.lock();
+            let p = t.procs.iter().find(|p| p.pid == pid)?;
+            let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
+            tids.sort_unstable();
+            let task_usage = std::iter::once(p.pid).chain(tids.iter().copied()).map(|id| t.tasks.get(&id).copied().unwrap_or_default()).collect();
+            (ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage, task_usage }, Arc::clone(&p.child.status))
+        };
+        e.zombie = st.lock().map(|s| s.is_some()).unwrap_or(false);
+        Some(e)
+    }
+
+    /// Whether `pid` has exited, if it is in the table (a zombie until it
+    /// is reaped): what a process descriptor asks at each poll. Its own row
+    /// alone, not the whole table's [`ProcTable::entries`], which builds
+    /// every process's under the table's lock: a desktop's dozens of
+    /// processes and hundreds of threads, for each poll of each descriptor,
+    /// held the table from every other thread's system calls.
+    pub fn exited(&self, pid: i32) -> Option<bool> {
+        if self.remote.is_some() {
+            return self.entries().into_iter().find(|e| e.pid == pid).map(|e| e.zombie);
+        }
+        // (the status read after the table is let go, as in `entries`)
+        let st = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status))?;
+        Some(st.lock().map(|s| s.is_some()).unwrap_or(false))
+    }
+
     /// Whether `pid` is in the table and has not exited: [`ProcTable::exists`]
     /// without the zombies, which are in the table until reaped.
     pub fn alive(&self, pid: i32) -> bool {
@@ -2103,8 +2137,14 @@ mod tests {
         assert_eq!(decode_entries(&encode_entries(&e)), e);
         t.end_tid(t2);
         assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().tids, vec![t1]);
+        // (one process's row alone, the same as in the whole table's)
+        assert_eq!(t.entry(a).as_ref(), t.entries().iter().find(|e| e.pid == a));
+        assert_eq!(t.exited(a), Some(false));
         t.exit(a, 0);
         assert!(t.entries().iter().find(|e| e.pid == a).unwrap().zombie);
+        assert!(t.entry(a).unwrap().zombie);
+        assert_eq!(t.exited(a), Some(true));
+        assert_eq!((t.entry(999), t.exited(999)), (None, None));
     }
 
     #[test]
