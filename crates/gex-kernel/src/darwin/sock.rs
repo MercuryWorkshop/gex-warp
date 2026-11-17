@@ -92,6 +92,12 @@ impl Kernel {
             a[..args.len()].copy_from_slice(args);
             Some(n)
         };
+        // A kernel control socket (`PF_SYSTEM`) and what is asked of one:
+        // the kernel's own ([`super::kctl`]), with no canonical call.
+        let kctl = |k: &Self| k.darwin_is_kctl(x[0] as i32);
+        if (code == d::SOCKET && x[0] == kctl::PF_SYSTEM) || (matches!(code, d::CONNECT | d::CONNECT_NOCANCEL | d::SETSOCKOPT | d::GETSOCKOPT) && kctl(self)) {
+            return Some(NATIVE + code);
+        }
         match code {
             d::SOCKET => set(nr::SOCKET, &[family(x[0]), x[1] & 0xf, x[2]]),
             d::SOCKETPAIR => set(nr::SOCKETPAIR, &[family(x[0]), x[1] & 0xf, x[2], x[3]]),
@@ -138,7 +144,10 @@ impl Kernel {
     /// waiting bytes answered, and anything else is no option.
     pub(super) fn darwin_sockopt(&mut self, m: &mut GuestMem<'_>, get: bool, x: [u64; 8]) -> SysResult {
         let (fd, level, name, val, len) = (x[0] as i32, x[1] & 0xffff_ffff, x[2] & 0xffff_ffff, x[3], x[4]);
-        socket_family_type(&self.fd_io(), fd)?;
+        let control = self.darwin_is_kctl(fd);
+        if !control {
+            socket_family_type(&self.fd_io(), fd)?;
+        }
         let put = |m: &mut GuestMem<'_>, v: u32| -> SysResult {
             if val != 0 && len != 0 {
                 if m.read_u32(len)? < 4 {
@@ -150,6 +159,10 @@ impl Kernel {
             Ok(0)
         };
         match (level, name, get) {
+            // A control socket's options (its buffers' sizes) are taken,
+            // and read as nothing.
+            (_, _, false) if control => Ok(0),
+            (_, _, true) if control => put(m, 0),
             (SOL_SOCKET, n, false) if SO_ACCEPTED.contains(&n) => Ok(0),
             (SOL_SOCKET, n, true) if SO_ACCEPTED.contains(&n) => put(m, 0),
             (SOL_SOCKET, SO_NREAD, true) => {

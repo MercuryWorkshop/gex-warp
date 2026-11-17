@@ -535,6 +535,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a Darwin kernel control socket
+    /// (`crate::darwin::kctl`), when it is one.
+    fn as_kctl(&self) -> Option<&crate::darwin::kctl::KernControl> {
+        None
+    }
+
     /// This handle as a signalfd (`crate::signalfd`), when it is one.
     fn as_signalfd(&self) -> Option<&crate::signalfd::SignalFd> {
         None

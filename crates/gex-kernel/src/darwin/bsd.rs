@@ -592,7 +592,11 @@ impl Kernel {
             d::SYSCTLBYNAME => self.darwin_sysctlbyname(m, x),
             d::CSOPS | d::CSOPS_AUDITTOKEN => self.darwin_csops(m, x),
             d::PROC_INFO => self.darwin_proc_info(m, x),
+            d::IOCTL if x[1] & 0xffff_ffff == super::kctl::CTLIOCGINFO => self.darwin_kctl_info(m, x[0] as i32, x[2]),
             d::IOCTL => self.darwin_ioctl(m, x[0] as i32, x[1], x[2]),
+            // A kernel control socket's ([`super::kctl`]).
+            d::SOCKET => self.darwin_kctl_socket(x[1], x[2]),
+            d::CONNECT | d::CONNECT_NOCANCEL => self.darwin_kctl_connect(m, x[0] as i32, x[1], x[2]),
             // Not a socket.
             d::SHUTDOWN => Err(Errno::ENOTSOCK),
             d::SETSOCKOPT => self.darwin_sockopt(m, false, x),

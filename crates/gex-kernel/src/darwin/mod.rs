@@ -29,6 +29,7 @@ mod bsd;
 mod fileport;
 pub mod info;
 pub mod iokit;
+pub mod kctl;
 pub mod kqueue;
 pub mod kqwl;
 mod mach;
