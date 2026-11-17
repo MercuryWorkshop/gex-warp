@@ -136,7 +136,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', bottles: '$RT/src/bottles.js', gl: '$RT/src/gl.js', metal: '$RT/src/metal.js', notifications: '$RT/src/notifications.js', devices: '$RT/src/devices.js', 'devices-webhid': '$RT/src/devices-webhid.js', 'devices-webusb': '$RT/src/devices-webusb.js', 'services-worker': '$RT/src/services-worker.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', bottles: '$RT/src/bottles.js', gl: '$RT/src/gl.js', metal: '$RT/src/metal.js', notifications: '$RT/src/notifications.js', devices: '$RT/src/devices.js', 'devices-webhid': '$RT/src/devices-webhid.js', 'devices-webusb': '$RT/src/devices-webusb.js', 'services-worker': '$RT/src/services-worker.js', codecs: '$RT/src/codecs.js', 'codecs-worker': '$RT/src/codecs-worker.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -273,6 +273,8 @@ cat > "$OUT/package.json" <<PKG
     "./devices-webhid": { "types": "./devices-webhid.d.ts", "default": "./devices-webhid.mjs" },
     "./devices-webusb": { "types": "./devices-webusb.d.ts", "default": "./devices-webusb.mjs" },
     "./services-worker": { "types": "./services-worker.d.ts", "default": "./services-worker.mjs" },
+    "./codecs": { "types": "./codecs.d.ts", "default": "./codecs.mjs" },
+    "./codecs-worker": { "types": "./codecs-worker.d.ts", "default": "./codecs-worker.mjs" },
     "./input": { "types": "./input.d.ts", "default": "./input.mjs" },
     "./package.json": "./package.json"
   },

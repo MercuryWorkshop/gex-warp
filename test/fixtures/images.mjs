@@ -296,6 +296,39 @@ export const images = {
         spawnSync('xcrun', ['clang', '-arch', arch === 'x86' ? 'x86_64' : 'arm64', '-O1', '-Wno-deprecated-declarations', '-o', prog, join(HERE, 'darwin', 'iousblib.c'),
           '-framework', 'IOKit', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
       }
+      // And darwin/codecs-page's (fixtures/darwin/codecs-cases.mjs): pyrus's
+      // test/media programs and clips, from the pyrus tree the root was made
+      // in (GEX_TEST_PYRUS_MEDIA, else the root's own tree's test/media),
+      // each case run here against this Mac's VideoToolbox: what it printed
+      // (darwin-codecs.ARCH/CASE.mac), and for a case that is measured, its
+      // frames' bytes (CASE.mac.raw).
+      {
+        const media = process.env.GEX_TEST_PYRUS_MEDIA || join(root, '..', '..', 'test', 'media');
+        const dir = join(work, `darwin-codecs.${arch}`);
+        rmSync(dir, { recursive: true, force: true });
+        if (existsSync(join(media, 'vtdecode.c'))) {
+          mkdirSync(join(work, 'darwin-codecs'), { recursive: true });
+          mkdirSync(dir, { recursive: true });
+          const { CASES, CLIPS, IMAGES, argsOf } = await import('./darwin/codecs-cases.mjs');
+          for (const c of CLIPS) copyFileSync(join(media, 'clips', c), join(work, 'darwin-codecs', c));
+          for (const c of IMAGES) if (existsSync(join(media, 'images', c))) copyFileSync(join(media, 'images', c), join(work, 'darwin-codecs', c));
+          const a = arch === 'x86' ? 'x86_64' : 'arm64';
+          for (const prog of ['vtdecode', 'vtencode', 'iiodecode'])
+            if (existsSync(join(media, `${prog}.c`)))
+              spawnSync('xcrun', ['clang', '-arch', a, '-O1', '-w', '-o', join(dir, prog), join(media, `${prog}.c`), '-framework', 'CoreMedia', '-framework', 'VideoToolbox',
+                '-framework', 'CoreVideo', '-framework', 'ImageIO', '-framework', 'CoreGraphics', '-framework', 'CoreFoundation'], { stdio: 'ignore' });
+          for (const c of CASES) {
+            const exe = join(dir, c.prog);
+            if (!existsSync(exe)) continue;
+            const args = argsOf(c, join(work, 'darwin-codecs'));
+            const raw = join(dir, `${c.name}.mac.raw`);
+            const env = { ...process.env, ...(c.measure ? { VTDECODE_DUMP: raw, IIODECODE_DUMP: raw } : {}) };
+            const r = arch === 'x86' ? spawnSync('arch', ['-x86_64', exe, ...args], { encoding: 'utf8', env }) : spawnSync(exe, args, { encoding: 'utf8', env });
+            // (Said as the page's run says it: the clip by its name alone.)
+            if (r.status === 0) writeFileSync(join(dir, `${c.name}.mac`), r.stdout);
+          }
+        }
+      }
       // And darwin/high's (fixtures/darwin/high.c: where a Mac program's
       // addresses are), with what this Mac says of them beside it
       // (darwin-high.ARCH.mac).
