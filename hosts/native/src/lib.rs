@@ -5294,10 +5294,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
                 // `GEX_STALL_BT=1`: where in the guest each blocking call was
                 // made, for a stall dump to say what a stuck thread waits in.
+                // (The guest's own frames, as the trace says them, and the
+                // program's name; the wasm frames too with
+                // GEX_WASM_BACKTRACE=1.)
                 if stall_on && stall::want_bt() {
-                    let bt = wasmtime::WasmBacktrace::force_capture(&caller);
-                    let names: Vec<&str> = bt.frames().iter().take(20).map(|f| f.func_name().unwrap_or("?")).collect();
-                    stall::blocked(names.join(" < "));
+                    let (mut frames, exe) = state.with_kernel(|k| (k.traced_frames(&gm, pc as u64), k.exe_path.clone()));
+                    if std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1") {
+                        let bt = wasmtime::WasmBacktrace::force_capture(&caller);
+                        let names: Vec<&str> = bt.frames().iter().take(20).map(|f| f.func_name().unwrap_or("?")).collect();
+                        frames.push_str(&format!("\n      wasm: {}", names.join(" < ")));
+                    }
+                    stall::blocked(frames, exe.rsplit('/').next().unwrap_or("").to_string());
                 }
                 let compositor = caller.data().wayland.clone();
                 let kernel_for_service = Arc::clone(&caller.data().kernel);

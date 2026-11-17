@@ -10,6 +10,9 @@
 //! stalled. For the
 //! stalls a CPU profile cannot see: a whole session idle, waiting on a
 //! wakeup that comes late. Off unless set; when off, one load per syscall.
+//! `GEX_STALL_BT=1`: each thread in a call says where in the guest it
+//! made it (its frames, as the trace says them) and its program's name.
+//! On a Mac host, which has no /proc, no thread's CPU is said.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -55,6 +58,8 @@ struct Entry {
     call: Option<u64>,
     /// Where it blocked, when asked for (`want_bt`).
     bt: Option<String>,
+    /// Its program's name, said when it blocked (`want_bt`).
+    exe: String,
     since: Instant,
     last: u64,
     /// The latest call-out from a unit: target, return address; how many
@@ -69,7 +74,29 @@ static START: OnceLock<Instant> = OnceLock::new();
 static LAST_ENTRY_MS: AtomicU64 = AtomicU64::new(0);
 static THREADS: Mutex<Option<HashMap<u32, Entry>>> = Mutex::new(None);
 
+/// (Where there is no /proc: a number of gex's own for each host thread.)
+#[cfg(not(target_os = "linux"))]
+static NEXT_HOST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// A host thread's entry goes with the thread: what a dump says is of
+/// threads that are still there.
+struct Gone(u32);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        if let Ok(mut g) = THREADS.lock() {
+            if let Some(m) = g.as_mut() {
+                m.remove(&self.0);
+            }
+        }
+    }
+}
+
 thread_local! {
+    static GONE: Gone = Gone(HOST_TID.with(|t| *t));
+    #[cfg(not(target_os = "linux"))]
+    static HOST_TID: u32 = NEXT_HOST.fetch_add(1, Relaxed);
+    #[cfg(target_os = "linux")]
     static HOST_TID: u32 = std::fs::read_link("/proc/thread-self")
         .ok()
         .and_then(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()))
@@ -88,8 +115,9 @@ pub fn enter(pid: i32, tid: i32, nr: u64) {
     let now = Instant::now();
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
+    GONE.with(|_| ());
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, exe: String::new(), since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
     e.tid = tid;
     e.pid = pid;
     e.inside = Some(nr);
@@ -105,12 +133,13 @@ pub fn want_bt() -> bool {
     *ON.get_or_init(|| std::env::var("GEX_STALL_BT").as_deref() == Ok("1"))
 }
 
-/// The guest frames a thread blocked from (`want_bt`).
-pub fn blocked(frames: String) {
+/// The guest frames a thread blocked from, and its program (`want_bt`).
+pub fn blocked(frames: String, exe: String) {
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
         e.bt = Some(frames);
+        e.exe = exe;
     }
 }
 
@@ -146,6 +175,7 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
         inside: None,
         call: None,
         bt: None,
+        exe: String::new(),
         since: Instant::now(),
         last: !0,
         co: (0, 0),
@@ -157,6 +187,22 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
     e.co_aborts += aborted as u64;
 }
 
+#[cfg(not(target_os = "linux"))]
+fn cpu_ms(_host: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn all_threads_cpu() -> HashMap<u32, (String, u64)> {
+    HashMap::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn comm(_host: u32) -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
 fn cpu_ms(host: u32) -> Option<u64> {
     let s = std::fs::read_to_string(format!("/proc/self/task/{host}/stat")).ok()?;
     let rest = &s[s.rfind(')')? + 2..];
@@ -167,6 +213,7 @@ fn cpu_ms(host: u32) -> Option<u64> {
 }
 
 /// Every host thread's name and CPU, by host tid.
+#[cfg(target_os = "linux")]
 fn all_threads_cpu() -> HashMap<u32, (String, u64)> {
     let mut out = HashMap::new();
     if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
@@ -181,6 +228,7 @@ fn all_threads_cpu() -> HashMap<u32, (String, u64)> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn comm(host: u32) -> String {
     std::fs::read_to_string(format!("/proc/self/task/{host}/comm")).map(|s| s.trim().to_string()).unwrap_or_default()
 }
@@ -209,7 +257,12 @@ fn dump(why: &str) {
     let t = start().elapsed().as_secs_f64();
     let mut lines = Vec::new();
     for (h, e) in &snap {
-        let (Some(b), Some(a)) = (before.get(h), cpu_ms(*h)) else { continue };
+        // (Without /proc, every thread the map has, its CPU unknown.)
+        let cpu = match (before.get(h), cpu_ms(*h)) {
+            (Some(b), Some(a)) => format!("{}", a.saturating_sub(*b)),
+            _ if cfg!(target_os = "linux") => continue,
+            _ => "?".into(),
+        };
         let state = match e.inside {
             Some(nr) => match e.call {
                 Some(c) => format!("in {} (raw {nr})", gex_kernel::syscalls::syscall_name(c)),
@@ -223,12 +276,13 @@ fn dump(why: &str) {
             String::new()
         };
         let bt = match (&e.inside, &e.bt) {
-            (Some(_), Some(bt)) => format!("\n      at {bt}"),
+            (Some(_), Some(bt)) => format!("\n     {bt}"),
             _ => String::new(),
         };
+        let exe = if e.exe.is_empty() { String::new() } else { format!(" ({})", e.exe) };
         lines.push((e.pid, e.tid, format!(
-            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}",
-            e.pid, e.tid, h, comm(*h), state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
+            "  pid {}{exe} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}",
+            e.pid, e.tid, h, comm(*h), state, e.since.elapsed().as_millis(), cpu
         )));
     }
     lines.sort();

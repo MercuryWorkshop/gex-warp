@@ -13321,7 +13321,7 @@ impl Kernel {
     /// counter and the return addresses its frame pointers chain through
     /// (at most 16), each as the file it is in and the offset there (what
     /// a wait that never ends was waiting for).
-    fn traced_frames(&self, m: &GuestMem<'_>, pc: u64) -> String {
+    pub fn traced_frames(&self, m: &GuestMem<'_>, pc: u64) -> String {
         let fp_slot = if gex_abi::X86 { ctx::x(5) } else { ctx::x(29) };
         let mem = self.mem.lock();
         // (Each as an offset from the first mapping of its file.)
