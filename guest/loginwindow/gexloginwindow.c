@@ -57,6 +57,10 @@ CGError SLSSetWindowLevel(int cid, uint32_t wid, int level);
 CGError SLSOrderWindow(int cid, uint32_t wid, int place, uint32_t relative);
 CGContextRef SLWindowContextCreate(int cid, uint32_t wid, CFDictionaryRef options);
 CGError CGSNewRegionWithRect(const CGRect *rect, CFTypeRef *region);
+CGError SLSSetSystemDefinedCursor(int cid, int cursor);
+CGError SLSShowCursor(int cid);
+bool SLCursorIsVisible(void);
+CGError SLSGetCurrentCursorLocation(int cid, CGPoint *at);
 
 enum {
     kBackingBuffered = 2,
@@ -164,6 +168,14 @@ int main(int argc, char **argv) {
     }
     e = SLSOrderWindow(cid, wid, kOrderAbove, 0);
     printf("gexloginwindow: SLSOrderWindow -> %d\n", (int)e);
+    // The pointer: WindowServer starts with it hidden and no cursor of
+    // its own, and loginwindow gives it the arrow (the system's cursor 0)
+    // and shows it.
+    e = SLSSetSystemDefinedCursor(cid, 0);
+    CGError shown_e = SLSShowCursor(cid);
+    CGPoint at = {0, 0};
+    SLSGetCurrentCursorLocation(cid, &at);
+    printf("gexloginwindow: the arrow -> %d, shown -> %d, visible %d, at %.0f,%.0f\n", (int)e, (int)shown_e, (int)SLCursorIsVisible(), at.x, at.y);
     if (c) CGContextFlush(c);
     // What WindowServer shows of it: the display as it composites it.
     sleep(2);
