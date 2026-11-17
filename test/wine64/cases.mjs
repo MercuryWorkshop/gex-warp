@@ -218,6 +218,16 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     want: /cbfault: sending\ncbfault: veh c0000005\n([^\n]*\n)*cbfault: returned 0, veh [0-9]+/ });
   await one('ptval', join(F, 'ptval.c'), ['-O1', '-mwindows'], { nullDriver: true });
   await one('selfaddr', join(F, 'selfaddr.c'), ['-O1'], { want: /selfaddr: data 1 bss 1 code 1\nselfaddr ok/ });
+  if (want('exitshape')) {
+    // native calls of a native DLL's exports through their guest addresses,
+    // every conv.h shape, against convdll's table
+    let dll;
+    try { dll = await w.gexccWin(join(F, 'convdll.c'), 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')]); } catch (e) {
+      if (e instanceof Skip) throw e;
+      t.check(`${pre}exitshape: convdll build`, false, String(e.message));
+    }
+    if (dll) await one('exitshape', join(F, 'exitshape.c'), ['-O2', `-I${F}`], { extra: [dll, `${dll}.wasm`], want: /exitshape: shapes agree\nexitshape ok/ });
+  }
   await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
   if (want('missimp')) {
     // an import no DLL exports: a stub, listed at the link; the program

@@ -29,6 +29,10 @@ thread_local! {
     static SEQ: Cell<i32> = const { Cell::new(0) };
     /// The wait this Worker's thread is in, as it was when it began.
     static WAIT: RefCell<Option<MyWait>> = const { RefCell::new(None) };
+    /// The queue list of the last wait that ended, kept for the next one:
+    /// a thread that waits over and over (a message loop, a pipe ping-pong)
+    /// makes its list once.
+    static SPARE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// This process's wait queue (`k_proc_queue`), with the pid it is for.
@@ -126,8 +130,9 @@ pub(crate) fn publish_timer() {
 }
 
 /// The queues a wait registers on, and when it becomes ready by the clock.
-fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64, page: bool) -> (Vec<u32>, Option<u64>) {
-    let mut qs = vec![proc_queue()];
+fn queues_of(mut qs: Vec<u32>, waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64, page: bool) -> (Vec<u32>, Option<u64>) {
+    qs.clear();
+    qs.push(proc_queue());
     let mut handle = |h: &Arc<dyn gex_kernel::vfs::FileHandle>, qs: &mut Vec<u32>| {
         let q = h.wait_queue();
         if q == 0 && !page && h.ready_in_ns().is_none() {
@@ -233,8 +238,9 @@ pub(crate) fn enter(i: usize, t: &Run, why: u8, all_blocked: bool, ends_by_itsel
         }
         if let Some(old) = w.take() {
             unregister(&old);
+            spare(old);
         }
-        let (queues, soonest) = queues_of(&t.waiting, &t.blocked_on, now, why & 4 != 0);
+        let (queues, soonest) = queues_of(SPARE.with(|s| std::mem::take(&mut *s.borrow_mut())), &t.waiting, &t.blocked_on, now, why & 4 != 0);
         let slot = slot() as u32;
         for &q in &queues {
             unsafe { k_wq_add(q, slot) };
@@ -275,6 +281,11 @@ fn same_wait(a: &Waiting, b: &Waiting) -> bool {
     }
 }
 
+/// Keep an ended wait's queue list for the next one.
+fn spare(m: MyWait) {
+    SPARE.with(|s| *s.borrow_mut() = m.queues);
+}
+
 fn unregister(m: &MyWait) {
     let slot = slot() as u32;
     for &q in &m.queues {
@@ -287,6 +298,7 @@ pub(crate) fn leave() {
     WAIT.with(|w| {
         if let Some(old) = w.borrow_mut().take() {
             unregister(&old);
+            spare(old);
         }
     });
 }

@@ -390,6 +390,25 @@ const CTX_PC = 32 * 8;
 const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
+// A call-out's trap steps (`#calloutTrap`) give this to enter again.
+const CALLOUT_AGAIN = Symbol('again');
+// ... or this, with a staged fault's hook to run first (`#calloutHook`).
+const CALLOUT_HOOK = Symbol('hook');
+const U64_MAX = (1n << 64n) - 1n;
+/** A call-out's record (`#calloutOpen` fills it). */
+/** A call-out's watch (`#armCallouts`): the dispatch entry its return is
+ *  reached through, and what that held. Its record's own, made once. */
+const watchRec = (c, table, index, old) => {
+  const w = c.wrec ??= { table: 0, index: 0, old: null };
+  w.table = table;
+  w.index = index;
+  w.old = old;
+  return w;
+};
+const calloutRec = () => ({
+  ret: 0n, spWant: 0n, w: null, ri: 0, tok: 0, alt: false, me: 0, sp0: 0, psp0: 0, d0: 0, pc: 0n, next: null, own: false,
+  span: 0n, unwound: 0n, back: 0n, top: 0n, anyStack: false, wrec: null, ft: null,
+});
 /** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
  *  `NATIVE_UNWOUND`. */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
@@ -5338,10 +5357,13 @@ export class Gex {
     // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
     // and the bytes copied out only when the page has no module for it.
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
-    // A wasm32 program's bytes as a copy the shim made for this Worker
-    // (`gex_wasmprog_owned`): another Worker of the process may release
-    // the shim's own while this one copies.
+    // Wine's PE module's and a wasm32 library's bytes from their file
+    // (`#pmodRead`), never held in the shim's heap; a wasm32 program's as a
+    // copy the shim made for this Worker (`gex_wasmprog_owned`): another
+    // Worker of the process may release the shim's own while this one copies.
     const pcopy = () => {
+      const read = this.#pmodRead(prov, plen);
+      if (read) return read;
       const own = wasmprog && e.gex_wasmprog_owned ? e.gex_wasmprog_owned(prov) >>> 0 : 0;
       if (wasmprog && e.gex_wasmprog_owned && !own) throw new Error(`wasm32 module ${prov}: its bytes are gone`);
       const at = own || (e.gex_cgen_pmod_wasm_ptr(prov) >>> 0);
@@ -5358,7 +5380,10 @@ export class Gex {
     let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
-    if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
+    // (no key, both lanes 0: a file the shim could not read to make one)
+    const keyed = (wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key
+      && (e.gex_cgen_pmod_wasm_key(prov, 0) !== 0n || e.gex_cgen_pmod_wasm_key(prov, 1) !== 0n);
+    if (keyed) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
       if (wasmprog && !w64 && !logNamed('nodlpack')) {
@@ -5483,7 +5508,7 @@ export class Gex {
           // takes it once `gex_image_mapped` exists).
           // In the single-thread build on a stack that may suspend, as the
           // function tier's call_out: 64-bit Wine's system calls are faults served
-          // inside this loop (`#callOutSteps`), and they block.
+          // inside this loop (`#callOut`), and they block.
           call_out: (SP_CODE && single.on)
             ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
               ? this.#callOut(ctx >>> 0, target, ret, spWant)
@@ -6027,6 +6052,33 @@ export class Gex {
    *  once per process and offered to the siblings. Synchronous. */
   /** The last `#cgenFileModule`'s compile, ms; -1 when the Worker had it. */
   #fileModuleMs = -1;
+  /** Provider module `prov`'s `len` bytes read from its file
+   *  (`gex_cgen_pmod_read`), through a window of 1 MiB of the shim's memory
+   *  into bytes of the page's own: a program's module is hundreds of MiB,
+   *  and the shim's heap never gives a span back. null for a module with no
+   *  file to read (a program's, whose bytes are its image's). */
+  #pmodRead(prov, len) {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_pmod_read || !len) return null;
+    const win = Math.min(len, 1 << 20);
+    const at = e.gex_alloc(win) >>> 0;
+    try {
+      let out = null;
+      for (let off = 0; off < len;) {
+        const n = e.gex_cgen_pmod_read(prov, BigInt(off), at, Math.min(win, len - off));
+        if (n === -1 && off === 0) return null;
+        if (n === -2) throw new Error(`${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: changed since it was loaded`);
+        if (n <= 0) throw new Error(`${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: ends at ${off} of its ${len} bytes`);
+        out ??= new Uint8Array(len);
+        out.set(new Uint8Array(this.#memory.buffer, at, n), off);
+        off += n;
+      }
+      return out;
+    } finally {
+      e.gex_free(at, win);
+    }
+  }
+
   #cgenFileModule(file, bytes = null, key = null) {
     const name = key ?? `cgenfile:${file}`;
     let mod = this.#sharedModules.get(name);
@@ -7065,7 +7117,7 @@ export class Gex {
       const sp = new DataView(this.#memory.buffer).getUint32(rec + SNAP_LV + j * SNAP_LVS + 16, true);
       const spG = this.#wasmprogStack();
       spG.value = typeof spG.value === 'bigint' ? BigInt(sp) : sp | 0;
-      return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false, () => this.#snapLevelEnter(rec, j, ctx)));
+      return this.#callOut(ctx, target, ret, spWant, () => this.#snapLevelEnter(rec, j, ctx));
     }
     try {
       return this.#callOut(ctx, target, ret, spWant);
@@ -7121,7 +7173,7 @@ export class Gex {
       W.asyncify_stop_rewind();
       W.__gexw_snap_globals(1, BigInt(sl + 40));
       sp.value = new DataView(this.#memory.buffer).getBigUint64(sl + 80, true);
-      return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false, () => this.#snapLevelEnter(rec, j, ctx)));
+      return this.#callOut(ctx, target, ret, spWant, () => this.#snapLevelEnter(rec, j, ctx));
     }
     if (rec && j < SNAP_LEVELS) {
       W.__gexw_snap_globals(0, BigInt(sl + 40));
@@ -8060,7 +8112,7 @@ export class Gex {
       // win::nr::NATIVE_LEFT: the guest re-entered native code from above
       // the innermost native entry. Only when the innermost loop is a native
       // caller's call-out that the guest has left does it leave (its caller
-      // drops its frames, `#callOutSteps`). Otherwise gexrt's mark is stale
+      // drops its frames, `#callOut`). Otherwise gexrt's mark is stale
       // or the frames it left were reached without a call-out (a function
       // body called straight from native code): the call returns and the
       // guest goes on nested, and gexrt's own checks drop the dead frames
@@ -9151,11 +9203,16 @@ export class Gex {
   /** The shim's and every module's `call_out` outside the single-thread
    *  build: one front per process (`callOutFront`). */
   #callOutFront() {
-    return this.#callOutFn ??= callOutFront((ctx, target, ret, spWant) => (ctx === 0 ? 0 : this.#drive(this.#callOutSteps(ctx >>> 0, target, ret, spWant, false))));
+    return this.#callOutFn ??= callOutFront((ctx, target, ret, spWant) => (ctx === 0 ? 0 : this.#callOut(ctx >>> 0, target, ret, spWant)));
   }
   /** What the watch stub found (`{ kind: 'return', i }` or `{ kind:
    *  'bypass', f }`), for the nested loop to act on. */
   #calloutSignal = null;
+  /** The signal of call-out `i`'s return, made once per depth. */
+  #returnSigs = [];
+  #returnSig(i) {
+    return this.#returnSigs[i] ??= Object.freeze({ kind: 'return', i });
+  }
   /** Which nested loops this Worker is in, innermost last ('callout', or
    *  'callout~' for one that may suspend). */
   #nest = [];
@@ -9272,7 +9329,7 @@ export class Gex {
   /** The innermost call-out whose return the guest is at (`ctx`'s PC and
    *  stack, by `#watchHit`'s rule), or -1. */
   #returnedAt(ctx) {
-    const dv = new DataView(this.#memory.buffer);
+    const dv = this.#dv();
     const pc = dv.getBigUint64(ctx + CTX_PC, true);
     const sp = dv.getBigUint64(ctx + this.#ctxSp(), true);
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
@@ -9287,7 +9344,7 @@ export class Gex {
    *  that shares the entry (another address of an x86 slot, a deeper frame
    *  returning to the same place), which runs what the entry held. */
   #watchHit(ctx) {
-    const dv = new DataView(this.#memory.buffer);
+    const dv = this.#dv();
     const target = dv.getBigUint64(ctx + CTX_LAST_TARGET, true);
     const sp = dv.getBigUint64(ctx + this.#ctxSp(), true);
     let i = -1;
@@ -9297,7 +9354,7 @@ export class Gex {
     }
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
-      this.#calloutSignal = { kind: 'return', i };
+      this.#calloutSignal = this.#returnSig(i);
       // The innermost call-out's return with only tail calls since its
       // loop's `enter`: the stub returns, and that `enter` with it.
       return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(this.#callouts[i].tok) ? 1 : 0;
@@ -9311,8 +9368,18 @@ export class Gex {
 
   /** The table `table` of `gex_dispatch_ref` names. */
   #refTable(table) {
-    return table === TABLE_NAMES.length ? this.#guest.exports.blocks : this.#dispatchTables()[table];
+    // Taken once per guest instance: its exports are fixed, and reading them
+    // again on every call-out cost more than the walk itself.
+    if (this.#refTablesOf !== this.#guest) {
+      this.#refTablesOf = this.#guest;
+      this.#refTables = this.#dispatchTables();
+      this.#refBlocks = this.#guest.exports.blocks;
+    }
+    return table === TABLE_NAMES.length ? this.#refBlocks : this.#refTables[table];
   }
+  #refTablesOf = null;
+  #refTables = null;
+  #refBlocks = null;
 
   /** `old` with arm `arm` watched (ENTRY_WATCH), made once per pair: a
    *  call-out arms and disarms the same return over and over. */
@@ -9388,7 +9455,21 @@ export class Gex {
   #armCallouts() {
     const e = this.#shim.exports;
     const stub = this.#watch();
-    for (const c of this.#callouts) {
+    const list = this.#callouts;
+    for (let k = 0; k < list.length; k++) {
+      const c = list[k];
+      // Still armed (dispatch reaches its return through the entry it
+      // watches, and that entry still runs the stub): nothing to do, and
+      // nothing made. Only a call-out whose return an install or a
+      // retirement moved or overwrote since is armed again.
+      if (c.w && e.gex_dispatch_ref_is(c.ret, c.alt ? 1 : 0, c.w.table, c.w.index) && this.#armed(c.w, stub)) continue;
+      // A new one whose return the one around it watches already (a run of
+      // nested calls to one place, as WoW64's are): it shares that watch.
+      const o = k > 0 ? list[k - 1] : null;
+      if (!c.w && o?.w && e.gex_dispatch_ref_is(c.ret, c.alt ? 1 : 0, o.w.table, o.w.index) && this.#armed(o.w, stub)) {
+        c.w = watchRec(c, o.w.table, o.w.index, o.w.old);
+        continue;
+      }
       // In the mode the call-out was made in: the thread may be in the
       // other, and a change of mode in wasm (no trap) comes back to it with
       // no arming in between.
@@ -9405,16 +9486,32 @@ export class Gex {
       }
       const shared = this.#callouts.find((o) => o !== c && o.w && o.w.table === table && o.w.index === index);
       const old = shared ? shared.w.old : this.#refGet(table, index);
-      c.w = { table, index, old };
+      c.w = watchRec(c, table, index, old);
       this.#refSet(table, index, stub);
     }
+  }
+
+  /** Whether the entry `w` names still runs the watch stub. */
+  #armed(w, stub) {
+    const t = this.#refTable(w.table);
+    if (!t) return false;
+    if (!this.#entries || w.table !== TABLE_NAMES.length) return w.index < t.length && t.get(w.index) === stub;
+    const at = w.index >>> 8;
+    if (at >= t.length) return false;
+    const ew = this.#entryWatch.get(at);
+    return !!ew && ew.fn === t.get(at) && ew.arms.has(w.index & 255);
   }
 
   /** Put a call-out's watched entry back, unless another still watches it. */
   #unwatch(c) {
     const w = c.w;
     c.w = null;
-    if (!w || this.#callouts.some((o) => o !== c && o.w && o.w.table === w.table && o.w.index === w.index)) return;
+    if (!w) return;
+    const list = this.#callouts;
+    for (let k = 0; k < list.length; k++) {
+      const o = list[k];
+      if (o !== c && o.w && o.w.table === w.table && o.w.index === w.index) return;
+    }
     if (this.#refHas(w.table, w.index) && this.#refGet(w.table, w.index) === this.#watchStub) this.#refSet(w.table, w.index, w.old);
   }
 
@@ -9427,8 +9524,31 @@ export class Gex {
    * where the guest is, and the body leaves as before. Synchronous: a shim
    * frame is below this one.
    */
-  #callOut(ctx, target, ret, spWant) {
-    return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false));
+  #callOut(ctx, target, ret, spWant, resume = null) {
+    const c = this.#calloutOpen(ctx, target, ret, spWant, false, resume);
+    try {
+      // A snapshot's level entered again inside it (`#snapCallOut`): the
+      // guest goes on where that leaves it.
+      if (resume) c.pc = resume();
+      this.#armCallouts();
+      for (;;) {
+        try {
+          const f = c.next;
+          c.next = null;
+          this.#shim.exports.gex_callout_leave_ok?.(c.tok);
+          if (f) f(ctx);
+          else this.#enterOf(ctx, c.pc)(ctx, c.pc);
+          return this.#calloutLeft(c, ctx);
+        } catch (err) {
+          this.#covTick();
+          let v = this.#calloutTrap(c, ctx, err);
+          if (v === CALLOUT_HOOK) v = this.#calloutResume(c, ctx, err, 0n, this.#calloutHook(c, ctx));
+          if (v !== CALLOUT_AGAIN) return v;
+        }
+      }
+    } finally {
+      this.#calloutClose(c, ctx);
+    }
   }
 
   /**
@@ -9437,50 +9557,37 @@ export class Gex {
    * runs can block -- the import that asked is a `Suspending`, and the
    * whole fiber waits.
    */
-  #callOutAsync(ctx, target, ret, spWant) {
-    return this.#driveAsync(this.#callOutSteps(ctx, target, ret, spWant, true));
-  }
-
-  /** Run a nested loop's steps (`['enter', ctx, pc]` / `['call', f, ...args]`)
-   *  synchronously: an exception goes back into the loop at its step. */
-  #drive(g) {
-    let r = g.next();
-    while (!r.done) {
-      let v;
-      try {
-        const [op, a, b, c, d, x] = r.value;
-        v = op === 'enter' ? this.#enterOf(a, b)(a, b) : a(b, c, d, x);
-      } catch (err) {
-        // A nested loop never yields to the event loop (a Wine thread's
-        // whole life can be one call-out): an instrumented unit's hits go
-        // from here too.
-        if (this.#cov.size && performance.now() - this.#covAt > 250) {
-          this.#covAt = performance.now();
-          this.covFlush();
+  async #callOutAsync(ctx, target, ret, spWant) {
+    const c = this.#calloutOpen(ctx, target, ret, spWant, true, null);
+    try {
+      this.#armCallouts();
+      for (;;) {
+        try {
+          const f = c.next;
+          c.next = null;
+          this.#shim.exports.gex_callout_leave_ok?.(c.tok);
+          if (f) await this.#promisingOf(f)(ctx);
+          else await this.#enterP(ctx, c.pc);
+          return this.#calloutLeft(c, ctx);
+        } catch (err) {
+          let v = this.#calloutTrap(c, ctx, err);
+          if (v === CALLOUT_HOOK) v = this.#calloutResume(c, ctx, err, 0n, await this.#calloutHookAsync(c, ctx));
+          if (v !== CALLOUT_AGAIN) return v;
         }
-        r = g.throw(err);
-        continue;
       }
-      r = g.next(v);
+    } finally {
+      this.#calloutClose(c, ctx);
     }
-    return r.value;
   }
 
-  /** The same, each step on a JSPI stack of its own that may suspend. */
-  async #driveAsync(g) {
-    let r = g.next();
-    while (!r.done) {
-      let v;
-      try {
-        const [op, a, b, c, d, x] = r.value;
-        v = op === 'enter' ? await this.#enterP(a, b) : await this.#promisingOf(a)(b, c, d, x);
-      } catch (err) {
-        r = g.throw(err);
-        continue;
-      }
-      r = g.next(v);
+  /** A nested loop never yields to the event loop (a Wine thread's whole
+   *  life can be one call-out): an instrumented unit's hits go from its
+   *  traps too. */
+  #covTick() {
+    if (this.#cov.size && performance.now() - this.#covAt > 250) {
+      this.#covAt = performance.now();
+      this.covFlush();
     }
-    return r.value;
   }
 
   /** `WebAssembly.promising` of a wasm function, made once per function. */
@@ -9498,7 +9605,8 @@ export class Gex {
     return false;
   }
 
-  *#callOutSteps(ctx, target, ret, spWant, suspendable, resume = null) {
+  /** Open a call-out (the setup of `#callOut`): its record, on the list. */
+  #calloutOpen(ctx, target, ret, spWant, suspendable, resume) {
     const e = this.#shim.exports;
     // A table index native code took for a guest address: at or past this
     // Worker's ICALL bound, a module another Worker installed since. In this
@@ -9526,7 +9634,22 @@ export class Gex {
     // which no shim index (a miss's `may_leave`) matches. Its watched return
     // then leaves `enter` by returning too, not by a trap through JS.
     const tok = ri >= 0 ? ri + 1 : (0x80000000 | (me + 1));
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri, tok, alt: (e.gex_ctx_alt?.(ctx) ?? 0) === 1 };
+    // Its record: one per depth, made once (a call-out at a depth has ended
+    // before another opens there).
+    const c = this.#calloutRecs[me] ??= calloutRec();
+    c.ret = BigInt.asUintN(64, ret);
+    c.spWant = BigInt.asUintN(64, spWant);
+    c.w = null;
+    c.ri = ri;
+    c.tok = tok;
+    c.alt = (e.gex_ctx_alt?.(ctx) ?? 0) === 1;
+    c.me = me;
+    c.sp0 = sp0;
+    c.psp0 = psp0;
+    c.d0 = d0;
+    c.pc = BigInt.asUintN(64, target);
+    c.next = null;
+    c.own = false;
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -9541,10 +9664,10 @@ export class Gex {
     // WoW64's stops: reached with the stack anywhere, never unwound past
     // (a spWant of 0 is never read as unwound). The shim counts them for
     // its stray-arrival rule (`gex_wow64_waits`).
-    const anyStack = c.ret === WOW64_STOP_SYSCALL || c.ret === WOW64_RETURN_MARK;
+    const anyStack = c.anyStack = c.ret === WOW64_STOP_SYSCALL || c.ret === WOW64_RETURN_MARK;
     if (anyStack) {
       c.spWant = 0n;
-      c.span = c.unwound = (1n << 64n) - 1n;
+      c.span = c.unwound = U64_MAX;
       e.gex_wow64_waits?.(1);
     }
     // The top of the stack it is made on: a stack pointer above it is
@@ -9555,7 +9678,7 @@ export class Gex {
     // longjmp or a catch past the native frames, however small they are)
     // leaves it, not only one past NATIVE_UNWOUND, which would hold one
     // more call-out open per jump landing within it.
-    if (span < 0n && c.ret === NATIVE_RETURN_PAD && !anyStack && c.top !== (1n << 64n) - 1n) c.unwound = 0n;
+    if (span < 0n && c.ret === NATIVE_RETURN_PAD && !anyStack && c.top !== U64_MAX) c.unwound = 0n;
     // Deep inside others, one more needs the host's stack to have room for
     // it: native Wine's guest calls hold their native frames, which no trap
     // drops, so the shim's count cannot bound them (the shim ends the
@@ -9569,232 +9692,275 @@ export class Gex {
     if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
       console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
     }
-    let pc = BigInt.asUintN(64, target);
-    let next = null;
-    // Whether this call-out ends at its own return (the loop gives 1): the
-    // frames of the one around it, between its `enter` and the call that
-    // made this one, are as they were, so its watched return may again
-    // leave by returning (the finally gives its token back).
-    let own = false;
-    const leave = (v) => { own = v === 1; return v; };
-    try {
-      // A snapshot's level entered again inside it (`#snapCallOut`): the
-      // guest goes on where that leaves it.
-      if (resume) pc = resume();
-      this.#armCallouts();
-      for (;;) {
-        try {
-          if (next) {
-            const f = next;
-            next = null;
-            e.gex_callout_leave_ok?.(tok);
-            yield ['call', f, ctx];
-          } else {
-            e.gex_callout_leave_ok?.(tok);
-            yield ['enter', ctx, pc];
-          }
-          // A watched return with only tail calls since this `enter`
-          // returns instead of trapping (`#watchHit`).
-          const ret = this.#calloutSignal;
-          if (ret?.kind === 'return') {
-            // An outer call-out's: it stays for that one's loop, which the
-            // frames between (function-tier bodies, which trap on a call-out
-            // that did not come back) reach through the loops between.
-            this.#calloutSignal = ret.i < me ? ret : null;
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
-            return leave(ret.i === me ? 1 : 0);
-          }
-          // A miss at a call-out's return with only tail calls since this
-          // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
-          const hit = e.gex_callout_hit?.() ?? -1;
-          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return leave(hit === ri ? 1 : 0); }
-          // A return the shim left at with no call-out of its own waiting
-          // there: one only this list has (native Wine's guest call, its
-          // return gex-kernel's NATIVE_RETURN_PAD), whose return has no
-          // translation to watch when nothing is translated at run time
-          // (AOT-only: the shim's miss at the pad leaves). The watch's
-          // rule (`#watchHit`) on where the guest is.
-          const at = this.#returnedAt(ctx);
-          if (at >= 0) {
-            this.#calloutSignal = at < me ? { kind: 'return', i: at } : null;
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: its return ${at} at the pad (no watch)`);
-            return leave(at === me ? 1 : 0);
-          }
-          console.error('[gex] guest code returned out of a call-out');
-          return 0;
-        } catch (err) {
-          e.__stack_pointer.value = sp0;
-          this.#progSpBack(psp0);
-          if (this.#snapDepth) this.#snapDepth.value = d0;
-          if (err === SNAP_NEST) throw err;
-          const sig = this.#calloutSignal;
-          this.#calloutSignal = null;
-          // A call-out ended here was the trap's whole business: the resume
-          // the miss path set at its return (`cgen::returned`) is spent, and
-          // left in place it is where the run loop next goes -- the next
-          // time this thread blocks with nothing else to run, it "resumed"
-          // at the provider's return address (under ?fjit).
-          // (Only this one's: an outer call-out's hit returns through the
-          // frames between, which leave as before.)
-          const ended = (v) => {
-            if (v === 1) {
-              e.gex_resume_pc();
-              e.gex_resume_ctx();
-            }
-            return leave(v);
-          };
-          // An outer call-out's return (the stack unwound to a native caller's
-          // frame, a 64-bit handler's target under a WoW64 thread's nested
-          // 32-bit calls): it stays for that one's loop, as above. Taken here,
-          // the loops between saw a plain trap at the return pad and left at
-          // STRAY_PC, which the outer loop then ran (its int3).
-          if (sig?.kind === 'return') {
-            if (sig.i < me) this.#calloutSignal = sig;
-            return ended(sig.i === me ? 1 : 0);
-          }
-          if (sig?.kind === 'bypass') {
-            if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
-            next = sig.f;
-            continue;
-          }
-          if (!err?.gexHandoff && !e.gex_handoff()) {
-            if (/table index is out of bounds/.test(err.message)) {
-              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
-              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
-                pc = BigInt.asUintN(64, tgt);
-                continue;
-              }
-            }
-            // The guest's own access out of bounds (a null pointer's): its
-            // fault, staged for the hook below (32-bit Wine) or its SIGSEGV, as the
-            // run loop does and natively's call-out loop.
-            // Any other trap in guest code likewise (`guestTrapSignal`).
-            const tsig = guestTrapSignal(err);
-            if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1) &&
-              !(tsig !== 0 && (e.gex_guest_trap?.(ctx, tsig) ?? 0) === 1)) throw err;
-          }
-          const hit = e.gex_callout_hit();
-          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === ri ? 1 : 0); }
-          // win::nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
-          // frames): a native caller's call-out leaves, at the context's PC
-          // (the entry the guest makes again); anything else carries on.
-          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && this.#left(c, this.#liveSp(ctx, c))) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
-          // The process ended: down through every frame to the run loop
-          // (returning would run the guest on).
-          if (e.gex_exited?.()) {
-            err.gexHandoff = true;
-            throw err;
-          }
-          // Nothing waiting: the resume the shim took. Otherwise each step.
-          const quick = this.#afterTrap();
-          let faulted = null;
-          let resumed = quick;
-          if (quick !== 0n) this.traps.callout++;
-          else {
-            this.traps.calloutFull++;
-            const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
-            if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
-            this.#denseCatchUp();
-            if (e.gex_jit_pending_len() >>> 0) {
-              const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
-              if (need) this.#growTables(need, 'call-out');
-            }
-            while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
-            this.#catchUpSync();
-            this.#cgenServe();
-            // A fork from the guest code this call-out runs (a function-tier
-            // unit's libc calling `fork`): its child is started from here, as
-            // the run loop starts one, since the guest goes on in this loop and
-            // may wait for it. The child's image is taken before this returns.
-            this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-            this.#startThread();
-            // The fault hook as one of this loop's steps: on a stack that may
-            // suspend in the single-thread build (`#driveAsync`). (Only here:
-            // a staged fault keeps the trap off the quick path.)
-            const ft = this.#faultTake(ctx);
-            // Inside a fault's dispatch, which this call-out may lie within:
-            // with no room on the stack for another, the process ends, as
-            // its frames below cannot be left (`gex_fault_overflow`).
-            if (ft && !ft.sig && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
-              ft.spG.value = ft.cur;
-              e.gex_fault_overflow(ft.code);
-              err.gexHandoff = true;
-              throw err;
-            }
-            if (ft) {
-              try {
-                if (this.#snapHooks && !ft.sig) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
-                else yield ['call', ft.f, ctx, ...ft.args];
-              } finally {
-                ft.spG.value = ft.cur;
-              }
-              faulted = this.#faultPc(ctx);
-            }
-            resumed = e.gex_resume_pc();
-          }
-          const nextPc = faulted ?? resumed;
-          // Nowhere to resume (the thread ended, or waits): the run loop's
-          // business, down through every frame.
-          if (nextPc === 0n) {
-            err.gexHandoff = true;
-            throw err;
-          }
-          pc = BigInt.asUintN(64, nextPc);
-          const rc = quick !== 0n ? this.#afterTrapCtx() : e.gex_resume_ctx() >>> 0;
-          if (rc && rc !== ctx) {
-            // A resume on another thread's context is not this call-out's.
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
-            return 0;
-          }
-          const sp = this.#liveSp(ctx, c);
-          // Native Wine's return pad, reached with nobody's watch or miss
-          // taking it (cgen.rs `native_return_stray`): the guest went on
-          // past this call-out to a native caller's return (an exception
-          // handled in the function that made it, which then returned on
-          // tier-1). It leaves, as every call-out down to that caller does,
-          // with the guest at STRAY_PC: the caller's `run_until` goes there,
-          // and its fallback puts back the registers the guest had at the
-          // pad (the bodies leaving between wrote stale ones) and ends the
-          // call (a body between two call-outs that leaves sends tier-1 to
-          // STRAY_PC inside the outer one, which leaves the same way). A
-          // call-out waiting for the pad itself with the stack where it
-          // wants it is simply done.
-          if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
-            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.back;
-            if (mine) e.gex_callout_stray(1);
-            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
-            return leave(mine ? 1 : 0);
-          }
-          // The stack unwound past the caller (longjmp, an exception
-          // handled further out): its frame is gone, so it leaves. A call-out
-          // that wants no stack (native Wine's thread loop) has no caller's
-          // frame to unwind past.
-          if (c.spWant !== 0n && this.#left(c, sp)) {
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
-            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
-            return 0;
-          }
-          this.#armCallouts();
+    return c;
+  }
+
+  /** A call-out's `enter` (or step) returned: where it leaves, by a
+   *  watched return, the shim's hit or its return at the pad. */
+  #calloutLeft(c, ctx) {
+    const e = this.#shim.exports;
+    const { me, ri } = c;
+    // A watched return with only tail calls since this `enter`
+    // returns instead of trapping (`#watchHit`).
+    const ret = this.#calloutSignal;
+    if (ret?.kind === 'return') {
+      // An outer call-out's: it stays for that one's loop, which the
+      // frames between (function-tier bodies, which trap on a call-out
+      // that did not come back) reach through the loops between.
+      if (ret.i >= me) this.#calloutSignal = null;
+      if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
+      return this.#calloutLeave(c, ret.i === me ? 1 : 0);
+    }
+    // A miss at a call-out's return with only tail calls since this
+    // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
+    const hit = e.gex_callout_hit?.() ?? -1;
+    if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return this.#calloutLeave(c, hit === ri ? 1 : 0); }
+    // A return the shim left at with no call-out of its own waiting
+    // there: one only this list has (native Wine's guest call, its
+    // return gex-kernel's NATIVE_RETURN_PAD), whose return has no
+    // translation to watch when nothing is translated at run time
+    // (AOT-only: the shim's miss at the pad leaves). The watch's
+    // rule (`#watchHit`) on where the guest is.
+    const at = this.#returnedAt(ctx);
+    if (at >= 0) {
+      this.#calloutSignal = at < me ? this.#returnSig(at) : null;
+      if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: its return ${at} at the pad (no watch)`);
+      return this.#calloutLeave(c, at === me ? 1 : 0);
+    }
+    console.error('[gex] guest code returned out of a call-out');
+    return 0;
+  }
+
+  /** A trap out of a call-out's `enter` (or step), served: what the
+   *  call-out gives, CALLOUT_AGAIN to enter again (at `c.pc`, or `c.next`),
+   *  or CALLOUT_HOOK with a staged fault's hook in `c.ft` for the caller to
+   *  run (on a stack that may suspend in the single-thread build), and then
+   *  `#calloutResume` with the PC the hook left. */
+  #calloutTrap(c, ctx, err) {
+    const e = this.#shim.exports;
+    const { me, ri } = c;
+    if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} trap: ${err?.gexHandoff ? 'handoff' : String(err?.message ?? err).slice(0, 60)}`);
+    e.__stack_pointer.value = c.sp0;
+    this.#progSpBack(c.psp0);
+    if (this.#snapDepth) this.#snapDepth.value = c.d0;
+    if (err === SNAP_NEST) throw err;
+    const sig = this.#calloutSignal;
+    this.#calloutSignal = null;
+    // A call-out ended here was the trap's whole business: the resume
+    // the miss path set at its return (`cgen::returned`) is spent, and
+    // left in place it is where the run loop next goes -- the next
+    // time this thread blocks with nothing else to run, it "resumed"
+    // at the provider's return address (under ?fjit).
+    // (Only this one's: an outer call-out's hit returns through the
+    // frames between, which leave as before.)
+    // An outer call-out's return (the stack unwound to a native caller's
+    // frame, a 64-bit handler's target under a WoW64 thread's nested
+    // 32-bit calls): it stays for that one's loop, as above. Taken here,
+    // the loops between saw a plain trap at the return pad and left at
+    // STRAY_PC, which the outer loop then ran (its int3).
+    if (sig?.kind === 'return') {
+      if (sig.i < me) this.#calloutSignal = sig;
+      return this.#calloutEnded(c, sig.i === me ? 1 : 0);
+    }
+    if (sig?.kind === 'bypass') {
+      if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
+      c.next = sig.f;
+      return CALLOUT_AGAIN;
+    }
+    if (!err?.gexHandoff && !e.gex_handoff()) {
+      if (/table index is out of bounds/.test(err.message)) {
+        const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
+        if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+          c.pc = BigInt.asUintN(64, tgt);
+          return CALLOUT_AGAIN;
         }
       }
-    } finally {
-      // A return signal for this call-out or a deeper one is spent with it.
-      if (this.#calloutSignal?.kind === 'return' && this.#calloutSignal.i >= me) this.#calloutSignal = null;
-      if (anyStack) e.gex_wow64_waits?.(-1);
-      e.gex_callout_leave_ok?.(own && me > 0 ? this.#callouts[me - 1].tok : 0);
-      this.#unwatch(c);
-      this.#callouts.pop();
-      this.#calloutGuard();
-      this.#nest.pop();
-      // Left by an exception, the shim's half has not popped its entry.
-      e.gex_callout_unwind?.(me);
-      if (globalThis.GEX_CALLOUT_TRACE) {
-        const dv = new DataView(this.#memory.buffer);
-        console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + this.#ctxSp(), true).toString(16)} want ${c.spWant.toString(16)}`);
+      // The guest's own access out of bounds (a null pointer's): its
+      // fault, staged for the hook below (32-bit Wine) or its SIGSEGV, as the
+      // run loop does and natively's call-out loop.
+      // Any other trap in guest code likewise (`guestTrapSignal`).
+      const tsig = guestTrapSignal(err);
+      if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1) &&
+        !(tsig !== 0 && (e.gex_guest_trap?.(ctx, tsig) ?? 0) === 1)) throw err;
+    }
+    const hit = e.gex_callout_hit();
+    if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return this.#calloutEnded(c, hit === ri ? 1 : 0); }
+    // win::nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
+    // frames): a native caller's call-out leaves, at the context's PC
+    // (the entry the guest makes again); anything else carries on.
+    if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
+        && this.#left(c, this.#liveSp(ctx, c))) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+    // The process ended: down through every frame to the run loop
+    // (returning would run the guest on).
+    if (e.gex_exited?.()) {
+      err.gexHandoff = true;
+      throw err;
+    }
+    // Nothing waiting: the resume the shim took. Otherwise each step.
+    const quick = this.#afterTrap();
+    if (quick !== 0n) this.traps.callout++;
+    else {
+      this.traps.calloutFull++;
+      const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+      if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+      this.#denseCatchUp();
+      if (e.gex_jit_pending_len() >>> 0) {
+        const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+        if (need) this.#growTables(need, 'call-out');
+      }
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+      this.#catchUpSync();
+      this.#cgenServe();
+      // A fork from the guest code this call-out runs (a function-tier
+      // unit's libc calling `fork`): its child is started from here, as
+      // the run loop starts one, since the guest goes on in this loop and
+      // may wait for it. The child's image is taken before this returns.
+      this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+      this.#startThread();
+      // The fault hook, for the call-out's loop to run: on a stack that
+      // may suspend in the single-thread build (`#calloutHookAsync`). (Only
+      // here: a staged fault keeps the trap off the quick path.)
+      const ft = this.#faultTake(ctx);
+      // Inside a fault's dispatch, which this call-out may lie within:
+      // with no room on the stack for another, the process ends, as
+      // its frames below cannot be left (`gex_fault_overflow`).
+      if (ft && !ft.sig && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
+        ft.spG.value = ft.cur;
+        e.gex_fault_overflow(ft.code);
+        err.gexHandoff = true;
+        throw err;
+      }
+      if (ft) {
+        c.ft = ft;
+        return CALLOUT_HOOK;
       }
     }
+    return this.#calloutResume(c, ctx, err, quick, null);
+  }
+
+  /** Run the hook `#calloutTrap` staged (`c.ft`), synchronously. */
+  #calloutHook(c, ctx) {
+    const ft = c.ft;
+    c.ft = null;
+    try {
+      if (this.#snapHooks && !ft.sig) this.#snapHookCall(ft.f, ft.idx, ctx, ft.code, ft.addr, ft.kind, ft.rsp);
+      else ft.f(ctx, ...ft.args);
+    } finally {
+      ft.spG.value = ft.cur;
+    }
+    return this.#faultPc(ctx);
+  }
+
+  /** The same on a stack of its own that may suspend. */
+  async #calloutHookAsync(c, ctx) {
+    const ft = c.ft;
+    c.ft = null;
+    try {
+      if (this.#snapHooks && !ft.sig) await this.#snapHookCall(ft.f, ft.idx, ctx, ft.code, ft.addr, ft.kind, ft.rsp);
+      else await this.#promisingOf(ft.f)(ctx, ...ft.args);
+    } finally {
+      ft.spG.value = ft.cur;
+    }
+    return this.#faultPc(ctx);
+  }
+
+  /** A trap served: the guest goes on at the PC a fault's hook left
+   *  (`faulted`) or where the shim resumes (`quick`, the quick path's, or
+   *  asked now); unless that leaves the call-out. */
+  #calloutResume(c, ctx, err, quick, faulted) {
+    const e = this.#shim.exports;
+    const { me } = c;
+    const resumed = quick !== 0n ? quick : e.gex_resume_pc();
+    const nextPc = faulted ?? resumed;
+    // Nowhere to resume (the thread ended, or waits): the run loop's
+    // business, down through every frame.
+    if (nextPc === 0n) {
+      err.gexHandoff = true;
+      throw err;
+    }
+    const pc = BigInt.asUintN(64, nextPc);
+    const rc = quick !== 0n ? this.#afterTrapCtx() : e.gex_resume_ctx() >>> 0;
+    if (rc && rc !== ctx) {
+      // A resume on another thread's context is not this call-out's.
+      if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
+      return 0;
+    }
+    const sp = this.#liveSp(ctx, c);
+    // Native Wine's return pad, reached with nobody's watch or miss
+    // taking it (cgen.rs `native_return_stray`): the guest went on
+    // past this call-out to a native caller's return (an exception
+    // handled in the function that made it, which then returned on
+    // tier-1). It leaves, as every call-out down to that caller does,
+    // with the guest at STRAY_PC: the caller's `run_until` goes there,
+    // and its fallback puts back the registers the guest had at the
+    // pad (the bodies leaving between wrote stale ones) and ends the
+    // call (a body between two call-outs that leaves sends tier-1 to
+    // STRAY_PC inside the outer one, which leaves the same way). A
+    // call-out waiting for the pad itself with the stack where it
+    // wants it is simply done.
+    if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
+      const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.back;
+      if (mine) e.gex_callout_stray(1);
+      new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
+      if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
+      return this.#calloutLeave(c, mine ? 1 : 0);
+    }
+    // The stack unwound past the caller (longjmp, an exception
+    // handled further out): its frame is gone, so it leaves. A call-out
+    // that wants no stack (native Wine's thread loop) has no caller's
+    // frame to unwind past.
+    if (c.spWant !== 0n && this.#left(c, sp)) {
+      if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
+      new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
+      return 0;
+    }
+    this.#armCallouts();
+    c.pc = pc;
+    return CALLOUT_AGAIN;
+  }
+
+  /** Close a call-out, however it left. */
+  #calloutClose(c, ctx) {
+    const e = this.#shim.exports;
+    const { me, anyStack } = c;
+    // A return signal for this call-out or a deeper one is spent with it.
+    if (this.#calloutSignal?.kind === 'return' && this.#calloutSignal.i >= me) this.#calloutSignal = null;
+    if (anyStack) e.gex_wow64_waits?.(-1);
+    e.gex_callout_leave_ok?.(c.own && me > 0 ? this.#callouts[me - 1].tok : 0);
+    this.#unwatch(c);
+    this.#callouts.pop();
+    this.#calloutGuard();
+    this.#nest.pop();
+    // Left by an exception, the shim's half has not popped its entry.
+    e.gex_callout_unwind?.(me);
+    if (globalThis.GEX_CALLOUT_TRACE) {
+      const dv = new DataView(this.#memory.buffer);
+      console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + this.#ctxSp(), true).toString(16)} want ${c.spWant.toString(16)}`);
+    }
+  }
+
+  #calloutRecs = [];
+
+  /** A call-out leaves with `v`: 1 at its own return. */
+  #calloutLeave(c, v) {
+    c.own = v === 1;
+    return v;
+  }
+
+  /** The same from a trap: a call-out ended there was the trap's whole
+   *  business, so the resume the miss path set at its return
+   *  (`cgen::returned`) is spent. Left in place it is where the run loop
+   *  next goes (the next time this thread blocks with nothing else to
+   *  run, it "resumed" at the provider's return address). Only this
+   *  one's: an outer call-out's hit returns through the frames between,
+   *  which leave as before. */
+  #calloutEnded(c, v) {
+    if (v === 1) {
+      const e = this.#shim.exports;
+      e.gex_resume_pc();
+      e.gex_resume_ctx();
+    }
+    return this.#calloutLeave(c, v);
   }
 
   #calloutsMade = 0;

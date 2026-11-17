@@ -46,13 +46,23 @@ struct WinePe {
     /// Writes into its data that follow its initialisation (ntdll's boot
     /// variables).
     pending: Vec<(u64, Vec<u8>)>,
-    wasm: Vec<u8>,
-    /// The file `wasm` is from, and its content key, made on first asking
-    /// (`gex_cgen_pmod_wasm_key`): from the system-wide cache, so a process
-    /// neither hashes the 9 MB nor has JS copy them out when the page
-    /// already has the module.
+    /// The module's file, its length and identity (inode, mtime, size) when
+    /// it was read, and its content key, made on first asking
+    /// (`gex_cgen_pmod_wasm_key`) from the file in pieces or the
+    /// system-wide cache. Its bytes are never held here: JS reads them
+    /// from the file to compile them (`gex_cgen_pmod_read`), and only when
+    /// the page has no module for the key.
     file: String,
+    len: u32,
+    id: Option<(u64, i64, u64)>,
     key: Option<(u64, u64)>,
+    /// The types of its imports and exports named in [`CROSS_MODE`]: what
+    /// a later install of the other mode's module checks.
+    cross_imports: HashMap<String, wasmparser::FuncType>,
+    cross_exports: HashMap<String, wasmparser::FuncType>,
+    /// Its table slots' types for the class adapters (`bind_classes`), when
+    /// it has them (`__gexw_adapters`).
+    slot_types: Option<(Vec<u32>, Vec<Option<String>>)>,
     installed: bool,
     /// The DLLs whose skeleton has been mapped. A later mapping of one (an
     /// image view: wineboot's install maps DLLs so) binds its exports but
@@ -442,7 +452,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     pairs.dedup_by_key(|&mut (a, _)| a);
 
     // Data exports: the skeleton's export address table pointed at the
-    // module's data (32-bit RVAs wrap to any address).
+    // module's data. In a 32-bit memory a 32-bit RVA wraps to any address;
+    // in a 64-bit one it reaches only the 4 GiB above the image.
     let edir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
     if edir != 0 && !data_list.is_empty() {
         let mut gm = crate::guest();
@@ -454,7 +465,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             };
             let at = wp.data + *off as u64;
             let target = at.wrapping_sub(base);
-            if target > u32::MAX as u64 {
+            if gex_abi::mem64() && target > u32::MAX as u64 {
                 crate::warn_line(&format!("gex-pe: {path}: data export {link} at {at:#x} is out of its 32-bit RVA's reach from the image at {base:#x}\n"));
             }
             let _ = gm.write_u32(base + functions + 4 * *i as u64, target as u32);
@@ -528,11 +539,34 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     Ok(if fresh { last as i32 } else { -2 })
 }
 
-/// A module's bytes, beside the skeleton: a twin install's
+/// What install_module reads of a module's file: every section but its
+/// code, its data and its names (`parts`, a module of those sections in
+/// their order), the file's length and identity. The whole file is never
+/// read into this heap: a program's module is hundreds of MiB (and the
+/// heap never gives a span back), and its code is the page's to compile.
+pub(super) struct ModFile {
+    file: String,
+    parts: Vec<u8>,
+    len: u32,
+    id: Option<(u64, i64, u64)>,
+}
+
+/// The sections [`ModFile::parts`] keeps: all but the code, the data and
+/// custom sections other than gex's own and `dylink.0`.
+fn part_kept(id: u8, name: &[u8]) -> bool {
+    match id {
+        10 | 11 => false,
+        0 => matches!(name, b"dylink.0" | b"gex.abi" | b"gexw.modules" | b"gexw.forwards" | b"gexw.dllslots"),
+        _ => true,
+    }
+}
+
+/// A module beside the skeleton, as [`ModFile`]: a twin install's
 /// (wine64-dist.sh WINE64_TWIN=1) memory64 build `<module>.m64` in a
-/// process with a 64-bit memory. The file it was read from too.
-fn read_module(dir: Option<&str>, name: &str) -> Result<(String, Vec<u8>), String> {
-    let ns = crate::sigs::proc_home().ns();
+/// process with a 64-bit memory.
+fn read_module(dir: Option<&str>, name: &str) -> Result<ModFile, String> {
+    let home = crate::sigs::proc_home();
+    let ns = home.ns();
     // found as Windows finds files, without case (the skeleton's .wasmref
     // names the link's output; an installer may have given it other case)
     let file = match dir {
@@ -540,13 +574,33 @@ fn read_module(dir: Option<&str>, name: &str) -> Result<(String, Vec<u8>), Strin
         None => name.to_string(),
     };
     let twin = format!("{file}.m64");
-    Ok(match gex_abi::mem64().then(|| gex_kernel::win::read_guest_file(&ns, &twin).ok()).flatten() {
-        Some(w) => (twin, w),
-        None => {
-            let w = gex_kernel::win::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
-            (file, w)
+    let file = if gex_abi::mem64() && ns.metadata(&twin).is_ok() { twin } else { file };
+    let m = ns.metadata(&file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+    let len = u32::try_from(m.size).map_err(|_| format!("Wine's PE module {file} is {} bytes, past 4 GiB", m.size))?;
+    let parts = home.read_wasm_parts(&file, part_kept).ok_or_else(|| format!("reading Wine's PE module {file}: not a wasm module, or it ends inside a section"))?;
+    Ok(ModFile { id: Some((m.ino, m.mtime, m.size)), file, parts, len })
+}
+
+/// The name of each slot of `m`'s table range (as
+/// `gex_cgen::provider::slot_names`: every element segment's functions in
+/// order), the names read from the file's name section in pieces.
+fn slot_names(m: &ModFile) -> Result<Vec<Option<String>>, String> {
+    let e = |e: wasmparser::BinaryReaderError| e.to_string();
+    let mut slots: Vec<u32> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&m.parts) {
+        if let wasmparser::Payload::ElementSection(r) = payload.map_err(e)? {
+            for el in r {
+                if let wasmparser::ElementItems::Functions(fs) = el.map_err(e)?.items {
+                    for f in fs {
+                        slots.push(f.map_err(e)?);
+                    }
+                }
+            }
         }
-    })
+    }
+    let want: std::collections::HashSet<u32> = slots.iter().copied().collect();
+    let names = crate::sigs::proc_home().wasm_func_names(&m.file, &want).ok_or_else(|| format!("reading {}'s name section", m.file))?;
+    Ok(slots.iter().map(|f| names.get(f).cloned()).collect())
 }
 
 /// What install_module reads of a module besides its slots: its imports
@@ -652,15 +706,14 @@ fn export_func_type(wasm: &[u8], name: &str) -> Option<wasmparser::FuncType> {
 /// A cross-mode import `name` of type `want` bound to `provider`'s export:
 /// the types must match exactly.
 fn cross_mode_check(name: &str, want: Option<&wasmparser::FuncType>, provider: &WinePe) -> Result<(), String> {
-    let have = export_func_type(&provider.wasm, name);
+    let have = provider.cross_exports.get(name).cloned();
     if want.is_some() && want == have.as_ref() {
         return Ok(());
     }
     Err(format!("{name}: imported as {want:?}, {} exports it as {have:?}", provider.file))
 }
 
-/// Install one of Wine's PE modules (`file`, `wasm` read by
-/// [`read_module`]) as a stateful provider: its data allocated, and with
+/// Install one of Wine's PE modules (`m`, read by [`read_module`]) as a stateful provider: its data allocated, and with
 /// `core` (a module of its own) its imports of the other modules bound, as
 /// natively (hosts/native wasmdll.rs `install_module`): the modules it calls
 /// into first (eagerly, `busy` the ones being installed), then functions
@@ -671,17 +724,25 @@ fn install_module(
     g: &mut WinePes,
     dir: Option<&str>,
     name: &str,
-    (file, wasm): (String, Vec<u8>),
+    m: ModFile,
     core: Option<usize>,
     is64: bool,
     near: Option<u64>,
     later: &std::collections::HashSet<String>,
     busy: &mut Vec<String>,
 ) -> Result<usize, String> {
+    // whether it has a memory64 build: the outgrow record's (a program's
+    // own module, built for a wasm32 memory only, cannot move)
+    if !gex_abi::mem64() {
+        let ns = crate::sigs::proc_home().ns();
+        let m64 = ns.open(&format!("{}.m64", m.file), gex_kernel::fs::oflags::O_RDONLY, 0).is_ok();
+        gex_kernel::syscalls::outgrow_module(crate::my_pid(), &m.file, m64);
+    }
     // The module's memory must be this process's: a wasm32 one in a
     // 64-bit memory fails to instantiate (a LinkError, deep in the
     // runtime), so it is said here, with what is missing.
-    if let Some(m64) = crate::vfork::wasm_memory64(&wasm[..wasm.len().min(4 << 20)]) {
+    let (file, wasm) = (&m.file, &m.parts);
+    if let Some(m64) = crate::vfork::wasm_memory64(wasm) {
         if m64 != gex_abi::mem64() {
             return Err(format!(
                 "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
@@ -694,11 +755,11 @@ fn install_module(
     // 32-bit Wine's PE module: refused when its inline probe reads another layout
     // (gexrt's `gex_ftab_idx`; 64-bit Wine's wasm64 gexrt has no probe).
     if !is64 {
-        if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
+        if let Some(e) = super::wasmprog::abi_refusal(wasm, &format!("Wine's PE module {file}")) {
             return Err(e);
         }
     }
-    let sh = shape(&wasm)?;
+    let sh = shape(wasm)?;
     let alt = module_alt(is64);
     if alt {
         crate::with_px(|px| crate::ensure_alt_dir(px));
@@ -741,9 +802,9 @@ fn install_module(
         busy.pop();
     }
 
-    let (size, align) = dylink_memory(&wasm)?;
+    let (size, align) = dylink_memory(wasm)?;
     let a = 1u64 << align;
-    let data_exports = exported_offsets(&wasm)?;
+    let data_exports = exported_offsets(wasm)?;
     // (an LLP64 module's above the images when it has data exports, whose
     // export table holds their RVAs from the skeleton: see
     // `crate::wine64_pe_data`; and an i386 module's in a 64-bit process,
@@ -763,7 +824,7 @@ fn install_module(
         provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
     };
     let data = (data + a - 1) & !(a - 1);
-    let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
+    let names = slot_names(&m)?;
     let mut slots = HashMap::new();
     let mut any_dll = HashMap::new();
     for (k, n) in names.iter().enumerate() {
@@ -774,7 +835,7 @@ fn install_module(
             slots.insert(n.clone(), k as u32);
         }
     }
-    for (name, target) in forwards(&wasm) {
+    for (name, target) in forwards(wasm) {
         if let Some((d, f)) = target.split_once('!') {
             if let Some(&k) = slots.get(&format!("{d}!gexp_{f}")) {
                 any_dll.entry(name).or_insert(k);
@@ -849,7 +910,22 @@ fn install_module(
         }
     }
 
-    let dll_slots = dll_slots(&wasm);
+    let dll_slots = dll_slots(wasm);
+    let cross_imports = sh
+        .imports
+        .iter()
+        .zip(&sh.import_types)
+        .filter(|((m, n, _, _), _)| m == "env" && CROSS_MODE.contains(&n.as_str()))
+        .filter_map(|((_, n, _, _), t)| Some((n.clone(), t.clone()?)))
+        .collect();
+    let cross_exports = CROSS_MODE.iter().filter_map(|n| Some((n.to_string(), export_func_type(wasm, n)?))).collect();
+    // (the class adapters' slot types, for `gex_wasmdll_installed`)
+    let slot_types = if data_exports.contains_key("__gexw_adapters") {
+        gex_dylink::slot_types(wasm).map_err(|e| crate::warn_line(&format!("gex-pe: {file}: slot types: {e:#}\n"))).ok()
+    } else {
+        None
+    };
+    let ModFile { file, len: file_len, id, .. } = m;
     g.mods.push(WinePe {
         number,
         install: 0,
@@ -859,9 +935,13 @@ fn install_module(
         any_dll,
         data_exports,
         pending: Vec::new(),
-        wasm,
         file,
+        len: file_len,
+        id,
         key: None,
+        cross_imports,
+        cross_exports,
+        slot_types,
         installed: false,
         mapped: Default::default(),
         data_size: size as u64,
@@ -934,8 +1014,7 @@ fn install_module(
                 continue;
             }
             let importer = g.mods.iter().find(|w| w.number == l.importer).ok_or("a late bind's importer is gone")?;
-            let sh = shape(&importer.wasm)?;
-            let want = sh.imports.iter().zip(sh.import_types).find(|((m, n, _, _), _)| m == "env" && *n == l.name).and_then(|(_, t)| t);
+            let want = importer.cross_imports.get(&l.name).cloned();
             cross_mode_check(&l.name, want.as_ref(), &g.mods[idx])?;
         }
         g.late[k].provider = Some(number);
@@ -1344,14 +1423,35 @@ pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
     binds_push(Bind { regs, dirs, slots });
 }
 
-/// Provider module `number`'s bytes when it is Wine's PE module or a
-/// wasm32 program (in the shim's heap), else 0.
+/// Provider module `number`'s bytes when they are in the shim's heap (a
+/// wasm32 program's), else 0: Wine's PE modules' are read from their files
+/// ([`gex_cgen_pmod_read`]).
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
     if let Some((p, _)) = super::wasmprog::wasm(number).or_else(|| super::libprov::wasm(number)) {
         return p;
     }
-    lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
+    0
+}
+
+/// Up to `len` bytes of provider module `number`'s file from `offset`, into
+/// `at` in this module's memory (JS's window, which it copies out): Wine's
+/// PE module's, or a wasm32 library's. The bytes read, -1 when there is no
+/// such file to read, -2 when it is not the file the module was read from
+/// (checked at offset 0: dpkg's rename gives a new inode).
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_read(number: u32, offset: u64, at: u32, len: u32) -> i32 {
+    let found = lock(&WINE_PE).mods.iter().find(|w| w.number == number).map(|w| (w.file.clone(), w.id, w.len));
+    let Some((path, id, size)) = found.or_else(|| super::wasmprog::file_of(number)) else { return -1 };
+    if offset == 0 && super::wasmprog::file_identity(&path) != id {
+        crate::warn_line(&format!("gex: {path}: changed since it was loaded\n"));
+        return -2;
+    }
+    let want = (len as u64).min((size as u64).saturating_sub(offset)) as usize;
+    // SAFETY: `at` is JS's window of `len` bytes in this module's memory
+    // (`gex_alloc`), which nothing else holds while it reads.
+    let out = unsafe { std::slice::from_raw_parts_mut(at as usize as *mut u8, want) };
+    crate::sigs::proc_home().read_file_at(&path, offset, out).map_or(-1, |n| n as i32)
 }
 
 /// Whether provider module `number` is Wine's PE module of the process's
@@ -1367,14 +1467,21 @@ pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
     if let Some(n) = super::wasmprog::len(number).or_else(|| super::libprov::wasm(number).map(|(_, n)| n)) {
         return n;
     }
-    lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
+    lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.len)
 }
 
 /// Wine's PE module's content key when it is provider module `number`.
 pub(super) fn wasm_key(number: u32) -> Option<(u64, u64)> {
     let mut g = lock(&WINE_PE);
     let w = g.mods.iter_mut().find(|w| w.number == number)?;
-    Some(*w.key.get_or_insert_with(|| super::wasmprog::file_key(&w.file, &w.wasm)))
+    if w.key.is_none() {
+        let k = super::wasmprog::file_key_streamed(&w.file, w.len as u64);
+        if k.is_none() {
+            crate::warn_line(&format!("gex-pe: {}: could not be read to key it\n", w.file));
+        }
+        w.key = k;
+    }
+    w.key
 }
 
 /// The publishing Worker instantiated Wine's PE modules it installed (their
@@ -1401,7 +1508,7 @@ pub extern "C" fn gex_wasmdll_installed() {
                 // the class adapters' directory, its facts and the module's
                 // slot types (`bind_classes`)
                 let classes = wp.data_exports.get("__gexw_adapters").and_then(|&dir| {
-                    let types = gex_dylink::slot_types(&wp.wasm).map_err(|e| crate::warn_line(&format!("gex-pe: {}: slot types: {e:#}\n", wp.file))).ok()?;
+                    let types = wp.slot_types.take()?;
                     Some((dir, wp.data_exports.get("__gexw_facts").copied(), types))
                 });
                 (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 }, classes)

@@ -31,6 +31,9 @@ Object.assign(t, {
   work: (name) => new URL(`/__t/work/${name}`, location.href).href,
   /** How many times the page asked for work file `name`. */
   hits: async (name) => (await fetch(`/__t/hits?${encodeURIComponent(name)}`)).json(),
+  /** The work files the page asked for whose names hold `part`, in the
+   *  order the requests came (one entry a request). */
+  asked: async (part = '') => (await fetch(`/__t/order?${encodeURIComponent(part)}`)).json(),
   /** Run this test again in a fresh page, as phase `t.phase + 1`, with
    *  `state` as `t.state`; what was checked so far is kept. */
   reload(state = null) {

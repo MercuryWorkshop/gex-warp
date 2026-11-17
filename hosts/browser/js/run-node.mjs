@@ -56,6 +56,13 @@ import { makeMetalChannel, setMetalHost } from './metal-bridge.mjs';
 
 /** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
  *  a directory against this one. */
+/** GEX_DEBUG_EXIT's account of a process's runtime heap: what the arena
+ *  gave it and its largest single claim (`gex_arena_spent_mib`), and its
+ *  command line. */
+function arenaSaid(m) {
+  return (m.arena ? `, arena heap ${m.arena[1]} MiB, largest claim ${m.arena[3] ?? '?'} MiB` : '') + (m.cmdline ? ` {${m.cmdline}}` : '');
+}
+
 function pageHostsFromEnv(v) {
   if (!v) return undefined;
   const map = {};
@@ -884,7 +891,7 @@ const host = new ProcessHost({
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
         const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
-        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}\n`);
+        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}\n`);
       }
       return;
     }
@@ -896,7 +903,7 @@ const host = new ProcessHost({
     }
     // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
-      process.stderr.write(`[gex] memory ${m.memoryMib} MiB\n`);
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${arenaSaid(m)}\n`);
     }
     if (process.env.GEX_HOT) {
       // An empty answer is a question about the run, not a crash.

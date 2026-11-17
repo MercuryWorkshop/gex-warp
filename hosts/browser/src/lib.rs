@@ -3465,6 +3465,119 @@ const PER_MISS_N: usize = 16;
 /// only the block that missed, so the blocks lifted are the blocks run.
 static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 
+/// The hot-rewrite mode: a page whose byte guards (`Block::guard`) fire
+/// [`SMC_HOT_HITS`] times running, each within [`SMC_HOT_QUIET_NS`] of the
+/// one before (a JIT patching a constant into its code before each pass),
+/// has a miss there lift only the block that missed, not the blocks
+/// discovery reaches from it: each hit retires the page, and the next pass
+/// lifts again what it runs, one block or a few, where it lifted hundreds.
+/// Every block still checks its bytes on entry, as on any page written
+/// while executable. A page whose guards stay quiet that long leaves the
+/// mode at its next miss.
+const SMC_HOT_HITS: u32 = 8;
+const SMC_HOT_QUIET_NS: u64 = 2_000_000_000;
+/// The most blocks one miss on a hot page lifts: the block that missed and
+/// the straight-line run after it on its page (`translate_runtime_run`).
+const SMC_HOT_RUN: usize = 8;
+
+/// Per page key: guard hits running, the last one's time (`now_ns`), and
+/// (`?jitdiag=1`) the nanoseconds and blocks its hot lifts took. See
+/// [`SMC_HOT_HITS`].
+static SMC_HOT: std::sync::Mutex<Option<std::collections::HashMap<u64, SmcHot>>> = std::sync::Mutex::new(None);
+
+/// On a hot page, a block whose guard fires is retired alone (its slot
+/// moves to its new translation; the page's other blocks stay installed,
+/// each checking its own bytes). Every this many of those the page is
+/// retired whole all the same, so the modules holding the old copies of its
+/// blocks, which nothing dispatches to any more, can go.
+const SMC_HOT_PAGE_RETIRE: u32 = 256;
+
+#[derive(Default, Clone, Copy)]
+struct SmcHot {
+    hits: u32,
+    /// Blocks retired alone since the page was last retired whole.
+    alone: u32,
+    last: u64,
+    lifts: u64,
+    lift_ns: u64,
+    blocks: u64,
+}
+
+/// A guard on `page` fired. Whether to retire only the block (the page
+/// is hot, and not due its whole retire: [`SMC_HOT_PAGE_RETIRE`]).
+fn smc_hit(page: u64) -> bool {
+    let now = now_ns();
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let h = m.get_or_insert_with(Default::default).entry(page).or_default();
+    let quiet = h.last != 0 && now.saturating_sub(h.last) > SMC_HOT_QUIET_NS;
+    let was = *h;
+    if quiet {
+        *h = SmcHot::default();
+    }
+    h.hits = h.hits.saturating_add(1);
+    h.last = now;
+    let alone = h.hits > SMC_HOT_HITS && h.alone < SMC_HOT_PAGE_RETIRE;
+    h.alone = if alone { h.alone + 1 } else { 0 };
+    let h = *h;
+    drop(m);
+    if quiet && was.hits >= SMC_HOT_HITS {
+        smc_cooled(page, was.hits);
+    }
+    if jit_diag() && h.hits == SMC_HOT_HITS {
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): a block whose bytes change is retired alone, and a miss there lifts only its block and the run after it\n", my_pid()));
+    }
+    if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x}: {} guard hits running, {} hot lifts of {} blocks in {} us\n",
+            my_pid(),
+            h.hits,
+            h.lifts,
+            h.blocks,
+            h.lift_ns / 1000
+        ));
+    }
+    alone
+}
+
+/// Whether a miss on `page` lifts only its block (the hot-rewrite mode); a
+/// page that has been quiet long enough leaves the mode here.
+fn smc_hot(page: u64) -> bool {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = m.as_mut() else { return false };
+    let Some(h) = map.get(&page).copied() else { return false };
+    if h.hits < SMC_HOT_HITS {
+        return false;
+    }
+    if now_ns().saturating_sub(h.last) <= SMC_HOT_QUIET_NS {
+        return true;
+    }
+    map.remove(&page);
+    drop(m);
+    smc_cooled(page, h.hits);
+    false
+}
+
+/// `page` left the hot-rewrite mode, quiet after `hits` guard hits.
+fn smc_cooled(page: u64, hits: u32) {
+    if jit_diag() {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x} quiet for {} ms after {hits} guard hits: misses there lift as before\n",
+            my_pid(),
+            SMC_HOT_QUIET_NS / 1_000_000
+        ));
+    }
+}
+
+/// `?jitdiag=1`: what a hot lift on `page` took.
+fn smc_lifted(page: u64, ns: u64, blocks: u64) {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = m.as_mut().and_then(|m| m.get_mut(&page)) {
+        h.lifts += 1;
+        h.lift_ns += ns;
+        h.blocks += blocks;
+    }
+}
+
 /// What the runtime translator did in this process, for `gex_xlate_stat`:
 /// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
 /// that lifted), 3 self-modifying-code page invalidations, 4 pages retired by
@@ -16582,6 +16695,13 @@ mod fault_code {
 /// when the process has no hook.
 #[must_use]
 fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
+    hook_fault_kind(pc, code, addr, 0, resumable)
+}
+
+/// [`hook_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+#[must_use]
+fn hook_fault_kind(pc: u64, code: u32, addr: u64, kind: u32, resumable: bool) -> bool {
     if cgen::fault_hook() == 0 {
         return false;
     }
@@ -16589,10 +16709,10 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     let mut gm = guest();
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
-    if resumable && cgen::fault_in_place(c, code, addr, 0) {
+    if resumable && cgen::fault_in_place(c, code, addr, kind) {
         return true;
     }
-    cgen::fault_stage(code, addr, 0);
+    cgen::fault_stage(code, addr, kind);
     set_resume(pc);
     set_resume_ctx(c);
     trap();
@@ -16783,6 +16903,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
             hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
+        } else if raw == i::BRK_FETCH_FAULT {
+            hook_fault_kind(pc, fault_code::ACCESS_VIOLATION, gex_abi::fetch_fault_addr(pc), 8, resumable)
         } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
             hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
         } else {
@@ -16849,6 +16971,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             pc
         ));
         set_exit(128 + 8);
+        trap();
+    }
+    // An instruction running onto memory that is not executable: SIGSEGV
+    // at the first byte of it there, for the program's handler if it has one.
+    if raw == gex_abi::imports::BRK_FETCH_FAULT {
+        segv_at(pc as u64, gex_abi::fetch_fault_addr(pc as u64));
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
@@ -17313,6 +17441,33 @@ pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// which are not a bug.
 pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `?jitdiag=1`: a block's guard found its bytes changed. Its first 32 bytes
+/// now, and whether they are the ones its last guard hit saw, at the 1st,
+/// 8th, 64th and 512th hit: bytes that are the same hit after hit were not
+/// rewritten since the last lift, and the translation, not the program, is
+/// what keeps disagreeing with them.
+fn guard_bytes_say(addr: u64, pc: u64) {
+    thread_local!(static SEEN: std::cell::RefCell<std::collections::HashMap<u64, (u32, Vec<u8>, u32)>> = Default::default());
+    let now = guest().read(addr, 32).map(|b| b.to_vec()).unwrap_or_default();
+    let said = SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(addr).or_insert((0, Vec::new(), 0));
+        e.0 += 1;
+        if e.1 == now {
+            e.2 += 1;
+        }
+        e.1 = now.clone();
+        matches!(e.0, 1 | 8 | 64 | 512).then(|| (e.0, e.2))
+    });
+    if let Some((n, same)) = said {
+        let hex: String = now.iter().map(|b| format!("{b:02x}")).collect();
+        warn_line(&format!(
+            "gex: pid {} guard hit {n} at {addr:#x} (block {pc:#x}): bytes now {hex}; {same} of the hits saw the bytes the one before did\n",
+            my_pid()
+        ));
+    }
+}
+
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
@@ -17618,6 +17773,48 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         with_jit_only(|j| {
             j.translated.remove(&(addr as u64));
         });
+        return;
+    }
+    if op == gex_abi::cache_op::GUARD_HIT {
+        // A block's self-modifying-code guard found its bytes changed: `pc`
+        // is the block, `addr` its module (dense base, id; as `PAGE_STALE`).
+        let start = _pc as u64;
+        let alt = thread_alt();
+        if jit_diag() {
+            guard_bytes_say(start, start);
+        }
+        // On a hot page, with dense numbering (a slot map word per block that
+        // every Worker reads), only this block: its translation again, into
+        // the slot. A Worker that has not instantiated the new module finds
+        // the miss stub at its index and catches up first (`dense::missing`);
+        // one that runs another block of the page meanwhile runs a block
+        // whose bytes did not change, or whose own guard sends it here.
+        // Otherwise (classic numbering, or a page not hot) the page, below.
+        if smc_hit(gex_abi::page_key(start, alt)) && dense::on() {
+            let again = with_jit_only(|j| {
+                // The slot already names a newer block than this module's
+                // (this copy was reached by a direct jump from a sibling of
+                // its own module, which keeps jumping to it): dispatch below
+                // goes there, or catches this Worker up to it.
+                let (base, _) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
+                let elsewhere = base != 0 && {
+                    let d = dense::index(start);
+                    d != 0 && j.module_dense.get(&base).is_some_and(|&n| d < base || d >= base + n)
+                };
+                if !elsewhere {
+                    let key = gex_abi::addr_key(start, alt);
+                    j.translated.remove(&key);
+                    j.provider.remove(&key);
+                }
+                !elsewhere
+            });
+            if again {
+                xlate_add(3, 1);
+                gex_dispatch_miss(_ctx, start as i64);
+            }
+            return;
+        }
+        gex_cache_op(_ctx, _pc, gex_abi::cache_op::IC_INVALIDATE, _pc);
         return;
     }
     if op == gex_abi::cache_op::IC_INVALIDATE {
@@ -19155,7 +19352,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
     let cs = if gex_abi::X86 { guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
-    let (mut unit, stats) = gex_xlate::translate_runtime(
+    // (or the block runs onto it: the block before a rewritten page fails
+    // its page check at each of the page's retires, and is lifted again)
+    let hot_page = gex_abi::page_key(pc, alt);
+    let hot = smc_hot(hot_page) || smc_hot(gex_abi::page_key(pc + gex_abi::DISPATCH_PAGE, alt));
+    let lift_t0 = if hot && jit_diag() { now_ns() } else { 0 };
+    // Hot: the block and its straight-line run on the page, in one module
+    // (`SMC_HOT_RUN`); else what discovery reaches.
+    let lift: fn(&[u8], u64, &(dyn Fn(u64) -> bool + Sync), &(dyn Fn(u64) -> bool + Sync), _, _, usize, bool, &_) -> _ =
+        if hot { gex_xlate::translate_runtime_run } else { gex_xlate::translate_runtime };
+    let (mut unit, stats) = lift(
             // SAFETY: the translator takes the whole memory (`guest_whole`).
             unsafe { guest_whole() },
             pc,
@@ -19165,7 +19371,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+            if hot { SMC_HOT_RUN } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -19175,6 +19381,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The translator is the shim's deepest caller: recursive over the
         // control-flow graph of up to `LIFT_MAX` blocks.
         stack_tripwire("the end of a translation");
+        if lift_t0 != 0 {
+            smc_lifted(hot_page, now_ns().saturating_sub(lift_t0), stats.blocks as u64);
+        }
         note_kuser_folds(pc);
         if pwatched(gex_abi::dispatch_page(pc)) {
             let pg = gex_abi::dispatch_page(pc);
@@ -19533,9 +19742,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// The whole process: a status set for this thread alone left the others
 /// running and its parent waiting.
 fn branch_fault(pc: u64) {
+    segv_at(pc, pc)
+}
+
+/// SIGSEGV at `pc` for an access at `addr`: the program's handler, or the
+/// process ends.
+fn segv_at(pc: u64, addr: u64) {
     let c = my_ctx();
     let mut gm = guest();
-    match sigs::fault(&mut gm, c, 11, pc, pc) {
+    match sigs::fault(&mut gm, c, 11, pc, addr) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;

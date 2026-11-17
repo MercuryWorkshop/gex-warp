@@ -1595,8 +1595,9 @@ async function handle(msg) {
       forkZeros: gex.forkZeroBytes,
       // A posix_spawn child that ran in its parent's Worker until this exec.
       vforkMs: msg.child?.vforkMs,
+      // (and the largest single claim of the four)
       arena: gex.shim.exports.gex_arena_spent_mib
-        ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
+        ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
     };
     // Last: nothing calls into this instance after (`releaseWorker`).

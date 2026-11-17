@@ -266,6 +266,8 @@ async function startBrowser() {
   const { createServer } = await import(join(WEB, 'node_modules/vite/dist/node/index.js'));
   const base = (await import(join(WEB, 'vite.config.js'))).default;
   const hits = new Map();
+  /** The work files asked for, in the order the requests came. */
+  const asked = [];
   /** Name parts whose next request fails (`/__t/drop`). */
   const drops = [];
   const server = await createServer({
@@ -316,6 +318,12 @@ async function startBrowser() {
             res.setHeader('Content-Type', 'application/json');
             return res.end(JSON.stringify(hits.get(decodeURIComponent(query)) ?? 0));
           }
+          // The work files asked for whose names hold a string, in order.
+          if (path === '/order') {
+            const part = decodeURIComponent(query);
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify(asked.filter((k) => k.includes(part))));
+          }
           // The work files asked for whose names hold a string, summed.
           if (path === '/asked') {
             const part = decodeURIComponent(query);
@@ -334,6 +342,7 @@ async function startBrowser() {
           if (!path.startsWith('/work/')) return next();
           const name = decodeURIComponent(path.slice(6));
           hits.set(name, (hits.get(name) ?? 0) + 1);
+          asked.push(name);
           const drop = drops.findIndex((part) => name.includes(part));
           if (drop >= 0) {
             drops.splice(drop, 1);

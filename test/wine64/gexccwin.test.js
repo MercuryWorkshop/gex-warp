@@ -14,6 +14,9 @@
 //   GetProcAddress's pointers;
 // - selfaddr: GetModuleHandleExW(FROM_ADDRESS) on the program's own data,
 //   zeroed data and function is the program's module;
+// - exitshape: native calls of a native DLL's exports through GetProcAddress's
+//   pointers (guest addresses, out through the guest) agree with calls
+//   through its table for every shape conv.h has;
 // - bigdata: 24 MiB of zeroed data, more than the page's PE data window
 //   for builtins' data exports holds: its ends written and read, and the
 //   program's module;

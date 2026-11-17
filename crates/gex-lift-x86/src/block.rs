@@ -36,8 +36,33 @@ pub fn lift_block(
     for _ in 0..limits.max_insts {
         let mut buf = [0u8; 16];
         let n = fetch(pc, &mut buf).min(MAX_INST_BYTES);
-        if n == 0 {
-            term = Some(Term::Illegal { raw: 0, pc });
+        // An instruction that is not all executable memory: past the first
+        // byte of it (an instruction running onto the next page) or from its
+        // start (the block running onto it). The block ends before it and
+        // goes on there, so what that memory is at run time decides: a miss
+        // at a non-executable address is an access violation, executing,
+        // and one at code mapped since is lifted then. Lifted into this
+        // block, the instruction would be a stale illegal one, and the
+        // block's page check would hold it to the next page for as long as
+        // that page kept changing. An instruction cut short at a block's
+        // start faults the same way (`BRK_FETCH_FAULT`).
+        let cut = n < MAX_INST_BYTES && (n == 0 || {
+            let short = decode(&buf[..n], pc);
+            short.op == gex_isa_x86::Op::Unknown && {
+                let whole = decode(&buf[..MAX_INST_BYTES], pc);
+                whole.op != gex_isa_x86::Op::Unknown && whole.len as usize > n
+            }
+        });
+        if cut {
+            if pc != start {
+                term = Some(Term::Goto { target: pc });
+            } else if n == 0 {
+                term = Some(Term::Illegal { raw: 0, pc });
+            } else {
+                let yes = builder.const_i32(1);
+                builder.stmt(gex_ir::Stmt::Trap { cond: yes, pc, code: gex_abi::imports::BRK_FETCH_FAULT });
+                term = Some(Term::Goto { target: pc });
+            }
             break;
         }
         let inst = decode(&buf[..n], pc);
@@ -243,6 +268,32 @@ mod tests {
             );
             assert_eq!(b.end, 0x1000 + code.len() as u64);
         }
+    }
+
+    /// A block that runs onto memory it cannot fetch ends there and goes
+    /// on at that address, whether the next instruction starts there or
+    /// only its tail lies there, so the memory's state at run time decides;
+    /// an instruction cut short at the block's start is a fetch fault.
+    #[test]
+    fn a_block_ends_where_executable_memory_does() {
+        // nop; nop; then nothing
+        let b = lift_block(bytes(0x1ffe, &[0x90, 0x90]), 0x1ffe, BlockLimits::default());
+        assert_eq!(b.term, Term::Goto { target: 0x2000 }, "{}", print::block(&b));
+        assert_eq!(b.end, 0x2000);
+        // nop; then the first two bytes of `mov eax, imm32`
+        let b = lift_block(bytes(0x1ffd, &[0x90, 0xb8, 0x01]), 0x1ffd, BlockLimits::default());
+        assert_eq!(b.term, Term::Goto { target: 0x1ffe }, "{}", print::block(&b));
+        assert_eq!(b.end, 0x1ffe);
+        // that `mov` at the block's start
+        let b = lift_block(bytes(0x1ffe, &[0xb8, 0x01]), 0x1ffe, BlockLimits::default());
+        assert!(
+            b.stmts.iter().any(|s| matches!(s, Stmt::Trap { code: gex_abi::imports::BRK_FETCH_FAULT, pc: 0x1ffe, .. })),
+            "{}",
+            print::block(&b)
+        );
+        // a real illegal instruction cut by nothing is still one
+        let b = lift_block(bytes(0x1ffe, &[0x0f, 0x0b]), 0x1ffe, BlockLimits::default());
+        assert!(matches!(b.term, Term::Illegal { .. }), "{}", print::block(&b));
     }
 
     #[test]

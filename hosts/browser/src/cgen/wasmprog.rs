@@ -462,6 +462,29 @@ pub(super) fn owned(number: u32) -> Option<Vec<u8>> {
     b
 }
 
+/// A wasm32 library's file for JS to read its bytes from
+/// (`gex_cgen_pmod_read`): its path, its identity when its bytes went (else
+/// the file's now) and its length. `None` for a program's (its bytes are
+/// the image's, from memory), a library's rewritten for checked calls, or a
+/// module that is not a wasm32 one.
+pub(super) fn file_of(number: u32) -> Option<(String, Option<(u64, i64, u64)>, u32)> {
+    if super::dylink::checked_on() {
+        return None;
+    }
+    let (path, gone, len) = {
+        let g = lock(&PROGS);
+        let p = g.iter().find(|p| p.number == number && p.from_file)?;
+        (p.path.clone(), p.gone, p.len)
+    };
+    let id = gone.or_else(|| file_identity(&path));
+    Some((path, id, len))
+}
+
+/// File `path`'s identity (inode, mtime, size), as [`file_id`].
+pub(super) fn file_identity(path: &str) -> Option<(u64, i64, u64)> {
+    file_id(path).map(|(_, ino, mtime, size)| (ino, mtime, size))
+}
+
 /// [`owned`] for JS: the bytes in a block of exactly the module's length,
 /// which the caller gives back with `gex_free(ptr, len)`; 0 when there are
 /// none.
@@ -497,14 +520,13 @@ pub(super) fn shed(path: &str, bytes: &[u8]) -> Option<Shed> {
     Some(Shed { len: bytes.len() as u32, key: file_key(path, bytes), gone: (ino, mtime, size) })
 }
 
-/// [`shed`] for a library whose bytes were not read: a process made its
-/// file's key already ([`known_key`]), so nothing here needs them. `None`
-/// for a file no process has hashed (it is read whole, and hashed then).
-pub(super) fn shed_known(path: &str) -> Option<Shed> {
-    let id = file_id(path)?;
-    let (_, ino, mtime, size) = id;
+/// [`shed`] for a library whose bytes are not read whole: its file's key
+/// from the system-wide cache, or made from the file in pieces
+/// ([`file_key_streamed`]). `None` when the file cannot be read.
+pub(super) fn shed_file(path: &str) -> Option<Shed> {
+    let (_, ino, mtime, size) = file_id(path)?;
     let len = u32::try_from(size).ok()?;
-    let key = known_key(&id, len)?;
+    let key = file_key_streamed(path, size)?;
     Some(Shed { len, key, gone: (ino, mtime, size) })
 }
 
@@ -528,21 +550,95 @@ pub extern "C" fn gex_wasmprog_release(number: u32) {
 /// trace of `apt-get update`, and copied the bytes out first even when the
 /// page already had the module.
 pub(super) fn content_key(b: &[u8]) -> (u64, u64) {
-    let (mut a, mut c) = (0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64);
-    let words = b.chunks_exact(8);
-    let tail = words.remainder();
-    for (i, w) in words.enumerate() {
-        let x = u64::from_le_bytes(w.try_into().unwrap());
-        a = (a ^ x).wrapping_mul(0x0000_0100_0000_01b3);
-        c = (c ^ x.rotate_left(29) ^ i as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        c ^= c >> 32;
+    let mut h = KeyHasher::new();
+    h.update(b);
+    h.finish()
+}
+
+/// [`content_key`] over bytes given in pieces (a file read in chunks): the
+/// same key as the whole at once, whatever the pieces' lengths.
+pub(super) struct KeyHasher {
+    a: u64,
+    c: u64,
+    /// Words hashed so far.
+    i: u64,
+    /// A word's bytes not yet complete.
+    part: [u8; 8],
+    have: usize,
+}
+
+impl KeyHasher {
+    pub(super) fn new() -> Self {
+        KeyHasher { a: 0xcbf2_9ce4_8422_2325, c: 0x9e37_79b9_7f4a_7c15, i: 0, part: [0; 8], have: 0 }
     }
-    for (i, &x) in tail.iter().enumerate() {
-        a = (a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        c = (c ^ ((x as u64) << (i * 8)) ^ 0xa5).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        c ^= c >> 32;
+
+    fn word(&mut self, x: u64) {
+        self.a = (self.a ^ x).wrapping_mul(0x0000_0100_0000_01b3);
+        self.c = (self.c ^ x.rotate_left(29) ^ self.i).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        self.c ^= self.c >> 32;
+        self.i += 1;
     }
-    (a, c)
+
+    pub(super) fn update(&mut self, mut b: &[u8]) {
+        if self.have > 0 {
+            let n = (8 - self.have).min(b.len());
+            self.part[self.have..self.have + n].copy_from_slice(&b[..n]);
+            self.have += n;
+            b = &b[n..];
+            if self.have < 8 {
+                return;
+            }
+            self.word(u64::from_le_bytes(self.part));
+            self.have = 0;
+        }
+        let words = b.chunks_exact(8);
+        let tail = words.remainder();
+        for w in words {
+            self.word(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        self.part[..tail.len()].copy_from_slice(tail);
+        self.have = tail.len();
+    }
+
+    pub(super) fn finish(self) -> (u64, u64) {
+        let (mut a, mut c) = (self.a, self.c);
+        for (i, &x) in self.part[..self.have].iter().enumerate() {
+            a = (a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            c = (c ^ ((x as u64) << (i * 8)) ^ 0xa5).wrapping_mul(0xff51_afd7_ed55_8ccd);
+            c ^= c >> 32;
+        }
+        (a, c)
+    }
+}
+
+/// The content key of file `path` (`len` bytes), read in pieces through a
+/// buffer of 1 MiB, never whole: from the system-wide cache when some process
+/// already made it for the same file, else made and noted there. `None` when
+/// the file cannot be read to its length.
+pub(super) fn file_key_streamed(path: &str, len: u64) -> Option<(u64, u64)> {
+    let id = file_id(path);
+    let len32 = u32::try_from(len).ok()?;
+    if let Some(k) = id.as_ref().and_then(|id| known_key(id, len32)) {
+        return Some(k);
+    }
+    let home = crate::sigs::proc_home();
+    let mut buf = vec![0u8; (1usize << 20).min(len as usize).max(1)];
+    let mut h = KeyHasher::new();
+    let mut off = 0u64;
+    while off < len {
+        let want = ((len - off) as usize).min(buf.len());
+        let n = home.read_file_at(path, off, &mut buf[..want])?;
+        if n == 0 {
+            return None;
+        }
+        h.update(&buf[..n]);
+        off += n as u64;
+    }
+    let k = h.finish();
+    if let Some(id) = &id {
+        note_key(id, len32, k);
+    }
+    Some(k)
 }
 
 /// Lane `lane` (0 or 1) of wasm32 program `number`'s content key, or of
