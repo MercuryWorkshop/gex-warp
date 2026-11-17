@@ -63,6 +63,7 @@ int xpc_pipe_receive(mach_port_t port, xpc_object_t *message);
 int xpc_pipe_routine_reply(xpc_object_t reply);
 xpc_object_t xpc_create_from_plist(const void *data, size_t length);
 void xpc_dictionary_set_mach_send(xpc_object_t d, const char *key, mach_port_t port);
+mach_port_t xpc_dictionary_copy_mach_send(xpc_object_t d, const char *key);
 void xpc_dictionary_set_mach_recv(xpc_object_t d, const char *key, mach_port_t port);
 void xpc_dictionary_get_audit_token(xpc_object_t d, audit_token_t *token);
 char *xpc_copy_description(xpc_object_t o);
@@ -84,6 +85,10 @@ enum {
     // bootstrap_check_in itself, of a name (the other is an XPC
     // listener's).
     ROUTINE_BOOTSTRAP_CHECKIN = 206,
+    // bootstrap_parent, and bootstrap_register2: a name a process gives a
+    // port of its own, in its own domain.
+    ROUTINE_PARENT = 203,
+    ROUTINE_REGISTER = 204,
     ROUTINE_LAUNCH_MSG = 100,
 };
 
@@ -112,6 +117,17 @@ struct job {
 
 static struct service *services;
 static int nservices;
+// The names processes have registered (bootstrap_register2), each in the
+// process's own domain, as launchd keeps one per process: AppKit registers
+// com.apple.coredrag and com.apple.axserver in an application's, where
+// another looks them up by its pid ("targetpid").
+struct registered {
+    pid_t pid;
+    char *name;
+    mach_port_t port;
+};
+static struct registered *registered;
+static int nregistered;
 static struct job *jobs;
 static int njobs;
 static mach_port_t bootstrap;
@@ -489,8 +505,12 @@ static void handle(xpc_object_t request) {
     pthread_mutex_lock(&lock);
     // (A job checks in for its own job's service, of its own domain.)
     struct job *caller = job_by_pid(from);
-    struct service *s = name ? find(name, aqua(caller, token)) : NULL;
     uint64_t subsystem = xpc_dictionary_get_uint64(request, "subsystem");
+    // (A lookup in a user's domain by its uid, type 2, is in the user's
+    // whoever asks: xpc_connection_set_target_uid, as CVMServer, a daemon,
+    // reaches its compiler agent for the user it compiles for.)
+    int in_user = aqua(caller, token) || (xpc_dictionary_get_uint64(request, "type") == 2 && xpc_dictionary_get_uint64(request, "handle") != 0);
+    struct service *s = name ? find(name, in_user) : NULL;
     if (subsystem == SUBSYSTEM_XPC && routine == ROUTINE_ENDPOINT_LOOKUP) routine = ROUTINE_LOOKUP;
     if (subsystem == SUBSYSTEM_VPROC && routine == ROUTINE_VPROC_SWAP) {
         // What a job is told of itself (vproc_priv.h's keys): the manager
@@ -530,9 +550,44 @@ static void handle(xpc_object_t request) {
         else reply_error(reply, ENOTSUP);
         routine = 0;
     }
+    // A name in a process's own domain: that process's (by "targetpid"),
+    // or the asker's own.
+    if (routine == ROUTINE_LOOKUP && name) {
+        int64_t target = xpc_dictionary_get_int64(request, "targetpid");
+        pid_t in = target > 0 ? (pid_t)target : from;
+        for (int i = nregistered - 1; i >= 0; i--) {
+            if (registered[i].pid != in || strcmp(registered[i].name, name)) continue;
+            xpc_dictionary_set_mach_send(reply, "port", registered[i].port);
+            say("lookup %s in %d's domain: found", name, in);
+            routine = 0;
+            break;
+        }
+    }
     switch (routine) {
     case 0:
         break;
+    case ROUTINE_PARENT:
+        // There is the one domain above every process here: this.
+        xpc_dictionary_set_mach_send(reply, "parent", bootstrap);
+        break;
+    case ROUTINE_REGISTER: {
+        mach_port_t port = xpc_dictionary_copy_mach_send(request, "port");
+        if (!name || port == MACH_PORT_NULL) {
+            reply_error(reply, EINVAL);
+            break;
+        }
+        // (A name registered again is the new port's.)
+        for (int i = 0; i < nregistered; i++)
+            if (registered[i].pid == from && !strcmp(registered[i].name, name)) {
+                mach_port_deallocate(mach_task_self(), registered[i].port);
+                registered[i] = registered[--nregistered];
+                break;
+            }
+        registered = realloc(registered, (nregistered + 1) * sizeof *registered);
+        registered[nregistered++] = (struct registered){from, strdup(name), port};
+        say("register %s in %d's domain", name, from);
+        break;
+    }
     case ROUTINE_LOOKUP:
         if (!s) {
             reply_error(reply, ESRCH);
