@@ -880,6 +880,11 @@ impl Kernel {
             // ENOSYS, it hands back as a failure, and colorsyncd, asking
             // for its own as it enters its sandbox, gives up.)
             d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Quarantine") && matches!(x[1], 0x50 | 0x52 | 0x54 | 0x55 | 0x58) => Err(abi::K_ENOATTR),
+            // And a quarantine put on a file (0x51 by path, 0x53 by
+            // descriptor), a volume (0x59) or the process itself (0x57,
+            // which colorsyncd does next): taken, and nothing kept, as
+            // nothing here asks after one.
+            d::MAC_SYSCALL if m.read_cstr(x[0], 32).is_ok_and(|p| p == b"Quarantine") && matches!(x[1], 0x51 | 0x53 | 0x57 | 0x59) => Ok(0),
             d::GETATTRLIST => self.darwin_getattrlist(m, CWD as i32, x[0], x[1], x[2], x[3], x[4]),
             d::FGETATTRLIST => self.darwin_getattrlist(m, x[0] as i32, 0, x[1], x[2], x[3], x[4]),
             d::GETATTRLISTBULK => self.darwin_getattrlistbulk(m, x[0] as i32, x[1], x[2], x[3], x[4]),
