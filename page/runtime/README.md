@@ -770,7 +770,8 @@ the native host's for tests (a module beside `notify.rs`, and a line in
 `libpyrusservices`. Two that are to come, as they would sit on it:
 
 - *Codecs* (VideoToolbox, AudioToolbox, AVFoundation's playback, ImageIO's
-  further formats, over WebCodecs). A `codec` service in a Worker. The
+  further formats, over WebCodecs): now the `codecs` service (Codecs,
+  below); this was its plan. A `codec` service in a Worker. The
   control connection creates and configures sessions (`{"op": "open",
   "seq", "codec", "width", ...}` answered with a stream token), flushes and
   resets them, and carries errors. Each session's samples and frames go on
@@ -794,6 +795,82 @@ the native host's for tests (a module beside `notify.rs`, and a line in
   HID input reports are events. Small frames on the control path suffice
   (a frame is 72 bytes and more); a device with high-rate input reports may
   have a stream of its own so that requests do not wait behind them.
+
+### Codecs
+
+`Codecs` (`@gexemu/runtime/codecs`): the browser's video codecs
+(WebCodecs' `VideoDecoder` and `VideoEncoder`) for programs, the service
+`codecs`. A Mac program's VideoToolbox (pyrus's) is its first user: each
+`VTDecompressionSession` and `VTCompressionSession` is a connection of its
+own. Without a `Codecs` (or in a browser without WebCodecs, or without the
+codec) a program's framework behaves as a Mac with no decoder or encoder
+for it (`kVTCouldNotFindVideoDecoderErr` from Create).
+
+```js
+import { Codecs } from '@gexemu/runtime/codecs';
+
+const sys = new System({ services: { bulk: 4 } });   // a bulk connection for each session at once
+new Codecs(sys);                                     // or new Codecs(sys, { worker }) with codecs-worker.js's serveCodecs
+```
+
+| Member | Does |
+| --- | --- |
+| `new Codecs(sys, { worker })` | Provide `codecs`, version 1, on the page's thread, or in `worker` (a Worker whose script calls `serveCodecs()` from `@gexemu/runtime/codecs-worker`; WebCodecs is in both). `stop()` stops providing it. |
+| `Codecs.available` | Whether this browser has WebCodecs at all. |
+| `codecsProvider()` | The provider itself, for `sys.services.provide` or `serveServices` of a Worker of the page's own. |
+| `LIMITS` | What a session takes: a frame's sides (16384), what is kept to decode again after a flush (64 MiB, 2048 samples), the decoded frames waiting for the program before the decoder is fed more (3). |
+
+A session's connection is on the bulk node where the page reserved one
+(`services.bulk`; a 1080p NV12 frame is 3 MiB, BGRA 8 MiB, and the
+default 16 MiB rings hold two or more), else on the ordinary node (frames
+of at most 4 MiB). Its messages are in order with its frames: a flush is
+answered once everything given before it has come out, which is what
+VideoToolbox's `WaitForAsynchronousFrames` and `CompleteFrames` want, and
+the end of the session is the connection's end. Ids are the program's
+(whole numbers, increasing); a decoder's or encoder's output carries the
+id of what it was made from, and the program keeps the times.
+
+| From the program | |
+| --- | --- |
+| `{ op: 'query', seq, configs: [{ kind, codec, width, height, hardware, description, type }] }` | Whether each is supported (`isConfigSupported`; `kind` `'decoder'`, `'encoder'`, or `'image'` with a MIME `type` for `ImageDecoder.isTypeSupported`). Answered `{ seq, results: [{ supported }] }`. A connection that asks only this is a short one. |
+| `{ op: 'configure', seq, kind: 'decoder', codec, description, width, height, output: { format }, hardware, optimizeForLatency }` | Make the session a decoder (WebCodecs' codec string; `description` a reference to the `avcC` or `hvcC` record; `format` `'NV12'`, `'I420'`, `'BGRA'` or `'RGBA'`, what frames come back as; `hardware` `'no-preference'`, `'prefer-hardware'` or `'prefer-software'`). Answered `{ seq, ok: true, codec }` or `{ seq, ok: false, error: 'unsupported' \| 'invalid', message }`. Again with another configuration: the decoder made again. |
+| `{ op: 'decode', id, key, data }` | A sample (`data` a reference: for H.264 and HEVC, length-prefixed NAL units as the description says). `key` says it is a key frame (an IDR or IRAP picture; the browser checks). |
+| `{ op: 'configure', seq, kind: 'encoder', codec, width, height, bitrate, framerate, latencyMode, bitrateMode, format }` | Make the session an encoder (`latencyMode` `'quality'` or `'realtime'`; `format` `'annexb'` for Annex B samples, else length-prefixed with a description). Again on a running encoder: its new bit rate or rate from the next frame. |
+| `{ op: 'encode', id, key, duration, format, width, height, colour, planes: [{ at, size, stride }] }` | A frame to encode (`format` `'NV12'`, `'I420'`, `'BGRA'`, `'BGRX'`, `'RGBA'` or `'RGBX'`; the planes in the frame's data; `key` asks for a key frame; `colour` as below). |
+| `{ op: 'flush', seq }` | Answered `{ seq, op: 'flushed', dropped: [ids] }` once every output of what came before has been sent; `dropped` the samples that made no frame. |
+| `{ op: 'reset', seq }` | A decoder's work dropped. Answered `{ seq, op: 'reset', dropped }`. |
+| `{ op: 'close' }` | The program is done with the session: its codec is closed and the connection ended. |
+| `{ op: 'image', seq, type, index, pixels, data }` | Decode image `index` of a file (`data`, of MIME `type`: `ImageDecoder`, on a short connection of its own; ImageIO's HEIC, AVIF and WebP). Answered `{ seq, ok: true, width, height, alpha, frames, data }`, the pixels RGBA, 8 bits a channel, alpha not premultiplied, in sRGB (none when `pixels` is false), or `{ seq, ok: false, error }`. |
+
+| To the program | |
+| --- | --- |
+| `{ op: 'frame', id, format, width, height, colour, planes: [{ at, size, stride }] }` | A decoded frame (its visible rectangle), the planes one after another in the frame's data, in the order the decoder made them (a decoder that reorders gives presentation order). `colour` is `{ primaries, transfer, matrix, fullRange }`, ISO/IEC 23091-2 code points (2 for unspecified). |
+| `{ op: 'chunk', id, key, duration, data, description, colour }` | An encoded sample, in the encoder's order; `description` (a reference, with `colour`) whenever the encoder's description changes, the first time included. |
+| `{ op: 'dropped', id, error }` | A sample or frame that made nothing (`error` why). |
+| `{ op: 'error', ids, message }` | The codec failed (WebCodecs' `error`): what it had is lost; a decoder's next sample must be a key frame. |
+
+NV12 and I420 are made of each other by moving bytes (exactly); RGB is the
+browser's conversion (`VideoFrame.copyTo` with a `format`). A decoded
+frame is copied out at once and the `VideoFrame` closed, so the decoder is
+never short of frames; it is fed only while what waits for the program is
+under `LIMITS.buffered` frames.
+
+WebCodecs wants a key frame after every flush; VideoToolbox does not (a
+program waits for its frames whenever it likes, and goes on decoding). So
+a decoder keeps the samples since the last key frame, and a delta frame
+after a flush is decoded after them again, their frames not sent twice. A
+program that waits after every frame of a stream with B-frames (ffmpeg's
+VideoToolbox decoder does, and VideoToolbox's synchronous decoding of a
+stream that reorders is the same) pays for that: each frame costs the
+group so far. Streams without reordering (Baseline, most real-time video)
+come out frame by frame with no flush.
+
+What each browser has (`test/darwin/codecs-page` says it, on a Mac):
+Google Chrome 157 decodes H.264, HEVC (its hardware decoder only), VP8,
+VP9 and AV1, and encodes all five; Chromium 156 decodes no H.264 and no
+HEVC (a program finds no decoder for either, as on a Mac without one),
+encodes H.264 (OpenH264) but not HEVC, and has VP8, VP9 and AV1 both ways.
+Of images, Chrome's `ImageDecoder` reads AVIF and WebP, not HEIC.
 
 ## Notifications
 
