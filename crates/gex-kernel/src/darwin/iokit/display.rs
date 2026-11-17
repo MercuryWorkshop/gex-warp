@@ -28,15 +28,18 @@ pub struct Fb {
     /// `kIOFBServerConnectType` (0) or `kIOFBSharedConnectType` (1).
     pub kind: u32,
     pub mode: Mode,
-    /// The largest cursor `IOFBCreateSharedCursor` asked room for.
+    /// The largest cursor `IOFBCreateSharedCursor` asked room for (the
+    /// larger of a cursor's and the wait cursor's width, square), and for
+    /// how many frames of it.
     pub cursor: (u32, u32),
+    pub frames: u32,
     pub cursor_at: (i32, i32),
     pub cursor_visible: bool,
 }
 
 impl Fb {
     pub fn new(kind: u32) -> Fb {
-        Fb { kind, mode: super::registry::mode(), cursor: (32, 32), cursor_at: (0, 0), cursor_visible: false }
+        Fb { kind, mode: super::registry::mode(), cursor: (32, 32), frames: 4, cursor_at: (0, 0), cursor_visible: false }
     }
 
     pub fn row_bytes(&self) -> u64 {
@@ -55,8 +58,10 @@ impl Fb {
         match kind {
             CURSOR_MEMORY => {
                 let (w, h) = self.cursor;
-                // (Four frames of a cursor of the largest size, 32-bit.)
-                let size = (SHMEM_SIZE + (w * h * 4 * 4) as usize).next_multiple_of(0x1000);
+                // (Each frame asked for of a cursor of the largest size,
+                // 32-bit: CoreDisplay puts frame i at 236 + i * w * h * 4,
+                // and WindowServer's wait cursor has 30.)
+                let size = (SHMEM_SIZE + (w * h * 4 * self.frames) as usize).next_multiple_of(0x1000);
                 let mut b = vec![0u8; size];
                 b[56..60].copy_from_slice(&SHMEM_VERSION.to_le_bytes());
                 b[60..64].copy_from_slice(&(SHMEM_SIZE as i32).to_le_bytes());
@@ -125,9 +130,14 @@ impl Fb {
         let none = Ok((Vec::new(), Vec::new()));
         let arg = |i: usize| scalars.get(i).copied().unwrap_or(0);
         match selector {
-            // extCreateSharedCursor(version, max width, max height)
+            // extCreateSharedCursor(version, max width, max wait cursor
+            // width): the version's bits 16-23 are the frames to have room
+            // for (`kIOFBShmemCursorNumFramesMask`; four at least), each as
+            // wide and high as the wider of the two.
             0 => {
-                self.cursor = ((arg(1) as u32).clamp(16, 256), (arg(2) as u32).clamp(16, 256));
+                let w = (arg(1) as u32).max(arg(2) as u32).clamp(16, 256);
+                self.cursor = (w, w);
+                self.frames = ((arg(0) >> 16) as u32 & 0xff).max(4);
                 none
             }
             // extGetPixelInformation(mode, depth, aperture)
@@ -178,7 +188,7 @@ mod tests {
 
     #[test]
     fn one_mode_of_32_bit_pixels() {
-        let mut fb = Fb { kind: 0, mode: Mode { width: 800, height: 600 }, cursor: (32, 32), cursor_at: (0, 0), cursor_visible: false };
+        let mut fb = Fb { kind: 0, mode: Mode { width: 800, height: 600 }, cursor: (32, 32), frames: 4, cursor_at: (0, 0), cursor_visible: false };
         assert_eq!(fb.method(6, &[], &[]), Ok((vec![1], Vec::new())));
         assert_eq!(fb.method(2, &[], &[]), Ok((vec![1, 0], Vec::new())));
         assert!(fb.method(4, &[1, 0], &[]).is_ok() && fb.method(4, &[0, 0], &[]).is_ok() && fb.method(4, &[7, 0], &[]).is_err());
@@ -194,5 +204,18 @@ mod tests {
         assert_eq!(fb.vram_size(), (3200 * 600u64).next_multiple_of(0x4000));
         let cursor = fb.memory(CURSOR_MEMORY).unwrap();
         assert_eq!(i32::from_le_bytes(cursor[56..60].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn the_shared_cursor_has_room_for_every_frame_asked_for() {
+        let mut fb = Fb::new(0);
+        // WindowServer's: version 3, 30 frames (bits 16-23), 256 wide, a
+        // wait cursor 256 wide; CoreDisplay's last frame ends at 236 +
+        // 30 * 256 * 256 * 4.
+        assert!(fb.method(0, &[0x1e_0003, 256, 256], &[]).is_ok());
+        assert!(fb.memory(CURSOR_MEMORY).unwrap().len() >= 236 + 30 * 256 * 256 * 4);
+        // Fewer than four asked for: four.
+        assert!(fb.method(0, &[2, 32, 64], &[]).is_ok());
+        assert_eq!((fb.cursor, fb.frames), ((64, 64), 4));
     }
 }
