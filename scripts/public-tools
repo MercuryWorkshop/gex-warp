@@ -3,6 +3,10 @@
 # path                                   what it is
 scripts/units-for.sh                       the function-tier units of a frozen image set, for one gexc (game repos' page legs)
 scripts/prof-report.py                     symbolise a GEX_PROF profile (crates/gexc/src/prof.rs)
+scripts/mojave-desktop.sh                  Mojave's WindowServer, gexloginwindow and an app under gexc, from an extracted 10.14 root
+hosts/macview/build.sh                     macview, a window on a Mac guest's display (GEX_FRAMEBUFFER_LIVE, GEX_HID_INPUT)
+guest/launchd/build.sh                     gexlaunchd, the bootstrap server for a Mac root (mojave-desktop.sh, darwin/mojave)
+guest/loginwindow/build.sh                 gexloginwindow, loginwindow's stand-in (mojave-desktop.sh, darwin/mojave)
 wine/dll-bases.py      pinned DLL addresses for a 64-bit Wine or WoW64 prefix (dll-bases)
 wine/legacy32/dll-bases.py      the same for a 32-bit Wine bundle (legacy)
 wine/page-prefix.sh           a Wine prefix template for the page
