@@ -888,13 +888,15 @@ service yet: a program there has virtual endpoints only.
 
 ### Codecs
 
-`Codecs` (`@gexemu/runtime/codecs`): the browser's video codecs
-(WebCodecs' `VideoDecoder` and `VideoEncoder`) for programs, the service
-`codecs`. A Mac program's VideoToolbox (pyrus's) is its first user: each
-`VTDecompressionSession` and `VTCompressionSession` is a connection of its
-own. Without a `Codecs` (or in a browser without WebCodecs, or without the
-codec) a program's framework behaves as a Mac with no decoder or encoder
-for it (`kVTCouldNotFindVideoDecoderErr` from Create).
+`Codecs` (`@gexemu/runtime/codecs`): the browser's codecs (WebCodecs'
+`VideoDecoder`, `VideoEncoder`, `AudioDecoder` and `AudioEncoder`) for
+programs, the service `codecs`. A Mac program's VideoToolbox and
+AudioToolbox (pyrus's) are its users: each `VTDecompressionSession`,
+`VTCompressionSession` and compressing or decompressing `AudioConverter`
+is a connection of its own. Without a `Codecs` (or in a browser without
+WebCodecs, or without the codec) a program's framework behaves as a Mac
+with no decoder or encoder for it (`kVTCouldNotFindVideoDecoderErr` from
+Create, `'fmt?'` from `AudioConverterNew`).
 
 ```js
 import { Codecs } from '@gexemu/runtime/codecs';
@@ -929,13 +931,17 @@ id of what it was made from, and the program keeps the times.
 | `{ op: 'encode', id, key, duration, format, width, height, colour, planes: [{ at, size, stride }] }` | A frame to encode (`format` `'NV12'`, `'I420'`, `'BGRA'`, `'BGRX'`, `'RGBA'` or `'RGBX'`; the planes in the frame's data; `key` asks for a key frame; `colour` as below). |
 | `{ op: 'flush', seq }` | Answered `{ seq, op: 'flushed', dropped: [ids] }` once every output of what came before has been sent; `dropped` the samples that made no frame. |
 | `{ op: 'reset', seq }` | A decoder's work dropped. Answered `{ seq, op: 'reset', dropped }`. |
+| `{ op: 'configure', seq, kind: 'audio-decoder', codec, sampleRate, channels, description }` | Make the session an audio decoder (`codec` WebCodecs' string: `'mp4a.40.2'`, `'mp4a.40.5'`, `'opus'`, `'mp3'`, ...; `description` a reference to AAC's AudioSpecificConfig, or Opus's identification header). Answered as a video decoder's. Its `decode`s are `{ op: 'decode', id, data }`, each packet standing alone; `flush` and `reset` as a video decoder's. |
+| `{ op: 'configure', seq, kind: 'audio-encoder', codec, sampleRate, channels, bitrate, bitrateMode, frameDuration, complexity, application }` | Make the session an audio encoder (`bitrateMode` `'constant'` or `'variable'`; Opus's `frameDuration` in microseconds, 2500 to 120000, its `complexity` 0 to 10, `application` `'audio'`, `'voip'` or `'lowdelay'`; AAC's packets raw, its AudioSpecificConfig the description). |
+| `{ op: 'encode', id, frames, data }` | An audio encoder's samples: `frames` frames, float32 interleaved, at the configured rate and channels; `id` is their time in microseconds. |
 | `{ op: 'close' }` | The program is done with the session: its codec is closed and the connection ended. |
 | `{ op: 'image', seq, type, index, pixels, data }` | Decode image `index` of a file (`data`, of MIME `type`: `ImageDecoder`, on a short connection of its own; ImageIO's HEIC, AVIF and WebP). Answered `{ seq, ok: true, width, height, alpha, frames, data }`, the pixels RGBA, 8 bits a channel, alpha not premultiplied, in sRGB (none when `pixels` is false), or `{ seq, ok: false, error }`. |
 
 | To the program | |
 | --- | --- |
+| `{ op: 'audio', id, frames, channels, rate, data }` | An audio decoder's samples, float32 interleaved, in the order the decoder made them; `id` the packet's. |
 | `{ op: 'frame', id, format, width, height, colour, planes: [{ at, size, stride }] }` | A decoded frame (its visible rectangle), the planes one after another in the frame's data, in the order the decoder made them (a decoder that reorders gives presentation order). `colour` is `{ primaries, transfer, matrix, fullRange }`, ISO/IEC 23091-2 code points (2 for unspecified). |
-| `{ op: 'chunk', id, key, duration, data, description, colour }` | An encoded sample, in the encoder's order; `description` (a reference, with `colour`) whenever the encoder's description changes, the first time included. |
+| `{ op: 'chunk', id, key, duration, data, description, colour }` | An encoded sample, in the encoder's order; `description` (a reference, with `colour`) whenever the encoder's description changes, the first time included. An audio encoder's says its `rate` and `channels` too. |
 | `{ op: 'dropped', id, error }` | A sample or frame that made nothing (`error` why). |
 | `{ op: 'error', ids, message }` | The codec failed (WebCodecs' `error`): what it had is lost; a decoder's next sample must be a key frame. |
 
@@ -955,12 +961,16 @@ stream that reorders is the same) pays for that: each frame costs the
 group so far. Streams without reordering (Baseline, most real-time video)
 come out frame by frame with no flush.
 
-What each browser has (`test/darwin/codecs-page` says it, on a Mac):
+What each browser has (`test/darwin/codecs-page` and
+`test/darwin/audio-codecs-page` say it, on a Mac):
 Google Chrome 157 decodes H.264, HEVC (its hardware decoder only), VP8,
 VP9 and AV1, and encodes all five; Chromium 156 decodes no H.264 and no
 HEVC (a program finds no decoder for either, as on a Mac without one),
 encodes H.264 (OpenH264) but not HEVC, and has VP8, VP9 and AV1 both ways.
-Of images, Chrome's `ImageDecoder` reads AVIF and WebP, not HEIC.
+Of images, Chrome's `ImageDecoder` reads AVIF and WebP, not HEIC. Of
+audio, Chrome 157 decodes AAC (LC, HE, HE v2), MP3, Opus, FLAC, Vorbis and
+A-law and mu-law, and encodes AAC (LC, HE and HE v2, by the Mac's own
+AudioToolbox) and Opus.
 
 ## Notifications
 
