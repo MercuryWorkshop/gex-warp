@@ -70,7 +70,8 @@ set -- \
   mds /private/var/db/mds empty  coreduet /private/var/db/CoreDuet empty \
   tcc "/Library/Application Support/com.apple.TCC" empty  keychains /Library/Keychains empty \
   crls /private/var/db/crls empty  home /Users/gex empty  prefs /Library/Preferences copy \
-  root /private/var/root copy  syscaches /System/Library/Caches copy
+  root /private/var/root copy  syscaches /System/Library/Caches copy \
+  cvms /private/var/db/CVMS copy
 names=""
 while [ $# -gt 0 ]; do dir "$1" "$2" "$3"; names="$names $1"; shift 3; done
 mkdir -p "$E/home/Library/Preferences" "$E/home/Library/Caches" "$E/home/Library/Application Support"
@@ -120,6 +121,7 @@ OS_ACTIVITY_DT_MODE=YES GEX_FRAMEBUFFER_PNG="$O/fb.png" GEX_FRAMEBUFFER_LIVE="$O
   --bind "$E/tcc=/Library/Application Support/com.apple.TCC" --bind "$E/keychains=/Library/Keychains" \
   --bind "$E/crls=/private/var/db/crls" --bind "$E/home=/Users/gex" --bind "$E/prefs=/Library/Preferences" \
   --bind "$E/root=/private/var/root" --bind "$E/syscaches=/System/Library/Caches" \
+  --bind "$E/cvms=/private/var/db/CVMS" \
   --bind "$O/gl=/gex" --bind "$O/lw/x86_64=/gex-login" --bind "$O/jobs=/gex-jobs" \
   --env OS_ACTIVITY_DT_MODE=YES \
   "$O/gl/gexlaunchd.x86_64" -v -x com.apple.configd -x com.apple.diskarbitrationd -x com.apple.aslmanager \
