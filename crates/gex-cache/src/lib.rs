@@ -447,12 +447,13 @@ pub fn load_or_compile(
     let meta_path = dir.join(format!("{key}.meta"));
     // Both halves must be present: a module without its metadata says nothing
     // about where its dispatch pages went.
-    if let (Ok(bytes), Ok(metadata)) = (std::fs::read(&path), std::fs::read(&meta_path)) {
-        // SAFETY: see the module comment. `deserialize` additionally rejects
-        // an artifact that does not match this engine, so a stale or truncated
-        // file produces an error rather than bad code -- which is why the
-        // failure path below simply rebuilds.
-        match unsafe { Module::deserialize(engine, &bytes) } {
+    if let Ok(metadata) = std::fs::read(&meta_path) {
+        // SAFETY: see the module comment. `deserialize_file` additionally
+        // rejects an artifact that does not match this engine, so a stale or
+        // truncated file produces an error rather than bad code -- which is
+        // why the failure path below simply rebuilds. Mapped from the file
+        // (`mapped`), not copied.
+        match mapped(engine, &path) {
             Ok(module) => {
                 refresh(&meta_path);
                 return Ok(Loaded {
@@ -464,27 +465,48 @@ pub fn load_or_compile(
             Err(_) => {
                 // Unusable: drop it so the next run does not pay to find out
                 // again. Failing to remove it is not worth reporting.
+                let len = std::fs::metadata(&path).map_or(0, |m| m.len());
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(&meta_path);
-                ledger_add(dir, -((bytes.len() + metadata.len()) as i64));
+                ledger_add(dir, -((len + metadata.len() as u64) as i64));
             }
         }
     }
 
     let (wasm, metadata) = build()?;
-    let module = compile(engine, &wasm).context("validating translated wasm")?;
+    let mut module = compile(engine, &wasm).context("validating translated wasm")?;
     if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
         account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
+        // And the module the store's file, mapped, in place of the one just
+        // compiled into memory of its own.
+        if let Ok(m) = mapped(engine, &path) {
+            module = m;
+        }
     }
     Ok(Loaded {
         module,
         metadata,
         hit: false,
     })
+}
+
+/// The module stored at `path`, mapped from the file rather than copied
+/// into memory: its pages are the file's (the system's file cache), clean,
+/// in no process's footprint, and a module made executable is not written.
+///
+/// A compiled module copied into memory of its own cost whole host pages for
+/// each of its sections: 64 KiB for a runtime translation of a few blocks,
+/// some 10 KiB of it used. A Mojave desktop (some 150,000 such modules, kept
+/// for the lives of the processes that made them) held gigabytes of them;
+/// mapped, a module costs a few KiB.
+fn mapped(engine: &Engine, path: &Path) -> Result<Module> {
+    // SAFETY: as `deserialize`'s (the module comment); the file is one this
+    // cache wrote whole and renamed into place, never written in place.
+    Ok(unsafe { Module::deserialize_file(engine, path) }?)
 }
 
 /// How stale a hit's metadata mtime may be before the hit refreshes it.
@@ -997,6 +1019,38 @@ mod tests {
         assert!(again.hit, "the store should have replaced it");
         assert_eq!(again.metadata, b"meta");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_module_is_mapped_from_its_file_and_holds_no_descriptor() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-mapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let engine = Engine::default();
+        // (func (export "f") (result i32) i32.const 42)
+        let wasm = vec![0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1, 0x66, 0, 0, 0x0a, 6, 1, 4, 0, 0x41, 0x2a, 0x0b];
+        let fds = || std::fs::read_dir("/dev/fd").map_or(0, |d| d.count());
+        let before = fds();
+        // Compiled (a miss) and then hit, two hundred of each: none keeps
+        // its file open.
+        let mut held = Vec::new();
+        for i in 0..200 {
+            let w = wasm.clone();
+            held.push(load_or_compile(&engine, &dir, &format!("m{i}"), move || Ok((w, Vec::new()))).unwrap());
+        }
+        for i in 0..200 {
+            let l = load_or_compile(&engine, &dir, &format!("m{i}"), || panic!("stored: must not rebuild")).unwrap();
+            assert!(l.hit);
+            held.push(l);
+        }
+        assert!(fds() < before + 20, "{} descriptors open for 400 modules", fds() - before);
+        // The files gone (an eviction), the modules still run: their pages
+        // are the mappings'.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let inst = wasmtime::Instance::new(&mut store, &held[399].module, &[]).unwrap();
+        let f = inst.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+        assert_eq!(f.call(&mut store, ()).unwrap(), 42);
     }
 
     #[test]

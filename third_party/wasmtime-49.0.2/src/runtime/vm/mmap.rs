@@ -204,9 +204,14 @@ impl Mmap<UnalignedLength> {
     /// returned.
     pub fn from_file(file: Arc<File>) -> Result<Self> {
         let sys = mmap::Mmap::from_file(&file)?;
+        // gex: the file is not kept open with its mapping (the mapping holds
+        // its pages): a host with a hundred thousand modules mapped from
+        // their cache files had as many descriptors open, past the system's
+        // limit. What wanted it again (a deep clone, a memory image) copies.
+        drop(file);
         Ok(Mmap {
             sys,
-            data: UnalignedLength { file: Some(file) },
+            data: UnalignedLength { file: None },
         })
     }
 
