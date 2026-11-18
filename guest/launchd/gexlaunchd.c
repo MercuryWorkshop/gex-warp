@@ -14,7 +14,9 @@
 // makes a port for each Mach service, and serves requests on the bootstrap
 // port it hands to every process it starts. A job is started when one of
 // its services is first looked up; it checks in and is given the receive right; when it ends, its
-// services get new ports and it can be started again.
+// services keep their ports, as launchd's do: the receive rights come back
+// here with what is queued on them, a client's send right stays good, and
+// the job is started again when a message waits on one of them.
 //
 // The requests arrive as libxpc sends them, an XPC pipe routine
 // (subsystem 5) of a dictionary, and are read and answered with the same
@@ -56,6 +58,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
 
@@ -122,6 +125,11 @@ struct job {
     // set in its process as launchd sets them. talagent will not run
     // without its NSRunningFromLaunchd.
     char **env;
+    // When it last ended (0: it has not), and whether by failing (not
+    // exit 0): one that failed is started again on demand no sooner than
+    // ten seconds after, launchd's throttle.
+    time_t ended;
+    int failed;
 };
 
 static struct service *services;
@@ -282,7 +290,7 @@ static void add_job(const char *path) {
     if (program) argv[n + 1] = program;  // (the file, kept past the arguments)
     jobs = realloc(jobs, (njobs + 1) * sizeof *jobs);
     jobs[njobs] = (struct job){label, argv, 0, 0, 0, strstr(path, "/LaunchAgents/") != NULL,
-                               dup_string(xpc_dictionary_get_value(plist, "UserName")), dup_string(xpc_dictionary_get_value(plist, "GroupName")), NULL};
+                               dup_string(xpc_dictionary_get_value(plist, "UserName")), dup_string(xpc_dictionary_get_value(plist, "GroupName")), NULL, 0, 0};
     xpc_object_t env = xpc_dictionary_get_value(plist, "EnvironmentVariables");
     if (env && xpc_get_type(env) == XPC_TYPE_DICTIONARY && xpc_dictionary_get_count(env)) {
         char **e = calloc(xpc_dictionary_get_count(env) + 1, sizeof *e);
@@ -692,22 +700,41 @@ static void *serve(void *arg) {
     return NULL;
 }
 
-// A job ended: its services get new ports (the old receive rights died
-// with it), and it may be started again.
+// A job ended: it may be started again. Its services keep their ports, as
+// launchd's do: each receive right it held comes back (take_back), with
+// the messages queued on it, and a client keeps the send right it has --
+// an XPC service that ends when idle (FontWorker) is sent to again on the
+// same connection, and fontd waited forever on a request queued as its
+// worker ended, when the port went with the job.
 static void ended(pid_t pid, int status) {
     pthread_mutex_lock(&lock);
     for (int i = 0; i < njobs; i++) {
         if (jobs[i].pid != pid) continue;
         say("%s ended, status %x", jobs[i].label, status);
         jobs[i].pid = 0;
-        for (int k = 0; k < nservices; k++) {
-            if (job_of(&services[k]) != &jobs[i]) continue;
-            if (services[k].send) mach_port_deallocate(mach_task_self(), services[k].send);
-            if (services[k].recv) mach_port_mod_refs(mach_task_self(), services[k].recv, MACH_PORT_RIGHT_RECEIVE, -1);
-            services[k].send = services[k].recv = MACH_PORT_NULL;
-        }
+        jobs[i].ended = time(NULL);
+        jobs[i].failed = status != 0;
     }
     pthread_mutex_unlock(&lock);
+}
+
+// The jobs that have ended and have a message waiting on one of their
+// services' ports, wanted again (launchd's start on demand); one that
+// failed, ten seconds after at the soonest. With the lock held.
+static void want_waited_on(void) {
+    time_t now = time(NULL);
+    for (int k = 0; k < nservices; k++) {
+        struct service *s = &services[k];
+        struct job *j = job_of(s);
+        if (!j || j->pid > 0 || j->wanted || !j->ended || s->recv == MACH_PORT_NULL || (j->failed && now - j->ended < 10)) continue;
+        mach_port_status_t st;
+        mach_msg_type_number_t n = MACH_PORT_RECEIVE_STATUS_COUNT;
+        if (mach_port_get_attributes(mach_task_self(), s->recv, MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&st, &n) != KERN_SUCCESS) continue;
+        if (st.mps_msgcount > 0) {
+            say("%s: %u message(s) waiting for %s", s->name, (unsigned)st.mps_msgcount, j->label);
+            want_job(j);
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -807,6 +834,9 @@ int main(int argc, char **argv) {
             (void)!read(wake[0], buf, sizeof buf);
         }
         pthread_mutex_lock(&lock);
+        // (Every second: whether an ended job's port has a message.)
+        static int ticks;
+        if (++ticks % 10 == 0) want_waited_on();
         for (int k = 0; k < njobs; k++)
             if (jobs[k].wanted) start_job(&jobs[k]);
         pthread_mutex_unlock(&lock);
