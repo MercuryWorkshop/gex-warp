@@ -573,8 +573,17 @@ struct Jit {
     cache: Option<(std::path::PathBuf, String)>,
     /// Instances live here because the table holds funcrefs into them.
     instances: Vec<wasmtime::Instance>,
-    /// Registry entries already instantiated into this store.
+    /// Registry entries this store has taken ([`take_unit`]): installed, or
+    /// (a unit of the lazy kind) its tables grown and directory written.
     replayed: usize,
+    /// The units instantiated in this store, by `CompiledUnit::module_id`:
+    /// where in `instances`. A unit published by another thread is
+    /// instantiated here at this store's first miss on one of its blocks
+    /// ([`ensure_provided`]), not when it is published.
+    have: std::collections::HashMap<u64, usize>,
+    /// Addresses whose provider this store had instantiated and still
+    /// missed: instantiated once more for each ([`ensure_provided`]).
+    refilled: std::collections::HashSet<u64>,
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
@@ -586,7 +595,7 @@ impl Jit {
     /// A store's half of `shared`, before anything is replayed into it.
     fn new(shared: Arc<Mutex<JitShared>>, engine: Engine, linker: Linker<HostState>, tables: Vec<Table>, cache: Option<(std::path::PathBuf, String)>, limits: gex_xlate::BlockLimits) -> Jit {
         let processes = Arc::clone(&shared.lock().unwrap_or_else(|e| e.into_inner()).processes);
-        Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, limits, ftab: None, processes }
+        Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, have: std::collections::HashMap::new(), refilled: std::collections::HashSet::new(), limits, ftab: None, processes }
     }
 }
 
@@ -665,6 +674,9 @@ struct JitShared {
     /// Blocks a publish did not count as translated because their page was
     /// retired after the translation's snapshot (their slots are abandoned).
     stale_blocks: usize,
+    /// The units by their `module_id` (those with a module of their own):
+    /// what [`ensure_provided`] instantiates in a store that has not.
+    by_id: std::collections::HashMap<u64, Arc<CompiledUnit>>,
     /// Which translation (`TranslatedModule::module_id`) provides each
     /// translated address: a block failing its page check is translated
     /// again only while its own module still does (`PAGE_STALE`).
@@ -773,6 +785,7 @@ impl JitShared {
             retired_pages: self.retired_pages.clone(),
             stale_blocks: self.stale_blocks,
             provider: self.provider.clone(),
+            by_id: self.by_id.clone(),
             ftab: self.ftab.fork_copy(),
             wasm_program: self.wasm_program,
             wine_pe: self.wine_pe.clone(),
@@ -1805,6 +1818,7 @@ fn run_program_with(
                 retired_pages: Default::default(),
                 stale_blocks: 0,
                 provider: Default::default(),
+                by_id: Default::default(),
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
@@ -4267,7 +4281,7 @@ fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
         sh.registry[from.min(sh.registry.len())..].to_vec()
     };
     for unit in &pending {
-        install_unit(&mut *store, unit)?;
+        take_unit(&mut *store, unit)?;
         store.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
     Ok(())
@@ -6289,8 +6303,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // not necessarily in this thread's table yet: without
                     // the catch-up, dispatch reached the stale block again,
                     // which asked again, for ever (x64 mtx under load, all
-                    // threads at one return address).
+                    // threads at one return address). Instantiated here if
+                    // this store has not (`take_unit`).
                     catch_up_in_caller(&mut caller)?;
+                    ensure_provided(&mut caller, key)?;
                 }
                 return Ok(());
             }
@@ -6601,6 +6617,11 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     // never served by a unit or function of the process's own class.
     let alt = thread_alt(caller);
     let key = gex_abi::addr_key(pc, alt);
+    // Translated already, by a unit this store has not instantiated yet
+    // (`take_unit`): that, and nothing more.
+    if ensure_provided(caller, key)? {
+        return Ok(Some(true));
+    }
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let replayed = replay_registry(caller)?;
         let covered = replayed && {
@@ -6620,6 +6641,7 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.translated.contains(&key)
     } {
+        ensure_provided(caller, key)?;
         return Ok(Some(true));
     }
 
@@ -6799,6 +6821,7 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     // instances of the same modules.
     publish_unit(&shared, &translated_module, module, stats.blocks)?;
     replay_registry(caller)?;
+    ensure_provided(caller, key)?;
 
     // If the address that faulted did not end up with code, resuming would
     // fault again at the same place forever. Say so instead -- unless its
@@ -6922,7 +6945,7 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
         sh.registry[from..].to_vec()
     };
     for unit in &pending {
-        install_unit(&mut *caller, unit)?;
+        take_unit(&mut *caller, unit)?;
         caller.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
     refresh_callouts(&mut *caller)?;
@@ -7004,6 +7027,9 @@ fn publish_unit(
             *by.entry(*a / gex_abi::DISPATCH_PAGE).or_default() += 1;
         }
     }
+    if unit.module.is_some() && unit.module_id != 0 {
+        sh.by_id.insert(unit.module_id, Arc::clone(&unit));
+    }
     sh.registry.push(Arc::clone(&unit));
     crate::REGISTRY_LEN.fetch_max(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
@@ -7031,31 +7057,7 @@ fn install_unit(
             jit.tables.clone(),
         )
     };
-    // Slots are allocated in one space that spans every table, so the figure
-    // the unit carries is a running total and each table's share is that
-    // total clamped to its own window.
-    let per = gex_xlate::PageTable::slots_per_table();
-    let miss = tables[0]
-        .get(cx.as_context_mut(), 0)
-        .ok_or_else(|| anyhow!("dispatch table is empty"))?;
-    for (i, t) in tables.iter().enumerate() {
-        let want = (unit.table_slots as u64)
-            .saturating_sub(i as u64 * per)
-            .min(per);
-        let have = t.size(cx.as_context_mut());
-        if want > have {
-            if have == 0 && i > 0 && per < gex_xlate::PageTable::SLOTS_PER_TABLE {
-                // (GEX_DISPATCH_TABLE_SLOTS: what a test of the later tables checks for)
-                static SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                if SAID.fetch_max(i, std::sync::atomic::Ordering::Relaxed) < i {
-                    eprintln!("gex: dispatch table {i} in use");
-                }
-            }
-            jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
-            t.grow(cx.as_context_mut(), want - have, miss.clone())
-                .with_context(|| format!("growing dispatch table {i}"))?;
-        }
-    }
+    grow_tables(&mut cx, &tables, unit.table_slots)?;
 
     if unit.module.is_none() {
         // Bridges only: tier-1's slots for addresses a function serves.
@@ -7110,6 +7112,9 @@ fn install_unit(
             unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a, alt_dir)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
+    // (lazily, out of publication order: the slots of its blocks another
+    // unit provides now, kept as they are across its instantiation)
+    let kept = if eager_units() { Vec::new() } else { others_slots(&mut cx, &memory, &tables, unit) };
     let instance = linker
         .instantiate(cx.as_context_mut(), unit.module.as_ref().unwrap())
         .context("instantiating a runtime-translated module")?;
@@ -7129,15 +7134,136 @@ fn install_unit(
     // idempotent: it lives in shared guest memory.
     // Only entries still current: replaying an old unit into a new store
     // must not point a page retired since back at its abandoned slots.
-    write_current_dir(&cx, memory, unit)?;
-    cx.as_context_mut()
-        .data_mut()
-        .jit
-        .as_mut()
-        .unwrap()
-        .instances
-        .push(instance);
+    write_current_dir(&cx, memory.clone(), unit)?;
+    {
+        let mut c = cx.as_context_mut();
+        let jit = c.data_mut().jit.as_mut().unwrap();
+        if unit.module_id != 0 {
+            jit.have.insert(unit.module_id, jit.instances.len());
+        }
+        jit.instances.push(instance);
+    }
+    for (t, index, was) in kept {
+        let _ = tables[t].set(cx.as_context_mut(), index, was);
+    }
     Ok(())
+}
+
+/// `GEX_EAGER_UNITS`: every unit instantiated in every store of its process
+/// as soon as the store sees it published (as gex did), rather than at the
+/// store's first miss on one of its blocks ([`ensure_provided`]).
+fn eager_units() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_EAGER_UNITS").is_some())
+}
+
+/// Grow this store's dispatch tables to `table_slots`, the running total of
+/// slots a unit needs (allocated in one space that spans every table: each
+/// table's share is that total clamped to its own window), the new slots
+/// the miss stub.
+fn grow_tables(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, tables: &[Table], table_slots: u64) -> Result<()> {
+    let per = gex_xlate::PageTable::slots_per_table();
+    let miss = tables[0]
+        .get(cx.as_context_mut(), 0)
+        .ok_or_else(|| anyhow!("dispatch table is empty"))?;
+    for (i, t) in tables.iter().enumerate() {
+        let want = table_slots.saturating_sub(i as u64 * per).min(per);
+        let have = t.size(cx.as_context_mut());
+        if want > have {
+            if have == 0 && i > 0 && per < gex_xlate::PageTable::SLOTS_PER_TABLE {
+                // (GEX_DISPATCH_TABLE_SLOTS: what a test of the later tables checks for)
+                static SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if SAID.fetch_max(i, std::sync::atomic::Ordering::Relaxed) < i {
+                    eprintln!("gex: dispatch table {i} in use");
+                }
+            }
+            jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
+            t.grow(cx.as_context_mut(), want - have, miss.clone())
+                .with_context(|| format!("growing dispatch table {i}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// A unit published since this store last looked. A unit with a module of
+/// its own is instantiated in a store only at that store's first miss on
+/// one of its blocks ([`ensure_provided`]); here its slots are made (the
+/// tables grown, holding the miss stub) and its directory entries written.
+/// Every thread's store instantiating every unit of its process cost an
+/// instance per thread per unit: a Mojave desktop's WindowServer, some
+/// forty threads, held hundreds of thousands, most for code the thread
+/// never ran. Bridges, and `GEX_EAGER_UNITS`, are installed as before.
+fn take_unit(mut cx: impl wasmtime::AsContextMut<Data = HostState>, unit: &CompiledUnit) -> Result<()> {
+    if eager_units() || unit.module.is_none() || unit.module_id == 0 {
+        return install_unit(cx, unit);
+    }
+    let (memory, tables) = {
+        let data = cx.as_context().data();
+        let jit = data.jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (data.memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?, jit.tables.clone())
+    };
+    grow_tables(&mut cx, &tables, unit.table_slots)?;
+    write_current_dir(&cx, memory, unit)
+}
+
+/// The unit that provides `key` (an address key: `gex_abi::addr_key`)
+/// now, instantiated in this store if it is not yet: whether it was, the
+/// miss this store took there answered.
+fn ensure_provided(caller: &mut Caller<'_, HostState>, key: u64) -> Result<bool> {
+    if eager_units() {
+        return Ok(false);
+    }
+    let unit = {
+        let Some(jit) = caller.data().jit.as_ref() else { return Ok(false) };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&m) = sh.provider.get(&key) else { return Ok(false) };
+        // (instantiated here already, and its slot missed all the same:
+        // once more, once, should anything have put the miss stub there)
+        if jit.have.contains_key(&m) && jit.refilled.contains(&key) {
+            return Ok(false);
+        }
+        let Some(u) = sh.by_id.get(&m) else { return Ok(false) };
+        Arc::clone(u)
+    };
+    {
+        let jit = caller.data_mut().jit.as_mut().unwrap();
+        if jit.have.contains_key(&unit.module_id) {
+            jit.refilled.insert(key);
+        }
+    }
+    install_unit(&mut *caller, &unit)?;
+    refresh_callouts(&mut *caller)?;
+    Ok(true)
+}
+
+/// The slots of `unit`'s blocks that another unit provides now, and what
+/// this store holds in each: put back once `unit` is instantiated (its
+/// element segments fill all its blocks' slots). A unit instantiated out of
+/// the order units were published in (at a miss, [`ensure_provided`]) so
+/// never stands over the translation that replaced one of its blocks: the
+/// slot keeps that one's code, or the miss stub that instantiates it.
+fn others_slots(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, memory: &gex_mem::GuestMemory, tables: &[Table], unit: &CompiledUnit) -> Vec<(usize, u64, wasmtime::Ref)> {
+    let alt = unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0);
+    let (addrs, alt_dir): (Vec<u64>, Option<u64>) = {
+        let jit = cx.as_context().data().jit.as_ref().unwrap();
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let addrs = unit
+            .exported_blocks
+            .iter()
+            .map(|&(a, _)| a)
+            .filter(|&a| sh.provider.get(&gex_abi::addr_key(a, alt)).is_some_and(|&m| m != unit.module_id))
+            .collect();
+        (addrs, alt.then_some(sh.alt_dir))
+    };
+    let mut kept = Vec::new();
+    for a in addrs {
+        let Some(slot) = dispatch_slot_of(memory, a, alt_dir) else { continue };
+        let Some(t) = tables.get(slot.table) else { continue };
+        if let Some(was) = t.get(cx.as_context_mut(), slot.index) {
+            kept.push((slot.table, slot.index, was));
+        }
+    }
+    kept
 }
 
 /// Write `unit`'s directory entries that are still the page table's, checked
