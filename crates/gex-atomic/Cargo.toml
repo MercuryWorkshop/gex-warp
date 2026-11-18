@@ -7,3 +7,7 @@ description = "Atomic operations on a word of guest memory, for the kernel (whic
 
 [dependencies]
 gex-abi.workspace = true
+
+# The futex a parked thread waits on (park.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

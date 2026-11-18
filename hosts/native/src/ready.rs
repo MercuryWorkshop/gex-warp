@@ -13,42 +13,73 @@
 //! One sequence for the whole host rather than a queue per descriptor: a
 //! wake costs every parked thread one re-check, but only syscalls that touch
 //! descriptors wake anyone, and only while someone is parked.
+//!
+//! The parked threads wait on the sequence's word itself (the host's
+//! compare-and-wait, `gex_atomic::park`: `__ulock_wait2` on macOS, a futex
+//! on Linux), with no lock of ours: a desktop's hundreds of parked threads,
+//! every one woken by each notification, used to queue on one mutex to
+//! leave their condition wait, and every notifier with them (the most
+//! contended lock of a Mojave desktop run once the process table's were
+//! gone). Elsewhere, a mutex and condition variable as before.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
+/// The sequence (its low 32 bits: a wait compares a word of 32).
+static SEQ: AtomicU32 = AtomicU32::new(0);
 static PARKED: AtomicUsize = AtomicUsize::new(0);
-static LOCK: Mutex<()> = Mutex::new(());
-static CV: Condvar = Condvar::new();
 
 /// The current sequence number: take it before checking the descriptors,
 /// then pass it to [`wait`].
 pub fn seq() -> u64 {
-    SEQ.load(SeqCst)
+    SEQ.load(SeqCst) as u64
 }
 
 /// Something may have become ready: wake every parked thread.
 pub fn notify() {
     SEQ.fetch_add(1, SeqCst);
     if PARKED.load(SeqCst) > 0 {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        CV.notify_all();
+        word::wake_all(&SEQ);
     }
 }
 
 /// Park until [`notify`] has run since `seen` was taken, or `max` passes.
-/// The check of the sequence and the sleep are under one lock, and a
-/// notifier takes that lock to wake, so no notification is lost between
-/// the caller's check of its descriptors and the sleep.
+/// No notification is lost between the caller's check of its descriptors
+/// and the sleep: the parked count is raised before the sequence is looked
+/// at again (a notifier that moves it after that sees the count and wakes),
+/// and the host's wait compares the word with `seen` as it sleeps.
 pub fn wait(seen: u64, max: Duration) {
     PARKED.fetch_add(1, SeqCst);
-    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if SEQ.load(SeqCst) == seen {
-        let _ = CV.wait_timeout(g, max);
+    if SEQ.load(SeqCst) == seen as u32 {
+        word::wait(&SEQ, seen as u32, max);
     }
     PARKED.fetch_sub(1, SeqCst);
+}
+
+/// Waiting on a word until it is no longer a value, and waking its waiters.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use gex_atomic::park as word;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod word {
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static CV: Condvar = Condvar::new();
+
+    pub fn wait(w: &AtomicU32, value: u32, max: Duration) {
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if w.load(SeqCst) == value {
+            let _ = CV.wait_timeout(g, max);
+        }
+    }
+
+    pub fn wake_all(_: &AtomicU32) {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        CV.notify_all();
+    }
 }
 
 #[cfg(test)]

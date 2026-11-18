@@ -563,6 +563,7 @@ name = "gex-atomic"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "libc",
 ]
 
 [[package]]

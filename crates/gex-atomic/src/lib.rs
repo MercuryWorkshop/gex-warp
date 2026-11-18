@@ -13,6 +13,8 @@
 //! slice) and an offset, and fails (`None`) for an offset that is out of
 //! range or not 4-aligned, as the futex syscalls require.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod park;
 pub mod mem;
 pub mod rcu;
 pub mod threads;
