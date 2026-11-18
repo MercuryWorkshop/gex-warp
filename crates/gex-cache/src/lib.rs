@@ -477,7 +477,13 @@ pub fn load_or_compile(
     }
 
     let (wasm, metadata) = build()?;
-    let mut module = compile(engine, &wasm).context("validating translated wasm")?;
+    // Not `compile`: its host-wide memo of a large module would keep this
+    // one in memory for the life of the host process, beside the mapped
+    // one that replaces it below and the entry that serves the next process
+    // to ask (a desktop's runtime translations of 1 MB and more, 1.6 GB of
+    // compiled code 25 minutes in). A caller that wants one kept wraps this
+    // in the memo itself (`load_or_compile_module`).
+    let mut module = compile_uncached(engine, &wasm).context("validating translated wasm")?;
     if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
