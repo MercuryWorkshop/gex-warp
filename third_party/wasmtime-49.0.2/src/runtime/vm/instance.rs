@@ -818,6 +818,21 @@ impl Instance {
         Ok(result)
     }
 
+    /// (gex) [`Table::reserve_lazily`] for a table defined here, its
+    /// `VMTableDefinition` written again (its storage may have moved).
+    pub(crate) fn defined_table_reserve_lazily(
+        mut self: Pin<&mut Self>,
+        table_index: DefinedTableIndex,
+        capacity: usize,
+        func_ref: NonNull<VMFuncRef>,
+    ) -> Result<bool> {
+        let table = self.as_mut().get_defined_table(table_index);
+        let ok = table.reserve_lazily(capacity, func_ref)?;
+        let element = table.vmtable();
+        self.set_table(table_index, element);
+        Ok(ok)
+    }
+
     fn alloc_layout(offsets: &VMOffsets<HostPtr>) -> Layout {
         let size = mem::size_of::<Self>()
             .checked_add(usize::try_from(offsets.size_of_vmctx()).unwrap())
@@ -1106,8 +1121,12 @@ impl Instance {
                 let precomputed = &module.table_initialization[idx];
                 // Panicking here helps catch bugs rather than silently truncating by accident.
                 let func_index = precomputed.get(usize::try_from(i).unwrap()).cloned();
-                let func_ref = func_index
-                    .and_then(|func_index| self.as_mut().get_func_ref(registry, func_index));
+                // (gex) Past what the module initializes, the default
+                // `reserve_lazily` gave the table, if any.
+                let func_ref = match func_index {
+                    Some(func_index) => self.as_mut().get_func_ref(registry, func_index),
+                    None => self.tables[idx].1.lazy_default(i),
+                };
                 self.as_mut().tables_mut()[idx]
                     .1
                     .set_func(i, func_ref)

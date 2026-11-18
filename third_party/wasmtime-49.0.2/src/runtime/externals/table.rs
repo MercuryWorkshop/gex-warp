@@ -361,6 +361,47 @@ impl Table {
         Ok(start)
     }
 
+    /// (gex) [`Table::grow`] for a funcref table grown with the same `init`
+    /// every time and set only here and there afterwards (gex's dispatch
+    /// tables: a thread's table has a slot for every address its process
+    /// has translated, nearly all of them the miss handler): the new
+    /// elements are not written, and read as `init` until set (lazy
+    /// initialization, which the engine's `table_lazy_init` must have on).
+    /// The first call gives the table storage for `reserve` elements, a
+    /// mapping of its own touched only where set, so growing within that
+    /// costs neither time nor memory. Where the table cannot be grown so, a
+    /// plain [`Table::grow`].
+    pub fn grow_lazily(&self, mut store: impl AsContextMut, delta: u64, init: Ref, reserve: u64) -> Result<u64> {
+        let store = store.as_context_mut();
+        let ty = self.ty_(store.0);
+        let lazy = match element_type(&ty) {
+            TableElementType::Func => match init.clone().into_table_func(store.0, ty.element())? {
+                Some(func_ref) => {
+                    let capacity = usize::try_from(reserve).unwrap_or(usize::MAX);
+                    self.instance
+                        .get_mut(store.0)
+                        .defined_table_reserve_lazily(self.index, capacity, func_ref)?
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if !lazy {
+            return self.grow(store, delta, init);
+        }
+        store.0.validate_sync_resource_limiter_and_store_opaque()?;
+        let (mut limiter, opaque) = store.0.resource_limiter_and_store_opaque();
+        // SAFETY: the new elements are uninitialized, which lazy
+        // initialization reads as `init` (`reserve_lazily`).
+        let result = vm::assert_ready(unsafe {
+            self.instance.get_mut(opaque).defined_table_grow(self.index, limiter.as_mut(), delta)
+        })?;
+        match result {
+            Some(size) => Ok(u64::try_from(size).unwrap()),
+            None => bail!("failed to grow table by `{delta}`"),
+        }
+    }
+
     /// Async variant of [`Table::grow`].
     ///
     /// Required when using a

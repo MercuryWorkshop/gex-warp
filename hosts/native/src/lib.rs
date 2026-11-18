@@ -7320,11 +7320,64 @@ fn grow_tables(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, tables: &
             if let Some(j) = cx.as_context_mut().data_mut().jit.as_mut() {
                 j.grown += want - have;
             }
-            t.grow(cx.as_context_mut(), want - have, miss.clone())
+            // Not written: the new slots read as the miss stub until a unit
+            // instantiated in this store sets them (`Table::grow_lazily`, a
+            // gex change to wasmtime), and the table's storage, reserved for
+            // the most it can hold, is untouched memory except where set.
+            // Every thread's tables have a slot for every address its
+            // process has translated, and filled each with the stub: a
+            // desktop's 125 million slots were 1 GB of host memory, and a
+            // second of `Table::set` per store for a large process.
+            t.grow_lazily(cx.as_context_mut(), want - have, miss.clone(), per)
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lazy_table_tests {
+    use wasmtime::{Engine, Instance, Module, Ref, Store};
+
+    /// A table grown lazily (`Table::grow_lazily`) reads as the element it
+    /// was grown with wherever nothing set it, from wasm and from the host;
+    /// what is set stays set; what was there before is as it was; and a
+    /// growth with another element is a plain one, filled.
+    #[test]
+    fn a_table_grown_lazily_reads_as_its_element_until_set() {
+        // (table (export "t") 2 funcref) (elem (i32.const 0) $a)
+        // $a: i32.const 1, $b: i32.const 2, exported "a", "b";
+        // "call" (param i32): call_indirect of the slot.
+        let wasm = [
+            0, 97, 115, 109, 1, 0, 0, 0, 1, 10, 2, 96, 0, 1, 127, 96, 1, 127, 1, 127, 3, 4, 3, 0, 0, 1, 4, 4, 1, 112, 0, 2, 7, 20, 4, 1, 116, 1, 0, 4, 99, 97, 108, 108, 0, 2, 1, 97, 0, 0,
+            1, 98, 0, 1, 9, 7, 1, 0, 65, 0, 11, 1, 0, 10, 19, 3, 4, 0, 65, 1, 11, 4, 0, 65, 2, 11, 7, 0, 32, 0, 17, 0, 0, 11,
+        ];
+        let engine = Engine::default();
+        let module = Module::new(&engine, wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let t = inst.get_table(&mut store, "t").unwrap();
+        let call = inst.get_typed_func::<i32, i32>(&mut store, "call").unwrap();
+        let (a, b) = (inst.get_func(&mut store, "a").unwrap(), inst.get_func(&mut store, "b").unwrap());
+        assert_eq!(t.grow_lazily(&mut store, 1000, Ref::Func(Some(b)), 1 << 20).unwrap(), 2);
+        assert_eq!(t.size(&store), 1002);
+        assert_eq!(call.call(&mut store, 0).unwrap(), 1, "what the module put there");
+        assert!(call.call(&mut store, 1).is_err(), "a slot from before stays null");
+        assert_eq!(call.call(&mut store, 2).unwrap(), 2);
+        assert_eq!(call.call(&mut store, 1001).unwrap(), 2);
+        t.set(&mut store, 7, Ref::Func(Some(a))).unwrap();
+        assert_eq!(call.call(&mut store, 7).unwrap(), 1, "what is set stays set");
+        assert_eq!(call.call(&mut store, 8).unwrap(), 2);
+        let Some(Ref::Func(Some(read))) = t.get(&mut store, 500) else { panic!("the host reads it as a function") };
+        assert_eq!(read.typed::<(), i32>(&store).unwrap().call(&mut store, ()).unwrap(), 2, "the host reads it too");
+        assert!(call.call(&mut store, 1002).is_err(), "and not past the end");
+        // Grown again, the same way and then with another element (filled).
+        assert_eq!(t.grow_lazily(&mut store, 10, Ref::Func(Some(b)), 1 << 20).unwrap(), 1002);
+        assert_eq!(call.call(&mut store, 1011).unwrap(), 2);
+        assert_eq!(t.grow_lazily(&mut store, 10, Ref::Func(Some(a)), 1 << 20).unwrap(), 1012);
+        assert_eq!(call.call(&mut store, 1015).unwrap(), 1);
+        assert_eq!(call.call(&mut store, 1005).unwrap(), 2);
+    }
 }
 
 /// A unit published since this store last looked. A unit with a module of

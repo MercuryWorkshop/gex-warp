@@ -78,6 +78,9 @@ debug = 1
 # `wasm_fault`): several instances claiming one shared memory is not an
 # assertion failure. Every module import of the guest's SharedMemory creates
 # such an instance, so without it a guest fault in a guard page panicked the
-# host instead of reaching the guest as SIGSEGV / an access violation.
+# host instead of reaching the guest as SIGSEGV / an access violation. And
+# `Table::grow_lazily` (runtime/externals/table.rs, vm/table.rs,
+# vm/instance.rs): a funcref table grown without writing its new elements,
+# which read as the one it was grown with until set (gex's dispatch tables).
 [patch.crates-io]
 wasmtime = { path = "third_party/wasmtime-49.0.2" }

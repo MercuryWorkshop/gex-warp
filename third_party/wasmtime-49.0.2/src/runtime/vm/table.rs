@@ -190,6 +190,32 @@ pub struct DynamicFuncTable {
     maximum: Option<usize>,
     /// Whether elements of this table are initialized lazily.
     lazy_init: bool,
+    /// (gex) What an element from `lazy.from` on reads as until it is set,
+    /// and the reservation `elements` is in: see [`Table::reserve_lazily`].
+    lazy: Option<LazyDefault>,
+}
+
+/// (gex) A dynamic funcref table's default element ([`Table::reserve_lazily`]).
+struct LazyDefault {
+    /// The element uninitialized ones from `from` on are initialized to.
+    func_ref: SendSyncPtr<VMFuncRef>,
+    from: usize,
+    /// The table's storage while its elements are in it: a mapping of its
+    /// own, zero where not written, so growing within it writes nothing.
+    /// (Not the allocator's: a large block it hands out again from those
+    /// it keeps is zeroed by writing every page of it, which made a
+    /// desktop's reserved tables resident whole.)
+    storage: Option<super::mmap::Mmap<super::mmap::AlignedLength>>,
+}
+
+impl Drop for DynamicFuncTable {
+    fn drop(&mut self) {
+        // (elements in the reservation are the mapping's, not the
+        // allocator's to free)
+        if self.lazy.as_ref().is_some_and(|l| l.storage.is_some()) {
+            mem::forget(mem::take(&mut self.elements));
+        }
+    }
 }
 
 pub struct DynamicGcRefTable {
@@ -339,6 +365,7 @@ impl Table {
                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
                 maximum,
                 lazy_init: tunables.table_lazy_init,
+                lazy: None,
             })),
             TableElementType::GcRef => Ok(Self::from(DynamicGcRefTable {
                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
@@ -697,8 +724,29 @@ impl Table {
             // loading the base address. However, in that case the above checks
             // that delta is non-zero and the new size doesn't exceed the
             // maximum mean we can't get here.
-            Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, .. })) => {
-                elements.resize_with(new_size, || None)?;
+            Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, lazy, .. })) => {
+                match lazy {
+                    // (gex) Within the reservation: the new elements are
+                    // zero (uninitialized) already, and left untouched.
+                    Some(l) if l.storage.is_some() && new_size <= elements.capacity() => {
+                        let (ptr, _, cap) = mem::take(elements).into_raw_parts();
+                        // SAFETY: the mapping's elements up to `cap` are
+                        // initialized, zero (`None`) past the old length.
+                        *elements = unsafe { TryVec::from_raw_parts(ptr, new_size, cap) };
+                    }
+                    // Past it: into memory of the allocator's.
+                    Some(l) if l.storage.is_some() => {
+                        // SAFETY: a funcref table's element, whose `None` is zero.
+                        let mut moved = unsafe { alloc_dynamic_table_elements::<SendSyncPtr<VMFuncRef>>(new_size)? };
+                        let old = elements.len();
+                        moved[..old].copy_from_slice(&elements[..old]);
+                        mem::forget(mem::replace(elements, moved));
+                        l.storage = None;
+                    }
+                    _ => {
+                        elements.resize_with(new_size, || None)?;
+                    }
+                }
             }
             Table::Dynamic(DynamicTable::GcRef(DynamicGcRefTable { elements, .. })) => {
                 elements.resize_with(new_size, || None)?;
@@ -709,6 +757,70 @@ impl Table {
         }
 
         Ok(Some(old_size))
+    }
+
+    /// (gex) Make this funcref table's elements from its current size on
+    /// read as `func_ref` until set, and give it `capacity` elements of
+    /// storage in a mapping of its own (untouched memory, which costs
+    /// nothing until written), so that growing it within that writes
+    /// nothing: a table
+    /// grown with the same element everywhere and set only here and there
+    /// then costs memory only where it is set. Elements past the size read
+    /// as `func_ref` by lazy initialization, so the table must be lazily
+    /// initialized. Returns whether this table can be: a dynamic funcref
+    /// table with lazy initialization, without a different default already.
+    /// The caller writes the instance's `VMTableDefinition` afterwards (the
+    /// storage may move).
+    #[cfg(has_virtual_memory)]
+    pub fn reserve_lazily(&mut self, capacity: usize, func_ref: NonNull<VMFuncRef>) -> Result<bool> {
+        let Table::Dynamic(DynamicTable::Func(t)) = self else { return Ok(false) };
+        if !t.lazy_init {
+            return Ok(false);
+        }
+        if let Some(l) = &t.lazy {
+            return Ok(l.func_ref.as_ptr() == func_ref.as_ptr());
+        }
+        let len = t.elements.len();
+        let capacity = capacity.max(len);
+        if let Some(max) = t.maximum {
+            if capacity > max && len <= max {
+                // (no more than the table can ever hold)
+                return self.reserve_lazily(max, func_ref);
+            }
+        }
+        let size = mem::size_of::<FuncTableElem>();
+        let bytes = capacity
+            .checked_mul(size)
+            .ok_or_else(|| format_err!("overflow calculating table reservation size"))?;
+        let storage = super::mmap::Mmap::with_at_least(bytes)?;
+        let cap = storage.len() / size;
+        let ptr = storage.as_mut_ptr().cast::<FuncTableElem>();
+        // SAFETY: the mapping holds `cap` elements, page-aligned, zero
+        // (`None`) everywhere; the first `len` take the table's own.
+        unsafe { core::ptr::copy_nonoverlapping(t.elements.as_ptr(), ptr, len) };
+        drop(mem::replace(&mut t.elements, unsafe { TryVec::from_raw_parts(ptr, len, cap) }));
+        t.lazy = Some(LazyDefault { func_ref: SendSyncPtr::new(func_ref), from: len, storage: Some(storage) });
+        Ok(true)
+    }
+
+    /// (gex) Without virtual memory there is no reservation: grown as ever.
+    #[cfg(not(has_virtual_memory))]
+    pub fn reserve_lazily(&mut self, _capacity: usize, _func_ref: NonNull<VMFuncRef>) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// (gex) What uninitialized element `index` of this table is initialized
+    /// to when its module's initialization says nothing of it
+    /// ([`Self::reserve_lazily`]).
+    pub(crate) fn lazy_default(&self, index: u64) -> Option<NonNull<VMFuncRef>> {
+        match self {
+            Table::Dynamic(DynamicTable::Func(DynamicFuncTable { lazy: Some(l), .. }))
+                if usize::try_from(index).is_ok_and(|i| i >= l.from) =>
+            {
+                Some(l.func_ref.as_non_null())
+            }
+            _ => None,
+        }
     }
 
     /// Get reference to the specified element.
