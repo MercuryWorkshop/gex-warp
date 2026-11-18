@@ -25,6 +25,14 @@
 // which is how an XPC client's wait for a reply ends when its server ends
 // without one.
 //
+// And a receive right that asked to be given back when its holder ends
+// (`machipc destroyed`), against the Mac, as an XPC client's connection
+// port does: it comes back (MACH_NOTIFY_PORT_DESTROYED) under the name of
+// the send right the parent kept, in XNU's 40 bytes (MIG's notify servers
+// check the size: libxpc's refused gex's 48 and left fontd waiting for
+// good), its queued requests with it; destroyed, the one still queued tells
+// its reply port. The dead-name and no-senders notices' sizes are said too.
+//
 // Under gexc only: on the page each process has a kernel of its own, and a
 // port does not yet leave its task there.
 import { darwin } from '../lib/darwin.mjs';
@@ -36,6 +44,7 @@ export default async function (t) {
   const prog = await d.build('machipc');
   await d.compare('machipc', prog, [], { timeout: 60000 });
   await d.compare('machipc once', prog, ['once'], { timeout: 60000 });
+  await d.compare('machipc destroyed', prog, ['destroyed'], { timeout: 60000 });
   const r = await d.gex(prog, ['task'], { timeout: 60000 });
   const lines = r.stdout.split('\n');
   const has = (line, what) => t.check(what, lines.includes(line), `exit ${r.code}: ${JSON.stringify(r.stdout)} / ${r.stderr.trim().split('\n').slice(-2).join(' / ')}`);

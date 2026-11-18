@@ -27,6 +27,19 @@
 // (MACH_NOTIFY_SEND_ONCE, 71, on each reply port): what an XPC client's
 // wait for a reply ends with when its server ends without one (fontd's
 // for fontworker, which ends when it has been idle ten seconds).
+//
+// `machipc destroyed`: a receive right that asked to be given back
+// (MACH_NOTIFY_PORT_DESTROYED), as an XPC client's connection port does:
+// the parent keeps a send right to it, gives the receive right to the
+// child, and sends two requests there, each with a send-once right to a
+// reply port; the child ends without receiving either. The right comes back
+// to the parent from the kernel (69, under the name of its send right; 40
+// bytes, no NDR record, as MIG's notify server wants it),
+// the requests still queued on it; the parent takes the first, then
+// destroys the right (mach_port_destruct, as libxpc does with a right that
+// came back): the second request goes with it, and its reply port is told
+// (71) -- the end of an XPC client's wait for a reply its server never
+// took.
 #include "t.h"
 
 // A trap with eight arguments: mach_msg2's.
@@ -45,7 +58,7 @@ __asm__(".text\n.globl _t_trap8\n_t_trap8:\n"
 
 enum {
     TRAP_port_allocate = 16, TRAP_port_mod_refs = 19, TRAP_port_guard = 41, TRAP_port_unguard = 42, TRAP_mach_msg = 31, TRAP_mach_msg2 = 47, TRAP_port_type = 76,
-    TRAP_pid_for_task = 46, TRAP_port_destroy = 17, TRAP_port_insert_right = 21,
+    TRAP_pid_for_task = 46, TRAP_port_destroy = 17, TRAP_port_insert_right = 21, TRAP_port_destruct = 25,
 };
 enum { RIGHT_SEND = 0, RIGHT_RECEIVE = 1 };
 enum { MOVE_SEND = 17, MOVE_SEND_ONCE = 18, COPY_SEND = 19, MAKE_SEND = 20, MAKE_SEND_ONCE = 21 };
@@ -359,8 +372,92 @@ static int once_parent(void) {
     return 0;
 }
 
+// `machipc destroyed`, the child: a send-once right to a port of its own,
+// to the bootstrap port; the receive right that comes back by it, kept
+// unreceived from; and the end, a while after.
+static int destroyed_child(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = get_special(4);
+    if (!boot) return 1;
+    u32 mine = allocate(RIGHT_RECEIVE);
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = boot, m.h.local = mine, m.h.id = 800;
+    if (msg1(&m, SEND_MSG, sizeof m.h, 0, 0, 0)) return 2;
+    t_memset(&m, 0, sizeof m);
+    if (msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, mine, 10000)) return 4;
+    struct port_desc *d = (struct port_desc *)(m.body + 1);
+    if (m.h.id != 801 || !(m.h.bits & COMPLEX) || d->disposition != 16 || !d->name) return 8;
+    // (The parent sends its requests there meanwhile.)
+    static struct { long s, us; } wait = {0, 300000};
+    SYS(SYS_select, 0, 0, 0, 0, &wait);
+    return 0;
+}
+
+// `machipc destroyed`, the parent.
+static int destroyed_parent(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = allocate(RIGHT_RECEIVE);
+    if (set_special(4, boot)) return 1;
+    u32 note = allocate(RIGHT_RECEIVE), conn = allocate(RIGHT_RECEIVE);
+    TRAP(TRAP_port_insert_right, task, conn, conn, MAKE_SEND);
+    t_printf("ask for the right back: %ld\n", ask_notice(conn, 69, 0, note));
+    long pid = 0, child_flag = -1;
+    pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
+    if (pid < 0) return 1;
+    if (child_flag) t_exit(destroyed_child());
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    long r = msg1(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, boot, 10000);
+    t_printf("received: %ld, id %d, a reply right: %s\n", r, m.h.id, m.h.remote ? "yes" : "no");
+    // The receive right, to the child.
+    u32 reply = m.h.remote;
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COMPLEX | MOVE_SEND_ONCE, m.h.remote = reply, m.h.id = 801;
+    m.body[0] = 1;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){conn, 0, 0, 16, 0};
+    t_printf("the receive right sent: %ld, ours now type %x\n", msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h + 16, 0, 0, 0), type_of(conn));
+    // Two requests there, each with a send-once right to a reply port.
+    u32 rp[2];
+    for (int i = 0; i < 2; i++) {
+        rp[i] = allocate(RIGHT_RECEIVE);
+        t_memset(&m, 0, sizeof m);
+        m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = conn, m.h.local = rp[i], m.h.id = 802 + i;
+        t_printf("request %d: %ld\n", i + 1, msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h, 0, 0, 0));
+    }
+    int status = -1;
+    long got = SYS(SYS_wait4, pid, &status, 0, 0);
+    t_printf("the child: %s, status %x\n", got == pid ? "waited for" : "not waited for", status);
+    // The right back, from the kernel.
+    t_memset(&m, 0, sizeof m);
+    r = msg2(&m, RCV_MSG | RCV_TIMEOUT | TRAILER_AUDIT, 0, sizeof m, note, 5000);
+    struct port_desc *d = (struct port_desc *)(m.body + 1);
+    u32 *trailer = (u32 *)((char *)&m + ((m.h.size + 3) & ~3u));
+    t_printf("told: %ld, id %d, %u bytes, %u descriptors, disposition %u, %s, sent by %s\n", r, m.h.id, m.h.size, (m.h.bits & COMPLEX) ? m.body[0] : 0,
+             d->disposition, d->name == conn ? "under the send right's name" : d->name ? "under another name" : "no name",
+             trailer[5 + 5] == 0 ? "the kernel" : "a process");
+    t_printf("ours now type %x\n", type_of(conn));
+    for (int i = 0; i < 2; i++) {
+        t_memset(&m, 0, sizeof m);
+        r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, rp[i], 0);
+        t_printf("reply port %d before: %lx\n", i + 1, r);
+    }
+    // The first request, still queued.
+    t_memset(&m, 0, sizeof m);
+    r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, conn, 0);
+    t_printf("on the right: %ld, id %d\n", r, m.h.id);
+    // Destroyed, as libxpc does: the second goes, its reply port told.
+    t_printf("destruct: %ld, now type %x\n", TRAP(TRAP_port_destruct, task, conn, 0, 0), type_of(conn));
+    t_memset(&m, 0, sizeof m);
+    r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, rp[1], 5000);
+    if (r) t_printf("reply port 2: nothing, %lx\n", r);
+    else t_printf("reply port 2: id %d, from %s\n", m.h.id, m.h.remote ? "a port" : "the kernel");
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)envp, (void)apple;
+    if (argc > 1 && !t_strcmp(argv[1], "destroyed")) return destroyed_parent();
     if (argc > 1 && !t_strcmp(argv[1], "task")) return task_parent();
     if (argc > 1 && !t_strcmp(argv[1], "once")) return once_parent();
     task = (u32)TRAP(TRAP_task_self);
@@ -423,14 +520,18 @@ int main(int argc, char **argv, char **envp, char **apple) {
 
     // What the child's end tells: its port is dead, and the second port
     // has no senders. (In whichever order they come.)
+    // (Each in the size XNU sends it, which MIG's notify servers check:
+    // the header, an NDR record and the word.)
     int dead = 0, none = 0;
+    u32 dead_size = 0, none_size = 0;
     for (int i = 0; i < 2; i++) {
         t_memset(&m, 0, sizeof m);
         if (msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, note, 5000)) break;
-        if (m.h.id == 72 && m.body[2] == theirs) dead++;
-        if (m.h.id == 70 && m.body[2] == 1) none++;
+        if (m.h.id == 72 && m.body[2] == theirs) dead++, dead_size = m.h.size;
+        if (m.h.id == 70 && m.body[2] == 1) none++, none_size = m.h.size;
     }
     t_printf("told: %d dead name, %d no senders\n", dead, none);
+    t_printf("their sizes: %u, %u bytes\n", dead_size, none_size);
     u32 t = type_of(theirs);
     t_printf("their port now: %s\n", (t & TYPE_DEAD_NAME) && !(t & TYPE_SEND) ? "a dead name" : "something else");
     // Sending to a dead name.

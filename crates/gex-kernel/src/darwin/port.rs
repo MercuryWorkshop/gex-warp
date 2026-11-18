@@ -463,11 +463,16 @@ fn rescue(port: &Arc<Port>) -> bool {
     if let Some(rx) = rx {
         rx.wake(&wake);
     }
-    // { one port descriptor, NDR }
+    // { one port descriptor }: 40 bytes in all, as XNU sends it and MIG's
+    // notify servers check it (no NDR record: the routine has no data
+    // arguments). One of 48 is refused (MIG_BAD_ARGUMENTS) and its right
+    // left where it is -- libxpc's client then never destroys the right
+    // that came back, nor the request still queued on it, and a sync call
+    // to the server that ended waits for its reply for good (fontd's for
+    // fontworker).
     let mut body = vec![0u8; 16];
     put32(&mut body, 0, 1);
     body[4 + 10] = disp::MOVE_RECEIVE as u8;
-    body.extend_from_slice(&NDR);
     post(&to, Msg { once: true, ..Msg::kernel(notice::PORT_DESTROYED, body, vec![(4, Arc::clone(port), disp::MOVE_RECEIVE)], Vec::new()) })
 }
 
