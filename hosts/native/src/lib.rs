@@ -656,7 +656,9 @@ struct CompiledUnit {
     /// Its `TranslatedModule::module_id`, for its `gex_module_id` global
     /// (`gex_emit::with_module_id_global`); 0 for one without.
     module_id: u64,
-    exported_blocks: Vec<(u64, String)>,
+    /// Where its blocks begin (their export names are the module's own: a
+    /// hundred thousand units' copies of them were ~100 MB).
+    exported_blocks: Box<[u64]>,
     dir_entries: Vec<(u64, u32)>,
     table_slots: u64,
     /// Slots to point at the function table's bridge (`ftab`), each a table
@@ -6948,7 +6950,7 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
         .registry
         .iter()
         .enumerate()
-        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == addr))
+        .filter(|(_, u)| u.exported_blocks.contains(&addr))
         .map(|(i, _)| i)
         .collect();
     let retired = sh.retired_pages.get(&page).copied().unwrap_or(0);
@@ -7028,7 +7030,7 @@ fn publish_unit(
         _live: UnitLive::of(&module),
         module,
         module_id: translated.module_id,
-        exported_blocks: translated.exported_blocks.clone(),
+        exported_blocks: translated.exported_blocks.iter().map(|&(a, _)| a).collect(),
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
         bridges: Vec::new(),
@@ -7165,7 +7167,7 @@ fn install_unit(
     if !cx.as_context().data().callouts.is_empty() {
         let alt_dir = unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0).then(|| other_dir(&cx));
         let slots: std::collections::HashSet<Slot> =
-            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a, alt_dir)).collect();
+            unit.exported_blocks.iter().filter_map(|&a| dispatch_slot_of(&memory, a, alt_dir)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
     // (lazily, out of publication order: the slots of its blocks another
@@ -7311,7 +7313,7 @@ fn others_slots(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, memory: 
         let addrs = unit
             .exported_blocks
             .iter()
-            .map(|&(a, _)| a)
+            .copied()
             .filter(|&a| sh.provider.get(&gex_abi::addr_key(a, alt)).is_some_and(|&m| m != unit.module_id))
             .collect();
         (addrs, alt.then_some(sh.alt_dir))

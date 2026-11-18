@@ -303,7 +303,7 @@ pub(crate) fn install_shared(
             _live: super::UnitLive::of(&module),
             module,
             module_id: 0,
-            exported_blocks: Vec::new(),
+            exported_blocks: Box::new([]),
             dir_entries: meta.dir_entries.clone(),
             table_slots: meta.table_slots,
             bridges: Vec::new(),

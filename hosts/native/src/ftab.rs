@@ -699,7 +699,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
         _live: crate::UnitLive::of(&None),
         module: None,
         module_id: 0,
-        exported_blocks: Vec::new(),
+        exported_blocks: Box::new([]),
         dir_entries: dirs,
         table_slots: s.page_table.slots(),
         bridges: slots,
