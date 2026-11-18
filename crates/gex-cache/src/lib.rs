@@ -551,6 +551,7 @@ pub fn load_or_compile(
     let mut module = compile_uncached(engine, &wasm).context("validating translated wasm")?;
     let mut mapped_key = None;
     if let Some(serialized) = serialize(&module) {
+        let serialized = lean(serialized);
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
@@ -576,6 +577,81 @@ pub fn load_or_compile(
         hit: false,
         mapped: mapped_key,
     })
+}
+
+/// A compiled module's artifact as the cache keeps it: without its ELF
+/// symbol table (`.symtab`, `.strtab`: a name for each function, which
+/// nothing in the engine reads back, `CodeMemory::new` passing over them),
+/// some 5 KiB of a runtime translation's 60 on disk. The section headers
+/// stay, the two empty. As it was when it is not laid out as expected.
+fn lean(mut elf: Vec<u8>) -> Vec<u8> {
+    fn u16_at(b: &[u8], at: usize) -> Option<usize> {
+        Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?) as usize)
+    }
+    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    }
+    fn u64_at(b: &[u8], at: usize) -> Option<usize> {
+        usize::try_from(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?)).ok()
+    }
+    // ELF64, little-endian: e_shoff +0x28, e_shentsize +0x3a, e_shnum
+    // +0x3c, e_shstrndx +0x3e; a section header's sh_type +4, sh_offset
+    // +0x18, sh_size +0x20.
+    let plan = || -> Option<(usize, usize, usize, usize, usize)> {
+        if elf.get(..6)? != b"\x7fELF\x02\x01" {
+            return None;
+        }
+        let (shoff, entsize, shnum, strndx) = (u64_at(&elf, 0x28)?, u16_at(&elf, 0x3a)?, u16_at(&elf, 0x3c)?, u16_at(&elf, 0x3e)?);
+        if entsize != 64 || strndx >= shnum || shoff.checked_add(shnum * 64)? != elf.len() {
+            return None;
+        }
+        let sh = |i: usize| shoff + i * 64;
+        let (mut symtab, mut strtab) = (None, None);
+        for i in 0..shnum {
+            match u32_at(&elf, sh(i) + 4)? {
+                2 => symtab = Some(i),
+                3 if i != strndx => strtab = Some(i),
+                _ => {}
+            }
+        }
+        let (sym, st) = (symtab?, strtab?);
+        // .symtab, .strtab and .shstrtab in that order at the end, before
+        // the headers; nothing else after the symbols.
+        let (so, ss) = (u64_at(&elf, sh(sym) + 0x18)?, u64_at(&elf, sh(sym) + 0x20)?);
+        let (to, ts) = (u64_at(&elf, sh(st) + 0x18)?, u64_at(&elf, sh(st) + 0x20)?);
+        let (ho, hs) = (u64_at(&elf, sh(strndx) + 0x18)?, u64_at(&elf, sh(strndx) + 0x20)?);
+        if !(so + ss <= to && to + ts <= ho && ho + hs <= shoff) {
+            return None;
+        }
+        for i in (0..shnum).filter(|&i| i != sym && i != st && i != strndx) {
+            let (o, s) = (u64_at(&elf, sh(i) + 0x18)?, u64_at(&elf, sh(i) + 0x20)?);
+            if s != 0 && o + s > so {
+                return None;
+            }
+        }
+        Some((sym, st, so, ho, hs))
+    };
+    let Some((sym, st, so, ho, hs)) = plan() else { return elf };
+    let shoff = u64_at(&elf, 0x28).unwrap();
+    let headers = elf[shoff..].to_vec();
+    let names = elf[ho..ho + hs].to_vec();
+    elf.truncate(so);
+    let new_ho = elf.len();
+    elf.extend_from_slice(&names);
+    while elf.len() % 8 != 0 {
+        elf.push(0);
+    }
+    let new_shoff = elf.len();
+    elf.extend_from_slice(&headers);
+    let strndx = u16_at(&elf, 0x3e).unwrap();
+    let put = |elf: &mut Vec<u8>, at: usize, v: usize| elf[at..at + 8].copy_from_slice(&(v as u64).to_le_bytes());
+    put(&mut elf, 0x28, new_shoff);
+    for i in [sym, st] {
+        put(&mut elf, new_shoff + i * 64 + 0x18, so);
+        put(&mut elf, new_shoff + i * 64 + 0x20, 0);
+    }
+    put(&mut elf, new_shoff + strndx * 64 + 0x18, new_ho);
+    elf
 }
 
 /// The module stored at `path`, mapped from the file rather than copied
@@ -1475,6 +1551,23 @@ mod tests {
         let _third = load_or_compile(&engine, &dir, &key, || panic!("stored: must not rebuild")).unwrap();
         assert_eq!(count(&key).map(|c| (c.1, c.2)), Some((1, false)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache keeps an artifact without its symbol table, and it loads
+    /// and runs as compiled.
+    #[test]
+    fn an_artifact_without_its_symbols_loads_and_runs() {
+        let engine = Engine::default();
+        let wasm = vec![0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1, 0x66, 0, 0, 0x0a, 6, 1, 4, 0, 0x41, 0x2a, 0x0b];
+        let full = serialize(&compile(&engine, &wasm).unwrap()).unwrap();
+        let lean = lean(full.clone());
+        assert!(lean.len() < full.len(), "{} bytes, as many as {}", lean.len(), full.len());
+        // SAFETY: just serialized by this engine.
+        let m = unsafe { Module::deserialize(&engine, &lean) }.unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let inst = wasmtime::Instance::new(&mut store, &m, &[]).unwrap();
+        assert_eq!(inst.get_typed_func::<(), i32>(&mut store, "f").unwrap().call(&mut store, ()).unwrap(), 42);
+        assert_eq!(super::lean(b"not an elf".to_vec()), b"not an elf", "anything else is kept as it is");
     }
 
     #[test]

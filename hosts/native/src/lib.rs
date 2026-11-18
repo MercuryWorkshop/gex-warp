@@ -1351,6 +1351,11 @@ fn new_engine() -> Result<Engine> {
     // on a page of their own): a quarter of a runtime translation's 64 KiB,
     // in memory or on disk, for each of a desktop's 100,000 units.
     config.memory_init_cow(false);
+    // No map from machine code back to wasm offsets: only a wasm backtrace
+    // reads it, and those are off (above). It was 5 KiB of each runtime
+    // translation's 60 on disk, where a desktop's mapped modules are bounded
+    // (`GEX_CACHE_MAPPED_BYTES`).
+    config.generate_address_map(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
     // A 64-bit guest memory: a shared memory is a static
     // allocation, so the reservation has to hold all of it. Only then: a
     // wasm32 process keeps the engine it always had.
