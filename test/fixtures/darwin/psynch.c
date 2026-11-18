@@ -29,17 +29,24 @@ static void nap(unsigned ms) {
 struct waiter {
     long n, a[8];
     volatile long answer;
+    volatile int calling;
     int handle;
 };
 static void *wait_once(void *arg) {
     struct waiter *w = arg;
+    w->calling = 1;
     w->answer = t_syscall(w->n, w->a[0], w->a[1], w->a[2], w->a[3], w->a[4], w->a[5], w->a[6], w->a[7]);
     return 0;
 }
 static void start(struct waiter *w) {
     w->answer = 0x7777;
+    w->calling = 0;
     w->handle = t_thread_start(wait_once, w);
-    // Long enough for it to be on its queue.
+    // Until it is making its call (a new thread may be slow to run on a
+    // busy machine, and the next waiter must not get to its queue first),
+    // then long enough for the call to have put it on its queue.
+    for (int i = 0; !w->calling && i < 10000; i++)
+        nap(1);
     nap(60);
 }
 static void show(const char *what, struct waiter *w) {
