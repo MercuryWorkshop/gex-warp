@@ -803,9 +803,54 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
         SEQ.fetch_add(1, Ordering::Relaxed),
         path.file_name().and_then(|n| n.to_str()).unwrap_or("x")
     ));
-    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+    if write_sparse(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// `bytes` written to a new file at `path`, and its runs of whole 4 KiB
+/// blocks of zeroes then given back to the filesystem as holes
+/// (`F_PUNCHHOLE`: APFS allocates the zeroes a seek skips): a compiled
+/// module is mostly the padding that puts each section on a 16 KiB page,
+/// ~40 KiB of zeroes in a 52 KiB file, of which the holes leave a half or
+/// less. The bytes read back are the same. It matters twice over now that
+/// modules are mapped from their files: an entry evicted while a process
+/// maps it keeps its blocks until that process ends.
+fn write_sparse(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const BLOCK: usize = 4096;
+        const F_PUNCHHOLE: libc::c_int = 99;
+        #[repr(C)]
+        struct FPunchhole {
+            fp_flags: u32,
+            reserved: u32,
+            fp_offset: libc::off_t,
+            fp_length: libc::off_t,
+        }
+        let f = std::fs::OpenOptions::new().write(true).open(path)?;
+        let zero = |i: usize| bytes[i * BLOCK..((i + 1) * BLOCK).min(bytes.len())].iter().all(|&b| b == 0);
+        let n = bytes.len() / BLOCK; // (whole blocks only)
+        let mut i = 0;
+        while i < n {
+            if !zero(i) {
+                i += 1;
+                continue;
+            }
+            let from = i;
+            while i < n && zero(i) {
+                i += 1;
+            }
+            let hole = FPunchhole { fp_flags: 0, reserved: 0, fp_offset: (from * BLOCK) as libc::off_t, fp_length: ((i - from) * BLOCK) as libc::off_t };
+            // SAFETY: the call reads the struct, which lives through it; a
+            // filesystem that cannot punch holes refuses, and the file is
+            // whole as written.
+            unsafe { libc::fcntl(f.as_raw_fd(), F_PUNCHHOLE, &hole as *const FPunchhole) };
+        }
+    }
+    Ok(())
 }
 
 
@@ -1086,6 +1131,24 @@ mod tests {
         evict(&dir, 1);
         assert!(!path.exists(), "the eviction left the entry");
         assert_eq!(run(&held.module), 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_leaves_blocks_of_zeroes_as_holes_and_reads_back_the_same() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = vec![0u8; 64 << 10];
+        bytes[..100].fill(1);
+        bytes[40000..40010].fill(2);
+        bytes[(64 << 10) - 1] = 3;
+        let path = dir.join("s.cwasm");
+        store(&dir, &path, &bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // (on a filesystem that keeps holes: fewer blocks than bytes)
+        let blocks = std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&path).unwrap()) * 512;
+        assert!(blocks < bytes.len() as u64, "{blocks} bytes of blocks for {} of file", bytes.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
