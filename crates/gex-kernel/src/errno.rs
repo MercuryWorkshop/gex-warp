@@ -63,6 +63,8 @@ impl Errno {
     pub const ENOPROTOOPT: Errno = Errno(92);
     pub const ECONNRESET: Errno = Errno(104);
     pub const EISCONN: Errno = Errno(106);
+    /// An unfair lock's owner is gone (Darwin's `ulock_wait`).
+    pub const EOWNERDEAD: Errno = Errno(130);
     /// Only between a process and the global kernel, never a guest's: a
     /// moved socket another holder connected out (`net::op::WENT_OUT`).
     pub const EREMCHG: Errno = Errno(78);

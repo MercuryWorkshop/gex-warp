@@ -155,6 +155,9 @@ const SCRATCH_SLOT: usize = if gex_abi::X86 { ctx::SCRATCH } else { ctx::MON_ADD
 pub enum Post {
     #[default]
     None,
+    /// Answered with this error and nothing done (the call was made a
+    /// no-op).
+    Fail(crate::errno::Errno),
     /// `wait4`: the status word at `status` names signals by Linux's
     /// numbers.
     WaitStatus { status: u64 },
@@ -464,6 +467,7 @@ pub fn finish(m: &mut GuestMem<'_>, ctx_addr: u64, post: Post, r: SysResult) -> 
     }
     match post {
         Post::None => r,
+        Post::Fail(e) => Err(e),
         Post::Zero => r.map(|_| 0),
         Post::WaitStatus { status } => {
             if r.is_ok() && status != 0 {

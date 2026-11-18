@@ -56,6 +56,28 @@ struct Queue {
     /// wakeup without re-reading guest memory.
     generation: Mutex<u64>,
     ready: Condvar,
+    /// How many wait on it now (in [`FutexTable::wait`], or parked:
+    /// [`FutexTable::park`]): what a wake says it woke. A wait that timed
+    /// out is not counted after, so a wake for nobody says so (Darwin's
+    /// `ulock_wake` answers ENOENT).
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+/// One waiter counted on a queue while this lives.
+#[derive(Debug)]
+struct Waiting(Arc<Queue>);
+
+impl Waiting {
+    fn new(queue: &Arc<Queue>) -> Waiting {
+        queue.waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Waiting(Arc::clone(queue))
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.waiters.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// A place on a futex queue, held by a host that polls instead of blocking.
@@ -67,6 +89,8 @@ struct Queue {
 #[derive(Debug, Clone)]
 pub struct Parked {
     queue: Arc<Queue>,
+    /// Counted as a waiter for as long as any clone lives.
+    _waiting: Arc<Waiting>,
     at: u64,
     /// The guest address parked on, so a deadlock can be named rather than
     /// just counted.
@@ -223,6 +247,7 @@ impl FutexTable {
             _ => {}
         }
         let start = *gen;
+        let _waiting = Waiting::new(&queue);
         loop {
             match timeout {
                 Some(d) => {
@@ -269,15 +294,18 @@ impl FutexTable {
         };
         let mut gen = queue.generation.lock().unwrap();
         *gen = gen.wrapping_add(1);
+        // (Those waiting now; read under the generation's lock, which a
+        // waiter holds from its check of the word until it sleeps.)
+        let waiting = queue.waiters.load(std::sync::atomic::Ordering::Acquire) as u64;
         match count {
             0 => 0,
             1 => {
                 queue.ready.notify_one();
-                1
+                waiting.min(1)
             }
             n => {
                 queue.ready.notify_all();
-                n as u64
+                waiting.min(n as u64)
             }
         }
     }
@@ -300,7 +328,8 @@ impl FutexTable {
     pub fn park(&self, addr: u64) -> Parked {
         let queue = self.queue(addr);
         let at = *queue.generation.lock().unwrap();
-        Parked { queue, at, addr }
+        let _waiting = Arc::new(Waiting::new(&queue));
+        Parked { queue, _waiting, at, addr }
     }
 
     /// Wake every waiter on every queue.
@@ -407,6 +436,21 @@ mod tests {
         let f = FutexTable::new();
         let r = f.wait(0x3000, 1, Some(Duration::from_millis(20)), &|| Some(1));
         assert_eq!(r.err(), Some(Errno::ETIMEDOUT));
+    }
+
+    /// A wait that timed out, or a park let go, is nobody waiting: a wake
+    /// after it says it woke none (Darwin's `ulock_wake`: ENOENT).
+    #[test]
+    fn a_wake_counts_only_those_waiting() {
+        let t = FutexTable::new();
+        let word = AtomicU32::new(0);
+        let read = || Some(word.load(Ordering::SeqCst));
+        assert_eq!(t.wait(0x1000, 0, Some(Duration::from_millis(1)), &read), Err(Errno::ETIMEDOUT));
+        assert_eq!(t.wake(0x1000, 1), 0);
+        let p = t.park(0x1000);
+        assert_eq!(t.wake(0x1000, i32::MAX as u32), 1);
+        drop(p);
+        assert_eq!(t.wake(0x1000, 1), 0);
     }
 
     #[test]
