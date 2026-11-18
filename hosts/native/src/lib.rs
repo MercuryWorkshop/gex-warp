@@ -1289,6 +1289,13 @@ fn new_engine() -> Result<Engine> {
     config.wasm_gc(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
+    // No copy-on-write images of memories: gex's modules import the guest's
+    // memory (a shared one, which takes no image) and have no data of
+    // their own, yet with images on every compiled module kept a page of
+    // nothing for them (`.rodata.wasm` page-aligned, the sections after it
+    // on a page of their own): a quarter of a runtime translation's 64 KiB,
+    // in memory or on disk, for each of a desktop's 100,000 units.
+    config.memory_init_cow(false);
     // A 64-bit guest memory: a shared memory is a static
     // allocation, so the reservation has to hold all of it. Only then: a
     // wasm32 process keeps the engine it always had.
