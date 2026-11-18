@@ -457,6 +457,10 @@ fn rescue(port: &Arc<Port>) -> bool {
         if to.state().dead {
             return false;
         }
+        // (Its guard and context were its holder's, and go: the next
+        // holder guards it again -- libxpc does, checking a service in,
+        // and gives the right up if that fails, as with a guard left on.)
+        (st.guarded, st.context) = (false, 0);
         (to, st.rx.take(), std::mem::take(&mut st.wake))
     };
     // Its receiver's waiting threads look again, and find nothing.
@@ -961,6 +965,9 @@ impl Space {
                 let mut st = port.state();
                 st.wake.clear();
                 st.rx = None;
+                // What its receiver kept with it stays behind: XNU clears a
+                // receive right's context and guard as it leaves a space.
+                (st.guarded, st.context) = (false, 0);
                 drop(st);
                 for set in self.names.values_mut().filter(|e| e.is_set()) {
                     set.members.retain(|m| *m != name);

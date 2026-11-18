@@ -34,7 +34,9 @@
 // child, and sends two requests there, each with a send-once right to a
 // reply port; the child ends without receiving either. The right comes back
 // to the parent from the kernel (69, under the name of its send right; 40
-// bytes, no NDR record, as MIG's notify server wants it),
+// bytes, no NDR record, as MIG's notify server wants it; without the guard
+// the child put on it, which a service's libxpc puts on again when it is
+// started again),
 // the requests still queued on it; the parent takes the first, then
 // destroys the right (mach_port_destruct, as libxpc does with a right that
 // came back): the second request goes with it, and its reply port is told
@@ -388,6 +390,8 @@ static int destroyed_child(void) {
     if (msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, mine, 10000)) return 4;
     struct port_desc *d = (struct port_desc *)(m.body + 1);
     if (m.h.id != 801 || !(m.h.bits & COMPLEX) || d->disposition != 16 || !d->name) return 8;
+    // Guarded, as libxpc guards a service's port when it checks in.
+    if (TRAP(TRAP_port_guard, task, d->name, 0x6e78, 0)) return 16;
     // (The parent sends its requests there meanwhile.)
     static struct { long s, us; } wait = {0, 300000};
     SYS(SYS_select, 0, 0, 0, 0, &wait);
@@ -437,6 +441,10 @@ static int destroyed_parent(void) {
              d->disposition, d->name == conn ? "under the send right's name" : d->name ? "under another name" : "no name",
              trailer[5 + 5] == 0 ? "the kernel" : "a process");
     t_printf("ours now type %x\n", type_of(conn));
+    // The child's guard went with it (XNU clears a receive right's guard
+    // and context as it leaves a space): no context, and guarded anew.
+    t_printf("its context: %s\n", get_context(conn) == 0x6e78 ? "the child's guard" : get_context(conn) ? "something" : "none");
+    t_printf("guarded again: %ld, unguarded: %ld\n", TRAP(TRAP_port_guard, task, conn, 0x1234, 0), TRAP(TRAP_port_unguard, task, conn, 0x1234));
     for (int i = 0; i < 2; i++) {
         t_memset(&m, 0, sizeof m);
         r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, rp[i], 0);

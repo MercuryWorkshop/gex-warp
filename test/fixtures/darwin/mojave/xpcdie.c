@@ -8,11 +8,20 @@
 // saying so, if a reply has not come in 60 s.
 //
 // `xpcdie N`: N requests, one after the other.
+//
+// `xpcdie restart`: to fixtures/darwin/mojave/xpcdie-listener.c, a service
+// made with libxpc's listener, which answers with its pid. It is killed
+// after its first answer; the second request starts it again, and the new
+// one answers. (Its libxpc guards the service's port when it checks in,
+// which it cannot when the guard of the one before is still on the port:
+// it then gives the port up, and nothing answers.)
 #include <xpc/xpc.h>
 #include <dispatch/dispatch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
+#include <string.h>
 
 static const char *what(xpc_object_t r) {
     if (r == XPC_ERROR_CONNECTION_INTERRUPTED) return "interrupted";
@@ -22,7 +31,8 @@ static const char *what(xpc_object_t r) {
 }
 
 int main(int argc, char **argv) {
-    int rounds = argc > 1 ? atoi(argv[1]) : 1;
+    int restart = argc > 1 && !strcmp(argv[1], "restart");
+    int rounds = restart ? 2 : argc > 1 ? atoi(argv[1]) : 1;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
         printf("xpcdie: no reply in 60 s\n");
         fflush(stdout);
@@ -39,6 +49,14 @@ int main(int argc, char **argv) {
         xpc_dictionary_set_int64(m, "n", i);
         xpc_object_t r = xpc_connection_send_message_with_reply_sync(c, m);
         printf("xpcdie: reply %d: %s\n", i, what(r));
+        if (restart && xpc_get_type(r) == XPC_TYPE_DICTIONARY) {
+            static int64_t first;
+            int64_t pid = xpc_dictionary_get_int64(r, "pid");
+            if (i == 1) first = pid;
+            printf("xpcdie: answered by %s\n", i == 1 ? "the service" : pid > 0 && pid != first ? "the service started again" : "the same one");
+            // (A while for the connection to be told, before the next.)
+            if (i == 1) printf("xpcdie: killed: %d\n", kill((pid_t)pid, SIGKILL)), fflush(stdout), sleep(2);
+        }
         fflush(stdout);
         xpc_release(m);
     }
