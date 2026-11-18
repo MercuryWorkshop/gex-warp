@@ -19,6 +19,11 @@
 # Settings, from the environment:
 #   GEXC   the x86 gexc (default the tree's target/x86/release/gexc)
 #   SECS   how long it goes on after the app starts (default 600)
+#   APPDIR a directory of the host's, copied to OUT/app and seen at /gex-app
+#          (APP can be a program in it: an app of one's own)
+#   OPENS=SECS  gexloginwindow sends the app its open event every SECS until
+#          it takes one, as a launch through LaunchServices hands it one (an
+#          application finishes launching on its first)
 #   SEED   a directory of saved state to start from, if it has some (the
 #          written directories by name: folders, home, ...), and SAVE=1
 #          keeps this run's there when it ends: LaunchServices' databases,
@@ -103,11 +108,13 @@ cat > "$O/jobs/com.gex.loginwindow.plist" <<PL
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.gex.loginwindow</string>
-<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string>$session<string>--</string><string>$APP</string></array>
+<key>ProgramArguments</key><array><string>/gex-login/loginwindow</string><string>-u</string><string>501:20</string><string>-n</string><string>gex</string>$session${OPENS:+<string>-o</string><string>$OPENS</string>}<string>--</string><string>$APP</string></array>
 </dict></plist>
 PL
 
 : > "$O/input"
+rm -rf "$O/app"; mkdir -p "$O/app"
+[ -z "${APPDIR:-}" ] || cp -a "$APPDIR/." "$O/app/"
 rm -f "$O/fb.live"
 if [ "${VIEW:-}" = 1 ]; then
   sh "$T/hosts/macview/build.sh" "$O/macview"
@@ -135,7 +142,7 @@ OS_ACTIVITY_DT_MODE=YES GEX_FRAMEBUFFER_PNG="$O/fb.png" GEX_FRAMEBUFFER_LIVE="$O
   --bind "$E/crls=/private/var/db/crls" --bind "$E/home=/Users/gex" --bind "$E/prefs=/Library/Preferences" \
   --bind "$E/root=/private/var/root" --bind "$E/syscaches=/System/Library/Caches" \
   --bind "$E/cvms=/private/var/db/CVMS" \
-  --bind "$O/gl=/gex" --bind "$O/lw/x86_64=/gex-login" --bind "$O/jobs=/gex-jobs" \
+  --bind "$O/gl=/gex" --bind "$O/lw/x86_64=/gex-login" --bind "$O/jobs=/gex-jobs" --bind "$O/app=/gex-app" \
   --env OS_ACTIVITY_DT_MODE=YES \
   "$O/gl/gexlaunchd.x86_64" -v -x com.apple.configd -x com.apple.diskarbitrationd -x com.apple.aslmanager \
   -a 501:20 -j /System/Library/LaunchDaemons -j /System/Library/LaunchAgents -j /gex-jobs -r com.gex.loginwindow -r com.apple.lsd $desktop $out \
