@@ -5107,7 +5107,18 @@ impl MapIo<'_> {
                     maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
                 }
                 self.retire_code_why(a[0], a[1], "munmap", 0);
-                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
+                flushed
+                    .and_then(|_| {
+                        let mut mm = self.mem.lock();
+                        // (the host's pages of it, nothing's from here: given
+                        // back first, so that the unmap's protections, none,
+                        // are what they are left with)
+                        if a[0].is_multiple_of(crate::mem::PAGE_SIZE) {
+                            mm.release(a[0], a[0].saturating_add(crate::mem::page_align_up(a[1])));
+                        }
+                        mm.unmap(a[0], a[1])
+                    })
+                    .map(|_| 0)
             }
             // MS_INVALIDATE (2): and what other processes wrote back since
             // read in ([`sync_shared_file`]).
@@ -5294,7 +5305,27 @@ impl MapIo<'_> {
     /// the file, which the demand path already does, so it is left alone.
     pub fn madvise(&self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
         const MADV_DONTNEED: u32 = 4;
+        // Darwin's MADV_FREE and MADV_FREE_REUSABLE (no Linux advice has
+        // either number): the pages' contents are the kernel's to drop, as
+        // libmalloc says of the memory it frees. Their whole host pages go
+        // back to the host (`MemoryMap::release`): zero when used again.
+        const MADV_FREE_DARWIN: u32 = 5;
+        const MADV_FREE_REUSABLE: u32 = 7;
         let addr = gex_abi::canon(addr);
+        if advice == MADV_FREE_DARWIN || advice == MADV_FREE_REUSABLE {
+            let end = addr.saturating_add(len);
+            let mm = self.mem.lock();
+            let anon: Vec<(u64, u64)> = mm
+                .vmas()
+                .iter()
+                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
+                .map(|v| (v.start.max(addr), v.end.min(end)))
+                .collect();
+            for (lo, hi) in anon {
+                mm.release(lo, hi);
+            }
+            return Ok(0);
+        }
         if advice == MADV_DONTNEED {
             let end = addr.saturating_add(len);
             let anon: Vec<(u64, u64)> = self

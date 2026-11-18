@@ -284,6 +284,19 @@ pub fn unshare_pages(base: u64, start: u64, end: u64) {
     if lo >= hi {
         return;
     }
+    // Whole host pages, all of them: one mapping and one remap of the view.
+    if lo == start && hi == end {
+        // SAFETY: as for each page below, the whole range at once.
+        let r = unsafe {
+            libc::mmap((base + lo) as *mut libc::c_void, (hi - lo) as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+        };
+        if r != libc::MAP_FAILED {
+            if view != base {
+                realias(base, view, lo, hi - lo);
+            }
+            return;
+        }
+    }
     let mut at = lo;
     while at < hi {
         let whole = at >= start && at + page <= end;

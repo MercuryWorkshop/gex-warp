@@ -430,6 +430,11 @@ impl Kernel {
             // (An x86-64 Mac has none of it, and its libmalloc does not ask.)
             d::MADVISE if x[2] == 11 && gex_abi::X86 => NATIVE + code,
             d::MADVISE if x[2] == 11 => set(nr::MADVISE, &[x[0], x[1], 4]),
+            // And `MADV_FREE` (5) and `MADV_FREE_REUSABLE` (7), libmalloc's
+            // word for memory it has freed: what the pages hold is the
+            // kernel's to drop, and their whole host pages go back to the
+            // host (`Kernel::madvise`).
+            d::MADVISE if x[2] == 5 || x[2] == 7 => set(nr::MADVISE, &x[..3]),
             d::MADVISE | d::MLOCK | d::MUNLOCK | d::MLOCKALL | d::MUNLOCKALL | d::MINCORE => set(nr::NOOP_OK, &[]),
             d::GETRUSAGE => set(nr::GETRUSAGE, &x[..2]),
             d::GETRLIMIT => match abi::rlimit(x[0]) {

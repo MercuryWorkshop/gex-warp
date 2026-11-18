@@ -1239,6 +1239,25 @@ impl MemoryMap {
         self.publish_shares();
     }
 
+    /// The whole host pages of `[start, end)`, which nothing maps any
+    /// more or whose contents the process gave up (`munmap`, `madvise`),
+    /// given back to the host: fresh zero pages in their place
+    /// ([`set_unshare_hook`]'s, which keeps both of the host's views on
+    /// them), as a kernel frees what is unmapped. Without this every page a
+    /// process ever touched stayed in the host's memory for its life,
+    /// written again with zeroes when reused. Nothing over a share (its
+    /// pages may be another process's too) or where the host has no hook.
+    pub fn release(&self, start: u64, end: u64) {
+        let g = share_granule();
+        let (lo, hi) = (start.next_multiple_of(g), end & !(g - 1));
+        if lo >= hi || self.host_base.0 == 0 || self.shares.iter().any(|s| s.start < hi && lo < s.end) || hits_runtime(lo, hi) {
+            return;
+        }
+        if let Some(f) = UNSHARE_HOOK.get() {
+            f(self.host_base.0, lo, hi);
+        }
+    }
+
     /// The process's shares ([`Share`]).
     pub fn shares(&self) -> &[Share] {
         &self.shares

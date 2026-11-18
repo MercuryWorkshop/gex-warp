@@ -46,6 +46,14 @@ int main(int argc, char **argv, char **envp, char **apple) {
     t_show("mprotect back", SYS(SYS_mprotect, big, PAGE, PROT_READ | PROT_WRITE));
     t_show("madvise", SYS(SYS_madvise, big, PAGE, 4));
     t_check("madvise kept the page", ((u8 *)big)[0] == 0x55);
+    // libmalloc's free of a large block: MADV_FREE_REUSABLE (its pages the
+    // kernel's to drop) and MADV_FREE_REUSE when it is used again; the
+    // memory is the process's to write and read throughout.
+    t_show("madvise reusable", SYS(SYS_madvise, big + 4 * PAGE, 4 * PAGE, 7));
+    ((u8 *)big)[5 * PAGE + 3] = 0x77;
+    t_check("written after reusable", ((u8 *)big)[5 * PAGE + 3] == 0x77);
+    t_show("madvise reuse", SYS(SYS_madvise, big + 4 * PAGE, 4 * PAGE, 8));
+    t_check("reuse keeps what was written since", ((u8 *)big)[5 * PAGE + 3] == 0x77 && ((u8 *)big)[3 * PAGE] == 0x55);
 
     // A file's bytes, privately and shared.
     long fd = SYS(SYS_open, "m.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
