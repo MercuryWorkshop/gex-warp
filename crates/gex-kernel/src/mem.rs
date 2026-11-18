@@ -378,7 +378,29 @@ impl Mm {
             }
         }
         for (a, b) in dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
+            // Its whole host pages given back, fresh zero pages in their
+            // place (`MemoryMap::release`), rather than read to find what
+            // to zero: a read of a page of the host's shared memory makes it
+            // resident, and memory nothing had touched (libmalloc's 8 MiB
+            // regions, a thread's stack) was the process's for its life.
+            let mm = self.lock();
+            let given = mm.release(a, b);
+            if let Some((lo, hi)) = given {
+                mm.reprotect(lo, hi);
+            }
+            drop(mm);
+            match given {
+                Some((lo, hi)) => {
+                    m.written(lo, hi - lo);
+                    if a < lo {
+                        m.zero_dirty(a, (lo - a) as usize)?;
+                    }
+                    if hi < b {
+                        m.zero_dirty(hi, (b - hi) as usize)?;
+                    }
+                }
+                None => m.zero_dirty(a, (b - a) as usize)?,
+            }
         }
         if prot_bits & prot::WRITE == 0 {
             self.lock().mark_clean(start, end);
@@ -1247,14 +1269,49 @@ impl MemoryMap {
     /// process ever touched stayed in the host's memory for its life,
     /// written again with zeroes when reused. Nothing over a share (its
     /// pages may be another process's too) or where the host has no hook.
-    pub fn release(&self, start: u64, end: u64) {
+    /// Answers the host pages given back, `[lo, hi)`, if any were.
+    pub fn release(&self, start: u64, end: u64) -> Option<(u64, u64)> {
         let g = share_granule();
         let (lo, hi) = (start.next_multiple_of(g), end & !(g - 1));
         if lo >= hi || self.host_base.0 == 0 || self.shares.iter().any(|s| s.start < hi && lo < s.end) || hits_runtime(lo, hi) {
+            return None;
+        }
+        let f = UNSHARE_HOOK.get()?;
+        f(self.host_base.0, lo, hi);
+        Some((lo, hi))
+    }
+
+    /// [`Self::release`] of `[start, end)`, which is being unmapped, and of
+    /// the host pages either end of it that nothing else maps: a host page
+    /// (16 KiB) holds four of an x86-64 guest's pages, and one unmapped a
+    /// guest page at a time (dyld's look at each library's first page, a
+    /// 4 KiB mapping it drops at once) was never whole in one unmap, so
+    /// none of it was given back.
+    pub fn release_unmapped(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        let g = share_granule();
+        // (or the host keeps data of its own there)
+        let mapped = |a: u64, b: u64| a < b && (self.vmas.iter().any(|v| v.start < b && a < v.end) || self.host_data.iter().any(|&(s, e)| s < b && a < e));
+        let (pa, pb) = (start & !(g - 1), end.next_multiple_of(g));
+        let lo = if pa < start && !mapped(pa, start) { pa } else { start };
+        let hi = if pb > end && !mapped(end, pb) { pb } else { end };
+        self.release(lo, hi)
+    }
+
+    /// Give the host pages `[lo, hi)` the protection the map has for them
+    /// again: after [`Self::release`] of pages a mapping still covers (their
+    /// fresh pages are readable and writable).
+    pub fn reprotect(&self, lo: u64, hi: u64) {
+        let Some(&(protect, _)) = PROTECT_HOOK.get() else { return };
+        let base = self.host_base.0;
+        if base == 0 {
             return;
         }
-        if let Some(f) = UNSHARE_HOOK.get() {
-            f(self.host_base.0, lo, hi);
+        let applied = self.applied.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, b, p) in applied.0.iter() {
+            let (a, b) = (a.max(lo), b.min(hi));
+            if a < b {
+                protect(base, a, b, p);
+            }
         }
     }
 

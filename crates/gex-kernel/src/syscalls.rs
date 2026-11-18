@@ -5120,7 +5120,7 @@ impl MapIo<'_> {
                         // back first, so that the unmap's protections, none,
                         // are what they are left with)
                         if a[0].is_multiple_of(crate::mem::PAGE_SIZE) {
-                            mm.release(a[0], a[0].saturating_add(crate::mem::page_align_up(a[1])));
+                            mm.release_unmapped(a[0], a[0].saturating_add(crate::mem::page_align_up(a[1])));
                         }
                         mm.unmap(a[0], a[1])
                     })
@@ -5328,7 +5328,7 @@ impl MapIo<'_> {
                 .map(|v| (v.start.max(addr), v.end.min(end)))
                 .collect();
             for (lo, hi) in anon {
-                mm.release(lo, hi);
+                let _ = mm.release(lo, hi);
             }
             return Ok(0);
         }

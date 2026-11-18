@@ -12,6 +12,87 @@ static long mmap_(void *addr, long len, int prot, int flags, int fd, long off) {
     return SYS(SYS_mmap, addr, len, prot, flags, fd, off);
 }
 
+static long fork_(void) {
+    long child_flag = 0;
+    long pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
+    if (pid < 0) return pid;
+    return child_flag ? 0 : pid;
+}
+
+// How many of `n` bytes at `p` are not zero.
+static long nonzero(const u8 *p, long n) {
+    long k = 0;
+    for (long i = 0; i < n; i++) k += p[i] != 0;
+    return k;
+}
+
+// A store into `p` in a child: how the child ended (its wait status).
+static int store_in_child(u8 *p) {
+    long pid = fork_();
+    if (pid == 0) {
+        *p = 1;
+        SYS(SYS_exit, 0);
+    }
+    int status = -1;
+    SYS(SYS_wait4, pid, &status, 0, 0);
+    return status;
+}
+
+// Anonymous memory made where memory was written reads as zero, and keeps
+// the protection it was made with, whatever was there: a fixed mapping over
+// written memory, read-only; one made after the written memory was
+// unmapped a page at a time; a reservation (no access) over written
+// memory, made readable later. (Sixteen pages, so that some of them are
+// whole pages of a host with larger ones.) `faults`: and that a store into
+// the read-only memory and into the reservation faults (not on the page's
+// runtime, whose memory has no protections).
+static void reused(int faults) {
+    const long n = 16 * PAGE;
+    u8 *w = (u8 *)mmap_(0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    t_memset(w, 0x5a, n);
+    long r = mmap_(w, n, PROT_READ, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    t_check("read-only over written memory, where asked", r == (long)w);
+    t_printf("  bytes of it not zero: %ld\n", nonzero(w, n));
+    int st;
+    if (faults) {
+        st = store_in_child(w + 5 * PAGE);
+        t_printf("  a store into it: %s\n", st == 0 ? "went through" : (st & 0x7f) == SIGBUS || (st & 0x7f) == SIGSEGV ? "a fault" : "something else");
+    }
+    t_show("munmap", SYS(SYS_munmap, w, n));
+
+    u8 *v = (u8 *)mmap_(0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    t_memset(v, 0x6b, n);
+    long gone = 0;
+    for (long i = 1; i < 15; i++) gone += SYS(SYS_munmap, v + i * PAGE, PAGE) == 0;
+    t_printf("  unmapped a page at a time: %ld of 14\n", gone);
+    long again = mmap_(v + PAGE, 14 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    t_check("mapped there again", again == (long)(v + PAGE));
+    t_printf("  bytes of it not zero: %ld; the page before %x, after %x\n", nonzero(v + PAGE, 14 * PAGE), v[PAGE - 1], v[15 * PAGE]);
+    SYS(SYS_munmap, v, n);
+
+    u8 *x = (u8 *)mmap_(0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    t_memset(x, 0x7c, n);
+    long none = mmap_(x, n, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    t_check("a reservation over written memory", none == (long)x);
+    if (faults) {
+        st = store_in_child(x + 8 * PAGE);
+        t_printf("  a store into the reservation: %s\n", st == 0 ? "went through" : (st & 0x7f) == SIGBUS || (st & 0x7f) == SIGSEGV ? "a fault" : "something else");
+    }
+    t_show("mprotect it readable", SYS(SYS_mprotect, x, n, PROT_READ | PROT_WRITE));
+    t_printf("  bytes of it not zero: %ld\n", nonzero(x, n));
+    SYS(SYS_munmap, x, n);
+
+    // And Mach's: vm_allocate over written memory (VM_FLAGS_OVERWRITE).
+    u64 m = 0;
+    long task = TRAP(TRAP_task_self);
+    TRAP(TRAP_mach_vm_allocate, task, &m, n, 1);
+    t_memset((void *)m, 0x2d, n);
+    u64 over = m;
+    t_show("mach_vm_allocate over written memory", TRAP(TRAP_mach_vm_allocate, task, &over, n, 0x4000));
+    t_printf("  where asked: %s; bytes of it not zero: %ld\n", over == m ? "yes" : "no", nonzero((u8 *)m, n));
+    TRAP(TRAP_mach_vm_deallocate, task, m, n);
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)argc, (void)argv, (void)envp, (void)apple;
     long a = mmap_(0, 100, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -110,5 +191,7 @@ int main(int argc, char **argv, char **envp, char **apple) {
     long left = 0;
     for (long i = PAGE; i < 3 * PAGE; i++) left += z[i] != 0;
     t_printf("  bytes of it not zero: %ld; before it %x, after it %x\n", left, z[PAGE - 1], z[3 * PAGE]);
+
+    reused(argc > 1 && !t_strcmp(argv[1], "faults"));
     return 0;
 }

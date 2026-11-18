@@ -31,7 +31,12 @@ export default async function (t) {
   await d.compare('attr', await d.build('attr'));
   // (Likewise the calls from before 64-bit inodes: it lists a directory.)
   await d.compare('old', await d.build('old'));
-  for (const name of ['proc', 'mem', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue', 'vnode', 'calls', 'shm', 'fifo', 'jobs']) await d.compare(name, await d.build(name), [], { page: true });
+  for (const name of ['proc', 'time', 'sig', 'thr', 'tty', 'mach', 'psynch', 'kqueue', 'vnode', 'calls', 'shm', 'fifo', 'jobs']) await d.compare(name, await d.build(name), [], { page: true });
+  // Memory, and under gexc that memory made over written memory keeps the
+  // protection it was made with (the page's runtime has none to keep).
+  const mem = await d.build('mem');
+  await d.compare('mem', mem, [], { page: true });
+  await d.compare('mem, faults', mem, ['faults']);
   // Processes that a fork parted making code at one address, in turns:
   // under gexc only, as the page's runtime refuses a fixed mapping in one
   // process (ENOMEM) where another, alive, has mapped since their fork.
