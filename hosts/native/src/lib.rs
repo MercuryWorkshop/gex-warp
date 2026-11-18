@@ -615,6 +615,13 @@ impl Jit {
     fn new(shared: Arc<Mutex<JitShared>>, engine: Engine, linker: Linker<HostState>, tables: Vec<Table>, cache: Option<(std::path::PathBuf, String)>, limits: gex_xlate::BlockLimits) -> Jit {
         let processes = Arc::clone(&shared.lock().unwrap_or_else(|e| e.into_inner()).processes);
         jit_stats::LIVE_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut all = ALL_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            if !all.iter().any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(&shared))) {
+                all.retain(|w| w.strong_count() > 0);
+                all.push(Arc::downgrade(&shared));
+            }
+        }
         Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, have: std::collections::HashMap::new(), refilled: std::collections::HashSet::new(), limits, ftab: None, processes, grown: 0 }
     }
 }
@@ -647,6 +654,59 @@ impl Drop for JitHold {
 /// only ever rises: a store behind its own registry must never read it as
 /// short. A longer registry elsewhere costs that check its lock.
 static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Every process's translation state, for `GEX_STALL_EVERY`'s census
+/// ([`unit_census`]).
+static ALL_SHARED: Mutex<Vec<std::sync::Weak<Mutex<JitShared>>>> = Mutex::new(Vec::new());
+
+/// What the processes' registries hold, for `GEX_STALL_EVERY`'s memory
+/// lines: units with a module, and of them those that provide none of
+/// their blocks now (each re-translated or withdrawn since: kept only by
+/// the append-only registry and the instances made of them), with their
+/// code images' bytes; and the largest registries.
+pub(crate) fn unit_census() -> String {
+    const MB: u64 = 1 << 20;
+    let all: Vec<Arc<Mutex<JitShared>>> = ALL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).collect();
+    let image = |u: &CompiledUnit| u.module.as_ref().map_or(0, |m| {
+        let r = m.image_range();
+        (r.end as usize - r.start as usize) as u64
+    });
+    let (mut units, mut bytes, mut dead, mut dead_bytes, mut blocks, mut dead_blocks) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut rows = Vec::new();
+    for sh in &all {
+        let sh = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut n, mut d) = (0u64, 0u64);
+        for u in sh.registry.iter().filter(|u| u.module.is_some() && u.module_id != 0) {
+            let alt = u.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0);
+            let live = u.exported_blocks.iter().filter(|&&a| sh.provider.get(&gex_abi::addr_key(a, alt)) == Some(&u.module_id)).count() as u64;
+            let b = image(u);
+            n += 1;
+            units += 1;
+            bytes += b;
+            blocks += u.exported_blocks.len() as u64;
+            dead_blocks += u.exported_blocks.len() as u64 - live;
+            if live == 0 {
+                d += 1;
+                dead += 1;
+                dead_bytes += b;
+            }
+        }
+        rows.push((n, d, sh.registry.len(), sh.processes.load(std::sync::atomic::Ordering::Relaxed)));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let top: Vec<String> = rows.iter().take(8).map(|(n, d, r, p)| format!("{n}/{d} of {r} ({p}p)")).collect();
+    format!(
+        "  registries: {} ({} units with a module, {} MB; {} provide no block now, {} MB; blocks {} of which {} replaced); largest units/dead: {}\n",
+        all.len(),
+        units,
+        bytes / MB,
+        dead,
+        dead_bytes / MB,
+        blocks,
+        dead_blocks,
+        top.join(", ")
+    )
+}
 
 /// One runtime-translated module, kept so another thread's store can
 /// instantiate it rather than translating the same code again.

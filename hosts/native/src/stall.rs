@@ -335,6 +335,12 @@ fn memory_lines(snap: &[(u32, Entry)]) -> String {
         gex_cache::mapped_bytes().0 / MB,
         gex_cache::mapped_bytes().1 / MB,
     );
+    let m = gex_cache::mapped_stats();
+    out.push_str(&format!(
+        "  mapped: {} entries, {} hand-outs, {} held for sharing; {} loads shared, {} entries released\n",
+        m.entries, m.refs, m.sharing, m.shared_loads, m.released
+    ));
+    out.push_str(&crate::unit_census());
     let mut rows = Vec::new();
     let (mut tr, mut td, mut ts) = (0, 0, 0);
     for (base, len, view) in gex_mem::live() {
