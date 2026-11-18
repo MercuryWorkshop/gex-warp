@@ -1047,8 +1047,8 @@ impl Kernel {
             Some(home) => home,
             None => addr,
         };
-        let mask = if fd == u64::MAX { self.darwin_room_mask(len, 0) } else { 0 };
-        let at = self.darwin_place(addr, len, prot_bits as u32, fd != u64::MAX, mask)?;
+        let (mask, phase) = if fd == u64::MAX { self.darwin_room(len, 0) } else { (0, 0) };
+        let at = self.darwin_place_phased(addr, len, prot_bits as u32, fd != u64::MAX, mask, phase)?;
         // The hint is honoured: the range was free a moment ago, under the
         // same lock.
         self.map_io().mmap(m, [at, len, prot_bits, kflags, fd, off]).map(gex_abi::guest_addr)
@@ -1061,7 +1061,40 @@ impl Kernel {
     /// the file's own (`map_sealed`) as XNU maps them, rather than copies.
     pub(super) fn darwin_room_mask(&self, len: u64, mask: u64) -> u64 {
         let g = crate::mem::share_granule();
-        if g > abi::PAGE_SIZE && len >= g && self.map_io().from_dyld() { mask | (g - 1) } else { mask }
+        if g > abi::PAGE_SIZE && len >= g && self.map_io().from_mac_dyld() { mask | (g - 1) } else { mask }
+    }
+
+    /// [`Self::darwin_room_mask`], and where on the host page the room
+    /// begins: the phase the library dyld opened last has its slice at in
+    /// its file (`MapLog::armed_room`, taken), so that a fat library's
+    /// segments too are the file's pages rather than copies (865 of Mojave's
+    /// libraries and frameworks have their x86-64 slice 4 KiB into the file:
+    /// every process copied their code, 150-200 MB a process on Foundation).
+    ///
+    /// The room is known by its length, the library's (`MapLog::armed_room`),
+    /// not by who asks: once libSystem is up, dyld makes its mappings
+    /// through libSystem's own calls (its syscall helpers), from code that is
+    /// not dyld's.
+    pub(super) fn darwin_room(&self, len: u64, mask: u64) -> (u64, u64) {
+        let g = crate::mem::share_granule();
+        if g > abi::PAGE_SIZE {
+            if let Some(phase) = self.take_room(len) {
+                return (mask | (g - 1), phase & (g - 1));
+            }
+        }
+        (self.darwin_room_mask(len, mask), 0)
+    }
+
+    /// The phase of the room dyld is making, of `len` bytes, if it is the
+    /// one armed (`MapLog::armed_room`), which it takes.
+    pub(super) fn take_room(&self, len: u64) -> Option<u64> {
+        let mut mm = self.mem.lock();
+        let (phase, span) = mm.log.armed_room?;
+        if span != len {
+            return None;
+        }
+        mm.log.armed_room = None;
+        Some(phase)
     }
 
     /// Where the library the dynamic linker is making room for belongs,
@@ -1098,6 +1131,12 @@ impl Kernel {
     /// that is free: found by reserving, and given back for the caller to
     /// map. `low`: where a file's mapping or code goes in a 64-bit memory.
     pub(super) fn darwin_place(&mut self, hint: u64, len: u64, prot_bits: u32, low: bool, mask: u64) -> Result<u64, Errno> {
+        self.darwin_place_phased(hint, len, prot_bits, low, mask, 0)
+    }
+
+    /// [`Self::darwin_place`], the range beginning `phase` (a multiple of
+    /// the Darwin page, under the alignment) past a boundary of `mask + 1`.
+    pub(super) fn darwin_place_phased(&mut self, hint: u64, len: u64, prot_bits: u32, low: bool, mask: u64, phase: u64) -> Result<u64, Errno> {
         let align = (mask.wrapping_add(1)).max(abi::PAGE_SIZE);
         if !align.is_power_of_two() {
             return Err(Errno::EINVAL);
@@ -1108,15 +1147,17 @@ impl Kernel {
         let reserve = |mm: &mut MemoryMap, hint: u64, len: u64| {
             if low { mm.mmap_low(hint, len, 0, fl, "") } else { mm.mmap(hint, len, 0, fl, "") }
         };
+        let phase = if phase % abi::PAGE_SIZE == 0 && phase < align { phase } else { 0 };
         let got = reserve(&mut mm, hint & !(align - 1), len)?;
         mm.unmap(got, len)?;
-        if got % align == 0 {
+        if got % align == phase {
             return Ok(got);
         }
         let slack = align - crate::mem::PAGE_SIZE;
         let got = reserve(&mut mm, 0, len.checked_add(slack).ok_or(Errno::ENOMEM)?)?;
         mm.unmap(got, len + slack)?;
-        Ok(got.next_multiple_of(align))
+        let at = (got & !(align - 1)) + phase;
+        Ok(if at < got { at + align } else { at })
     }
 
     /// `fcntl`: Darwin's commands, the descriptor ones as the kernel's.

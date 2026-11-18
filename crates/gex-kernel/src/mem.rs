@@ -658,6 +658,15 @@ pub struct MapLog {
     /// this one has to ask, and can only ask once the reservation says how
     /// long the object is.
     pub armed_place: Option<String>,
+    /// The room a Mac's dynamic linker makes next for the library it
+    /// opened last (`Kernel::darwin_room`): where on a host page it should
+    /// begin, and how long it is. The first is the offset on its host page
+    /// of the file offset of the library's slice (a fat file's x86-64 slice
+    /// at 4 KiB is on no 16 KiB page), so that its segments, mapped at their
+    /// offsets in the room from their offsets in the file, are on whole
+    /// host pages of the file's (`map_sealed`) rather than copies. Armed at
+    /// that open, taken by the reservation of that length.
+    pub armed_room: Option<(u64, u64)>,
     /// Where each pinned object actually landed, for checking afterwards.
     ///
     /// A pin that silently does not take is the worst outcome available: the

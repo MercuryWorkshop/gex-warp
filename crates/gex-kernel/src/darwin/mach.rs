@@ -232,8 +232,8 @@ impl Kernel {
         let page = abi::PAGE_SIZE;
         let len = size.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
         if flags & VM_FLAGS_ANYWHERE != 0 {
-            let mask = self.darwin_room_mask(len, mask);
-            let at = self.darwin_place(want, len, prot_bits, false, mask)?;
+            let (mask, phase) = self.darwin_room(len, mask);
+            let at = self.darwin_place_phased(want, len, prot_bits, false, mask, phase)?;
             self.mem.mmap_anon(m, at, len, prot_bits, 0, false, "")
         } else {
             let at = want & !(page - 1);
@@ -242,6 +242,20 @@ impl Kernel {
             // zone finds of its 0x600000000000 on x86-64, and does without.
             if at.checked_add(len).is_none_or(|end| end > m.limit() as u64) {
                 return Err(Errno::EFAULT);
+            }
+            // dyld's room for a library at the address it chose (after the
+            // last library, a few pages of random padding on): where that
+            // puts the library's file offsets on no host page with its
+            // addresses, the room is refused, as a range already taken
+            // would be. dyld then asks for its rooms anywhere, and gets
+            // them where the files' whole host pages can be the process's
+            // own (`Kernel::darwin_room`): a library placed so had all its
+            // code copied into every process that loaded it.
+            if flags & VM_FLAGS_OVERWRITE == 0 && crate::mem::share_granule() > abi::PAGE_SIZE {
+                let g = crate::mem::share_granule();
+                if self.take_room(len).is_some_and(|phase| at % g != phase) {
+                    return Err(Errno::ENOMEM);
+                }
             }
             let extra = if flags & VM_FLAGS_OVERWRITE != 0 { mflags::FIXED } else { mflags::FIXED_NOREPLACE };
             self.mem.mmap_anon(m, at, len, prot_bits, extra, false, "")

@@ -602,6 +602,147 @@ pub mod clone_flags {
     pub const NAMESPACES: u64 = NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET;
 }
 
+/// The room a Mac's dynamic linker will make for the library it opened
+/// (`MapLog::armed_room`): where on a host page of `granule` bytes it
+/// should begin, and how long it is. The first is where the library's code
+/// begins in its file: the offset of its slice of this machine's
+/// architecture in a fat (universal) file, modulo the granule, 0 for a thin
+/// one. dyld maps the slice it takes (x86-64's: `CPU_SUBTYPE_X86_64_ALL`
+/// before any other, as this kernel tells it the CPU is; arm64's) at the
+/// offsets its segments have in it, from the slice's offset in the file on,
+/// into a room as long as the segments span. `None` for what is no Mach-O
+/// file, or a fat one of no such slice.
+fn macho_room(h: &dyn crate::vfs::FileHandle, granule: u64) -> Option<(u64, u64)> {
+    let mut head = [0u8; 4096];
+    let n = h.read_at(0, &mut head).ok()? as usize;
+    let at = slice_offset(&head[..n.min(head.len())])?;
+    let mut cmds = vec![0u8; 64 << 10];
+    let n = h.read_at(at, &mut cmds).ok()? as usize;
+    let span = segments_span(&cmds[..n.min(cmds.len())])?;
+    Some((at % granule, span))
+}
+
+/// Where in a file that begins `head` its Mach-O image for this machine
+/// begins ([`macho_room`]): 0 for a thin one.
+fn slice_offset(head: &[u8]) -> Option<u64> {
+    let n = head.len();
+    let be32 = |at: usize| (at + 4 <= n).then(|| u32::from_be_bytes(head[at..at + 4].try_into().unwrap()));
+    let wide = match be32(0)? {
+        0xcafe_babe => false,
+        0xcafe_babf => true,
+        // (a thin one, either byte order, 32- or 64-bit)
+        0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe => return Some(0),
+        _ => return None,
+    };
+    let count = be32(4)? as usize;
+    let (cputype, subtype) = if gex_abi::X86 { (0x0100_0007u32, 3u32) } else { (0x0100_000cu32, 0u32) };
+    let stride = if wide { 32 } else { 20 };
+    let mut best: Option<(bool, u64)> = None;
+    for i in 0..count.min(32) {
+        let at = 8 + i * stride;
+        if be32(at)? != cputype {
+            continue;
+        }
+        let exact = be32(at + 4)? & 0x00ff_ffff == subtype;
+        let offset = if wide { (be32(at + 8)? as u64) << 32 | be32(at + 12)? as u64 } else { be32(at + 8)? as u64 };
+        if best.is_none_or(|(e, _)| exact && !e) {
+            best = Some((exact, offset));
+        }
+    }
+    Some(best?.1)
+}
+
+/// How much address space a 64-bit Mach-O image's segments span, from the
+/// lowest to the end of the highest, on Darwin pages (no `__PAGEZERO`: a
+/// segment of no access and nothing in the file), as dyld reserves it:
+/// read from its header and load commands, `image`.
+fn segments_span(image: &[u8]) -> Option<u64> {
+    let le32 = |at: usize| image.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let le64 = |at: usize| image.get(at..at + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    if le32(0)? != 0xfeed_facf {
+        return None;
+    }
+    let ncmds = le32(16)? as usize;
+    let (mut at, mut lo, mut hi) = (32usize, u64::MAX, 0u64);
+    for _ in 0..ncmds.min(512) {
+        let (cmd, size) = (le32(at)?, le32(at + 4)? as usize);
+        // LC_SEGMENT_64: vmaddr, vmsize, fileoff, filesize, maxprot, initprot
+        if cmd == 0x19 {
+            let (addr, len, filesize, initprot) = (le64(at + 24)?, le64(at + 32)?, le64(at + 48)?, le32(at + 60)?);
+            if len != 0 && !(filesize == 0 && initprot == 0) {
+                lo = lo.min(addr);
+                hi = hi.max(addr.checked_add(len)?);
+            }
+        }
+        if size < 8 {
+            return None;
+        }
+        at += size;
+    }
+    (hi > lo).then(|| (hi - lo).next_multiple_of(crate::mem::PAGE_SIZE))
+}
+
+#[cfg(test)]
+mod slice_phase_tests {
+    use super::{segments_span, slice_offset};
+
+    fn fat(arches: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut h = vec![0xca, 0xfe, 0xba, 0xbe];
+        h.extend_from_slice(&(arches.len() as u32).to_be_bytes());
+        for &(cputype, subtype, offset) in arches {
+            for v in [cputype, subtype, offset, 0x1000, 12] {
+                h.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn a_libraries_slice_is_where_its_code_begins_in_the_file() {
+        // i386 at 4 KiB, x86-64 further on: the x86-64 slice's offset.
+        let f = fat(&[(7, 3, 0x1000), (0x0100_0007, 3, 0x9000)]);
+        let x86 = if gex_abi::X86 { Some(0x9000) } else { None };
+        assert_eq!(slice_offset(&f), x86);
+        // x86-64h and x86-64: the plain one, as dyld takes on this CPU.
+        let f = fat(&[(0x0100_0007, 8, 0x5000), (0x0100_0007, 0x8000_0003, 0xa000)]);
+        assert_eq!(slice_offset(&f), if gex_abi::X86 { Some(0xa000) } else { None });
+        // A thin one begins the file; what is no Mach-O says nothing.
+        assert_eq!(slice_offset(&[0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]), Some(0));
+        assert_eq!(slice_offset(b"#!/bin/sh\n"), None);
+        assert_eq!(slice_offset(&[0xca, 0xfe]), None);
+    }
+
+    fn segment(name: &str, addr: u64, len: u64, filesize: u64, prot: u32) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&0x19u32.to_le_bytes());
+        c.extend_from_slice(&72u32.to_le_bytes());
+        let mut n = [0u8; 16];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        c.extend_from_slice(&n);
+        for v in [addr, len, 0, filesize] {
+            c.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [prot, prot, 0, 0] {
+            c.extend_from_slice(&v.to_le_bytes());
+        }
+        c
+    }
+
+    #[test]
+    fn a_librarys_room_spans_its_segments() {
+        let cmds = [segment("__PAGEZERO", 0, 0x1_0000_0000, 0, 0), segment("__TEXT", 0x1_0000_0000, 0x5000, 0x5000, 5), segment("__DATA", 0x1_0000_5000, 0x2800, 0x1000, 3), segment("__LINKEDIT", 0x1_0000_8000, 0x1234, 0x1234, 1)];
+        let mut image = vec![0u8; 32];
+        image[..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        image[16..20].copy_from_slice(&(cmds.len() as u32).to_le_bytes());
+        for c in &cmds {
+            image.extend_from_slice(c);
+        }
+        assert_eq!(segments_span(&image), Some(0xa000));
+        assert_eq!(segments_span(&image[..40]), None, "load commands cut short");
+        assert_eq!(segments_span(&[0u8; 64]), None);
+    }
+}
+
 /// Whether a path names a shared object, by the only thing available at
 /// `openat`: its name.
 ///
@@ -3938,6 +4079,11 @@ impl PathIo<'_> {
             if self.map.place.is_some() && (is_shared_object(&p) || self.map.from_dyld()) {
                 self.map.mem.lock().log.armed_place = Some(p.clone());
             }
+            // And where on a host page the room for it goes, for a Mac's
+            // dynamic linker (`MapLog::armed_room`).
+            if crate::mem::share_granule() > crate::mem::PAGE_SIZE && self.map.from_mac_dyld() {
+                self.map.mem.lock().log.armed_room = macho_room(&*h, crate::mem::share_granule());
+            }
             h
         };
         let acc = flags & oflags::ACCMODE;
@@ -5071,6 +5217,17 @@ impl MapIo<'_> {
         let mm = self.mem.lock();
         mm.vma_at(self.pc)
             .is_some_and(|v| v.code.as_ref().map_or(v.name.as_str(), |(id, _)| id.as_str()).ends_with(DYLD))
+    }
+
+    /// [`Self::from_dyld`], or from the interpreter a Mac program was
+    /// started with (dyld, as gex's loader places it: an `[image]` mapping
+    /// from `INTERP_BASE` on, in a process with the Darwin window), which
+    /// no file names.
+    pub fn from_mac_dyld(&self) -> bool {
+        if self.from_dyld() {
+            return true;
+        }
+        gex_abi::guest_base() != 0 && self.mem.lock().vma_at(self.pc).is_some_and(|v| v.name == "[image]" && v.start >= gex_abi::INTERP_BASE)
     }
 
     /// The mapping call `n` (canonical), or `None` for any other.
