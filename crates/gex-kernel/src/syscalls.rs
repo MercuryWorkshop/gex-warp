@@ -632,6 +632,12 @@ pub trait ObjectPlace: Send + Sync {
 
 /// One guest process's kernel state.
 pub struct Kernel {
+    /// The signal sequence ([`crate::proc::signal_seq`]) and pid as they
+    /// were when the table last said nothing was sent to this process
+    /// (bit 63 set once it has): while the sequence has not moved, nothing
+    /// has been sent since, and the table is not asked
+    /// ([`Kernel::sent_signals`]).
+    pub sent_none_at: std::sync::atomic::AtomicU64,
     pub fds: Arc<FdTable>,
     pub mem: crate::mem::Mm,
     pub vfs: Vfs,
@@ -7104,6 +7110,9 @@ pub struct Creds {
     base: [std::sync::atomic::AtomicU32; 2],
     /// The session's login name, as `setlogin` set it: none until it is.
     login: std::sync::Mutex<Option<String>>,
+    /// Counts the changes to what is behind a lock (the groups, the login):
+    /// part of [`Creds::fingerprint`].
+    changes: std::sync::atomic::AtomicU64,
 }
 
 /// The capabilities the credential and permission checks ask for.
@@ -7144,6 +7153,7 @@ impl Creds {
             asid: 0.into(),
             base: [uid.into(), gid.into()],
             login: Default::default(),
+            changes: 0.into(),
         }
     }
 
@@ -7265,6 +7275,7 @@ impl Creds {
     /// Replace the supplementary groups.
     pub fn set_groups(&self, groups: &[u32]) {
         *self.groups.lock().unwrap_or_else(|e| e.into_inner()) = groups.to_vec();
+        self.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Whether the process is in group `gid` for a permission check: its
@@ -7304,6 +7315,7 @@ impl Creds {
 
     pub fn set_login(&self, name: &str) {
         *self.login.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+        self.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The ids and sets as bytes, for a process another memory goes on in
@@ -7314,6 +7326,31 @@ impl Creds {
     /// (Darwin's `auditinfo_addr_t`: its id, audit user and flags).
     pub fn save(&self) -> Vec<u8> {
         self.save_within(usize::MAX)
+    }
+
+    /// A number that changes when what [`Creds::save`] says does (but for
+    /// a change to the audit session's record, which
+    /// [`crate::darwin::audit::generation`] counts): every id, set and flag
+    /// as it is, and the count of changes to the groups and login, mixed.
+    /// Made of loads alone, no lock and nothing allocated: what a process
+    /// asks at each system call, whether its credentials are to be
+    /// published again ([`Kernel::publish_proc`]).
+    pub fn fingerprint(&self) -> u64 {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut mix = |v: u64| {
+            h = (h ^ v).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^= h >> 31;
+        };
+        for a in self.uid.iter().chain(&self.gid).chain(&self.base).chain(std::iter::once(&self.asid)) {
+            mix(a.load(Acquire) as u64);
+        }
+        for c in &self.caps {
+            mix(c.load(Acquire));
+        }
+        mix(self.keep_caps.load(Acquire) as u64 | (self.sugid.load(Acquire) as u64) << 1);
+        mix(self.changes.load(Acquire));
+        h
     }
 
     /// [`Creds::save`], as much of it as fits `room` bytes: the groups a
@@ -8122,7 +8159,7 @@ pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_
     let r = cred_change(creds, procs, pid, m, n, a);
     // A change the other processes' `/proc/<pid>/status` shows.
     if r.is_ok() && !matches!(n, nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::GETRESUID | nr::GETRESGID | nr::CAPGET | nr::SETFSUID | nr::SETFSGID | nr::SETSID | nr::GETSID | nr::GETPGID | nr::SETPGID) {
-        procs.set_creds(pid, &creds.save_within(256));
+        procs.set_creds(pid, &creds.save());
     }
     r
 }
@@ -11511,6 +11548,7 @@ impl Kernel {
             );
         }
         Kernel {
+            sent_none_at: 0.into(),
             fds: Arc::new(fds),
             mem: crate::mem::Mm::new(MemoryMap::new(brk_start)),
             vfs: Vfs::new(),
@@ -11871,7 +11909,7 @@ impl Kernel {
     fn exec_commit(&mut self) {
         let (uid, gid) = std::mem::take(&mut self.exec_setid);
         self.creds.exec_ids(uid, gid);
-        self.procs.set_creds(self.pid, &self.creds.save_within(256));
+        self.procs.set_creds(self.pid, &self.creds.save());
     }
 
     /// Whether `path` is a file whose mode lets nobody execute it. Where
@@ -12105,6 +12143,7 @@ impl Kernel {
 
     fn fork_kernel_inner(&self) -> Kernel {
         Kernel {
+            sent_none_at: 0.into(),
             fds: Arc::new((*self.fds).clone()),
             mem: self.mem.clone(),
             vfs: self.vfs.clone(),
@@ -13353,6 +13392,30 @@ impl Kernel {
         signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
     }
 
+    /// Whether another process has left this one a signal (in the table:
+    /// [`ProcTable::has_signals`]). Asked at every system call, and the
+    /// table's lock is every process's: so the table is asked only when the
+    /// signal sequence has moved since it last said there was none (every
+    /// send moves it once its signal is there). A table elsewhere (a page's
+    /// kernel module) is asked every time: its sends move its own sequence.
+    fn sent_signals(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.procs.is_remote() {
+            return self.procs.has_signals(self.pid);
+        }
+        // (the sequence read before the table is asked: a send after that
+        // moves it again)
+        let at = 1u64 << 63 | (self.pid as u32 as u64 & 0x7fff_ffff) << 32 | crate::proc::signal_seq() as u64;
+        if self.sent_none_at.load(Ordering::Acquire) == at {
+            return false;
+        }
+        let sent = self.procs.has_signals(self.pid);
+        if !sent {
+            self.sent_none_at.store(at, Ordering::Release);
+        }
+        sent
+    }
+
     /// Move signals other processes have sent into this one's pending set.
     ///
     /// `kill` cannot reach into another process's kernel -- each has its own
@@ -13361,7 +13424,7 @@ impl Kernel {
     /// supervisor work.
     pub fn collect_signals(&self) {
         // `tgkill`s from other processes, each for one thread.
-        if self.procs.has_signals(self.pid) {
+        if self.sent_signals() {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
                 let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid() };
@@ -14644,7 +14707,7 @@ impl Kernel {
 
     /// Move anything another process has sent into this one's pending set.
     fn take_sent_signals(&mut self) {
-        if !self.procs.has_signals(self.pid) {
+        if !self.sent_signals() {
             return;
         }
         self.signals.process().collect(&self.procs, self.pid, self.creds.ruid());

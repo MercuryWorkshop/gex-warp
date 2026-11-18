@@ -631,7 +631,7 @@ impl Kernel {
                 }
                 let name = m.read_cstr(x[0], 256)?;
                 self.creds.set_login(&String::from_utf8_lossy(&name));
-                self.procs.set_creds(self.pid, &self.creds.save_within(256));
+                self.procs.set_creds(self.pid, &self.creds.save());
                 Ok(0)
             }
             // The audit session the process is in and its audit user, and
@@ -1142,7 +1142,7 @@ impl Kernel {
         if list != self.creds.groups() {
             self.creds.set_groups(&list);
             self.creds.set_sugid(true);
-            self.procs.set_creds(self.pid, &self.creds.save_within(256));
+            self.procs.set_creds(self.pid, &self.creds.save());
         }
         Ok(0)
     }

@@ -1634,6 +1634,11 @@ impl ProcTable {
 
     /// Whether anything is waiting for `pid`, without taking it. Cheap enough
     /// to ask on every syscall.
+    /// Whether the table is elsewhere ([`Remote`]).
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
     pub fn has_signals(&self, pid: i32) -> bool {
         if let Some(r) = self.remote {
             return (r.has_signals)(pid) != 0;
@@ -1711,6 +1716,16 @@ impl ProcTable {
         };
         e.zombie = st.lock().map(|s| s.is_some()).unwrap_or(false);
         Some(e)
+    }
+
+    /// `pid`'s exit-status cell, while it is in the table (none for a
+    /// table elsewhere): filled when it exits, so what a process descriptor
+    /// asks of a live process ([`crate::pidfd`]) needs no table lock.
+    pub fn status_cell(&self, pid: i32) -> Option<Arc<Mutex<Option<i32>>>> {
+        if self.remote.is_some() {
+            return None;
+        }
+        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status))
     }
 
     /// Whether `pid` has exited, if it is in the table (a zombie until it

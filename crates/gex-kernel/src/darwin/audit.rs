@@ -104,6 +104,21 @@ struct Table {
 
 static TABLE: Mutex<Option<Table>> = Mutex::new(None);
 
+/// Counts the changes to the sessions' records (one made, adopted or
+/// changed): see [`generation`].
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A number that changes whenever a session's record does: with
+/// [`crate::syscalls::Creds::fingerprint`], whether a process's saved
+/// credentials (which carry its session's record) are still what they were.
+pub fn generation() -> u64 {
+    CHANGES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn changed() {
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     f(t.get_or_insert_with(Table::default))
@@ -135,6 +150,7 @@ pub fn session(asid: u32) -> u32 {
     }
     with(|t| {
         t.sessions.entry(ASSIGNED_ASID_MIN).or_insert_with(|| {
+            changed();
             let mut info = default_info();
             info[ASID..ASID + 4].copy_from_slice(&ASSIGNED_ASID_MIN.to_le_bytes());
             info[FLAGS..].copy_from_slice(&IS_INITIAL.to_le_bytes());
@@ -162,7 +178,10 @@ pub fn adopt(info: &[u8; INFO]) -> u32 {
     let asid = get32(info, ASID);
     if asid != 0 {
         with(|t| {
-            t.sessions.entry(asid).or_insert(Session { info: *info, port: Weak::new() });
+            t.sessions.entry(asid).or_insert_with(|| {
+                changed();
+                Session { info: *info, port: Weak::new() }
+            });
             if asid >= ASSIGNED_ASID_MIN {
                 t.last = t.last.max(asid);
             }
@@ -239,16 +258,18 @@ impl Kernel {
                 Some(s) => {
                     if s.info[AUID..AUID + 4] != new[AUID..AUID + 4] || s.info[TERMID..ASID] != new[TERMID..ASID] || s.info[FLAGS..] != new[FLAGS..] {
                         s.info = new;
+                        changed();
                     }
                 }
                 None => {
                     t.sessions.insert(asid, Session { info: new, port: Weak::new() });
+                    changed();
                 }
             }
             Ok(asid)
         })?;
         self.creds.set_asid(asid);
-        self.procs.set_creds(self.pid, &self.creds.save_within(256));
+        self.procs.set_creds(self.pid, &self.creds.save());
         Ok(asid)
     }
 
@@ -369,7 +390,7 @@ impl Kernel {
         }
         if asid != self.creds.asid() {
             self.creds.set_asid(asid);
-            self.procs.set_creds(self.pid, &self.creds.save_within(256));
+            self.procs.set_creds(self.pid, &self.creds.save());
         }
         Ok(asid as u64)
     }

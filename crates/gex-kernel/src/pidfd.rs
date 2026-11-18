@@ -15,7 +15,7 @@ use crate::errno::{Errno, SysResult};
 use crate::proc::ProcTable;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The name a process descriptor has (`/proc/self/fd`'s link).
 pub const PATH: &str = "anon_inode:[pidfd]";
@@ -30,6 +30,13 @@ pub struct PidFd {
     queue: u32,
     /// Once seen exited it stays so: an exited process does not come back.
     exited: AtomicBool,
+    /// The process's exit-status cell, taken when the descriptor is made
+    /// (none for a process not in the table then, or a table elsewhere):
+    /// while it is empty the process is alive, and neither readiness asks
+    /// the table, whose lock every system call of every process takes too
+    /// (libdispatch's process sources poll theirs at each wakeup of a
+    /// kqueue).
+    status: Option<Arc<Mutex<Option<i32>>>>,
 }
 
 impl std::fmt::Debug for PidFd {
@@ -41,7 +48,8 @@ impl std::fmt::Debug for PidFd {
 impl PidFd {
     pub fn new(pid: i32, procs: Arc<ProcTable>) -> PidFd {
         let queue = procs.queue(pid);
-        PidFd { pid, procs, queue, exited: AtomicBool::new(false) }
+        let status = procs.status_cell(pid);
+        PidFd { pid, procs, queue, exited: AtomicBool::new(false), status }
     }
 
     /// The process it names.
@@ -61,6 +69,9 @@ impl PidFd {
     fn exited(&self) -> bool {
         if self.exited.load(Ordering::Acquire) {
             return true;
+        }
+        if self.status.as_ref().is_some_and(|s| s.lock().map(|s| s.is_none()).unwrap_or(false)) {
+            return false;
         }
         let (exited, _) = self.state();
         if exited {
@@ -99,7 +110,8 @@ impl FileHandle for PidFd {
     }
 
     fn poll_hup(&self) -> bool {
-        self.state().1
+        // (Not reaped before it has exited.)
+        self.exited() && self.state().1
     }
 
     fn wait_queue(&self) -> u32 {

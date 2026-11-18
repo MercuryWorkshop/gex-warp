@@ -51,6 +51,13 @@ pub struct ProcCell {
     /// formatting the VMA tree is the expensive part, and between two
     /// changes to the map it is the same string.
     maps: Mutex<(u64, String)>,
+    /// What the process's credentials were when last published to the
+    /// table ([`Kernel::publish_proc`]): its pid, its credentials' address,
+    /// their fingerprint and the audit sessions' generation, mixed; and the
+    /// lock a publication takes, so that what is noted is what was put
+    /// there last.
+    creds_said: std::sync::atomic::AtomicU64,
+    creds_saying: Mutex<()>,
 }
 
 impl ProcCell {
@@ -282,8 +289,20 @@ impl Kernel {
                 && Arc::ptr_eq(&o.creds, &self.creds)
         });
         // The ids as they are now, for the other processes' `status` (an
-        // exec's capabilities, a fork child's own).
-        self.procs.set_creds(self.pid, &self.creds.save());
+        // exec's capabilities, a fork child's own): when they have changed
+        // since they were last put there. (Every system call publishes; the
+        // table's lock is every process's, and the audit sessions' too.)
+        let creds_now = || {
+            let mut h = self.creds.fingerprint() ^ crate::darwin::audit::generation().wrapping_mul(0x94d0_49bb_1331_11eb);
+            h ^= (Arc::as_ptr(&self.creds) as u64).rotate_left(17) ^ (self.pid as u32 as u64).rotate_left(41);
+            h | 1
+        };
+        if cell.creds_said.load(std::sync::atomic::Ordering::Acquire) != creds_now() {
+            let _one = cell.creds_saying.lock().unwrap_or_else(|e| e.into_inner());
+            let now = creds_now();
+            self.procs.set_creds(self.pid, &self.creds.save());
+            cell.creds_said.store(now, std::sync::atomic::Ordering::Release);
+        }
         if same {
             return;
         }
