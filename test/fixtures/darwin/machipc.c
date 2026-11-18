@@ -18,6 +18,15 @@
 // task; and what is asked of the child's task port is not answered as if
 // it were asked of the parent's. Then mach_port_destroy, the trap, of a
 // name with two rights, of no name, and of the name for the child's task.
+//
+// `machipc once`: send-once rights that die unused. The child gives the
+// parent a send right to a port of its own; the parent sends it two
+// requests there, each with a send-once right to a reply port of its own;
+// the child receives the first, does not answer it, and ends with the
+// second still queued. The parent is told of each right that died
+// (MACH_NOTIFY_SEND_ONCE, 71, on each reply port): what an XPC client's
+// wait for a reply ends with when its server ends without one (fontd's
+// for fontworker, which ends when it has been idle ten seconds).
 #include "t.h"
 
 // A trap with eight arguments: mach_msg2's.
@@ -291,9 +300,69 @@ static int task_parent(void) {
     return 0;
 }
 
+// `machipc once`, the child: a send right to a port of its own, to the
+// bootstrap port; then the first request that comes, taken and not
+// answered; and the end, once the second is queued behind it.
+static int once_child(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = get_special(4);
+    if (!boot) return 1;
+    u32 mine = allocate(RIGHT_RECEIVE);
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    m.h.bits = COMPLEX | COPY_SEND, m.h.remote = boot, m.h.id = 700;
+    m.body[0] = 1;
+    *(struct port_desc *)(m.body + 1) = (struct port_desc){mine, 0, 0, MAKE_SEND, 0};
+    if (msg1(&m, SEND_MSG, sizeof m.h + 16, 0, 0, 0)) return 2;
+    t_memset(&m, 0, sizeof m);
+    if (msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, mine, 10000)) return 4;
+    if (m.h.id != 701 || !m.h.remote) return 8;
+    // (The parent sends the second before it waits for this one's end:
+    // a while for it to be there.)
+    static struct { long s, us; } wait = {0, 300000};
+    SYS(SYS_select, 0, 0, 0, 0, &wait);
+    return 0;
+}
+
+// `machipc once`, the parent.
+static int once_parent(void) {
+    task = (u32)TRAP(TRAP_task_self);
+    u32 boot = allocate(RIGHT_RECEIVE);
+    if (set_special(4, boot)) return 1;
+    long pid = 0, child_flag = -1;
+    pid = t_syscall2(&child_flag, SYS_fork, 0, 0, 0);
+    if (pid < 0) return 1;
+    if (child_flag) t_exit(once_child());
+    static struct message m;
+    t_memset(&m, 0, sizeof m);
+    long r = msg1(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, boot, 10000);
+    u32 theirs = ((struct port_desc *)(m.body + 1))->name;
+    t_printf("received: %ld, id %d, a port: %s\n", r, m.h.id, theirs ? "yes" : "no");
+    // Two requests, each with a send-once right to a reply port.
+    u32 reply[2];
+    for (int i = 0; i < 2; i++) {
+        reply[i] = allocate(RIGHT_RECEIVE);
+        t_memset(&m, 0, sizeof m);
+        m.h.bits = COPY_SEND | MAKE_SEND_ONCE << 8, m.h.remote = theirs, m.h.local = reply[i], m.h.id = 701 + i;
+        t_printf("request %d: %ld\n", i + 1, msg2(&m, SEND_MSG | MQ_CALL, sizeof m.h, 0, 0, 0));
+    }
+    int status = -1;
+    long got = SYS(SYS_wait4, pid, &status, 0, 0);
+    t_printf("the child: %s, status %x\n", got == pid ? "waited for" : "not waited for", status);
+    // Each reply port is told its send-once right died.
+    for (int i = 0; i < 2; i++) {
+        t_memset(&m, 0, sizeof m);
+        r = msg2(&m, RCV_MSG | RCV_TIMEOUT, 0, sizeof m, reply[i], 5000);
+        if (r) t_printf("reply port %d: nothing, %lx\n", i + 1, r);
+        else t_printf("reply port %d: id %d, %u bytes, from %s\n", i + 1, m.h.id, m.h.size, m.h.remote ? "a port" : "the kernel");
+    }
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp, char **apple) {
     (void)envp, (void)apple;
     if (argc > 1 && !t_strcmp(argv[1], "task")) return task_parent();
+    if (argc > 1 && !t_strcmp(argv[1], "once")) return once_parent();
     task = (u32)TRAP(TRAP_task_self);
     u32 boot = allocate(RIGHT_RECEIVE);
     t_printf("set the bootstrap port: %ld\n", set_special(4, boot));

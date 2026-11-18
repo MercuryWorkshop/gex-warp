@@ -19,6 +19,12 @@
 // of the Mac: its answers are 10.14's, and a Mac of today may not let a
 // task's control port leave its task, or have that trap.
 //
+// And send-once rights that die unused (`machipc once`), against the Mac:
+// one the receiver took and never answered, one still queued on its port
+// when the receiver ends -- each reply port is told (MACH_NOTIFY_SEND_ONCE),
+// which is how an XPC client's wait for a reply ends when its server ends
+// without one.
+//
 // Under gexc only: on the page each process has a kernel of its own, and a
 // port does not yet leave its task there.
 import { darwin } from '../lib/darwin.mjs';
@@ -29,6 +35,7 @@ export default async function (t) {
   const d = darwin(t);
   const prog = await d.build('machipc');
   await d.compare('machipc', prog, [], { timeout: 60000 });
+  await d.compare('machipc once', prog, ['once'], { timeout: 60000 });
   const r = await d.gex(prog, ['task'], { timeout: 60000 });
   const lines = r.stdout.split('\n');
   const has = (line, what) => t.check(what, lines.includes(line), `exit ${r.code}: ${JSON.stringify(r.stdout)} / ${r.stderr.trim().split('\n').slice(-2).join(' / ')}`);
