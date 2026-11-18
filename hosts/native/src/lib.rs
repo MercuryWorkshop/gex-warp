@@ -2877,6 +2877,7 @@ fn run_thread_loop_inner(
     // This host thread's processor time is its process's while it runs here.
     usage::install();
     shmem::install();
+    gex_mem::relieve_malloc();
     let _cpu = store.data_mut().with_kernel(|k| usage::Counting::enter(k));
     // Units for code that is in place before the first instruction (the
     // interpreter, which gex's loader places): installed now, not at the

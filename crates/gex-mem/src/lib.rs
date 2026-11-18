@@ -72,6 +72,33 @@ impl Drop for Live {
     }
 }
 
+/// Give the system back, every `GEX_MALLOC_RELIEF_SECS` seconds (10; 0
+/// for never), the memory the host's allocator holds free: macOS's keeps
+/// the regions and large blocks a process frees dirty, for its next
+/// allocations, and a desktop's worth of compiling and instantiating left
+/// some 1.1 GB of them ("Malloc Small (empty)", "Malloc Large (empty)")
+/// in its footprint 13 minutes in. A thread of its own, started once.
+pub fn relieve_malloc() {
+    #[cfg(target_os = "macos")]
+    {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let secs = std::env::var("GEX_MALLOC_RELIEF_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
+            if secs == 0 {
+                return;
+            }
+            unsafe extern "C" {
+                fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+            }
+            let _ = std::thread::Builder::new().name("gex-malloc-relief".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                // SAFETY: every zone (null), as much as it can (0).
+                unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+            });
+        });
+    }
+}
+
 /// Every guest memory alive: (wasm memory base, length, host view).
 pub fn live() -> Vec<(u64, u64, u64)> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
