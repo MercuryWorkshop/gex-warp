@@ -16,6 +16,11 @@
 //   caller's audit session, and the caller is its owner. It asks for the
 //   entitlement com.apple.private.SkyLight.loginwindow, which this
 //   program's signature carries (build.sh);
+// - checked in as an application (the Process Manager's GetCurrentProcess:
+//   LaunchServices and WindowServer's process list): the first root
+//   process named loginwindow to do so gives the process list its session,
+//   which WindowServer's front process, and so every application's window
+//   being ordered in, needs;
 // - the console given to the user: its device's owner, and the login name;
 // - and something to show: a window the size of the display, filled, with
 //   a square in it, which WindowServer composites to the framebuffer; and
@@ -239,6 +244,22 @@ int main(int argc, char **argv) {
     printf("gexloginwindow: connection %d\n", cid);
     CGError e = SLSSetLoginwindowConnection(cid);
     printf("gexloginwindow: SLSSetLoginwindowConnection -> %d\n", (int)e);
+    // And loginwindow checked in as the session's process (the Process
+    // Manager's check-in: LaunchServices, then WindowServer's process
+    // list, as an application does), which gives WindowServer's process
+    // list the login's session (`_XCreateApplication`: the first euid-0
+    // process named loginwindow sets it). Without it WindowServer knows of
+    // no front process (CPXGetFrontProcess: procNotFound) and orders no
+    // application's window in: Calculator's stayed off screen after its
+    // open event. On a thread of its own: the check-in waits on lsd.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        ProcessSerialNumber me = {0, 0};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        OSErr pe = GetCurrentProcess(&me);
+#pragma clang diagnostic pop
+        printf("gexloginwindow: checked in as the session's process: %d, psn %u/%u\n", (int)pe, (unsigned)me.highLongOfPSN, (unsigned)me.lowLongOfPSN);
+    });
 
     CGDirectDisplayID display = CGMainDisplayID();
     CGRect bounds = CGDisplayBounds(display);
