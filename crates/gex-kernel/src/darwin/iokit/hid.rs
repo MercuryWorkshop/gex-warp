@@ -292,6 +292,26 @@ impl Hid {
         }
     }
 
+    /// What `setMouseLocation` (selector 4) writes into the shared memory's
+    /// globals, as IOHIDSystem's `_setCursorPosition` does, at their offsets
+    /// in the memory: `cursorLoc` (two shorts) and the cursor's place in
+    /// 24.8 fixed point on the screen and on the desktop
+    /// (`screenCursorFixed`, `desktopCursorFixed`: one screen, at the
+    /// desktop's origin). `at` is the place in whole points; `inband` the
+    /// request, whose fixed-point form (12 bytes) is kept to the bit.
+    pub fn cursor_globals(at: (i32, i32), inband: &[u8]) -> Vec<(usize, Vec<u8>)> {
+        let (fx, fy) = if inband.len() >= 12 {
+            (i32::from_le_bytes(inband[0..4].try_into().unwrap()), i32::from_le_bytes(inband[4..8].try_into().unwrap()))
+        } else {
+            (at.0 << 8, at.1 << 8)
+        };
+        let mut loc = (at.0 as i16).to_le_bytes().to_vec();
+        loc.extend_from_slice(&(at.1 as i16).to_le_bytes());
+        let mut fixed = fx.to_le_bytes().to_vec();
+        fixed.extend_from_slice(&fy.to_le_bytes());
+        vec![(EVG + 20, loc), (EVG + 56, fixed.clone()), (EVG + 64, fixed)]
+    }
+
     /// Write the posted events into the shared memory `shm` (the task's,
     /// as bytes), as `IOHIDSystem::postEvent` would put each in the queue:
     /// the cursor moved, the buttons' state, an element at the tail. False
@@ -471,6 +491,30 @@ mod tests {
         assert_eq!((rd(8 + 212), rd(8 + 216)), (1, 1));
         assert_eq!(rd(8 + 224), 1);
         assert_eq!(rd(8 + 224 + 239 * 96), 0);
+    }
+
+    #[test]
+    fn setting_the_mouse_location_says_it_in_the_globals() {
+        // IOFixedPoint32 (and a word more): kept as given.
+        let mut inband = Vec::new();
+        for v in [300 << 8 | 0x80, 200 << 8, 0] {
+            inband.extend_from_slice(&(v as i32).to_le_bytes());
+        }
+        let mut h = Hid::new(0);
+        assert_eq!(h.method(4, &[], &inband).map(|(s, _)| s), Ok(vec![]));
+        assert_eq!(h.at, (300, 200));
+        let g = Hid::cursor_globals(h.at, &inband);
+        let mut shm = Hid::shmem();
+        for (at, b) in &g {
+            shm[*at..*at + b.len()].copy_from_slice(b);
+        }
+        let rd = |at: usize| i32::from_le_bytes(shm[at..at + 4].try_into().unwrap());
+        assert_eq!((i16::from_le_bytes([shm[EVG + 20], shm[EVG + 21]]), i16::from_le_bytes([shm[EVG + 22], shm[EVG + 23]])), (300, 200));
+        assert_eq!((rd(EVG + 64), rd(EVG + 68)), (300 << 8 | 0x80, 200 << 8));
+        assert_eq!((rd(EVG + 56), rd(EVG + 60)), (300 << 8 | 0x80, 200 << 8));
+        // An IOGPoint: whole points.
+        let g = Hid::cursor_globals((5, 7), &[5, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(g[2], (EVG + 64, [5i32 << 8, 7 << 8].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
     }
 
     #[test]

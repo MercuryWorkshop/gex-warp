@@ -1176,6 +1176,18 @@ impl Kernel {
                         if selector == 4 && hc.kind <= 1 {
                             *said = format!("{said}: the pointer to {},{}", hc.at.0, hc.at.1);
                         }
+                        // And it is where the shared memory's globals say the
+                        // cursor is, as IOHIDSystem's setCursorPosition
+                        // writes them: WindowServer reads its current cursor
+                        // location back from there (desktopCursorFixed, in
+                        // _EVGSetMouseLocation and CGXGetCurrentCursorLocation).
+                        if selector == 4 && hc.kind == 0 && r.is_ok() {
+                            if let Some(&(_, at, _)) = c.maps.iter().find(|(t, _, _)| *t == 0) {
+                                for (off, bytes) in hid::Hid::cursor_globals(hc.at, &inband) {
+                                    let _ = m.write(at + off as u64, &bytes);
+                                }
+                            }
+                        }
                         r
                     }
                     Client::Fb(fb) => fb.method(selector, &scalars, &inband),
