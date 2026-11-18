@@ -4,7 +4,8 @@
 // - a wait on a word that no longer holds the value returns at once, and a
 //   wake nobody waits for says so (ENOENT);
 // - an unfair lock's word names its owner (the thread's port name; the low
-//   bit set while nobody waits): a wait for a lock whose owner has ended
+//   bit set while nobody waits): a wait for a lock held by a thread that
+//   lives (slept on, its flag bits clear or not), and one whose owner has ended
 //   (EOWNERDEAD, at once: XNU looks the owner up), one whose word names no
 //   thread at all, and one whose owner is the caller (EDEADLK);
 // - two threads taking and giving back one unfair lock by turns, as
@@ -86,6 +87,13 @@ static void *turns(void *arg) {
     return 0;
 }
 
+static u32 go;
+static void *live_until_go(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&go, __ATOMIC_ACQUIRE)) ulock_wait(UL_COMPARE_AND_WAIT, &go, 0, 0);
+    return 0;
+}
+
 static u32 ended_owner;
 static void *own_and_end(void *arg) {
     (void)arg;
@@ -129,6 +137,17 @@ int main(int argc, char **argv, char **envp, char **apple) {
     static u32 mine;
     mine = (u32)TRAP(TRAP_thread_self) & ~1u;
     say("unfair lock, held by the caller", ulock_wait(UL_UNFAIR_LOCK, &mine, mine, 300000));
+
+    // One held by a thread that lives, the two low bits of its name
+    // cleared (as libdispatch's lock clears them for its flags): waited on.
+    int l = t_thread_start(live_until_go, 0);
+    if (l < 0) return 1;
+    static u32 held;
+    held = t_thread_port(l) & ~3u;
+    say("unfair lock, held by a living thread, 50 ms", ulock_wait(UL_UNFAIR_LOCK, &held, held, 50000));
+    __atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+    ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, &go);
+    t_thread_join(l);
 
     // Two threads by turns.
     int a = t_thread_start(turns, 0), b = t_thread_start(turns, 0);

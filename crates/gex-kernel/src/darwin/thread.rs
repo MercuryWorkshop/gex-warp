@@ -208,13 +208,15 @@ impl Kernel {
             return nr::NOOP_OK;
         }
         // An unfair lock's word names its owner (the thread's port name,
-        // its low bit cleared while somebody waits). XNU looks the owner up
+        // whose low two bits, always set in a name, are the lock's flags:
+        // os_unfair_lock's no-waiters bit, libdispatch's waiters and
+        // failed-trylock bits). XNU looks the owner up
         // and does not sleep on a lock nobody can give back: a name that is
         // no living thread of this task's, or the caller's own, is
         // EOWNERDEAD at once (libplatform then says the lock is corrupt). A
         // word that no longer holds the value is waited on by nobody first.
         if op == UL_UNFAIR_LOCK && m.read_u32(x[1]).is_ok_and(|v| v == x[2] as u32) {
-            let owner = x[2] as u32 | 1;
+            let owner = x[2] as u32 | 3;
             let alive = super::mach::port_thread(self.pid, owner)
                 .filter(|&tid| tid != self.tid)
                 .is_some_and(|tid| self.procs.is_remote() || self.procs.task_owner(tid) == Some(self.pid));
