@@ -434,6 +434,65 @@ pub struct Loaded {
     pub metadata: Vec<u8>,
     /// True when the compile was skipped.
     pub hit: bool,
+    /// The entry it is mapped from, by key, until [`Loaded::hold`] takes it.
+    mapped: Option<String>,
+}
+
+impl Loaded {
+    /// The module's mapping, this process's for as long as what is returned
+    /// lives: the caller keeps it beside the module, and beside every
+    /// instance of it, and drops it with them. While it lives, a load of the
+    /// same key (another guest process's translation of the same code) is
+    /// handed this module rather than mapping the file again ([`shared`]);
+    /// once every hold of the key is dropped, its file's blocks are no
+    /// longer counted as mapped ([`MAPPED_BYTES`], [`MAPPED_EVICTED`]). A
+    /// mapping no hold is taken of stays counted for the life of the process
+    /// (as every one was: a desktop run's processes ending left their
+    /// modules counted, some 15% of what had stopped mapping 35 minutes in).
+    /// `None` when the module is not mapped from the cache.
+    pub fn hold(&mut self) -> Option<Held> {
+        let key = self.mapped.take()?;
+        let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.as_mut().and_then(|m| m.get_mut(&key)) {
+            if e.share.is_none() {
+                e.share = Some((self.module.clone(), self.metadata.clone()));
+            }
+        }
+        Some(Held(key))
+    }
+}
+
+/// One hold of a mapped module ([`Loaded::hold`]): dropped, the module's
+/// share of the mapping's count goes.
+pub struct Held(String);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        release(&self.0);
+    }
+}
+
+/// One hand-out of `key`'s mapping given back ([`Held`]): the last one takes
+/// the entry and its blocks off the counts, and lets its module go.
+fn release(key: &str) {
+    let gone = {
+        let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = g.as_mut() else { return };
+        let Some(e) = map.get_mut(key) else { return };
+        e.refs = e.refs.saturating_sub(1);
+        if e.refs > 0 {
+            return;
+        }
+        let e = map.remove(key).unwrap();
+        MAPPED_BYTES.fetch_sub(e.blocks, Ordering::Relaxed);
+        if e.evicted {
+            MAPPED_EVICTED.fetch_sub(e.blocks, Ordering::Relaxed);
+        }
+        RELEASED.fetch_add(1, Ordering::Relaxed);
+        e.share
+    };
+    // (the module's last handle, maybe: unmapped outside the lock)
+    drop(gone);
 }
 
 /// Get the compiled form of a translation, using `dir` as the cache. `build`
@@ -446,6 +505,11 @@ pub fn load_or_compile(
     key: &str,
     build: impl FnOnce() -> Result<(Vec<u8>, Vec<u8>)>,
 ) -> Result<Loaded> {
+    // Held in this process already: the same module (no file read, no
+    // second mapping and no second copy of the engine's data for it).
+    if let Some(l) = shared(engine, key) {
+        return Ok(l);
+    }
     let path = dir.join(format!("{key}.cwasm"));
     let meta_path = dir.join(format!("{key}.meta"));
     // Both halves must be present: a module without its metadata says nothing
@@ -457,12 +521,13 @@ pub fn load_or_compile(
         // why the failure path below simply rebuilds. Mapped from the file
         // (`mapped`), not copied.
         match loaded(engine, &path) {
-            Ok(module) => {
+            Ok((module, mapped)) => {
                 refresh(&meta_path);
                 return Ok(Loaded {
                     module,
                     metadata,
                     hit: true,
+                    mapped,
                 });
             }
             Err(_) => {
@@ -484,6 +549,7 @@ pub fn load_or_compile(
     // compiled code 25 minutes in). A caller that wants one kept wraps this
     // in the memo itself (`load_or_compile_module`).
     let mut module = compile_uncached(engine, &wasm).context("validating translated wasm")?;
+    let mut mapped_key = None;
     if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
@@ -492,19 +558,23 @@ pub fn load_or_compile(
         account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
         // And the module the store's file, mapped, in place of the one just
         // compiled into memory of its own.
-        if within_mapped_budget(&path) {
-            if let Ok(m) = mapped(engine, &path) {
+        match map_counted(engine, &path) {
+            Ok(Some((m, k))) => {
                 module = m;
+                mapped_key = Some(k);
             }
-        } else {
-            IN_MEMORY_LOADS.fetch_add(1, Ordering::Relaxed);
-            IN_MEMORY_BYTES.fetch_add(serialized.len() as u64, Ordering::Relaxed);
+            Ok(None) => {
+                IN_MEMORY_LOADS.fetch_add(1, Ordering::Relaxed);
+                IN_MEMORY_BYTES.fetch_add(serialized.len() as u64, Ordering::Relaxed);
+            }
+            Err(_) => {}
         }
     }
     Ok(Loaded {
         module,
         metadata,
         hit: false,
+        mapped: mapped_key,
     })
 }
 
@@ -524,17 +594,17 @@ fn mapped(engine: &Engine, path: &Path) -> Result<Module> {
 }
 
 /// A stored module: mapped from its file while this process's mapped
-/// files come to less than [`mapped_budget`] ([`within_mapped_budget`]),
+/// files are within their budgets ([`map_counted`]), with the entry's key;
 /// read into memory of its own after that.
-fn loaded(engine: &Engine, path: &Path) -> Result<Module> {
-    if within_mapped_budget(path) {
-        return mapped(engine, path);
+fn loaded(engine: &Engine, path: &Path) -> Result<(Module, Option<String>)> {
+    if let Some((m, k)) = map_counted(engine, path)? {
+        return Ok((m, Some(k)));
     }
     let bytes = std::fs::read(path)?;
     IN_MEMORY_LOADS.fetch_add(1, Ordering::Relaxed);
     IN_MEMORY_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     // SAFETY: as `mapped`'s.
-    Ok(unsafe { Module::deserialize(engine, &bytes) }?)
+    Ok((unsafe { Module::deserialize(engine, &bytes) }?, None))
 }
 
 /// Modules read into memory of their own rather than mapped ([`loaded`],
@@ -543,61 +613,126 @@ fn loaded(engine: &Engine, path: &Path) -> Result<Module> {
 pub static IN_MEMORY_LOADS: AtomicU64 = AtomicU64::new(0);
 pub static IN_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// The disk this process has mapped modules from ([`within_mapped_budget`]),
-/// and of it what its evictions left mapped.
+/// The disk this process maps modules from ([`map_counted`]), and of it
+/// what its evictions left mapped.
 pub fn mapped_bytes() -> (u64, u64) {
     (MAPPED_BYTES.load(Ordering::Relaxed), MAPPED_EVICTED.load(Ordering::Relaxed))
 }
 
+/// What this process maps, for a diagnostic: entries, the hand-outs of
+/// them not given back, entries held for sharing, loads served by a held
+/// module ([`shared`]), and entries released ([`Held`]).
+pub struct MappedStats {
+    pub entries: u64,
+    pub refs: u64,
+    pub sharing: u64,
+    pub shared_loads: u64,
+    pub released: u64,
+}
+
+pub fn mapped_stats() -> MappedStats {
+    let g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut entries, mut refs, mut sharing) = (0, 0, 0);
+    for e in g.iter().flat_map(|m| m.values()) {
+        entries += 1;
+        refs += e.refs;
+        sharing += e.share.is_some() as u64;
+    }
+    MappedStats { entries, refs, sharing, shared_loads: SHARED_LOADS.load(Ordering::Relaxed), released: RELEASED.load(Ordering::Relaxed) }
+}
+
 /// `GEX_CACHE_MAPPED_BYTES`: how much disk the files this process maps
-/// modules from may hold once evicted ([`within_mapped_budget`]); the
-/// cache's budget (`GEX_CACHE_MAX_BYTES`) unless set. More trades disk for
-/// memory: a module mapped costs no memory of its own, one read in some
-/// 48 KiB.
+/// modules from may hold once evicted ([`map_counted`]); the cache's
+/// budget (`GEX_CACHE_MAX_BYTES`) unless set. More trades disk for memory:
+/// a module mapped costs no memory of its own, one read in some 48 KiB.
 fn mapped_budget() -> u64 {
     std::env::var("GEX_CACHE_MAPPED_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or_else(budget)
 }
 
 /// The disk the files this process maps modules from hold, each counted
-/// once (by its key, [`MAPPED`]) as it is first mapped, never taken back:
-/// what is still in the cache and what its evictions left mapped.
+/// once (by its key, [`MAPPED`]) from when it is first mapped until its
+/// last hold is dropped ([`release`]): what is still in the cache and what
+/// its evictions left mapped.
 static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Of [`MAPPED_BYTES`], what this process evicted while it was mapped
-/// (unlinked, its blocks kept until the process ends): at most
+/// (unlinked, its blocks kept until its last mapping goes): at most
 /// [`mapped_budget`] ([`may_evict`]).
 static MAPPED_EVICTED: AtomicU64 = AtomicU64::new(0);
 
-/// The entries this process maps a module from and has not evicted, by
-/// key: their blocks.
-static MAPPED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+/// Loads [`shared`] served, and entries [`release`] took off the counts.
+static SHARED_LOADS: AtomicU64 = AtomicU64::new(0);
+static RELEASED: AtomicU64 = AtomicU64::new(0);
 
-/// Whether one more module may be mapped from its file at `path`, and if so
-/// its blocks counted ([`MAPPED_BYTES`]; a file mapped already, by another
-/// process of this host that runs the same unit, is not counted again).
-/// What the cache holds is within its budget; what this process's evictions
-/// unlink while mapped is at most [`mapped_budget`] ([`may_evict`]), and an
-/// entry it may not evict stays in the cache, past its budget, as one it
-/// maps. So the cache and what its evictions leave mapped hold no more
-/// than the two budgets between them, and mapping stops once what is
-/// mapped comes to that ([`MAPPED_BYTES`]). (Before, every mapping was
-/// counted against [`mapped_budget`] alone, and a desktop run had used it
-/// all 10 minutes in, its entries all still in the cache: past it each
-/// module was read into some 48 KiB of memory of its own, 5.7 GB of a
-/// 16 GB run.) Over it, modules are read into memory.
-fn within_mapped_budget(path: &Path) -> bool {
-    let Some(key) = path.file_stem().and_then(|k| k.to_str()) else { return false };
+/// An entry this process maps a module from.
+struct MapEntry {
+    /// Its file's blocks, as counted in [`MAPPED_BYTES`].
+    blocks: u64,
+    /// Hand-outs of its mapping not given back ([`Held`]); one never held
+    /// is never given back.
+    refs: u64,
+    /// Evicted while mapped (counted in [`MAPPED_EVICTED`]).
+    evicted: bool,
+    /// The module and its metadata, once a hand-out is held: what a later
+    /// load of the key is given ([`shared`]).
+    share: Option<(Module, Vec<u8>)>,
+}
+
+/// The entries this process maps a module from, by key.
+static MAPPED: std::sync::Mutex<Option<std::collections::HashMap<String, MapEntry>>> = std::sync::Mutex::new(None);
+
+/// `key`'s module, when this process holds it mapped already
+/// ([`Loaded::hold`]) for `engine`: one hand-out more of it. Before, each
+/// guest process that translated the same code (a desktop's daemons start
+/// alike) mapped the file again and kept the engine's data for the module
+/// once more: 6% of a desktop's live modules were second and later
+/// mappings of the same file.
+fn shared(engine: &Engine, key: &str) -> Option<Loaded> {
     let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
-    let map = g.get_or_insert_with(Default::default);
-    if map.contains_key(key) {
-        return true;
+    let e = g.as_mut()?.get_mut(key)?;
+    let (m, meta) = e.share.as_ref()?;
+    if !Engine::same(m.engine(), engine) {
+        return None;
     }
-    let blocks = std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512);
-    if MAPPED_EVICTED.load(Ordering::Relaxed) >= mapped_budget() || !take_within(&MAPPED_BYTES, blocks, budget().saturating_add(mapped_budget())) {
-        return false;
+    e.refs += 1;
+    SHARED_LOADS.fetch_add(1, Ordering::Relaxed);
+    Some(Loaded { module: m.clone(), metadata: meta.clone(), hit: true, mapped: Some(key.to_string()) })
+}
+
+/// The module at `path` mapped from its file, with its key, when one more
+/// mapping fits: its blocks counted ([`MAPPED_BYTES`]) when this process
+/// maps the file first. What the cache holds is within its budget; what
+/// this process's evictions unlink while mapped is at most
+/// [`mapped_budget`] ([`may_evict`]), and an entry it may not evict stays
+/// in the cache, past its budget, as one it maps. So the cache and what its
+/// evictions leave mapped hold no more than the two budgets between them,
+/// and mapping stops once what is mapped comes to that. `None` past it, and
+/// for a file stored anew under a key whose evicted file is still mapped
+/// (its blocks are not counted): the caller reads the module into memory.
+fn map_counted(engine: &Engine, path: &Path) -> Result<Option<(Module, String)>> {
+    let Some(key) = path.file_stem().and_then(|k| k.to_str()) else { return Ok(None) };
+    {
+        let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(Default::default);
+        match map.get_mut(key) {
+            Some(e) if e.evicted => return Ok(None),
+            Some(e) => e.refs += 1,
+            None => {
+                let blocks = std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512);
+                if MAPPED_EVICTED.load(Ordering::Relaxed) >= mapped_budget() || !take_within(&MAPPED_BYTES, blocks, budget().saturating_add(mapped_budget())) {
+                    return Ok(None);
+                }
+                map.insert(key.to_string(), MapEntry { blocks, refs: 1, evicted: false, share: None });
+            }
+        }
     }
-    map.insert(key.to_string(), blocks);
-    true
+    match mapped(engine, path) {
+        Ok(m) => Ok(Some((m, key.to_string()))),
+        Err(e) => {
+            release(key);
+            Err(e)
+        }
+    }
 }
 
 /// Whether this process may evict the entry `key`: one it maps a module
@@ -609,13 +744,18 @@ fn may_evict(key: &str) -> bool {
     may_evict_from(map, &MAPPED_EVICTED, key, mapped_budget())
 }
 
-/// [`may_evict`] against `mapped` and `evicted`, within `limit`.
-fn may_evict_from(mapped: &mut std::collections::HashMap<String, u64>, evicted: &AtomicU64, key: &str, limit: u64) -> bool {
-    let Some(&blocks) = mapped.get(key) else { return true };
-    if !take_within(evicted, blocks, limit) {
+/// [`may_evict`] against `mapped` and `evicted`, within `limit`. (An entry
+/// evicted already maps a file that is gone: what is at its key now is
+/// another, not mapped.)
+fn may_evict_from(mapped: &mut std::collections::HashMap<String, MapEntry>, evicted: &AtomicU64, key: &str, limit: u64) -> bool {
+    let Some(e) = mapped.get_mut(key) else { return true };
+    if e.evicted {
+        return true;
+    }
+    if !take_within(evicted, e.blocks, limit) {
         return false;
     }
-    mapped.remove(key);
+    e.evicted = true;
     true
 }
 
@@ -1286,14 +1426,55 @@ mod tests {
 
     #[test]
     fn an_entry_mapped_is_evicted_only_within_the_mapped_budget() {
-        let mut mapped: std::collections::HashMap<String, u64> = [("a".to_string(), 40), ("b".to_string(), 40)].into();
+        let e = |blocks| MapEntry { blocks, refs: 1, evicted: false, share: None };
+        let mut mapped: std::collections::HashMap<String, MapEntry> = [("a".to_string(), e(40)), ("b".to_string(), e(40))].into();
         let evicted = AtomicU64::new(0);
         assert!(may_evict_from(&mut mapped, &evicted, "a", 60), "the first fits");
         assert_eq!(evicted.load(Ordering::Relaxed), 40);
         assert!(!may_evict_from(&mut mapped, &evicted, "b", 60), "a second would pass the budget");
         assert!(mapped.contains_key("b"), "and stays, mapped");
         assert!(may_evict_from(&mut mapped, &evicted, "c", 60), "what is not mapped goes");
-        assert!(!mapped.contains_key("a"));
+        assert!(mapped["a"].evicted, "an evicted entry is still mapped");
+        assert!(may_evict_from(&mut mapped, &evicted, "a", 60), "and a new file at its key goes freely");
+        assert_eq!(evicted.load(Ordering::Relaxed), 40, "without counting again");
+    }
+
+    /// A held module is handed to the next load of its key (the same
+    /// code, the same mapping) and counted once; when the last hold goes,
+    /// its blocks come off what is mapped. One never held stays counted.
+    #[test]
+    fn a_held_module_is_shared_and_its_blocks_given_back_with_the_last_hold() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::default();
+        let wasm = vec![0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1, 0x66, 0, 0, 0x0a, 6, 1, 4, 0, 0x41, 0x2a, 0x0b];
+        let key = format!("held{}", std::process::id());
+        let count = |k: &str| MAPPED.lock().unwrap().as_ref().and_then(|m| m.get(k).map(|e| (e.blocks, e.refs, e.share.is_some())));
+        let w = wasm.clone();
+        let mut first = load_or_compile(&engine, &dir, &key, move || Ok((w, b"m".to_vec()))).unwrap();
+        let (blocks, refs, _) = count(&key).expect("mapped");
+        assert!(blocks > 0);
+        assert_eq!(refs, 1);
+        let h1 = first.hold().expect("a mapped module has a hold");
+        assert!(first.hold().is_none(), "one hold for one hand-out");
+        let shared_before = SHARED_LOADS.load(Ordering::Relaxed);
+        let mut second = load_or_compile(&engine, &dir, &key, || panic!("held: must not rebuild")).unwrap();
+        assert!(second.hit);
+        assert_eq!(second.metadata, b"m");
+        assert!(SHARED_LOADS.load(Ordering::Relaxed) > shared_before, "the held module, handed out again");
+        assert_eq!(second.module.image_range(), first.module.image_range(), "the same mapping");
+        assert_eq!(count(&key), Some((blocks, 2, true)));
+        let h2 = second.hold().unwrap();
+        drop(h1);
+        assert_eq!(count(&key).map(|c| c.1), Some(1), "one hold left");
+        drop(h2);
+        drop((first, second));
+        assert_eq!(count(&key), None, "the last hold took the entry off the counts");
+        // Not held: counted for good.
+        let _third = load_or_compile(&engine, &dir, &key, || panic!("stored: must not rebuild")).unwrap();
+        assert_eq!(count(&key).map(|c| (c.1, c.2)), Some((1, false)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

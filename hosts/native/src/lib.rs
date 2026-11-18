@@ -667,6 +667,13 @@ struct CompiledUnit {
     bridges: Vec<u32>,
     /// Counted in `jit_stats::LIVE_UNITS` while it lives.
     _live: UnitLive,
+    /// Its module's mapping from the cache, this process's while the unit
+    /// lives (`gex_cache::Loaded::hold`): the unit outlives every instance
+    /// of its module (a store holds its process's registry, which holds the
+    /// unit), so when it goes the mapping is no longer counted, and until
+    /// then another process's translation of the same code is given this
+    /// module.
+    _held: Option<gex_cache::Held>,
 }
 
 /// A compiled unit's share of `jit_stats::LIVE_UNITS` / `LIVE_UNIT_BYTES`.
@@ -6863,11 +6870,16 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
                 .context("compiling runtime-translated wasm")?;
             let c = if l.hit { &jit_stats::CACHE_HITS } else { &jit_stats::CACHE_MISSES };
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            l.module
+            let mut l = l;
+            let held = l.hold();
+            (l.module, held)
         }
-        None => gex_cache::compile(&engine, &translated_module.wasm)
-            .map_err(keep_bad)
-            .context("validating runtime-translated wasm")?,
+        None => (
+            gex_cache::compile(&engine, &translated_module.wasm)
+                .map_err(keep_bad)
+                .context("validating runtime-translated wasm")?,
+            None,
+        ),
     };
     jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
@@ -7015,7 +7027,7 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
 fn publish_unit(
     shared: &Arc<Mutex<JitShared>>,
     translated: &gex_xlate::TranslatedModule,
-    module: Module,
+    (module, held): (Module, Option<gex_cache::Held>),
     blocks: usize,
 ) -> Result<Arc<CompiledUnit>> {
     aot_share::note(&module, aot_share::Kind::Tier1);
@@ -7035,6 +7047,7 @@ fn publish_unit(
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
         bridges: Vec::new(),
+        _held: held,
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -8708,12 +8721,12 @@ fn recompile_object(
             Some((dir, build)) => {
                 let key = gex_cache::key(build, [translated.wasm.as_slice()]);
                 let wasm = translated.wasm.clone();
-                gex_cache::load_or_compile(&engine, dir, &key, move || Ok((wasm, Vec::new())))
-                    .context("compiling a statically recompiled object")?
-                    .module
+                let mut l = gex_cache::load_or_compile(&engine, dir, &key, move || Ok((wasm, Vec::new())))
+                    .context("compiling a statically recompiled object")?;
+                let held = l.hold();
+                (l.module, held)
             }
-            None => gex_cache::compile(&engine, &translated.wasm)
-                .context("validating a statically recompiled object")?,
+            None => (gex_cache::compile(&engine, &translated.wasm).context("validating a statically recompiled object")?, None),
         };
         let unit = publish_unit(&shared, translated, module, translated.n_blocks)?;
         install_unit(caller.as_context_mut(), &unit)?;
