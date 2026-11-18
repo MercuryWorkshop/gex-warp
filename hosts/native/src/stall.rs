@@ -50,6 +50,8 @@ pub fn frame() {
 
 #[derive(Clone)]
 struct Entry {
+    /// Where its process's memory is in the host (`gex_mem::live`'s view).
+    mem: u64,
     tid: i32,
     pid: i32,
     /// The raw number of the call it is in, or `None` when outside one.
@@ -110,16 +112,18 @@ fn start() -> Instant {
     })
 }
 
-/// Guest thread `tid` of process `pid` is entering raw syscall `nr`.
-pub fn enter(pid: i32, tid: i32, nr: u64) {
+/// Guest thread `tid` of process `pid` is entering raw syscall `nr`; its
+/// process's memory is at `mem` in the host.
+pub fn enter(pid: i32, tid: i32, nr: u64, mem: u64) {
     let now = Instant::now();
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
     GONE.with(|_| ());
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, exe: String::new(), since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { mem, tid, pid, inside: None, call: None, bt: None, exe: String::new(), since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
     e.tid = tid;
     e.pid = pid;
+    e.mem = mem;
     e.inside = Some(nr);
     e.call = None;
     e.bt = None;
@@ -170,6 +174,7 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry {
+        mem: 0,
         tid: 0,
         pid: 0,
         inside: None,
@@ -304,11 +309,56 @@ fn dump(why: &str) {
             j::CACHE_MISSES.load(Relaxed)
         ));
     }
+    out.push_str(&memory_lines(&snap));
     for (_, _, l) in lines {
         out.push_str(&l);
         out.push('\n');
     }
     eprint!("{out}");
+}
+
+/// What holds memory: each guest memory's resident, dirty and swapped
+/// bytes (with the process whose threads use it), and what the stores and
+/// compiled units alive hold.
+fn memory_lines(snap: &[(u32, Entry)]) -> String {
+    use crate::jit_stats as j;
+    const MB: u64 = 1 << 20;
+    let mut out = format!(
+        "  live: {} stores, {} instances, {} table entries; {} units, {} MB of code images (in memory {} MB in {} loads, mapped {} MB, {} MB of it evicted)\n",
+        j::LIVE_STORES.load(Relaxed),
+        j::LIVE_INSTANCES.load(Relaxed),
+        j::LIVE_SLOTS.load(Relaxed),
+        j::LIVE_UNITS.load(Relaxed),
+        j::LIVE_UNIT_BYTES.load(Relaxed) / MB,
+        gex_cache::IN_MEMORY_BYTES.load(Relaxed) / MB,
+        gex_cache::IN_MEMORY_LOADS.load(Relaxed),
+        gex_cache::mapped_bytes().0 / MB,
+        gex_cache::mapped_bytes().1 / MB,
+    );
+    let mut rows = Vec::new();
+    let (mut tr, mut td, mut ts) = (0, 0, 0);
+    for (base, len, view) in gex_mem::live() {
+        let (r, d, s) = gex_mem::region_use(base, len);
+        tr += r;
+        td += d;
+        ts += s;
+        let users: Vec<&Entry> = snap.iter().map(|(_, e)| e).filter(|e| e.mem == view || e.mem == base).collect();
+        let who = users.first().map_or("?".to_string(), |e| format!("pid {} {}", e.pid, e.exe));
+        let mut line = format!("    mem {who} ({} threads): resident {} MB, dirty {} MB, swapped {} MB, at {base:#x} view {view:#x}\n", users.len(), r / MB, d / MB, s / MB);
+        // `GEX_STALL_PAGES=1`: the modified runs, by offset in the memory.
+        if std::env::var_os("GEX_STALL_PAGES").is_some() {
+            for (a, b) in gex_mem::modified_runs(view, len) {
+                line.push_str(&format!("      dirty {a:#x}-{b:#x} {}K\n", (b - a) >> 10));
+            }
+        }
+        rows.push((d + s, line));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    out.push_str(&format!("  guest memories: {}, resident {} MB, dirty {} MB, swapped {} MB\n", rows.len(), tr / MB, td / MB, ts / MB));
+    for (_, l) in rows.into_iter().take(25) {
+        out.push_str(&l);
+    }
+    out
 }
 
 fn watch() {

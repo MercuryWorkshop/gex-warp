@@ -696,6 +696,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
     }
     s.translated.extend(keys);
     let unit = Arc::new(CompiledUnit {
+        _live: crate::UnitLive::of(&None),
         module: None,
         module_id: 0,
         exported_blocks: Vec::new(),

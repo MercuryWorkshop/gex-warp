@@ -72,6 +72,99 @@ impl Drop for Live {
     }
 }
 
+/// Every guest memory alive: (wasm memory base, length, host view).
+pub fn live() -> Vec<(u64, u64, u64)> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The runs of host pages of `[start, start + len)` that are modified, as
+/// offsets from `start` (a diagnostic: `GEX_STALL_PAGES`). Empty elsewhere
+/// than macOS.
+pub fn modified_runs(start: u64, len: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let page = host_page();
+        let n = (len / page) as usize;
+        let mut vec = vec![0u8; n];
+        // SAFETY: `vec` has a byte for every page of the range.
+        if unsafe { libc::mincore(start as *mut libc::c_void, (n as u64 * page) as usize, vec.as_mut_ptr() as *mut _) } != 0 {
+            return out;
+        }
+        // (MINCORE_MODIFIED | MINCORE_MODIFIED_OTHER)
+        let mut run: Option<u64> = None;
+        for (i, v) in vec.iter().enumerate() {
+            let m = v & (0x4 | 0x10) != 0;
+            match (m, run) {
+                (true, None) => run = Some(i as u64 * page),
+                (false, Some(a)) => {
+                    out.push((a, i as u64 * page));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(a) = run {
+            out.push((a, n as u64 * page));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (start, len);
+    out
+}
+
+/// What of `[start, start + len)` of this host process is resident, dirty
+/// and swapped out, in bytes, by the regions the system has there (a
+/// diagnostic: `GEX_STALL_EVERY`'s memory lines). Zeros elsewhere than macOS.
+pub fn region_use(start: u64, len: u64) -> (u64, u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Extended {
+            protection: i32,
+            user_tag: u32,
+            pages_resident: u32,
+            pages_shared_now_private: u32,
+            pages_swapped_out: u32,
+            pages_dirtied: u32,
+            ref_count: u32,
+            shadow_depth: u16,
+            external_pager: u8,
+            share_mode: u8,
+            pages_reusable: u32,
+        }
+        unsafe extern "C" {
+            fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64, flavor: i32, info: *mut Extended, count: *mut u32, object: *mut u32) -> i32;
+        }
+        const VM_REGION_EXTENDED_INFO: i32 = 13;
+        let page = host_page();
+        let (mut res, mut dirty, mut swapped) = (0u64, 0u64, 0u64);
+        let end = start + len;
+        let mut at = start;
+        while at < end {
+            let (mut a, mut size, mut info) = (at, 0u64, Extended::default());
+            let mut count = (std::mem::size_of::<Extended>() / 4) as u32;
+            let mut obj = 0u32;
+            // SAFETY: plain out-parameters of the right sizes.
+            let kr = unsafe { mach_vm_region(mach::mach_task_self_, &mut a, &mut size, VM_REGION_EXTENDED_INFO, &mut info, &mut count, &mut obj) };
+            if kr != 0 || a >= end || size == 0 {
+                break;
+            }
+            res += info.pages_resident as u64 * page;
+            dirty += info.pages_dirtied as u64 * page;
+            swapped += info.pages_swapped_out as u64 * page;
+            at = a + size;
+        }
+        (res, dirty, swapped)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (start, len);
+        (0, 0, 0)
+    }
+}
+
 impl GuestMemory {
     pub fn new(inner: SharedMemory) -> GuestMemory {
         let base = inner.data().as_ptr() as u64;

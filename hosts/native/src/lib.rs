@@ -538,6 +538,14 @@ pub(crate) mod jit_stats {
     pub static COMPILE_US: AtomicU64 = AtomicU64::new(0);
     /// Blocks that failed their page check and were translated again.
     pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// What is alive now (`GEX_STALL_EVERY`'s memory lines): stores, the
+    /// instances they hold, their dispatch-table entries; compiled units and
+    /// their code images' bytes.
+    pub static LIVE_STORES: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE_INSTANCES: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE_SLOTS: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE_UNITS: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE_UNIT_BYTES: AtomicU64 = AtomicU64::new(0);
     /// The last few translated pcs, and since the last line the lowest and
     /// highest, so a translation storm shows where it is without a print per
     /// miss (which changes the timing enough to hide it).
@@ -589,13 +597,25 @@ struct Jit {
     ftab: Option<ftab::Store>,
     /// `shared`'s `JitShared::processes`.
     processes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Dispatch-table entries this store's tables have grown by.
+    grown: u64,
+}
+
+impl Drop for Jit {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        jit_stats::LIVE_STORES.fetch_sub(1, Relaxed);
+        jit_stats::LIVE_INSTANCES.fetch_sub(self.instances.len() as u64, Relaxed);
+        jit_stats::LIVE_SLOTS.fetch_sub(self.grown, Relaxed);
+    }
 }
 
 impl Jit {
     /// A store's half of `shared`, before anything is replayed into it.
     fn new(shared: Arc<Mutex<JitShared>>, engine: Engine, linker: Linker<HostState>, tables: Vec<Table>, cache: Option<(std::path::PathBuf, String)>, limits: gex_xlate::BlockLimits) -> Jit {
         let processes = Arc::clone(&shared.lock().unwrap_or_else(|e| e.into_inner()).processes);
-        Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, have: std::collections::HashMap::new(), refilled: std::collections::HashSet::new(), limits, ftab: None, processes }
+        jit_stats::LIVE_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Jit { shared, engine, linker, tables, cache, instances: Vec::new(), replayed: 0, have: std::collections::HashMap::new(), refilled: std::collections::HashSet::new(), limits, ftab: None, processes, grown: 0 }
     }
 }
 
@@ -643,6 +663,32 @@ struct CompiledUnit {
     /// and slot packed as a directory entry: addresses a function body
     /// serves.
     bridges: Vec<u32>,
+    /// Counted in `jit_stats::LIVE_UNITS` while it lives.
+    _live: UnitLive,
+}
+
+/// A compiled unit's share of `jit_stats::LIVE_UNITS` / `LIVE_UNIT_BYTES`.
+struct UnitLive(u64);
+
+impl UnitLive {
+    fn of(module: &Option<Module>) -> UnitLive {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = module.as_ref().map_or(0, |m| {
+            let r = m.image_range();
+            (r.end as usize - r.start as usize) as u64
+        });
+        jit_stats::LIVE_UNITS.fetch_add(1, Relaxed);
+        jit_stats::LIVE_UNIT_BYTES.fetch_add(n, Relaxed);
+        UnitLive(n)
+    }
+}
+
+impl Drop for UnitLive {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        jit_stats::LIVE_UNITS.fetch_sub(1, Relaxed);
+        jit_stats::LIVE_UNIT_BYTES.fetch_sub(self.0, Relaxed);
+    }
 }
 
 /// Runtime translation state shared by every guest thread.
@@ -5341,6 +5387,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
+            let mem_at = data.as_ptr() as u64;
             let mut gm = GuestMem::new(data);
             // /proc must reflect the state this syscall will see, so the
             // snapshot is refreshed before the call rather than after.
@@ -5356,7 +5403,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let stall_on = stall::on();
             if stall_on {
                 let pid = KernelProcSource(Arc::clone(&state.proc_state)).pid();
-                stall::enter(pid, state.thread.tid, nr);
+                stall::enter(pid, state.thread.tid, nr, mem_at);
             }
             watch_check(&gm, pc as u64, state.thread.tid);
             lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
@@ -6976,8 +7023,10 @@ fn publish_unit(
         jit_stats::WASM_BYTES.fetch_add(translated.wasm.len() as u64, Relaxed);
         jit_stats::SLOTS.fetch_max(translated.table_slots, Relaxed);
     }
+    let module = Some(module);
     let unit = Arc::new(CompiledUnit {
-        module: Some(module),
+        _live: UnitLive::of(&module),
+        module,
         module_id: translated.module_id,
         exported_blocks: translated.exported_blocks.clone(),
         dir_entries: translated.dir_entries.clone(),
@@ -7149,6 +7198,7 @@ fn install_unit(
             jit.have.insert(unit.module_id, jit.instances.len());
         }
         jit.instances.push(instance);
+        jit_stats::LIVE_INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     for (t, index, was) in kept {
         let _ = tables[t].set(cx.as_context_mut(), index, was);
@@ -7185,6 +7235,10 @@ fn grow_tables(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, tables: &
                 }
             }
             jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
+            jit_stats::LIVE_SLOTS.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
+            if let Some(j) = cx.as_context_mut().data_mut().jit.as_mut() {
+                j.grown += want - have;
+            }
             t.grow(cx.as_context_mut(), want - have, miss.clone())
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }

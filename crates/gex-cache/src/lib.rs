@@ -496,6 +496,9 @@ pub fn load_or_compile(
             if let Ok(m) = mapped(engine, &path) {
                 module = m;
             }
+        } else {
+            IN_MEMORY_LOADS.fetch_add(1, Ordering::Relaxed);
+            IN_MEMORY_BYTES.fetch_add(serialized.len() as u64, Ordering::Relaxed);
         }
     }
     Ok(Loaded {
@@ -528,8 +531,22 @@ fn loaded(engine: &Engine, path: &Path) -> Result<Module> {
         return mapped(engine, path);
     }
     let bytes = std::fs::read(path)?;
+    IN_MEMORY_LOADS.fetch_add(1, Ordering::Relaxed);
+    IN_MEMORY_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     // SAFETY: as `mapped`'s.
     Ok(unsafe { Module::deserialize(engine, &bytes) }?)
+}
+
+/// Modules read into memory of their own rather than mapped ([`loaded`],
+/// and compiled ones over [`mapped_budget`]): how many, and their artifacts'
+/// bytes (a diagnostic; never taken back).
+pub static IN_MEMORY_LOADS: AtomicU64 = AtomicU64::new(0);
+pub static IN_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The disk this process has mapped modules from ([`within_mapped_budget`]),
+/// and of it what its evictions left mapped.
+pub fn mapped_bytes() -> (u64, u64) {
+    (MAPPED_BYTES.load(Ordering::Relaxed), MAPPED_EVICTED.load(Ordering::Relaxed))
 }
 
 /// `GEX_CACHE_MAPPED_BYTES`: how much disk the files this process maps
@@ -852,7 +869,9 @@ fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     // asked (the first few frames of ours).
     let t0 = std::time::Instant::now();
     let m = new_module(engine, wasm);
-    if std::env::var_os("GEX_COMPILE_TRACE").is_some() {
+    // (`GEX_COMPILE_TRACE=KIB`: only modules of at least that many KiB)
+    let min_kib = std::env::var("GEX_COMPILE_TRACE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    if std::env::var_os("GEX_COMPILE_TRACE").is_some() && wasm.len() >> 10 >= min_kib {
         let bt = std::backtrace::Backtrace::force_capture().to_string();
         let who: Vec<&str> = bt
             .lines()
