@@ -453,7 +453,7 @@ pub fn load_or_compile(
         // truncated file produces an error rather than bad code -- which is
         // why the failure path below simply rebuilds. Mapped from the file
         // (`mapped`), not copied.
-        match mapped(engine, &path) {
+        match loaded(engine, &path) {
             Ok(module) => {
                 refresh(&meta_path);
                 return Ok(Loaded {
@@ -483,8 +483,10 @@ pub fn load_or_compile(
         account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
         // And the module the store's file, mapped, in place of the one just
         // compiled into memory of its own.
-        if let Ok(m) = mapped(engine, &path) {
-            module = m;
+        if within_mapped_budget(&path) {
+            if let Ok(m) = mapped(engine, &path) {
+                module = m;
+            }
         }
     }
     Ok(Loaded {
@@ -507,6 +509,53 @@ fn mapped(engine: &Engine, path: &Path) -> Result<Module> {
     // SAFETY: as `deserialize`'s (the module comment); the file is one this
     // cache wrote whole and renamed into place, never written in place.
     Ok(unsafe { Module::deserialize_file(engine, path) }?)
+}
+
+/// A stored module: mapped from its file while this process's mapped
+/// files come to less than [`mapped_budget`] ([`within_mapped_budget`]),
+/// read into memory of its own after that.
+fn loaded(engine: &Engine, path: &Path) -> Result<Module> {
+    if within_mapped_budget(path) {
+        return mapped(engine, path);
+    }
+    let bytes = std::fs::read(path)?;
+    // SAFETY: as `mapped`'s.
+    Ok(unsafe { Module::deserialize(engine, &bytes) }?)
+}
+
+/// `GEX_CACHE_MAPPED_BYTES`: how much disk the files this process maps
+/// modules from may hold ([`within_mapped_budget`]); the cache's budget
+/// (`GEX_CACHE_MAX_BYTES`) unless set. More trades disk for memory: a
+/// module mapped costs no memory of its own, one read in some 64 KiB.
+fn mapped_budget() -> u64 {
+    std::env::var("GEX_CACHE_MAPPED_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or_else(budget)
+}
+
+/// The disk the files this process has mapped modules from hold (their
+/// allocated blocks, counted as each is mapped and never taken back).
+static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether one more module may be mapped from its file at `path`, and if so
+/// its blocks counted: while what this process has mapped is under
+/// [`mapped_budget`]. A file evicted while it is mapped keeps its blocks until
+/// the process ends, outside the cache's own count (a desktop run's
+/// modules come to several times the budget, so the eviction unlinks
+/// mapped ones): bounded so, the cache and what its evictions leave mapped
+/// hold no more than the two budgets between them. Over it, modules are
+/// read into memory as before.
+fn within_mapped_budget(path: &Path) -> bool {
+    let blocks = std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512);
+    take_within(&MAPPED_BYTES, blocks, mapped_budget())
+}
+
+/// `n` more counted in `count` if that stays within `limit`: whether it was.
+fn take_within(count: &AtomicU64, n: u64, limit: u64) -> bool {
+    let before = count.fetch_add(n, Ordering::Relaxed);
+    if before + n > limit {
+        count.fetch_sub(n, Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 
 /// How stale a hit's metadata mtime may be before the hit refreshes it.
@@ -1150,6 +1199,16 @@ mod tests {
         let blocks = std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&path).unwrap()) * 512;
         assert!(blocks < bytes.len() as u64, "{blocks} bytes of blocks for {} of file", bytes.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_is_mapped_stays_within_its_budget() {
+        let count = AtomicU64::new(0);
+        assert!(take_within(&count, 40, 100));
+        assert!(take_within(&count, 40, 100));
+        assert!(!take_within(&count, 40, 100), "a third would pass the budget");
+        assert_eq!(count.load(Ordering::Relaxed), 80);
+        assert!(take_within(&count, 20, 100), "one that fits still does");
     }
 
     #[test]
