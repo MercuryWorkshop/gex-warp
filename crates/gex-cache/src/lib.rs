@@ -145,7 +145,7 @@ fn evict_victims(dir: &Path, want: u64, walked: u64) -> u64 {
         let read_since = std::fs::metadata(&meta_path)
             .and_then(|m| m.modified())
             .is_ok_and(|t| t.duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() > walked));
-        if read_since {
+        if read_since || !may_evict(key) {
             continue;
         }
         let gone = std::fs::remove_file(dir.join(format!("{key}.cwasm"))).is_ok();
@@ -299,6 +299,9 @@ fn evict(dir: &Path, budget: u64) -> u64 {
     while total > target {
         let mut removed = 0u64;
         for (_, key, size) in items.by_ref().take(EVICT_BATCH) {
+            if !may_evict(&key) {
+                continue;
+            }
             let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
             let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
             removed += size;
@@ -524,28 +527,73 @@ fn loaded(engine: &Engine, path: &Path) -> Result<Module> {
 }
 
 /// `GEX_CACHE_MAPPED_BYTES`: how much disk the files this process maps
-/// modules from may hold ([`within_mapped_budget`]); the cache's budget
-/// (`GEX_CACHE_MAX_BYTES`) unless set. More trades disk for memory: a
-/// module mapped costs no memory of its own, one read in some 64 KiB.
+/// modules from may hold once evicted ([`within_mapped_budget`]); the
+/// cache's budget (`GEX_CACHE_MAX_BYTES`) unless set. More trades disk for
+/// memory: a module mapped costs no memory of its own, one read in some
+/// 48 KiB.
 fn mapped_budget() -> u64 {
     std::env::var("GEX_CACHE_MAPPED_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or_else(budget)
 }
 
-/// The disk the files this process has mapped modules from hold (their
-/// allocated blocks, counted as each is mapped and never taken back).
+/// The disk the files this process maps modules from hold, each counted
+/// once (by its key, [`MAPPED`]) as it is first mapped, never taken back:
+/// what is still in the cache and what its evictions left mapped.
 static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Of [`MAPPED_BYTES`], what this process evicted while it was mapped
+/// (unlinked, its blocks kept until the process ends): at most
+/// [`mapped_budget`] ([`may_evict`]).
+static MAPPED_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// The entries this process maps a module from and has not evicted, by
+/// key: their blocks.
+static MAPPED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+
 /// Whether one more module may be mapped from its file at `path`, and if so
-/// its blocks counted: while what this process has mapped is under
-/// [`mapped_budget`]. A file evicted while it is mapped keeps its blocks until
-/// the process ends, outside the cache's own count (a desktop run's
-/// modules come to several times the budget, so the eviction unlinks
-/// mapped ones): bounded so, the cache and what its evictions leave mapped
-/// hold no more than the two budgets between them. Over it, modules are
-/// read into memory as before.
+/// its blocks counted ([`MAPPED_BYTES`]; a file mapped already, by another
+/// process of this host that runs the same unit, is not counted again).
+/// What the cache holds is within its budget; what this process's evictions
+/// unlink while mapped is at most [`mapped_budget`] ([`may_evict`]), and an
+/// entry it may not evict stays in the cache, past its budget, as one it
+/// maps. So the cache and what its evictions leave mapped hold no more
+/// than the two budgets between them, and mapping stops once what is
+/// mapped comes to that ([`MAPPED_BYTES`]). (Before, every mapping was
+/// counted against [`mapped_budget`] alone, and a desktop run had used it
+/// all 10 minutes in, its entries all still in the cache: past it each
+/// module was read into some 48 KiB of memory of its own, 5.7 GB of a
+/// 16 GB run.) Over it, modules are read into memory.
 fn within_mapped_budget(path: &Path) -> bool {
+    let Some(key) = path.file_stem().and_then(|k| k.to_str()) else { return false };
+    let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    if map.contains_key(key) {
+        return true;
+    }
     let blocks = std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512);
-    take_within(&MAPPED_BYTES, blocks, mapped_budget())
+    if MAPPED_EVICTED.load(Ordering::Relaxed) >= mapped_budget() || !take_within(&MAPPED_BYTES, blocks, budget().saturating_add(mapped_budget())) {
+        return false;
+    }
+    map.insert(key.to_string(), blocks);
+    true
+}
+
+/// Whether this process may evict the entry `key`: one it maps a module
+/// from only while what its evictions have left mapped stays within
+/// [`mapped_budget`] (and then that is counted).
+fn may_evict(key: &str) -> bool {
+    let mut g = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = g.as_mut() else { return true };
+    may_evict_from(map, &MAPPED_EVICTED, key, mapped_budget())
+}
+
+/// [`may_evict`] against `mapped` and `evicted`, within `limit`.
+fn may_evict_from(mapped: &mut std::collections::HashMap<String, u64>, evicted: &AtomicU64, key: &str, limit: u64) -> bool {
+    let Some(&blocks) = mapped.get(key) else { return true };
+    if !take_within(evicted, blocks, limit) {
+        return false;
+    }
+    mapped.remove(key);
+    true
 }
 
 /// `n` more counted in `count` if that stays within `limit`: whether it was.
@@ -1209,6 +1257,18 @@ mod tests {
         assert!(!take_within(&count, 40, 100), "a third would pass the budget");
         assert_eq!(count.load(Ordering::Relaxed), 80);
         assert!(take_within(&count, 20, 100), "one that fits still does");
+    }
+
+    #[test]
+    fn an_entry_mapped_is_evicted_only_within_the_mapped_budget() {
+        let mut mapped: std::collections::HashMap<String, u64> = [("a".to_string(), 40), ("b".to_string(), 40)].into();
+        let evicted = AtomicU64::new(0);
+        assert!(may_evict_from(&mut mapped, &evicted, "a", 60), "the first fits");
+        assert_eq!(evicted.load(Ordering::Relaxed), 40);
+        assert!(!may_evict_from(&mut mapped, &evicted, "b", 60), "a second would pass the budget");
+        assert!(mapped.contains_key("b"), "and stays, mapped");
+        assert!(may_evict_from(&mut mapped, &evicted, "c", 60), "what is not mapped goes");
+        assert!(!mapped.contains_key("a"));
     }
 
     #[test]
