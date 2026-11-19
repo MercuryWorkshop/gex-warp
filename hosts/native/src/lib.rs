@@ -391,6 +391,10 @@ struct HostState {
     /// thread rather than the process live in `thread` and are installed
     /// under the lock; see [`ThreadState`].
     kernel: Arc<Mutex<Kernel>>,
+    /// The process's signal state, the kernel's own for the process's life
+    /// (an exec keeps it): what a thread asks whether the process is to
+    /// stop, without the kernel's lock ([`job_stop_point`]).
+    proc_signals: Arc<gex_kernel::signal::ProcSig>,
     /// This thread's identity.
     thread: ThreadState,
     memory: Option<gex_mem::GuestMemory>,
@@ -1830,11 +1834,13 @@ fn run_program_with(
     }
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
+    let proc_signals = Arc::clone(kernel.signals.process());
 
     let mut store = Store::new(
         &engine,
         HostState {
             kernel: Arc::new(Mutex::new(kernel)),
+            proc_signals,
             thread: ThreadState::new(ctx_addr, tid),
             memory: None,
             proc_state,
@@ -3784,10 +3790,13 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
 /// Job control: a thread of a stopped process waits here until the process
 /// is continued (or killed, or the system halts), which is where the host
 /// puts it before a call, after one, and at a poll. Two loads when nothing
-/// has stopped. (Out of the way of a fork in another thread meanwhile,
-/// which waits for every thread in guest code to reach a place like this.)
+/// has stopped, and not the kernel's lock: every thread of a process asked
+/// here around each of its calls, and took the lock to (27% of the host's
+/// waits on a mutex in d42). (Out of the way of a fork in another thread
+/// meanwhile, which waits for every thread in guest code to reach a place
+/// like this.)
 fn job_stop_point(state: &mut HostState) {
-    if !state.with_kernel(|k| k.job_stopped()) {
+    if !state.proc_signals.stop_due() || !state.with_kernel(|k| k.job_stopped()) {
         return;
     }
     let gate = state.spawn.as_ref().map(|s| Arc::clone(&s.gate));
@@ -3895,10 +3904,12 @@ fn crash_line(c: &gex_kernel::proc::Crash) {
 
 /// Run a child process to completion in this host thread.
 fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> Result<Exit> {
+    let proc_signals = Arc::clone(cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).signals.process());
     let mut store = Store::new(
         &cx.engine,
         HostState {
             kernel: Arc::clone(&cx.kernel),
+            proc_signals,
             thread,
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
@@ -4272,11 +4283,15 @@ fn exec_program(
 /// (`exit_group`, a fatal signal), not just its own.
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
     // Without the kernel lock at the end, which a process ending may hold.
-    let slots = Arc::clone(&cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).next_ctx_slot);
+    let (slots, proc_signals) = {
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&k.next_ctx_slot), Arc::clone(k.signals.process()))
+    };
     let mut store = Store::new(
         &cx.engine,
         HostState {
             kernel: Arc::clone(&cx.kernel),
+            proc_signals,
             thread,
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),

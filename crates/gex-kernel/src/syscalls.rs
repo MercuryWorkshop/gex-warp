@@ -20605,3 +20605,27 @@ mod pe_mem64_tests {
         assert!(!pe_needs_mem64(b"\x7fELF"));
     }
 }
+
+#[cfg(test)]
+mod proc_signals_tests {
+    use super::*;
+
+    /// The host keeps a process's signal state with each of its threads,
+    /// to ask whether the process is to stop without the kernel's lock: it
+    /// is the kernel's own through other threads' turns and an exec, and a
+    /// fork's child has its own.
+    #[test]
+    fn a_processs_signal_state_is_its_own_through_its_threads_and_an_exec() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        let pid = k.pid;
+        let kept = Arc::clone(k.signals.process());
+        k.enter_thread(&ThreadState::new(0, pid + 1));
+        assert!(Arc::ptr_eq(&kept, k.signals.process()));
+        k.enter_thread(&ThreadState::new(0, pid));
+        k.exec_signals(pid);
+        assert!(Arc::ptr_eq(&kept, k.signals.process()));
+        assert!(!kept.stop_due() && !k.job_stopped());
+        let child = k.fork_kernel();
+        assert!(!Arc::ptr_eq(&kept, child.signals.process()));
+    }
+}
