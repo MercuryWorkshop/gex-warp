@@ -15,7 +15,7 @@ use crate::errno::{Errno, SysResult};
 use crate::proc::ProcTable;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The name a process descriptor has (`/proc/self/fd`'s link).
 pub const PATH: &str = "anon_inode:[pidfd]";
@@ -30,13 +30,13 @@ pub struct PidFd {
     queue: u32,
     /// Once seen exited it stays so: an exited process does not come back.
     exited: AtomicBool,
-    /// The process's exit-status cell, taken when the descriptor is made
-    /// (none for a process not in the table then, or a table elsewhere):
-    /// while it is empty the process is alive, and neither readiness asks
-    /// the table, whose lock every system call of every process takes too
-    /// (libdispatch's process sources poll theirs at each wakeup of a
-    /// kqueue).
-    status: Option<Arc<Mutex<Option<i32>>>>,
+    /// Whether the process has ended (its status filled), taken when the
+    /// descriptor is made (none for a process not in the table then, or a
+    /// table elsewhere): until it is set the process is alive, and neither
+    /// readiness asks the table, whose lock every system call of every
+    /// process takes too (libdispatch's process sources poll theirs at each
+    /// wakeup of a kqueue).
+    ended: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for PidFd {
@@ -48,8 +48,8 @@ impl std::fmt::Debug for PidFd {
 impl PidFd {
     pub fn new(pid: i32, procs: Arc<ProcTable>) -> PidFd {
         let queue = procs.queue(pid);
-        let status = procs.status_cell(pid);
-        PidFd { pid, procs, queue, exited: AtomicBool::new(false), status }
+        let ended = procs.ended_flag(pid);
+        PidFd { pid, procs, queue, exited: AtomicBool::new(false), ended }
     }
 
     /// The process it names.
@@ -70,7 +70,7 @@ impl PidFd {
         if self.exited.load(Ordering::Acquire) {
             return true;
         }
-        if self.status.as_ref().is_some_and(|s| s.lock().map(|s| s.is_none()).unwrap_or(false)) {
+        if self.ended.as_ref().is_some_and(|e| !e.load(Ordering::Acquire)) {
             return false;
         }
         let (exited, _) = self.state();

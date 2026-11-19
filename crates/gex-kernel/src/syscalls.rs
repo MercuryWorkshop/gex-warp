@@ -11484,6 +11484,10 @@ pub struct Child {
     /// Set once a `wait4` has collected this child, so a second one reports
     /// `ECHILD` rather than blocking forever.
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
+    /// Set (for good) once `status` has been filled: what a process
+    /// descriptor asks of a live process without taking `status`'s lock
+    /// ([`crate::pidfd`]).
+    pub ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Child {
@@ -11493,6 +11497,7 @@ impl Child {
             status: Arc::new(Mutex::new(None)),
             done: Arc::new(std::sync::Condvar::new()),
             reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

@@ -1118,7 +1118,7 @@ impl ProcTable {
     fn end(&self, pid: i32, status: i32, word: i32) {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let crashed;
-        let (cell, done, was_ppid, own_q, orphans) = {
+        let (cell, ended_flag, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
             let mut orphans = Vec::new();
@@ -1140,7 +1140,7 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
-                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
+                    (Arc::clone(&p.child.status), Arc::clone(&p.child.ended), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
                 }
                 None => return,
             }
@@ -1164,6 +1164,7 @@ impl ProcTable {
         // first and the table second by everyone, here too.
         let mut published = cell.lock().unwrap_or_else(|e| e.into_inner());
         *published = Some(status);
+        ended_flag.store(true, Ordering::Release);
         // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
         // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
         // `sigsuspend` between polls has nothing else to wake it -- coreutils
@@ -1718,14 +1719,17 @@ impl ProcTable {
         Some(e)
     }
 
-    /// `pid`'s exit-status cell, while it is in the table (none for a
-    /// table elsewhere): filled when it exits, so what a process descriptor
-    /// asks of a live process ([`crate::pidfd`]) needs no table lock.
-    pub fn status_cell(&self, pid: i32) -> Option<Arc<Mutex<Option<i32>>>> {
+    /// Whether `pid` has ended, while it is in the table (none for a table
+    /// elsewhere): set for good when its status is filled, so what a
+    /// process descriptor asks of a live process ([`crate::pidfd`]) needs
+    /// no lock at all. (The status's own, which it took before, was every
+    /// watcher's of the process at each kqueue wakeup: 12% of a desktop's
+    /// waits on a mutex.)
+    pub fn ended_flag(&self, pid: i32) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         if self.remote.is_some() {
             return None;
         }
-        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status))
+        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.ended))
     }
 
     /// Whether `pid` has exited, if it is in the table (a zombie until it
