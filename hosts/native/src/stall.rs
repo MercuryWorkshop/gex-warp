@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct Conf {
@@ -74,17 +74,30 @@ struct Entry {
 static START: OnceLock<Instant> = OnceLock::new();
 /// Milliseconds since `START` of the latest syscall entry by any thread.
 static LAST_ENTRY_MS: AtomicU64 = AtomicU64::new(0);
-static THREADS: Mutex<Option<HashMap<u32, Entry>>> = Mutex::new(None);
+/// Each host thread's entry, by host tid: a thread locks only its own
+/// (`Mine`), which only a dump also does. (One map under one lock, which
+/// every thread took three times a call, held a Mojave desktop's threads
+/// waiting on each other: some 80% of the host's waits on a mutex.)
+static THREADS: Mutex<Option<HashMap<u32, Arc<Mutex<Entry>>>>> = Mutex::new(None);
 
 /// (Where there is no /proc: a number of gex's own for each host thread.)
 #[cfg(not(target_os = "linux"))]
 static NEXT_HOST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// A host thread's entry goes with the thread: what a dump says is of
-/// threads that are still there.
-struct Gone(u32);
+/// A host thread's entry, in `THREADS` from its first use until the thread
+/// ends: what a dump says is of threads that are still there.
+struct Mine(u32, Arc<Mutex<Entry>>);
 
-impl Drop for Gone {
+impl Mine {
+    fn new() -> Mine {
+        let host = HOST_TID.with(|t| *t);
+        let e = Arc::new(Mutex::new(Entry { mem: 0, tid: 0, pid: 0, inside: None, call: None, bt: None, exe: String::new(), since: Instant::now(), last: !0, co: (0, 0), co_n: 0, co_aborts: 0 }));
+        THREADS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(host, Arc::clone(&e));
+        Mine(host, e)
+    }
+}
+
+impl Drop for Mine {
     fn drop(&mut self) {
         if let Ok(mut g) = THREADS.lock() {
             if let Some(m) = g.as_mut() {
@@ -95,7 +108,7 @@ impl Drop for Gone {
 }
 
 thread_local! {
-    static GONE: Gone = Gone(HOST_TID.with(|t| *t));
+    static MINE: Mine = Mine::new();
     #[cfg(not(target_os = "linux"))]
     static HOST_TID: u32 = NEXT_HOST.fetch_add(1, Relaxed);
     #[cfg(target_os = "linux")]
@@ -103,6 +116,11 @@ thread_local! {
         .ok()
         .and_then(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()))
         .unwrap_or(0);
+}
+
+/// `f` on this thread's entry.
+fn mine(f: impl FnOnce(&mut Entry)) {
+    let _ = MINE.try_with(|m| f(&mut m.1.lock().unwrap_or_else(|e| e.into_inner())));
 }
 
 fn start() -> Instant {
@@ -117,17 +135,15 @@ fn start() -> Instant {
 pub fn enter(pid: i32, tid: i32, nr: u64, mem: u64) {
     let now = Instant::now();
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
-    let host = HOST_TID.with(|t| *t);
-    GONE.with(|_| ());
-    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { mem, tid, pid, inside: None, call: None, bt: None, exe: String::new(), since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
-    e.tid = tid;
-    e.pid = pid;
-    e.mem = mem;
-    e.inside = Some(nr);
-    e.call = None;
-    e.bt = None;
-    e.since = now;
+    mine(|e| {
+        e.tid = tid;
+        e.pid = pid;
+        e.mem = mem;
+        e.inside = Some(nr);
+        e.call = None;
+        e.bt = None;
+        e.since = now;
+    });
 }
 
 /// `GEX_STALL_BT=1` (with `GEX_WASM_BACKTRACE=1`): keep where each blocking
@@ -139,57 +155,35 @@ pub fn want_bt() -> bool {
 
 /// The guest frames a thread blocked from, and its program (`want_bt`).
 pub fn blocked(frames: String, exe: String) {
-    let host = HOST_TID.with(|t| *t);
-    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
+    mine(|e| {
         e.bt = Some(frames);
         e.exe = exe;
-    }
+    });
 }
 
 /// The kernel has decoded the call this thread is in: its canonical number,
 /// which a stall dump names (the raw number is the guest ABI's).
 pub fn decoded(canonical: u64) {
-    let host = HOST_TID.with(|t| *t);
-    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
-        e.call = Some(canonical);
-    }
+    mine(|e| e.call = Some(canonical));
 }
 
 /// The call it entered has returned; `name` is the kernel's canonical number.
 pub fn exit(canonical: u64) {
-    let host = HOST_TID.with(|t| *t);
-    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
+    mine(|e| {
         e.inside = None;
         e.since = Instant::now();
         e.last = canonical;
-    }
+    });
 }
 
 /// A unit's call-out to `target`, returning to `ret`, has ended; `aborted`
 /// when the callee did not return through it.
 pub fn callout(target: u64, ret: u64, aborted: bool) {
-    let host = HOST_TID.with(|t| *t);
-    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry {
-        mem: 0,
-        tid: 0,
-        pid: 0,
-        inside: None,
-        call: None,
-        bt: None,
-        exe: String::new(),
-        since: Instant::now(),
-        last: !0,
-        co: (0, 0),
-        co_n: 0,
-        co_aborts: 0,
+    mine(|e| {
+        e.co = (target, ret);
+        e.co_n += 1;
+        e.co_aborts += aborted as u64;
     });
-    e.co = (target, ret);
-    e.co_n += 1;
-    e.co_aborts += aborted as u64;
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -240,8 +234,8 @@ fn comm(host: u32) -> String {
 
 fn dump(why: &str) {
     let snap: Vec<(u32, Entry)> = {
-        let g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        g.as_ref().map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect()).unwrap_or_default()
+        let all: Vec<(u32, Arc<Mutex<Entry>>)> = THREADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.iter().map(|(k, v)| (*k, Arc::clone(v))).collect()).unwrap_or_default();
+        all.into_iter().map(|(k, v)| (k, v.lock().unwrap_or_else(|e| e.into_inner()).clone())).collect()
     };
     // Threads that have exited have no /proc entry: left out.
     let before: HashMap<u32, u64> = snap.iter().filter_map(|(h, _)| Some((*h, cpu_ms(*h)?))).collect();
