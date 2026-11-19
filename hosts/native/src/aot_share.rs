@@ -41,6 +41,12 @@ pub fn set_sampler(f: Sampler) {
 
 /// Register a module's compiled code.
 pub fn note(module: &wasmtime::Module, kind: Kind) {
+    // Only a sampler reads them, and it is set before anything is compiled
+    // (gexc's `GEX_PROF`). Kept sorted, each a move of everything after it:
+    // a desktop's hundred thousand runtime translations moved some 70 GB.
+    if SAMPLER.get().is_none() {
+        return;
+    }
     let r = module.image_range();
     let (lo, hi) = (r.start as usize, r.end as usize);
     if lo < hi {

@@ -660,12 +660,22 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     e.f.finish()
 }
 
+/// Whether the environment variable is set, read once for the process:
+/// these are asked per block, and every read takes the environment's lock
+/// (a desktop's translating threads waited on one another there).
+macro_rules! env_once {
+    ($name:literal) => {{
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 /// The body of both entry points: a region if one can be grown here,
 /// otherwise the block on its own.
 fn run_one(e: &mut Emitter<'_>, block: &Block, region: Option<crate::region::Region>) {
     match region {
         Some(region) => {
-            if std::env::var_os("GEX_REGION_DEBUG").is_some() {
+            if env_once!("GEX_REGION_DEBUG") {
                 let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
                 eprintln!("[region] {}", members.join(" "));
             }
@@ -907,7 +917,7 @@ impl<'a> Emitter<'a> {
             }
         }
         touched.sort_by_key(|r| Self::reg_offset(*r));
-        if std::env::var_os("GEX_REGION_DEBUG").is_some() {
+        if env_once!("GEX_REGION_DEBUG") {
             let insts: u64 = region
                 .iter()
                 .map(|a| (self.cx.gir[a].end - self.cx.gir[a].start) / 4)
@@ -1167,7 +1177,7 @@ impl<'a> Emitter<'a> {
         };
         // A kill switch, so the fused and unfused forms can be compared and a
         // suspected miscompilation bisected.
-        if std::env::var_os("GEX_NO_LOOP_FUSION").is_some() {
+        if env_once!("GEX_NO_LOOP_FUSION") {
             return false;
         }
         // And a finer one: `GEX_FUSE_SKIP=0xaaa,0xbbb` leaves the named
@@ -1188,7 +1198,7 @@ impl<'a> Emitter<'a> {
             if skip.contains(&block.start) {
                 return false;
             }
-            if std::env::var_os("GEX_FUSE_LIST").is_some() {
+            if env_once!("GEX_FUSE_LIST") {
                 eprintln!("[fuse] self-loop at {:#x}", block.start);
             }
         }
