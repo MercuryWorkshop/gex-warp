@@ -846,6 +846,10 @@ impl Kernel {
         pump.1.rung.store(false, Ordering::SeqCst);
         let unserved = wq.events.unserved();
         self.darwin_events_kick(m, wq, &unserved);
+        // (The kick rings for the poller, which is this thread, here now:
+        // a ring left would end its wait at once, and it would poll again
+        // without end. Who rings later holds the queue after this call.)
+        pump.1.rung.store(false, Ordering::SeqCst);
         if self.darwin_workq_does.is_some() {
             // (A thread to make: made as this call ends, and the call is
             // made again.)
@@ -885,5 +889,51 @@ impl Kernel {
         self.darwin_post = Post::Workq;
         *a = [slot + fds, ask.len() as u64, if left.is_some() { slot } else { 0 }, 0, 8, 0];
         nr::PPOLL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syscalls::Kernel;
+
+    /// The kernel's own thread rings for itself in its kick, and a ring left
+    /// would end its wait at once: it would poll again without end (one
+    /// such thread spun in every daemon of a Mojave desktop). Its wait is
+    /// left unrung; a kick or a let-go by another thread rings it.
+    #[test]
+    fn the_pollers_own_kick_leaves_its_wait_unrung_and_a_later_one_rings_it() {
+        let mut bytes = vec![0u8; 0x40000];
+        let mut m = GuestMem::new(&mut bytes);
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        // (Its page for what it waits on: mapped, though past these bytes,
+        // whose writes the call does not need.)
+        let page = gex_abi::MMAP_BOTTOM;
+        let fl = crate::mem::flags::PRIVATE | crate::mem::flags::ANONYMOUS | crate::mem::flags::FIXED;
+        k.mem.lock().mmap(page, abi::PAGE_SIZE, 3, fl, "[kqueue]").unwrap();
+        k.darwin_kevent_pages.insert(k.tid, page);
+        let shared = Arc::clone(&k.darwin_workq);
+        let pump = {
+            let mut wq = shared.lock().unwrap();
+            // (Its thread there already: the kick asks for none.)
+            wq.events.poller = Some(k.tid);
+            let mut a = [0u64; 6];
+            assert_eq!(k.darwin_events_poll(&mut m, &mut wq, &mut a), nr::PPOLL);
+            assert_eq!(a[1], 1, "it waits on the pump alone");
+            Arc::clone(&wq.events.pump.as_ref().expect("a pump").1)
+        };
+        assert!(!pump.rung.load(Ordering::SeqCst));
+        assert!(!pump.poll_readable(), "nothing to say, nobody rang: it waits");
+        {
+            let mut wq = shared.lock().unwrap();
+            k.darwin_events_kick(&mut m, &mut wq, &[]);
+        }
+        assert!(pump.poll_readable(), "another thread's kick ends the wait");
+        pump.rung.store(false, Ordering::SeqCst);
+        {
+            let mut wq = shared.lock().unwrap();
+            k.darwin_events_unbind(&mut wq, Target::Kqwq);
+        }
+        assert!(pump.poll_readable(), "a thread letting a queue go ends it too");
     }
 }
