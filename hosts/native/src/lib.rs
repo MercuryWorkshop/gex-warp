@@ -5636,9 +5636,24 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
+            // What the call left for the host, asked in one go: whether it
+            // may have made a descriptor ready, and whether the map's log has
+            // code for the steps below (its code ranges; its flag of changed
+            // code only for a process that shares its translations, the one
+            // that acts on it). Most calls leave neither, and each of those
+            // steps took the process's kernel lock to find so (with the
+            // job-control checks, the most of a desktop's waits for it). What
+            // another thread adds after this is taken by its own call's end,
+            // or the next one's here.
+            let shares = shares_translations(caller.data());
+            let (fd_activity, code_logged) = caller.data_mut().with_kernel(|k| {
+                let fd_activity = k.take_fd_activity();
+                let mm = k.mem.lock();
+                (fd_activity, mm.log.has_code_ranges() || (shares && mm.log.code_changed))
+            });
             // Wake threads parked on descriptors if this call may have made
             // one ready (`ready`).
-            if caller.data_mut().with_kernel(|k| k.take_fd_activity()) {
+            if fd_activity {
                 ready::notify();
             }
             profile::syscall_exit(caller.data_mut(), memory.bytes());
@@ -5655,7 +5670,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A process that shares its translations with another (a fork's
             // parent or child) and has changed its code takes its own first,
             // before anything below retires or adds to them for that change.
-            if shares_translations(caller.data())
+            if code_logged
+                && shares
                 && caller.data_mut().with_kernel(|k| {
                     let log = &mut k.mem.lock().log;
                     std::mem::take(&mut log.code_changed) || !log.retired_code.is_empty() || !log.new_code.is_empty() || !log.recheck_code.is_empty()
@@ -5666,28 +5682,34 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // Code that has gone away, retired before the newly mapped code
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
             // would throw away the fresh translation.
-            let retired: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
-                let mut mm = k.mem.lock();
-                // (this host keeps no translation of writable code: those
-                // ranges are retired with the rest)
-                mm.log.writable_code.clear();
-                let r = std::mem::take(&mut mm.log.retired_code);
-                drop(mm);
-                if !r.is_empty() {
-                    RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                r
-            });
+            let retired: Vec<(u64, u64)> = if !code_logged {
+                Vec::new()
+            } else {
+                caller.data_mut().with_kernel(|k| {
+                    let mut mm = k.mem.lock();
+                    // (this host keeps no translation of writable code: those
+                    // ranges are retired with the rest)
+                    mm.log.writable_code.clear();
+                    let r = std::mem::take(&mut mm.log.retired_code);
+                    drop(mm);
+                    if !r.is_empty() {
+                        RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    r
+                })
+            };
             if !retired.is_empty() {
                 let r = retire_translations(&mut caller, &retired);
                 RETIRING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 r?;
             }
             await_retires();
-            recheck_units(&mut caller);
-            let mapped: Vec<gex_kernel::CodeMap> = caller
-                .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.new_code));
+            let mapped: Vec<gex_kernel::CodeMap> = if !code_logged {
+                Vec::new()
+            } else {
+                recheck_units(&mut caller);
+                caller.data_mut().with_kernel(|k| std::mem::take(&mut k.mem.lock().log.new_code))
+            };
             profile::note_mapped(caller.data_mut(), &mapped);
             // Shared objects only: Wine maps its server's shared memory
             // (`/tmp/.wine-*/tmpmap-*`) executable too.

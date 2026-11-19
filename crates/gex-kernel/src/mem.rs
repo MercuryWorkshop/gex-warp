@@ -713,6 +713,16 @@ pub struct MapLog {
     pub code_changed: bool,
 }
 
+impl MapLog {
+    /// Whether the logs of code ranges above hold any: asked after every
+    /// call, to skip taking each of them when, as for most calls, none do.
+    /// ([`Self::code_changed`] is apart: only a host whose process shares its
+    /// translations acts on it, and clears it.)
+    pub fn has_code_ranges(&self) -> bool {
+        !self.new_code.is_empty() || !self.retired_code.is_empty() || !self.writable_code.is_empty() || !self.recheck_code.is_empty()
+    }
+}
+
 impl Clone for MapLog {
     fn clone(&self) -> MapLog {
         // A fork's copy keeps only its shared file mappings: the child's
@@ -2549,6 +2559,29 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each of the logs of code ranges is code for the host to act on after
+    /// a call; a log with none in them is not, whatever else it notes.
+    #[test]
+    fn a_log_has_code_ranges_when_any_of_its_code_logs_does() {
+        assert!(!MapLog::default().has_code_ranges());
+        let mut l = MapLog::default();
+        l.new_code.push(crate::syscalls::CodeMap { start: 0x1000, end: 0x2000, path: String::new(), offset: 0 });
+        assert!(l.has_code_ranges());
+        for set in [
+            |l: &mut MapLog| l.retired_code.push((0x1000, 0x2000)),
+            |l: &mut MapLog| l.writable_code.push((0x1000, 0x2000)),
+            |l: &mut MapLog| l.recheck_code.push((0x1000, 0x2000)),
+        ] {
+            let mut l = MapLog::default();
+            set(&mut l);
+            assert!(l.has_code_ranges());
+        }
+        // (The flag a sharing process acts on, and notes that are not code,
+        // are not ranges.)
+        let l = MapLog { code_changed: true, armed_place: Some("/lib/a.so".into()), ..MapLog::default() };
+        assert!(!l.has_code_ranges());
+    }
 
     /// A page of mapped code made writable no longer names the file as its
     /// code's source; the rest of the mapping still does.
