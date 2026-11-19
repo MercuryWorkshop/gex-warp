@@ -5589,12 +5589,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // the exec'ing thread's tid word, which never changes, slept
                 // on and the process never ended (1 run in 15-200 hung).
                 let stopping = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.stopping));
+                // (Asked at every turn of a wait, a millisecond apart: when
+                // another thread of the process holds its kernel, this turn
+                // does not wait for it and the next asks again. A Mojave
+                // desktop's waiting threads, dozens in a process, each
+                // taking the lock a thousand times a second, held one
+                // another and the process's running threads up: a quarter
+                // of the host's waits on a mutex.)
                 let interrupted = move || {
                     stopping.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire))
-                        || kernel_for_signals
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .signal_pending_for(waiting_tid)
+                        || match kernel_for_signals.try_lock() {
+                            Ok(mut k) => k.signal_pending_for(waiting_tid),
+                            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().signal_pending_for(waiting_tid),
+                            Err(std::sync::TryLockError::WouldBlock) => false,
+                        }
                 };
                 // Blocked, the thread does not hold up a fork's copy; it
                 // waits for the copy before writing its result.
