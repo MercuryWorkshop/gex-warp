@@ -264,7 +264,7 @@ impl Kernel {
         if let Some((_, pump)) = &ev.pump {
             pump.rung.store(true, Ordering::SeqCst);
         }
-        self.fd_activity = true;
+        self.fd_activity.store(true, Ordering::Release);
     }
 
     /// Ask for a thread for each of `targets` that wants one, and for the
@@ -924,11 +924,14 @@ mod tests {
         };
         assert!(!pump.rung.load(Ordering::SeqCst));
         assert!(!pump.poll_readable(), "nothing to say, nobody rang: it waits");
+        let woken = k.fd_activity_flag();
+        woken.store(false, Ordering::SeqCst);
         {
             let mut wq = shared.lock().unwrap();
             k.darwin_events_kick(&mut m, &mut wq, &[]);
         }
         assert!(pump.poll_readable(), "another thread's kick ends the wait");
+        assert!(woken.swap(false, Ordering::SeqCst), "and the host is told to look at its waiters");
         pump.rung.store(false, Ordering::SeqCst);
         {
             let mut wq = shared.lock().unwrap();

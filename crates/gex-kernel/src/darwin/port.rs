@@ -1199,7 +1199,7 @@ impl Kernel {
             Some(rx) if rx.is(&self.futexes) => self.darwin_wake(m, sp, &wake, true),
             Some(rx) => {
                 rx.wake(&wake);
-                self.fd_activity = true;
+                self.fd_activity.store(true, std::sync::atomic::Ordering::Release);
             }
             None => {}
         }

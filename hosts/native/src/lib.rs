@@ -395,6 +395,12 @@ struct HostState {
     /// (an exec keeps it): what a thread asks whether the process is to
     /// stop, without the kernel's lock ([`job_stop_point`]).
     proc_signals: Arc<gex_kernel::signal::ProcSig>,
+    /// The kernel's flag of calls that may have made a descriptor ready,
+    /// and the process's memory map (the same map, the kernel's for the
+    /// process's life): what a thread asks after each call without the
+    /// kernel's lock.
+    fd_activity: Arc<std::sync::atomic::AtomicBool>,
+    mm: gex_kernel::mem::Mm,
     /// This thread's identity.
     thread: ThreadState,
     memory: Option<gex_mem::GuestMemory>,
@@ -1835,12 +1841,15 @@ fn run_program_with(
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
     let proc_signals = Arc::clone(kernel.signals.process());
+    let (fd_activity, mm) = (kernel.fd_activity_flag(), kernel.mem.shared());
 
     let mut store = Store::new(
         &engine,
         HostState {
             kernel: Arc::new(Mutex::new(kernel)),
             proc_signals,
+            fd_activity,
+            mm,
             thread: ThreadState::new(ctx_addr, tid),
             memory: None,
             proc_state,
@@ -3904,12 +3913,17 @@ fn crash_line(c: &gex_kernel::proc::Crash) {
 
 /// Run a child process to completion in this host thread.
 fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> Result<Exit> {
-    let proc_signals = Arc::clone(cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).signals.process());
+    let (proc_signals, fd_activity, mm) = {
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(k.signals.process()), k.fd_activity_flag(), k.mem.shared())
+    };
     let mut store = Store::new(
         &cx.engine,
         HostState {
             kernel: Arc::clone(&cx.kernel),
             proc_signals,
+            fd_activity,
+            mm,
             thread,
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
@@ -4283,15 +4297,17 @@ fn exec_program(
 /// (`exit_group`, a fatal signal), not just its own.
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
     // Without the kernel lock at the end, which a process ending may hold.
-    let (slots, proc_signals) = {
+    let (slots, proc_signals, fd_activity, mm) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
-        (Arc::clone(&k.next_ctx_slot), Arc::clone(k.signals.process()))
+        (Arc::clone(&k.next_ctx_slot), Arc::clone(k.signals.process()), k.fd_activity_flag(), k.mem.shared())
     };
     let mut store = Store::new(
         &cx.engine,
         HostState {
             kernel: Arc::clone(&cx.kernel),
             proc_signals,
+            fd_activity,
+            mm,
             thread,
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
@@ -5636,21 +5652,22 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
-            // What the call left for the host, asked in one go: whether it
-            // may have made a descriptor ready, and whether the map's log has
-            // code for the steps below (its code ranges; its flag of changed
-            // code only for a process that shares its translations, the one
-            // that acts on it). Most calls leave neither, and each of those
-            // steps took the process's kernel lock to find so (with the
-            // job-control checks, the most of a desktop's waits for it). What
-            // another thread adds after this is taken by its own call's end,
-            // or the next one's here.
+            // What the call left for the host, asked without the kernel's
+            // lock: whether it may have made a descriptor ready (the
+            // kernel's flag), and whether the map's log has code for the
+            // steps below (its code ranges; its flag of changed code only for
+            // a process that shares its translations, the one that acts on
+            // it), under the map's own lock, as a mapping call takes it. Most
+            // calls leave neither, and each of those steps took the process's
+            // kernel lock to find so (with the job-control checks, the most of
+            // a desktop's waits for it). What another thread adds after this
+            // is taken by its own call's end, or the next one's here.
             let shares = shares_translations(caller.data());
-            let (fd_activity, code_logged) = caller.data_mut().with_kernel(|k| {
-                let fd_activity = k.take_fd_activity();
-                let mm = k.mem.lock();
-                (fd_activity, mm.log.has_code_ranges() || (shares && mm.log.code_changed))
-            });
+            let fd_activity = caller.data().fd_activity.swap(false, std::sync::atomic::Ordering::AcqRel);
+            let code_logged = {
+                let mm = caller.data().mm.lock();
+                mm.log.has_code_ranges() || (shares && mm.log.code_changed)
+            };
             // Wake threads parked on descriptors if this call may have made
             // one ready (`ready`).
             if fd_activity {
@@ -5691,10 +5708,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // ranges are retired with the rest)
                     mm.log.writable_code.clear();
                     let r = std::mem::take(&mut mm.log.retired_code);
-                    drop(mm);
+                    // (Counted before the map is let go: another thread's
+                    // call end, which looks at the log under the map's lock
+                    // alone, either finds these ranges or finds them being
+                    // retired, and waits for that, `await_retires`.)
                     if !r.is_empty() {
                         RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
+                    drop(mm);
                     r
                 })
             };

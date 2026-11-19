@@ -969,8 +969,10 @@ pub struct Kernel {
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
-    /// on descriptors ([`Kernel::take_fd_activity`]).
-    pub fd_activity: bool,
+    /// on descriptors ([`Kernel::take_fd_activity`]). Shared with the host's
+    /// threads of the process ([`Kernel::fd_activity_flag`]), which take it
+    /// after a call without the kernel's lock; a fork's child has its own.
+    pub fd_activity: Arc<std::sync::atomic::AtomicBool>,
     /// The wasm32 personality: a native wasm32
     /// program on the i386 ABI. Everything is i386's except how control
     /// moves: a signal frame or a `sigreturn` is left in the thread context
@@ -11779,7 +11781,7 @@ impl Kernel {
             darwin_conf: Default::default(),
             darwin_compat: Default::default(),
             darwin_threads: Default::default(),
-            fd_activity: false,
+            fd_activity: Default::default(),
             wasm32: false,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
@@ -12390,7 +12392,7 @@ impl Kernel {
             darwin_compat: Arc::new(std::sync::atomic::AtomicBool::new(self.darwin_compat.load(std::sync::atomic::Ordering::Relaxed))),
             // The child's libpthread is the parent's, registered already.
             darwin_threads: Arc::new(std::sync::Mutex::new(*self.darwin_threads.lock().unwrap_or_else(|e| e.into_inner()))),
-            fd_activity: false,
+            fd_activity: Default::default(),
             wasm32: self.wasm32,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
@@ -12570,7 +12572,9 @@ impl Kernel {
             raw
         };
 
-        self.fd_activity |= wakes_fd_waiters(n) && self.io_may_wake(n, &a);
+        if wakes_fd_waiters(n) && self.io_may_wake(n, &a) {
+            self.fd_activity.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.syscall_nr = n;
 
         // Returning from a handler restores a whole context, so it cannot go
@@ -13173,8 +13177,13 @@ impl Kernel {
     /// Finish a syscall whose blocking half the host has now run.
     /// Whether a syscall since the last call may have changed descriptor
     /// readiness ([`Kernel::fd_activity`]), clearing it.
-    pub fn take_fd_activity(&mut self) -> bool {
-        std::mem::take(&mut self.fd_activity)
+    pub fn take_fd_activity(&self) -> bool {
+        self.fd_activity.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// [`Kernel::fd_activity`] itself, for a host to take without the lock.
+    pub fn fd_activity_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.fd_activity)
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
@@ -20627,5 +20636,21 @@ mod proc_signals_tests {
         assert!(!kept.stop_due() && !k.job_stopped());
         let child = k.fork_kernel();
         assert!(!Arc::ptr_eq(&kept, child.signals.process()));
+    }
+
+    /// The host takes the flag of calls that may have made a descriptor
+    /// ready without the kernel's lock: the flag it holds is the kernel's,
+    /// taken once, and a fork's child has its own.
+    #[test]
+    fn the_flag_of_descriptor_activity_the_host_holds_is_the_kernels() {
+        let k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        let held = k.fd_activity_flag();
+        let child = k.fork_kernel();
+        k.fd_activity.store(true, std::sync::atomic::Ordering::Release);
+        assert!(held.swap(false, std::sync::atomic::Ordering::AcqRel));
+        assert!(!k.take_fd_activity(), "taken once");
+        k.fd_activity.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!child.take_fd_activity(), "the child's is its own");
+        assert!(k.take_fd_activity());
     }
 }
