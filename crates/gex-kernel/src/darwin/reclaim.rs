@@ -120,8 +120,9 @@ impl Kernel {
             let (Ok(addr), Ok(size)) = (m.read_u64(e), m.read_u32(e + 8)) else { continue };
             let what = m.read(e + 12, 1).map_or(0, |b| b[0]);
             let size = size as u64;
-            // (An entry of nothing was taken back by the task.)
-            if addr == 0 || size == 0 || addr % abi::PAGE_SIZE != 0 {
+            // (An entry of nothing was taken back by the task; one below the
+            // window, in __PAGEZERO, names none of its memory.)
+            if addr == 0 || size == 0 || addr % abi::PAGE_SIZE != 0 || gex_abi::below_window(addr) {
                 continue;
             }
             let size = size.next_multiple_of(abi::PAGE_SIZE);

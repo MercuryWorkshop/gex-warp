@@ -140,7 +140,14 @@ impl Kernel {
                     KERN_SUCCESS
                 } else {
                     let (lo, hi) = (x[1] & !(abi::PAGE_SIZE - 1), (x[1] + x[2]).next_multiple_of(abi::PAGE_SIZE));
-                    kern(self.map_io().call(m, nr::MUNMAP, [lo, hi - lo, 0, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL)))
+                    // (Below the window, in __PAGEZERO, there is nothing to
+                    // take back: only what of the range is in the window.)
+                    let lo = if gex_abi::below_window(lo) { gex_abi::guest_base() } else { lo };
+                    if hi <= lo {
+                        KERN_SUCCESS
+                    } else {
+                        kern(self.map_io().call(m, nr::MUNMAP, [lo, hi - lo, 0, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL)))
+                    }
                 }
             }
             // (target, address, size, set_maximum, new_protection); a
@@ -150,6 +157,9 @@ impl Kernel {
                     MACH_SEND_INVALID_DEST
                 } else if x[3] != 0 {
                     KERN_SUCCESS
+                } else if gex_abi::below_window(x[1]) {
+                    // (memory below the window, in __PAGEZERO: none)
+                    KERN_INVALID_ADDRESS
                 } else {
                     let (lo, hi) = (x[1] & !(abi::PAGE_SIZE - 1), (x[1] + x[2]).next_multiple_of(abi::PAGE_SIZE));
                     kern(self.map_io().call(m, nr::MPROTECT, [lo, hi - lo, x[4] & 7, 0, 0, 0]).unwrap_or(Err(Errno::EINVAL)))
@@ -225,6 +235,19 @@ impl Kernel {
         if size == 0 {
             return Ok(0);
         }
+        // Below the window, a Mac's __PAGEZERO: fixed there, no address at
+        // all (KERN_INVALID_ADDRESS, as XNU's vm_map_enter answers below its
+        // map's minimum), rather than the window's memory 4 GiB up, which
+        // the caller would take to be where it asked (`Kernel::darwin_mmap`);
+        // anywhere from there, anywhere.
+        let want = if gex_abi::below_window(want) {
+            if flags & VM_FLAGS_ANYWHERE == 0 {
+                return Err(Errno::EFAULT);
+            }
+            0
+        } else {
+            want
+        };
         self.darwin_vm_map_offset(m, gex_abi::canon(want), size, mask, flags, prot_bits).map(gex_abi::guest_addr)
     }
 

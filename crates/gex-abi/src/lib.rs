@@ -496,6 +496,19 @@ pub fn canon(a: u64) -> u64 {
     }
 }
 
+/// Whether `a`, an address a process with the window hands in, is below
+/// the window: in a Mac's __PAGEZERO (its program's first 4 GiB), where
+/// nothing of the process is. [`canon`] takes such an address as an offset
+/// of its own, and so as the window's memory 4 GiB above it (the commpage
+/// pyrus's headers name at 0xffc000 is read that way); a call that maps,
+/// unmaps or changes memory is not to: XNU answers it as for an address
+/// below its map's minimum, which __PAGEZERO raised to 4 GiB.
+#[inline]
+pub fn below_window(a: u64) -> bool {
+    let b = guest_base();
+    b != 0 && a < b
+}
+
 /// The address the guest is given for offset `o`: in the window when the
 /// process has one. 0 (no address) stays 0.
 #[inline]
@@ -1716,6 +1729,10 @@ mod tests {
         // Below the window, and past it, an address is left as it is.
         assert_eq!(canon(0x00ff_c000), 0x00ff_c000);
         assert_eq!(canon(0x2_0000_0000), 0x2_0000_0000);
+        // ... and one below it is in __PAGEZERO, for the calls that map or
+        // change memory (none is, with no window).
+        assert!(below_window(0) && below_window(0x80_0000) && below_window(DARWIN_BASE - 1));
+        assert!(!below_window(DARWIN_BASE) && !below_window(0x2_0000_0000));
         // No address stays none.
         assert_eq!(guest_addr(0), 0);
         assert_eq!(windowed_limit(GUEST_LIMIT), DARWIN_BASE + GUEST_LIMIT);
@@ -1731,6 +1748,7 @@ mod tests {
         }
         set_guest_base(0);
         assert_eq!(canon(0x1_7e00_1230), 0x1_7e00_1230);
+        assert!(!below_window(0x80_0000));
         assert_eq!(fold_commpage(xnu), None);
     }
 

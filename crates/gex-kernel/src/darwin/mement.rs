@@ -166,6 +166,10 @@ impl Kernel {
         if len == 0 {
             return Err(KERN_INVALID_ARGUMENT);
         }
+        // (Below the window, in __PAGEZERO, there is no memory of the task's.)
+        if gex_abi::below_window(start) {
+            return Err(KERN_INVALID_ADDRESS);
+        }
         let (lo, hi) = (gex_abi::canon(start), gex_abi::canon(start) + len);
         let parts: Vec<(u64, u64, u32, bool)> = {
             let mm = self.mem.lock();
@@ -313,6 +317,10 @@ impl Kernel {
         let r = (|| {
             let kind = if copy { crate::mem::flags::PRIVATE } else { crate::mem::flags::SHARED };
             if flags & VM_FLAGS_ANYWHERE == 0 {
+                // (not below the window: `Kernel::darwin_vm_map_at`)
+                if gex_abi::below_window(want) {
+                    return Err(KERN_INVALID_ADDRESS);
+                }
                 let at = gex_abi::canon(want) & !(page - 1);
                 if at.checked_add(len).is_none_or(|end| end > m.limit() as u64) {
                     return Err(KERN_INVALID_ADDRESS);
@@ -340,7 +348,8 @@ impl Kernel {
             let whole = !copy && g > page && (mask.wrapping_add(1)).max(page) <= g;
             let (flo, fhi) = if whole { (flo, fhi) } else { (foff, foff + len) };
             let align = if whole { g - 1 } else { mask };
-            let at = self.darwin_place(gex_abi::canon(want), fhi - flo, cur, false, align).map_err(|e| kern(Err(e)))?;
+            let hint = if gex_abi::below_window(want) { 0 } else { gex_abi::canon(want) };
+            let at = self.darwin_place(hint, fhi - flo, cur, false, align).map_err(|e| kern(Err(e)))?;
             let r = self.map_io().call(m, nr::MMAP, [at, fhi - flo, cur as u64, kind | crate::mem::flags::FIXED_NOREPLACE, fd as u64, flo]);
             r.unwrap_or(Err(Errno::EINVAL)).map_err(|e| kern(Err(e)))?;
             Ok(at + (foff - flo))

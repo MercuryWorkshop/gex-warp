@@ -415,6 +415,17 @@ impl Kernel {
                 signal::dframe::UC_SET_ALT_STACK | signal::dframe::UC_RESET_ALT_STACK => set(nr::NOOP_OK, &[]),
                 _ => set(nr::RT_SIGRETURN, &x[..3]),
             },
+            // An address below the window, in a Mac's __PAGEZERO, names
+            // none of the process's memory (taken as its offset it would
+            // name the window's 4 GiB above): unmapping there unmaps nothing
+            // but what of the range is past the window's start, and
+            // protecting, syncing or advising there is ENOMEM, as XNU
+            // answers for memory below its map's minimum.
+            d::MUNMAP if gex_abi::below_window(x[0]) => match (x[0].saturating_add(x[1])).checked_sub(gex_abi::guest_base()) {
+                Some(past) if past > 0 => set(nr::MUNMAP, &[gex_abi::guest_base(), past]),
+                _ => set(nr::NOOP_OK, &[]),
+            },
+            d::MPROTECT | d::MSYNC | d::MADVISE if gex_abi::below_window(x[0]) => NATIVE + code,
             d::MUNMAP => set(nr::MUNMAP, &x[..2]),
             d::MPROTECT => set(nr::MPROTECT, &x[..3]),
             d::MSYNC => set(nr::MSYNC, &x[..3]),
@@ -683,6 +694,8 @@ impl Kernel {
             // No copy-on-write clones, and no exchange of two names: the
             // caller does without.
             d::CLONEFILEAT | d::RENAMEATX_NP => Err(Errno::EOPNOTSUPP),
+            // (Memory below the window, which is none: `Kernel::darwin_bsd`.)
+            d::MPROTECT | d::MSYNC | d::MADVISE if gex_abi::below_window(x[0]) => Err(Errno::ENOMEM),
             // (`MADV_ZERO` on x86-64: the one advice that comes here.)
             d::MADVISE => Err(Errno::EOPNOTSUPP),
             d::FSCTL | d::FFSCTL => Err(Errno::ENOTTY),
@@ -1036,10 +1049,20 @@ impl Kernel {
             if addr % page != 0 {
                 return Err(Errno::EINVAL);
             }
-            // (one asked for below the window is where it was asked for: an
-            // address gex's userland was built with)
-            return self.map_io().mmap(m, [addr, len, prot_bits, kflags, fd, off]).map(|a| if asked == a { a } else { gex_abi::guest_addr(a) });
+            // Below the window, a Mac's __PAGEZERO: nothing is mapped there
+            // (ENOMEM, as XNU's mmap answers below its map's minimum). Taken
+            // as its offset, it was the window's memory 4 GiB up, which the
+            // caller then took to be where it asked: the dynamic linker
+            // placed a library linked at 8 MiB at 8 MiB so, kept that as its
+            // address, and ran it 4 GiB higher, where its lazy binding named
+            // an image the linker did not know (secinitd's abort).
+            if gex_abi::below_window(asked) {
+                return Err(Errno::ENOMEM);
+            }
+            return self.map_io().mmap(m, [addr, len, prot_bits, kflags, fd, off]).map(gex_abi::guest_addr);
         }
+        // (A hint below the window is no place: wherever there is room.)
+        let addr = if gex_abi::below_window(asked) { 0 } else { addr };
         let len = len.checked_next_multiple_of(page).ok_or(Errno::ENOMEM)?;
         // The dynamic linker's room for a library goes where every process
         // has that library, when the host keeps such places.
